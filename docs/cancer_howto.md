@@ -150,6 +150,28 @@ tumor_model: tools/cosmic_per_tissue_BRCA.json.gz
 sv_rate_scale: 1.0       # 1.0 = the model's nominal rate; higher stress-tests SV callers
 ```
 
+### Subclonal architecture (somatic VAF spectrum)
+
+By default the somatic burden sits at ~one effective VAF, set by `purity` alone.
+Real tumors are mixtures of subclones at distinct **cancer-cell fractions (CCF)**.
+Add a `subclones:` list to spread de-novo somatic variants across those fractions —
+each variant is assigned a subclone (share ∝ `weight`) and takes its `ccf`:
+
+```yaml
+purity: 0.8
+subclones:
+  - {ccf: 1.0, weight: 0.6}   # clonal / truncal — present in every tumor cell
+  - {ccf: 0.4, weight: 0.3}   # major subclone
+  - {ccf: 0.15, weight: 0.1}  # minor subclone
+```
+
+CCF **composes** with purity: a somatic variant at CCF `f` is observed in the merged
+output at `VAF = purity · f` (purity = normal contamination, CCF = subclonal fraction —
+orthogonal axes). Germline (shared) variants are unaffected. This produces the
+multi-modal somatic VAF spectrum that subclonal-deconvolution tools (PyClone, SciClone,
+…) consume. `ccf ∈ (0, 1]`; `weight` defaults to `1.0` (equal share). Omit the block for
+the single-fraction default (output is byte-identical to pre-subclone runs).
+
 ### One germline, many tumor scenarios
 
 Fix the germline once and sweep purity/depth by pointing each run at the same
@@ -198,6 +220,7 @@ tools/cancer_sv_benchmark.sh \
 | `tumor_mutation_rate` | per-base somatic rate. Default `1e-5`. `model` = use the model's fitted rate. |
 | `normal_mutation_rate` | per-base germline rate. Default = the model's fitted rate. |
 | `sv_rate_scale` | de novo SV multiplier; `0` = off, `1.0` = the model's `sv_model` rate. |
+| `subclones` | optional list of `{ccf, weight}` subclones; spreads somatic variants across CCFs → observed VAF = `purity · ccf`. Omit for a single fraction. |
 | `germline_vcf` | fixed shared germline instead of de-novo generation. |
 | `rng_seed` | seeds both passes (suffixed `-normal`/`-tumor`); printed to the log. |
 | `keep_per_pass` | keep per-pass FASTQs (`false` = merged only). |

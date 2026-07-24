@@ -12,6 +12,7 @@ use serde_yml::Value;
 
 use crate::gen_cancer_reads::errors::GenCancerReadsError;
 use crate::gen_reads::utils::config::RunConfiguration;
+use crate::gen_reads::utils::subclone::{Subclone, SubcloneModel};
 
 /// Default tumor-pass somatic SNP/indel rate (typical solid tumor; see #235).
 /// The de-novo mutations added in the tumor pass are somatic, so this — not the
@@ -48,6 +49,12 @@ pub struct CancerConfig {
     pub sv_rate_scale: f64,
     pub keep_per_pass: bool,
     pub overwrite_output: bool,
+    /// Optional subclonal architecture (#405). When set, the tumor pass distributes
+    /// its de-novo somatic variants across these subclones, stamping each with its
+    /// subclone's cancer-cell fraction (CCF) as a per-variant allele_fraction. The
+    /// observed VAF in the merged output is `purity × CCF`. `None` → the pre-#405
+    /// single-fraction behavior (every somatic variant near one effective VAF).
+    pub subclones: Option<SubcloneModel>,
 }
 
 impl Default for CancerConfig {
@@ -72,6 +79,7 @@ impl Default for CancerConfig {
             sv_rate_scale: 0.0,
             keep_per_pass: true,
             overwrite_output: false,
+            subclones: None,
         }
     }
 }
@@ -143,6 +151,7 @@ impl CancerConfig {
                     };
                 }
                 "germline_vcf" => cfg.germline_vcf = Some(req_path(value, "germline_vcf")?),
+                "subclones" => cfg.subclones = Some(parse_subclones(value)?),
                 "sv_rate_scale" => cfg.sv_rate_scale = as_f64(value, "sv_rate_scale")?,
                 "keep_per_pass" => cfg.keep_per_pass = as_bool(value, "keep_per_pass")?,
                 "overwrite_output" => cfg.overwrite_output = as_bool(value, "overwrite_output")?,
@@ -248,6 +257,9 @@ impl CancerConfig {
             mutation_model: self.tumor_model.clone(),
             input_vcf: Some(germline_vcf),
             sv_rate_scale: self.sv_rate_scale,
+            // #405: only the tumor pass carries the subclonal architecture — the
+            // normal pass has no somatic variants to stamp.
+            subclone_model: self.subclones.clone(),
             output_filename: format!("{}_tumor", self.output_prefix),
             rng_seed: Some(format!("{}-tumor", self.rng_seed_root)),
             ..self.shared_run_config()
@@ -278,6 +290,42 @@ fn as_f64(v: &Value, key: &str) -> Result<f64, GenCancerReadsError> {
 fn as_bool(v: &Value, key: &str) -> Result<bool, GenCancerReadsError> {
     v.as_bool()
         .ok_or_else(|| GenCancerReadsError::ConfigError(format!("{key} must be a boolean")))
+}
+
+/// Parse the optional `subclones:` YAML list into a validated [`SubcloneModel`] (#405).
+///
+/// Expected shape — a non-empty sequence of `{ccf, weight}` mappings:
+/// ```yaml
+/// subclones:
+///   - {ccf: 1.0, weight: 0.6}   # clonal / truncal
+///   - {ccf: 0.4, weight: 0.3}   # major subclone
+///   - {ccf: 0.15, weight: 0.1}  # minor subclone
+/// ```
+/// `weight` is optional and defaults to `1.0` (equal share). CCF/weight validity is
+/// enforced by `SubcloneModel::new`.
+fn parse_subclones(v: &Value) -> Result<SubcloneModel, GenCancerReadsError> {
+    let seq = v.as_sequence().ok_or_else(|| {
+        GenCancerReadsError::ConfigError("subclones must be a list of {ccf, weight} entries".into())
+    })?;
+    let mut subclones = Vec::with_capacity(seq.len());
+    for (i, entry) in seq.iter().enumerate() {
+        let map = entry.as_mapping().ok_or_else(|| {
+            GenCancerReadsError::ConfigError(format!(
+                "subclones[{i}] must be a mapping with a ccf (and optional weight)"
+            ))
+        })?;
+        let ccf_val = map.get(Value::String("ccf".into())).ok_or_else(|| {
+            GenCancerReadsError::ConfigError(format!("subclones[{i}] is missing required 'ccf'"))
+        })?;
+        let ccf = as_f64(ccf_val, &format!("subclones[{i}].ccf"))?;
+        let weight = match map.get(Value::String("weight".into())) {
+            Some(w) => as_f64(w, &format!("subclones[{i}].weight"))?,
+            None => 1.0,
+        };
+        subclones.push(Subclone { ccf, weight });
+    }
+    SubcloneModel::new(subclones)
+        .map_err(|e| GenCancerReadsError::ConfigError(format!("invalid subclones: {e}")))
 }
 
 #[cfg(test)]
@@ -413,5 +461,98 @@ mod tests {
         assert!(normal.output_filename.ends_with("_normal"));
         assert!(tumor.output_filename.ends_with("_tumor"));
         assert_eq!(tumor.input_vcf, Some(PathBuf::from("/tmp/g.vcf.gz")));
+    }
+
+    #[test]
+    fn no_subclones_by_default() {
+        let cfg = CancerConfig::from_scrape(base_scrape()).unwrap();
+        assert!(cfg.subclones.is_none());
+        // And it must not leak into either pass.
+        assert!(cfg.normal_pass().unwrap().subclone_model.is_none());
+        assert!(
+            cfg.tumor_pass(PathBuf::from("/tmp/g.vcf.gz"))
+                .unwrap()
+                .subclone_model
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn subclones_parse_and_land_on_tumor_pass_only() {
+        let mut s = base_scrape();
+        let sub: Value =
+            serde_yml::from_str("- {ccf: 1.0, weight: 3.0}\n- {ccf: 0.2, weight: 1.0}").unwrap();
+        s.insert("subclones".into(), sub);
+        let cfg = CancerConfig::from_scrape(s).unwrap();
+
+        let model = cfg.subclones.as_ref().expect("subclones parsed");
+        assert_eq!(model.subclones().len(), 2);
+        assert_eq!(
+            model.subclones()[0],
+            Subclone {
+                ccf: 1.0,
+                weight: 3.0
+            }
+        );
+        assert_eq!(
+            model.subclones()[1],
+            Subclone {
+                ccf: 0.2,
+                weight: 1.0
+            }
+        );
+
+        // The normal pass has no somatic variants → no model; the tumor pass carries it.
+        assert!(cfg.normal_pass().unwrap().subclone_model.is_none());
+        assert_eq!(
+            cfg.tumor_pass(PathBuf::from("/tmp/g.vcf.gz"))
+                .unwrap()
+                .subclone_model,
+            Some(model.clone())
+        );
+    }
+
+    #[test]
+    fn subclones_weight_defaults_to_one() {
+        let mut s = base_scrape();
+        let sub: Value = serde_yml::from_str("- {ccf: 0.5}\n- {ccf: 0.3}").unwrap();
+        s.insert("subclones".into(), sub);
+        let cfg = CancerConfig::from_scrape(s).unwrap();
+        let model = cfg.subclones.unwrap();
+        assert_eq!(
+            model.subclones()[0],
+            Subclone {
+                ccf: 0.5,
+                weight: 1.0
+            }
+        );
+        assert_eq!(
+            model.subclones()[1],
+            Subclone {
+                ccf: 0.3,
+                weight: 1.0
+            }
+        );
+    }
+
+    #[test]
+    fn subclones_reject_bad_ccf() {
+        let mut s = base_scrape();
+        let sub: Value = serde_yml::from_str("- {ccf: 1.5, weight: 1.0}").unwrap();
+        s.insert("subclones".into(), sub);
+        assert!(matches!(
+            CancerConfig::from_scrape(s),
+            Err(GenCancerReadsError::ConfigError(_))
+        ));
+    }
+
+    #[test]
+    fn subclones_reject_empty_list() {
+        let mut s = base_scrape();
+        s.insert("subclones".into(), Value::Sequence(vec![]));
+        assert!(matches!(
+            CancerConfig::from_scrape(s),
+            Err(GenCancerReadsError::ConfigError(_))
+        ));
     }
 }

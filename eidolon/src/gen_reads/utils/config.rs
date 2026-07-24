@@ -5,6 +5,7 @@ use chrono::Utc;
 
 use crate::eidolon_core::file_tools::folder_tools::check_create_dir;
 use crate::gen_reads::errors::GenerateReadsError;
+use crate::gen_reads::utils::subclone;
 use log::{error, info, warn};
 use serde_yml::Value;
 use std::collections::HashMap;
@@ -127,6 +128,12 @@ pub struct RunConfiguration {
     // Optional 3' sequencing-adapter readthrough (#125). Default disabled; when
     // disabled, output is byte-identical to pre-adapter behavior.
     pub adapters: AdapterConfig,
+    // Optional subclonal architecture for de-novo variants (#405). When `Some`,
+    // each de-novo variant generated in this run is assigned a subclone's
+    // cancer-cell fraction as its per-variant `allele_fraction`, yielding a
+    // realistic somatic VAF spectrum. Set only on the cancer *tumor* pass; `None`
+    // everywhere else keeps output byte-identical to pre-#405 behavior.
+    pub subclone_model: Option<subclone::SubcloneModel>,
 }
 
 impl Default for RunConfiguration {
@@ -169,6 +176,7 @@ impl Default for RunConfiguration {
             sv_rate_scale: 0.0,
             sv_max_length_fraction: 0.25,
             adapters: AdapterConfig::default(),
+            subclone_model: None,
         }
     }
 }
@@ -836,6 +844,7 @@ mod tests {
             sv_rate_scale: 0.0,
             sv_max_length_fraction: 0.25,
             adapters: AdapterConfig::default(),
+            subclone_model: None,
         };
 
         println!("{:?}", test_configuration);

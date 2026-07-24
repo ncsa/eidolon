@@ -40,6 +40,20 @@ fragment_st_dev: 50     # required when paired_ended
 # tumor_mutation_rate: 1e-5
 # normal_mutation_rate: <float>           # default: normal model's fitted rate
 
+# ── Subclonal architecture (optional) ─────────────────────────────────────
+# By default every somatic variant lands at ~one effective VAF (purity alone).
+# `subclones` splits the somatic burden across cell populations at distinct
+# cancer-cell fractions (CCF): each de-novo somatic variant is assigned a
+# subclone (share ∝ weight) and takes its CCF. Composes with purity — the
+# observed VAF in the merged output is `purity × CCF`. Yields the realistic
+# somatic VAF spectrum that subclonal-deconvolution tools (PyClone, etc.) expect.
+# ccf ∈ (0, 1]; weight optional (default 1.0, equal share). Omit for the
+# single-fraction default.
+# subclones:
+#   - {ccf: 1.0, weight: 0.6}   # clonal / truncal — in every tumor cell
+#   - {ccf: 0.4, weight: 0.3}   # major subclone
+#   - {ccf: 0.15, weight: 0.1}  # minor subclone
+
 # ── Structural variants (optional) ────────────────────────────────────────
 sv_rate_scale: 0.0      # 0 = no de-novo SVs; 1.0 = the tumor model's nominal SV rate
 
