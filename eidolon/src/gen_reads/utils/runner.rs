@@ -162,14 +162,23 @@ pub fn run_neat(
         for variants in som.values_mut() {
             for v in variants.iter_mut() {
                 v.provenance = Provenance::SomaticVcf;
+                // Drop the source VCF's INFO (like germline input_vcf) so it doesn't
+                // leak into the golden; re-populate only with our own ground-truth tag.
+                v.info = None;
                 if let Some(af) = v.allele_fraction {
-                    let scaled = af * config.somatic_af_scale;
-                    v.allele_fraction = Some(if scaled > 1.0 {
+                    let raw = af * config.somatic_af_scale;
+                    let scaled = if raw > 1.0 {
                         clamped += 1;
                         1.0
                     } else {
-                        scaled
-                    });
+                        raw
+                    };
+                    v.allele_fraction = Some(scaled);
+                    // NEAT_VAF = intended observed VAF after mixing = purity × scaled =
+                    // the input observed VAF (or purity, if it was clamped).
+                    if let Some(p) = config.merged_vaf_purity {
+                        append_info_tag(&mut v.info, format!("NEAT_VAF={:.4}", p * scaled));
+                    }
                 }
             }
         }
@@ -1138,16 +1147,16 @@ fn generate_mutated_map(
                     let base = variant
                         .allele_fraction
                         .unwrap_or_else(|| variant.dosage_fraction());
-                    variant.allele_fraction = Some(base * ccf);
-                    // Record the intended cellular fraction (INFO/NEAT_CCF) so the
-                    // golden VCF carries ground truth for validation — observed AD/AF
-                    // should track dosage × NEAT_CCF. De-novo literals have no prior
-                    // INFO, but merge defensively in case that changes.
-                    let tag = format!("NEAT_CCF={ccf:.4}");
-                    variant.info = Some(match variant.info.take() {
-                        Some(e) if !e.is_empty() && e != "." => format!("{e};{tag}"),
-                        _ => tag,
-                    });
+                    let af = base * ccf;
+                    variant.allele_fraction = Some(af);
+                    // Ground truth in the golden VCF: NEAT_CCF = intended cellular
+                    // fraction (observed AD/AF tracks dosage × CCF within the tumor
+                    // pass); NEAT_VAF = intended observed fraction after tumor/normal
+                    // mixing (purity × af), directly comparable to a caller's VAF.
+                    append_info_tag(&mut variant.info, format!("NEAT_CCF={ccf:.4}"));
+                    if let Some(p) = config.merged_vaf_purity {
+                        append_info_tag(&mut variant.info, format!("NEAT_VAF={:.4}", p * af));
+                    }
                 }
                 if variant.variant_type == VariantType::Deletion
                     && variant.reference.len() - 1 > max_del_len
@@ -2499,6 +2508,16 @@ fn collect_chunk_result(
 /// Symbolic / structural variants (`<DEL>`, `<DUP>`, `<CNV>`, ...) are also
 /// kept — gen_reads uses them downstream to modulate coverage and to round-
 /// trip into the output VCF; they never go through per-base mutation.
+/// Append a `KEY=value` tag to a variant's optional INFO string, merging with any
+/// existing content (`;`-joined). Used to attach simulator ground-truth tags
+/// (NEAT_CCF, NEAT_VAF) to somatic variants for the golden VCF (#405).
+fn append_info_tag(info: &mut Option<String>, tag: String) {
+    *info = Some(match info.take() {
+        Some(e) if !e.is_empty() && e != "." => format!("{e};{tag}"),
+        _ => tag,
+    });
+}
+
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
     for (contig, variants) in raw {

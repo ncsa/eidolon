@@ -285,6 +285,10 @@ impl CancerConfig {
             // observed VAFs are divided by purity so they reproduce after mixing.
             somatic_vcf: self.somatic_vcf.clone(),
             somatic_af_scale: 1.0 / self.purity,
+            // #405: record each somatic variant's intended observed VAF
+            // (INFO/NEAT_VAF = purity × allele_fraction) for direct comparison
+            // against a caller's VAF on the merged reads.
+            merged_vaf_purity: Some(self.purity),
             output_filename: format!("{}_tumor", self.output_prefix),
             rng_seed: Some(format!("{}-tumor", self.rng_seed_root)),
             ..self.shared_run_config()

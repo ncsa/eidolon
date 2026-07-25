@@ -115,6 +115,14 @@ pub fn write_vcf(
     )?;
     writeln!(
         &mut buffer,
+        "##INFO=<ID=NEAT_VAF,Number=1,Type=Float,\
+        Description=\"Intended observed variant allele fraction of this somatic \
+        variant in the tumor/normal-mixed output (purity x dosage x CCF; #405). \
+        Directly comparable to a caller's VAF on the merged reads — unlike FORMAT/AF, \
+        which is measured per-pass (tumor-only). Absent outside cancer somatic runs.\">"
+    )?;
+    writeln!(
+        &mut buffer,
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
     )?;
     writeln!(
@@ -182,13 +190,15 @@ pub fn write_vcf(
                     Some(existing) => format!("{existing};NEAT_PROVENANCE={prov}"),
                 }
             } else {
-                // Literal records: NEAT_PROVENANCE is the base INFO. A de-novo literal
-                // may carry extra simulator-emitted tags (e.g. NEAT_CCF, the intended
-                // cellular fraction) in `info`; pass those through. Input-VCF literals
-                // deliberately drop their source INFO — only provenance is emitted — so
-                // existing golden output for input_vcf: runs is unchanged.
+                // Literal records: NEAT_PROVENANCE is the base INFO. Simulator-emitted
+                // tags (NEAT_CCF, NEAT_VAF) live in `info` on de-novo and reproductive
+                // somatic (SomaticVcf) variants — pass those through. Germline input-VCF
+                // literals deliberately drop their source INFO (only provenance emitted),
+                // so existing golden output for input_vcf: runs is unchanged.
                 match (variant.provenance, variant.info.as_deref()) {
-                    (Provenance::Denovo, Some(extra)) if !extra.is_empty() && extra != "." => {
+                    (Provenance::Denovo | Provenance::SomaticVcf, Some(extra))
+                        if !extra.is_empty() && extra != "." =>
+                    {
                         format!("{extra};NEAT_PROVENANCE={prov}")
                     }
                     _ => format!("NEAT_PROVENANCE={prov}"),

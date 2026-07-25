@@ -270,6 +270,37 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
         mean_err < 0.05,
         "measured AF should track dosage × NEAT_CCF; mean |err| = {mean_err:.4} over {checked} sites"
     );
+
+    // ── INFO/NEAT_VAF: intended observed (post-mixing) VAF = purity × dosage × CCF ──
+    assert!(
+        truth.iter().any(|l| l.contains("##INFO=<ID=NEAT_VAF")),
+        "merged truth missing NEAT_VAF header declaration"
+    );
+    let vaf_of = |line: &str| -> Option<f64> {
+        line.split('\t')
+            .nth(7)?
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("NEAT_VAF="))?
+            .parse()
+            .ok()
+    };
+    // purity 0.5 in this run → NEAT_VAF should equal 0.5 × dosage × NEAT_CCF exactly
+    // (it's the intended value, not a measurement — no sampling noise).
+    let mut vaf_checked = 0;
+    for l in &somatic {
+        let (Some(vaf), Some(ccf), Some(d)) = (vaf_of(l), ccf_of(l), dosage_of(l)) else {
+            panic!("somatic record missing NEAT_VAF/NEAT_CCF/GT: {l}");
+        };
+        assert!(
+            (vaf - 0.5 * d * ccf).abs() < 1e-4,
+            "NEAT_VAF {vaf} should equal purity·dosage·CCF = 0.5·{d}·{ccf}: {l}"
+        );
+        vaf_checked += 1;
+    }
+    assert!(
+        vaf_checked >= 10,
+        "too few somatic NEAT_VAF checks ({vaf_checked})"
+    );
 }
 
 /// End-to-end contract for #405 reproductive mode: a supplied `somatic_vcf` is
@@ -372,5 +403,26 @@ fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
         (meas_af(&record("1200")) - 0.30).abs() < 0.08,
         "H1N1_HA:1200 AF {} should be ~0.30 (0.18/0.6)",
         meas_af(&record("1200"))
+    );
+
+    // INFO/NEAT_VAF carries the intended *observed* VAF — the exact input value
+    // (purity × scaled AF = the original), not the noisy tumor-only FORMAT/AF.
+    let neat_vaf = |l: &str| -> f64 {
+        l.split('\t')
+            .nth(7)
+            .unwrap()
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("NEAT_VAF="))
+            .expect("somatic record has NEAT_VAF")
+            .parse()
+            .unwrap()
+    };
+    assert!(
+        (neat_vaf(&record("500")) - 0.30).abs() < 1e-4,
+        "NEAT_VAF should be the input 0.30"
+    );
+    assert!(
+        (neat_vaf(&record("1200")) - 0.18).abs() < 1e-4,
+        "NEAT_VAF should be the input 0.18"
     );
 }

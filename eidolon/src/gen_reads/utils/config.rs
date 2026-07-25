@@ -144,6 +144,11 @@ pub struct RunConfiguration {
     // tumor/normal mixing (merged VAF = purity × af = the input VAF). Clamped to 1.0.
     // Default 1.0 (no scaling).
     pub somatic_af_scale: f64,
+    // Purity used to record a somatic variant's intended *observed* merged VAF as
+    // `INFO/NEAT_VAF = purity × allele_fraction` (#405). The cancer tumor pass sets
+    // `Some(purity)`; `None` elsewhere suppresses the tag. Only emitted where a
+    // subclone model or somatic_vcf is active, so plain runs stay byte-identical.
+    pub merged_vaf_purity: Option<f64>,
 }
 
 impl Default for RunConfiguration {
@@ -189,6 +194,7 @@ impl Default for RunConfiguration {
             subclone_model: None,
             somatic_vcf: None,
             somatic_af_scale: 1.0,
+            merged_vaf_purity: None,
         }
     }
 }
@@ -859,6 +865,7 @@ mod tests {
             subclone_model: None,
             somatic_vcf: None,
             somatic_af_scale: 1.0,
+            merged_vaf_purity: None,
         };
 
         println!("{:?}", test_configuration);

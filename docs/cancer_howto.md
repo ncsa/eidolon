@@ -181,15 +181,22 @@ contamination, dosage = per-copy multiplicity, CCF = subclonal fraction). Germli
 share). Omit the block for the dosage-only default (output is byte-identical to
 pre-subclone runs).
 
-Each somatic record in the golden/merged-truth VCF carries the **intended** CCF as
-`INFO/NEAT_CCF` — ground truth for validation. Measured `AF` should track
-`dosage × NEAT_CCF`, so you can score how well a subclonal-deconvolution caller
-recovers the planted architecture. Germline/shared records never carry it.
+Each somatic record in the golden/merged-truth VCF carries two ground-truth INFO tags:
+
+- **`NEAT_CCF`** — the intended cellular fraction (subclone CCF).
+- **`NEAT_VAF`** — the intended **observed** VAF after tumor/normal mixing
+  (`purity × dosage × CCF`; for a reproductive `somatic_vcf` replay, the original
+  input VAF). This is the number a somatic caller measures on the merged reads.
+
+Mind the difference from `FORMAT/AF`: that field is measured **per-pass (tumor-only)**,
+so it reads `dosage × CCF` (≈ `NEAT_VAF ÷ purity`) and carries sampling noise.
+For scoring a caller's VAF against ground truth, compare to `NEAT_VAF`; use `FORMAT/AF`
+only if you want the tumor-cell fraction. Germline/shared records carry neither tag.
 
 ```bash
-# planted CCF vs measured AF for somatic sites
+# planted observed VAF vs caller VAF: score against NEAT_VAF, not FORMAT/AF
 bcftools view -H -i 'INFO/NEAT_ORIGIN="somatic"' merged_truth.vcf.gz \
-  | awk -F'\t' '{match($8,/NEAT_CCF=[0-9.]+/); print substr($8,RSTART+9), $NF}'
+  | awk -F'\t' '{match($8,/NEAT_VAF=[0-9.]+/); print $2, substr($8,RSTART+9)}'
 ```
 
 ### Building the architecture from real data
