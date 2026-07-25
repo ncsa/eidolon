@@ -1092,10 +1092,20 @@ fn generate_mutated_map(
                 // dosage (#266/#267) flow in for free once genotype_str carries a real
                 // per-copy spread. `None` elsewhere leaves output byte-identical.
                 if let Some(model) = &config.subclone_model {
+                    let ccf = model.sample_ccf(&mut rng)?;
                     let base = variant
                         .allele_fraction
                         .unwrap_or_else(|| variant.dosage_fraction());
-                    variant.allele_fraction = Some(base * model.sample_ccf(&mut rng)?);
+                    variant.allele_fraction = Some(base * ccf);
+                    // Record the intended cellular fraction (INFO/NEAT_CCF) so the
+                    // golden VCF carries ground truth for validation — observed AD/AF
+                    // should track dosage × NEAT_CCF. De-novo literals have no prior
+                    // INFO, but merge defensively in case that changes.
+                    let tag = format!("NEAT_CCF={ccf:.4}");
+                    variant.info = Some(match variant.info.take() {
+                        Some(e) if !e.is_empty() && e != "." => format!("{e};{tag}"),
+                        _ => tag,
+                    });
                 }
                 if variant.variant_type == VariantType::Deletion
                     && variant.reference.len() - 1 > max_del_len

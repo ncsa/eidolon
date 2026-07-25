@@ -184,4 +184,90 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
          n={}): {somatic_afs:?}",
         somatic_afs.len()
     );
+
+    // ── INFO/NEAT_CCF ground-truth tag (#405) ────────────────────────────────
+    // The header must declare it, every somatic record must carry the *intended*
+    // CCF (one of the two configured values), and no germline/shared record may.
+    assert!(
+        truth.iter().any(|l| l.contains("##INFO=<ID=NEAT_CCF")),
+        "merged truth missing NEAT_CCF header declaration"
+    );
+
+    let ccf_of = |line: &str| -> Option<f64> {
+        let info = line.split('\t').nth(7)?;
+        info.split(';')
+            .find_map(|kv| kv.strip_prefix("NEAT_CCF="))?
+            .parse::<f64>()
+            .ok()
+    };
+    // Dosage from the GT string (alt copies / total called), mirroring
+    // Variant::dosage_fraction — the sampler's per-copy alt probability.
+    let dosage_of = |line: &str| -> Option<f64> {
+        let gt = line.split('\t').next_back()?.split(':').next()?;
+        let (mut alt, mut total) = (0u32, 0u32);
+        for a in gt.split(['/', '|']) {
+            match a {
+                "." | "" => {}
+                "0" => total += 1,
+                _ => {
+                    alt += 1;
+                    total += 1;
+                }
+            }
+        }
+        (total > 0).then(|| alt as f64 / total as f64)
+    };
+    let dp_of = |line: &str| -> Option<u32> {
+        line.split('\t')
+            .next_back()?
+            .split(':')
+            .nth(2)?
+            .parse()
+            .ok()
+    };
+
+    let body: Vec<&String> = truth.iter().filter(|l| !l.starts_with('#')).collect();
+
+    // Germline / shared records never carry a somatic CCF.
+    for l in body.iter().filter(|l| !l.contains("NEAT_ORIGIN=somatic")) {
+        assert!(
+            ccf_of(l).is_none(),
+            "non-somatic record carries NEAT_CCF: {l}"
+        );
+    }
+
+    // Every somatic record carries a NEAT_CCF from the configured architecture.
+    let somatic: Vec<&&String> = body
+        .iter()
+        .filter(|l| l.contains("NEAT_ORIGIN=somatic"))
+        .collect();
+    let mut checked = 0;
+    let mut err_sum = 0.0;
+    for l in &somatic {
+        let ccf = ccf_of(l).unwrap_or_else(|| panic!("somatic record lacks NEAT_CCF: {l}"));
+        assert!(
+            (ccf - 1.0).abs() < 1e-6 || (ccf - 0.3).abs() < 1e-6,
+            "unexpected NEAT_CCF {ccf} (configured 1.0 / 0.3): {l}"
+        );
+        // Ground-truth relationship: measured AF ≈ dosage × NEAT_CCF. Average the
+        // absolute error over adequately-covered sites to stay robust to per-site
+        // binomial noise (the assertion is on the aggregate, not each record).
+        if let (Some(d), Some(dp)) = (dosage_of(l), dp_of(l))
+            && dp >= 25
+        {
+            let sample = l.split('\t').next_back().unwrap();
+            let af: f64 = sample.split(':').next_back().unwrap().parse().unwrap();
+            err_sum += (af - d * ccf).abs();
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 10,
+        "too few well-covered somatic sites to validate ({checked})"
+    );
+    let mean_err = err_sum / checked as f64;
+    assert!(
+        mean_err < 0.05,
+        "measured AF should track dosage × NEAT_CCF; mean |err| = {mean_err:.4} over {checked} sites"
+    );
 }
