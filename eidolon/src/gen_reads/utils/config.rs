@@ -134,6 +134,16 @@ pub struct RunConfiguration {
     // yielding a realistic somatic VAF spectrum. Set only on the cancer *tumor*
     // pass; `None` everywhere else keeps output byte-identical to pre-#405 behavior.
     pub subclone_model: Option<subclone::SubcloneModel>,
+    // Reproductive somatic input (#405): a VCF of somatic variants to replay in the
+    // tumor pass. Loaded as `Provenance::SomaticVcf` (→ merged truth origin
+    // `somatic`, not `shared`) with their `allele_fraction` honored. Set only on the
+    // cancer tumor pass; `None` elsewhere.
+    pub somatic_vcf: Option<PathBuf>,
+    // Multiplier applied to `somatic_vcf` variants' `allele_fraction` on load. The
+    // cancer tumor pass sets `1/purity` so a supplied *observed* VAF reproduces after
+    // tumor/normal mixing (merged VAF = purity × af = the input VAF). Clamped to 1.0.
+    // Default 1.0 (no scaling).
+    pub somatic_af_scale: f64,
 }
 
 impl Default for RunConfiguration {
@@ -177,6 +187,8 @@ impl Default for RunConfiguration {
             sv_max_length_fraction: 0.25,
             adapters: AdapterConfig::default(),
             subclone_model: None,
+            somatic_vcf: None,
+            somatic_af_scale: 1.0,
         }
     }
 }
@@ -845,6 +857,8 @@ mod tests {
             sv_max_length_fraction: 0.25,
             adapters: AdapterConfig::default(),
             subclone_model: None,
+            somatic_vcf: None,
+            somatic_af_scale: 1.0,
         };
 
         println!("{:?}", test_configuration);

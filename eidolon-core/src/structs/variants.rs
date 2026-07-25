@@ -41,6 +41,10 @@ pub enum Provenance {
     Denovo,
     /// Variant was carried through from the user's `input_vcf:` file.
     InputVcf,
+    /// Variant was supplied via a reproductive somatic VCF (#405). Distinct from
+    /// `InputVcf` (germline) so a tumor/normal merge resolves it to `somatic`, not
+    /// `shared`, even though — like `InputVcf` — it came from a file.
+    SomaticVcf,
 }
 
 impl Provenance {
@@ -49,6 +53,7 @@ impl Provenance {
         match self {
             Provenance::Denovo => "denovo",
             Provenance::InputVcf => "input",
+            Provenance::SomaticVcf => "somatic_input",
         }
     }
 }

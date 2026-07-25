@@ -217,6 +217,30 @@ rows are dropped, both warned with a count. Extra columns (`cellular_prevalence_
 VCF's `NEAT_CCF` carries exactly those planted CCFs → run the deconvolution tool on
 the *simulated* reads → confirm it recovers the architecture you fed in.
 
+### Reproductive replay (from a real somatic VCF)
+
+The subclonal options above are *generative* — they invent somatic variants matching
+a target architecture. To instead **replay a specific real tumor's somatic calls**,
+point at a somatic VCF:
+
+```yaml
+purity: 0.6
+tumor_mutation_rate: 0.0      # pure replay — no de-novo somatic on top
+somatic_vcf: tumor_somatic.vcf.gz
+```
+
+Each variant is honored at its **observed VAF** (`INFO/AF`, else derived from
+`FORMAT/AD`), divided by `purity` so the merged reads reproduce that VAF after
+tumor/normal mixing (a raw Mutect2/Strelka VCF works directly). Replayed variants are
+tagged `NEAT_ORIGIN=somatic` / `NEAT_PROVENANCE=somatic_input` in the truth — distinct
+from germline even though both come from files. Notes:
+
+- Composes with generation: leave `tumor_mutation_rate > 0` (and optional `subclones`)
+  to layer de-novo somatic variants on top of the replayed set.
+- A variant with no AF falls back to its genotype dosage (het ≈ 0.5, hom = 1.0).
+- Observed VAF above `purity` is physically impossible for a somatic variant; it's
+  clamped to a tumor-cell fraction of 1.0 with a warning.
+
 ### One germline, many tumor scenarios
 
 Fix the germline once and sweep purity/depth by pointing each run at the same

@@ -271,3 +271,106 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
         "measured AF should track dosage × NEAT_CCF; mean |err| = {mean_err:.4} over {checked} sites"
     );
 }
+
+/// End-to-end contract for #405 reproductive mode: a supplied `somatic_vcf` is
+/// replayed in the tumor pass at its observed VAF. Each variant must land in the
+/// merged truth as `NEAT_ORIGIN=somatic` (not `shared`, despite coming from a
+/// file), tagged `NEAT_PROVENANCE=somatic_input`, with its tumor-pass AF scaled to
+/// `VAF/purity` so the merged reads reproduce the input VAF after mixing.
+#[test]
+fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
+    let (_dir, work) = fresh_workdir();
+
+    // Two somatic SNVs at distinct observed VAFs, well inside H1N1_HA (1701 bp).
+    let som = work.join("somatic.vcf");
+    std::fs::write(
+        &som,
+        "##fileformat=VCFv4.2\n\
+         ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">\n\
+         ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n\
+         H1N1_HA\t500\t.\tA\tT\t60\tPASS\tAF=0.30\tGT\t0/1\n\
+         H1N1_HA\t1200\t.\tA\tC\t60\tPASS\tAF=0.18\tGT\t0/1\n",
+    )
+    .unwrap();
+
+    let yaml = work.join("repro.yml");
+    // purity 0.6 → tumor-pass AF = VAF/0.6 (0.30→0.50, 0.18→0.30). High coverage for
+    // a tight per-site estimate; no de-novo somatic (pure replay).
+    std::fs::write(
+        &yaml,
+        format!(
+            "reference: {ref}\n\
+             output_dir: {out}\n\
+             output_prefix: rep\n\
+             total_coverage: 300\n\
+             purity: 0.6\n\
+             read_len: 70\n\
+             paired_ended: true\n\
+             fragment_mean: 250\n\
+             fragment_st_dev: 30\n\
+             normal_mutation_rate: 0.005\n\
+             tumor_mutation_rate: 0.0\n\
+             somatic_vcf: {som}\n\
+             overwrite_output: true\n\
+             rng_seed: repro-e2e\n",
+            ref = h1n1_reference().display(),
+            out = work.display(),
+            som = som.display(),
+        ),
+    )
+    .unwrap();
+
+    eidolon()
+        .args(["gen-cancer-reads", "-c"])
+        .arg(&yaml)
+        .assert()
+        .success();
+
+    let truth = read_gz_lines(&work.join("rep_merged_truth.vcf.gz"));
+    let record = |pos: &str| -> String {
+        truth
+            .iter()
+            .find(|l| {
+                let mut c = l.split('\t');
+                c.next() == Some("H1N1_HA") && c.next() == Some(pos)
+            })
+            .unwrap_or_else(|| panic!("no merged-truth record at H1N1_HA:{pos}"))
+            .clone()
+    };
+    let meas_af = |l: &str| -> f64 {
+        l.split('\t')
+            .next_back()
+            .unwrap()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    // Both replayed variants: origin somatic (not shared), provenance somatic_input.
+    for pos in ["500", "1200"] {
+        let r = record(pos);
+        assert!(
+            r.contains("NEAT_ORIGIN=somatic"),
+            "replayed somatic {pos} not tagged somatic: {r}"
+        );
+        assert!(
+            r.contains("NEAT_PROVENANCE=somatic_input"),
+            "replayed somatic {pos} not tagged somatic_input: {r}"
+        );
+    }
+    // Tumor-pass AF ≈ VAF/purity: 0.30/0.6 = 0.50 and 0.18/0.6 = 0.30. The merged
+    // reads then pile up to the input VAF after purity mixing.
+    assert!(
+        (meas_af(&record("500")) - 0.50).abs() < 0.08,
+        "H1N1_HA:500 AF {} should be ~0.50 (0.30/0.6)",
+        meas_af(&record("500"))
+    );
+    assert!(
+        (meas_af(&record("1200")) - 0.30).abs() < 0.08,
+        "H1N1_HA:1200 AF {} should be ~0.30 (0.18/0.6)",
+        meas_af(&record("1200"))
+    );
+}

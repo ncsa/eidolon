@@ -3,12 +3,13 @@
 //!
 //! Both inputs are eidolon-golden VCFs with identical record representation (the
 //! tumor pass carries normal's germline verbatim via `input_vcf`, tagged
-//! `INFO/NEAT_PROVENANCE=input`; somatic de-novo records are `=denovo`). So an
-//! exact `(contig,pos,ref,alt)` key is sufficient — no positional/normalized
-//! matching needed. Origin rules:
-//!   - tumor `denovo`            -> `somatic`
-//!   - tumor `input` (or other)  -> `shared`   (germline carried into the tumor)
-//!   - normal key absent in tumor -> `germline` (germline-only; lost in tumor)
+//! `INFO/NEAT_PROVENANCE=input`; somatic de-novo records are `=denovo`, and
+//! reproductive somatic-VCF records (#405) are `=somatic_input`). So an exact
+//! `(contig,pos,ref,alt)` key is sufficient — no positional/normalized matching
+//! needed. Origin rules:
+//!   - tumor `denovo` / `somatic_input` -> `somatic`  (tumor-only)
+//!   - tumor `input` (or other)         -> `shared`   (germline carried into tumor)
+//!   - normal key absent in tumor       -> `germline` (germline-only; lost in tumor)
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -64,12 +65,15 @@ fn key_of(cols: &[&str]) -> Option<Key> {
 }
 
 /// Origin for a tumor-pass record, from its INFO/NEAT_PROVENANCE.
+///
+/// De-novo-sampled variants and reproductive somatic-VCF variants (#405) are both
+/// tumor-only → `somatic`; anything else in the tumor pass is germline carried
+/// through `input_vcf` → `shared`.
 pub fn tumor_origin(info: &str) -> &'static str {
-    if info.split(';').any(|f| f == "NEAT_PROVENANCE=denovo") {
-        "somatic"
-    } else {
-        "shared"
-    }
+    let is_somatic = info
+        .split(';')
+        .any(|f| f == "NEAT_PROVENANCE=denovo" || f == "NEAT_PROVENANCE=somatic_input");
+    if is_somatic { "somatic" } else { "shared" }
 }
 
 /// Append `NEAT_ORIGIN=<origin>` to an INFO column.
@@ -221,6 +225,13 @@ mod tests {
     fn tumor_origin_classifies_provenance() {
         assert_eq!(tumor_origin("NEAT_PROVENANCE=denovo"), "somatic");
         assert_eq!(tumor_origin("SVTYPE=DEL;NEAT_PROVENANCE=denovo"), "somatic");
+        // #405 reproductive somatic-VCF variants classify as somatic, not shared,
+        // even though (like germline input) they came from a file.
+        assert_eq!(tumor_origin("NEAT_PROVENANCE=somatic_input"), "somatic");
+        assert_eq!(
+            tumor_origin("AF=0.3;NEAT_PROVENANCE=somatic_input"),
+            "somatic"
+        );
         assert_eq!(tumor_origin("NEAT_PROVENANCE=input"), "shared");
         assert_eq!(tumor_origin("."), "shared");
     }

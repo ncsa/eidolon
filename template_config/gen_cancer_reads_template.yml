@@ -68,6 +68,14 @@ fragment_st_dev: 50     # required when paired_ended
 # ── Structural variants (optional) ────────────────────────────────────────
 sv_rate_scale: 0.0      # 0 = no de-novo SVs; 1.0 = the tumor model's nominal SV rate
 
+# ── Reproductive somatic replay (optional) ────────────────────────────────
+# Replay a real tumor's somatic calls instead of (or on top of) generating them.
+# Each variant is honored at its observed VAF (INFO/AF, else FORMAT/AD), divided
+# by purity so the merged reads reproduce that VAF, and tagged `somatic` in the
+# truth. For pure replay set `tumor_mutation_rate: 0`. A variant with no AF falls
+# back to its genotype dosage. (Observed VAF above purity is clamped to 1.0.)
+# somatic_vcf: /path/to/somatic_calls.vcf.gz
+
 # ── Misc (optional) ───────────────────────────────────────────────────────
 # germline_vcf: /path/to/germline.vcf.gz  # supply a fixed germline instead of de-novo
 # keep_per_pass: true                     # keep per-pass FASTQs (false = merged only)

@@ -56,6 +56,12 @@ pub struct CancerConfig {
     /// observed VAF in the merged output is `purity × dosage × CCF`. `None` → the
     /// pre-#405 behavior (somatic VAF driven by dosage and purity alone).
     pub subclones: Option<SubcloneModel>,
+    /// Reproductive somatic input (#405): a VCF of somatic variants to replay in the
+    /// tumor pass, honored at their observed VAF (`INFO/AF` or `FORMAT/AD`). Each
+    /// variant's fraction is divided by `purity` so it reproduces after tumor/normal
+    /// mixing, and it is tagged `somatic` in the merged truth. Composes with de-novo
+    /// somatic generation (set `tumor_mutation_rate: 0` for pure replay).
+    pub somatic_vcf: Option<PathBuf>,
 }
 
 impl Default for CancerConfig {
@@ -81,6 +87,7 @@ impl Default for CancerConfig {
             keep_per_pass: true,
             overwrite_output: false,
             subclones: None,
+            somatic_vcf: None,
         }
     }
 }
@@ -160,6 +167,7 @@ impl CancerConfig {
                     };
                 }
                 "germline_vcf" => cfg.germline_vcf = Some(req_path(value, "germline_vcf")?),
+                "somatic_vcf" => cfg.somatic_vcf = Some(req_path(value, "somatic_vcf")?),
                 "subclones" => cfg.subclones = Some(parse_subclones(value)?),
                 "subclones_file" => {
                     cfg.subclones =
@@ -273,6 +281,10 @@ impl CancerConfig {
             // #405: only the tumor pass carries the subclonal architecture — the
             // normal pass has no somatic variants to stamp.
             subclone_model: self.subclones.clone(),
+            // #405 reproductive: replay the somatic VCF only in the tumor pass. Its
+            // observed VAFs are divided by purity so they reproduce after mixing.
+            somatic_vcf: self.somatic_vcf.clone(),
+            somatic_af_scale: 1.0 / self.purity,
             output_filename: format!("{}_tumor", self.output_prefix),
             rng_seed: Some(format!("{}-tumor", self.rng_seed_root)),
             ..self.shared_run_config()
@@ -822,6 +834,22 @@ mod tests {
                 .subclone_model
                 .is_some()
         );
+    }
+
+    #[test]
+    fn somatic_vcf_lands_on_tumor_pass_with_purity_scale() {
+        let mut s = base_scrape();
+        s.insert("purity".into(), Value::from(0.8));
+        s.insert("somatic_vcf".into(), Value::String("/tmp/som.vcf".into()));
+        let cfg = CancerConfig::from_scrape(s).unwrap();
+        assert_eq!(cfg.somatic_vcf, Some(PathBuf::from("/tmp/som.vcf")));
+
+        // Only the tumor pass replays it, at 1/purity.
+        let normal = cfg.normal_pass().unwrap();
+        let tumor = cfg.tumor_pass(PathBuf::from("/tmp/g.vcf.gz")).unwrap();
+        assert!(normal.somatic_vcf.is_none());
+        assert_eq!(tumor.somatic_vcf, Some(PathBuf::from("/tmp/som.vcf")));
+        assert!((tumor.somatic_af_scale - 1.25).abs() < 1e-9); // 1/0.8
     }
 
     #[test]

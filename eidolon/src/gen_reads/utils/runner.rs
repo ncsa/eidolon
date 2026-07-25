@@ -1,7 +1,7 @@
 use eidolon_core::file_tools::block_gz::BlockGzWriter;
 use eidolon_core::file_tools::file_io::create_output_file;
 use eidolon_core::rng::NeatRng;
-use eidolon_core::structs::variants::{Genotype, SvType, VariantType};
+use eidolon_core::structs::variants::{Genotype, Provenance, SvType, VariantType};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -149,6 +149,48 @@ pub fn run_neat(
             Some(filter_input_vcf(raw))
         }
         None => None,
+    };
+
+    // #405 reproductive somatic: replay a supplied somatic VCF in this pass. Tag its
+    // variants `SomaticVcf` (so the tumor/normal merge resolves origin `somatic`, not
+    // `shared`) and scale their allele_fraction by `somatic_af_scale` — the cancer
+    // tumor pass sets 1/purity, so a supplied *observed* VAF reproduces after mixing.
+    let input_variants = if let Some(path) = &config.somatic_vcf {
+        info!("Loading reproductive somatic VCF: {}", path.display());
+        let mut som = filter_input_vcf(read_vcf(path.to_path_buf())?);
+        let mut clamped = 0usize;
+        for variants in som.values_mut() {
+            for v in variants.iter_mut() {
+                v.provenance = Provenance::SomaticVcf;
+                if let Some(af) = v.allele_fraction {
+                    let scaled = af * config.somatic_af_scale;
+                    v.allele_fraction = Some(if scaled > 1.0 {
+                        clamped += 1;
+                        1.0
+                    } else {
+                        scaled
+                    });
+                }
+            }
+        }
+        if clamped > 0 {
+            warn!(
+                "somatic_vcf: clamped {clamped} scaled allele fraction(s) > 1.0 \
+                 (observed VAF exceeded purity)"
+            );
+        }
+        // Merge the somatic variants into the germline input map (or stand alone).
+        Some(match input_variants {
+            Some(mut germline) => {
+                for (contig, mut vs) in som {
+                    germline.entry(contig).or_default().append(&mut vs);
+                }
+                germline
+            }
+            None => som,
+        })
+    } else {
+        input_variants
     };
 
     info!("Reading fasta file: {}", &config.reference.display());
