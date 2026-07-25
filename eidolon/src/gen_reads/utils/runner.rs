@@ -1083,12 +1083,19 @@ fn generate_mutated_map(
         if let Some(vec) = result {
             for mut variant in vec {
                 // #405: in the cancer tumor pass, distribute de-novo somatic variants
-                // across subclones — each takes its subclone's CCF as the per-variant
-                // allele_fraction. Composes with purity (the tumor/normal coverage
-                // split) at merge time → observed VAF = purity × CCF. `None` elsewhere
-                // leaves allele_fraction untouched, so output is byte-identical.
+                // across subclones. A subclone's CCF is a *cellular-fraction factor*
+                // that composes with the variant's allele dosage — it does not replace
+                // it. So observed alt fraction = dosage × CCF (× purity via the
+                // tumor/normal coverage split at merge time): a heterozygous somatic
+                // SNV at CCF f lands at f/2, which is what subclonal-deconvolution
+                // tools invert. Multiplying (not overwriting) also lets polyploid
+                // dosage (#266/#267) flow in for free once genotype_str carries a real
+                // per-copy spread. `None` elsewhere leaves output byte-identical.
                 if let Some(model) = &config.subclone_model {
-                    variant.allele_fraction = Some(model.sample_ccf(&mut rng)?);
+                    let base = variant
+                        .allele_fraction
+                        .unwrap_or_else(|| variant.dosage_fraction());
+                    variant.allele_fraction = Some(base * model.sample_ccf(&mut rng)?);
                 }
                 if variant.variant_type == VariantType::Deletion
                     && variant.reference.len() - 1 > max_del_len

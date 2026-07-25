@@ -165,12 +165,21 @@ subclones:
   - {ccf: 0.15, weight: 0.1}  # minor subclone
 ```
 
-CCF **composes** with purity: a somatic variant at CCF `f` is observed in the merged
-output at `VAF = purity · f` (purity = normal contamination, CCF = subclonal fraction —
-orthogonal axes). Germline (shared) variants are unaffected. This produces the
-multi-modal somatic VAF spectrum that subclonal-deconvolution tools (PyClone, SciClone,
-…) consume. `ccf ∈ (0, 1]`; `weight` defaults to `1.0` (equal share). Omit the block for
-the single-fraction default (output is byte-identical to pre-subclone runs).
+CCF is a **cellular-fraction factor** that composes with the variant's dosage and with
+purity — it does not replace them:
+
+```text
+observed VAF = purity · dosage · CCF
+```
+
+`dosage` is the alt-copy fraction from the genotype (0.5 for a heterozygous SNV, 1.0 for
+homozygous; `alt_copies/ploidy` in general). So a heterozygous somatic variant at CCF `f`
+is observed at `~purity·f/2` — the value a subclonal-deconvolution tool (PyClone,
+SciClone, …) inverts back to `f`. These are orthogonal axes (purity = normal
+contamination, dosage = per-copy multiplicity, CCF = subclonal fraction). Germline
+(shared) variants are unaffected. `ccf ∈ (0, 1]`; `weight` defaults to `1.0` (equal
+share). Omit the block for the dosage-only default (output is byte-identical to
+pre-subclone runs).
 
 ### One germline, many tumor scenarios
 
@@ -220,7 +229,7 @@ tools/cancer_sv_benchmark.sh \
 | `tumor_mutation_rate` | per-base somatic rate. Default `1e-5`. `model` = use the model's fitted rate. |
 | `normal_mutation_rate` | per-base germline rate. Default = the model's fitted rate. |
 | `sv_rate_scale` | de novo SV multiplier; `0` = off, `1.0` = the model's `sv_model` rate. |
-| `subclones` | optional list of `{ccf, weight}` subclones; spreads somatic variants across CCFs → observed VAF = `purity · ccf`. Omit for a single fraction. |
+| `subclones` | optional list of `{ccf, weight}` subclones; spreads somatic variants across CCFs → observed VAF = `purity · dosage · ccf`. Omit for the dosage-only default. |
 | `germline_vcf` | fixed shared germline instead of de-novo generation. |
 | `rng_seed` | seeds both passes (suffixed `-normal`/`-tumor`); printed to the log. |
 | `keep_per_pass` | keep per-pass FASTQs (`false` = merged only). |

@@ -50,10 +50,10 @@ pub struct CancerConfig {
     pub keep_per_pass: bool,
     pub overwrite_output: bool,
     /// Optional subclonal architecture (#405). When set, the tumor pass distributes
-    /// its de-novo somatic variants across these subclones, stamping each with its
-    /// subclone's cancer-cell fraction (CCF) as a per-variant allele_fraction. The
-    /// observed VAF in the merged output is `purity × CCF`. `None` → the pre-#405
-    /// single-fraction behavior (every somatic variant near one effective VAF).
+    /// its de-novo somatic variants across these subclones; each subclone's
+    /// cancer-cell fraction (CCF) composes with the variant's dosage, so the
+    /// observed VAF in the merged output is `purity × dosage × CCF`. `None` → the
+    /// pre-#405 behavior (somatic VAF driven by dosage and purity alone).
     pub subclones: Option<SubcloneModel>,
 }
 

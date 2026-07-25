@@ -8,12 +8,22 @@
 //! somatic variant is assigned to a subclone (weighted draw) and takes the
 //! subclone's CCF as its per-variant [`allele_fraction`](eidolon_core::structs::variants::Variant::allele_fraction).
 //!
-//! The CCF **composes** with tumor purity for free. Purity is realized as the
-//! tumor/normal coverage split at read-mixing time, so a somatic variant stamped at
-//! CCF `f` in the tumor pass lands in the merged BAM at
-//! `observed VAF = purity × f` — exactly the orthogonal decomposition #405 calls for
-//! (purity = normal contamination; CCF = subclonal cellular fraction). No new
-//! read-mixing math is needed; the model only stamps `allele_fraction`.
+//! A subclone's CCF is a **cellular-fraction factor** that *composes* — it does not
+//! replace the variant's allele dosage or tumor purity. For a variant at dosage `d`
+//! (alt copies / ploidy) assigned to a subclone at CCF `f`, the caller stamps
+//! `allele_fraction = d × f`, and purity — realized as the tumor/normal coverage
+//! split at read-mixing time — contributes the final factor:
+//!
+//! ```text
+//! observed VAF = purity × dosage × CCF
+//! ```
+//!
+//! So a heterozygous somatic SNV (d = 0.5) at CCF `f` lands at `f/2` — the value a
+//! subclonal-deconvolution tool inverts back to `f`. These are orthogonal axes
+//! (purity = normal contamination; dosage = per-copy multiplicity; CCF = subclonal
+//! cellular fraction). This model owns only the CCF factor; dosage composition lives
+//! at the call site (`Variant::dosage_fraction`), so polyploid dosage (#266/#267)
+//! flows in for free. No new read-mixing math is needed.
 //!
 //! This is the generative half of #405. The reproductive half (honor per-variant CCF
 //! from an input somatic VCF) rides the existing `INFO/AF` → `allele_fraction` parse

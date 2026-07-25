@@ -129,10 +129,10 @@ pub struct RunConfiguration {
     // disabled, output is byte-identical to pre-adapter behavior.
     pub adapters: AdapterConfig,
     // Optional subclonal architecture for de-novo variants (#405). When `Some`,
-    // each de-novo variant generated in this run is assigned a subclone's
-    // cancer-cell fraction as its per-variant `allele_fraction`, yielding a
-    // realistic somatic VAF spectrum. Set only on the cancer *tumor* pass; `None`
-    // everywhere else keeps output byte-identical to pre-#405 behavior.
+    // each de-novo variant is assigned a subclone whose cancer-cell fraction (CCF)
+    // *composes* with the variant's dosage into `allele_fraction = dosage × CCF`,
+    // yielding a realistic somatic VAF spectrum. Set only on the cancer *tumor*
+    // pass; `None` everywhere else keeps output byte-identical to pre-#405 behavior.
     pub subclone_model: Option<subclone::SubcloneModel>,
 }
 

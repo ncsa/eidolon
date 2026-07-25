@@ -97,12 +97,13 @@ fn gen_cancer_reads_produces_tagged_fastqs_and_origin_truth() {
     );
 }
 
-/// End-to-end contract for #405 (generative subclonal VAF): with a `subclones:`
-/// architecture, de-novo somatic variants must spread across the configured
-/// cancer-cell fractions instead of collapsing to the Genotype default
-/// (het 0.5 / hom 1.0). A minor subclone at CCF 0.3 is the discriminating signal:
-/// its measured AF (~0.3, in the tumor-pass golden VCF the truth VCF carries
-/// through) is a value the pre-#405 single-fraction model cannot produce.
+/// End-to-end contract for #405 (generative subclonal VAF): a `subclones:`
+/// architecture spreads de-novo somatic variants across cancer-cell fractions,
+/// and each CCF *composes with the variant's dosage* (alt = dosage × CCF) rather
+/// than replacing it. With two subclones (CCF 1.0, 0.3) over het/hom de-novo
+/// variants the measured somatic AFs land at {0.5·1, 1·1, 0.5·0.3, 1·0.3} =
+/// {0.5, 1.0, 0.15, 0.3}. The discriminating signal is any AF below ~0.4 — a
+/// value the pre-#405 dosage-only model (het 0.5 / hom 1.0) cannot produce.
 #[test]
 fn subclonal_somatic_variants_span_a_vaf_spectrum() {
     let (_dir, work) = fresh_workdir();
@@ -158,24 +159,25 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
         somatic_afs.len()
     );
 
-    // The minor-subclone cluster: AFs near 0.3 that the het(0.5)/hom(1.0) default
-    // cannot produce. Window [0.15, 0.45] is clear of both defaults.
+    // The minor-subclone cluster: dosage × 0.3 ∈ {0.15, 0.3}, i.e. AFs at/below
+    // ~0.4 that the dosage-only default (het 0.5 / hom 1.0) cannot produce.
     let minor = somatic_afs
         .iter()
-        .filter(|&&a| (0.15..=0.45).contains(&a))
+        .filter(|&&a| (0.05..=0.4).contains(&a))
         .count();
-    // The clonal cluster: high AFs.
-    let clonal = somatic_afs.iter().filter(|&&a| a >= 0.7).count();
+    // The clonal cluster: dosage × 1.0 ∈ {0.5, 1.0}.
+    let clonal = somatic_afs.iter().filter(|&&a| a >= 0.45).count();
 
     assert!(
         minor > 0,
-        "no somatic AF near the 0.3 subclone — subclonal CCF not applied: {somatic_afs:?}"
+        "no somatic AF below ~0.4 — subclonal CCF not composed in: {somatic_afs:?}"
     );
     assert!(
         clonal > 0,
-        "no somatic AF near the clonal (1.0) subclone: {somatic_afs:?}"
+        "no somatic AF at the clonal (CCF 1.0) fractions: {somatic_afs:?}"
     );
-    // A genuine spectrum, not a single fraction: both clusters populated.
+    // A genuine spectrum, not a single fraction: both clusters populated. With
+    // equal subclone weights ~half the somatic burden falls in each.
     assert!(
         minor >= somatic_afs.len() / 5 && clonal >= somatic_afs.len() / 5,
         "expected both subclones well-represented (minor={minor}, clonal={clonal}, \
