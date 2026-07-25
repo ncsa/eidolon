@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use log::warn;
 use serde_yml::Value;
 
 use crate::gen_cancer_reads::errors::GenCancerReadsError;
@@ -95,6 +96,14 @@ impl CancerConfig {
     fn from_scrape(scrape: HashMap<String, Value>) -> Result<CancerConfig, GenCancerReadsError> {
         let mut cfg = CancerConfig::default();
 
+        // A subclonal architecture may be given inline (`subclones:`) OR loaded from a
+        // deconvolution-tool cluster table (`subclones_file:`), but not both.
+        if scrape.contains_key("subclones") && scrape.contains_key("subclones_file") {
+            return Err(GenCancerReadsError::ConfigError(
+                "specify either `subclones` (inline) or `subclones_file` (path), not both".into(),
+            ));
+        }
+
         let req_path = |v: &Value, key: &str| -> Result<PathBuf, GenCancerReadsError> {
             let s = v.as_str().ok_or_else(|| {
                 GenCancerReadsError::ConfigError(format!("{key} must be a path string"))
@@ -152,6 +161,10 @@ impl CancerConfig {
                 }
                 "germline_vcf" => cfg.germline_vcf = Some(req_path(value, "germline_vcf")?),
                 "subclones" => cfg.subclones = Some(parse_subclones(value)?),
+                "subclones_file" => {
+                    cfg.subclones =
+                        Some(parse_subclones_file(&req_path(value, "subclones_file")?)?);
+                }
                 "sv_rate_scale" => cfg.sv_rate_scale = as_f64(value, "sv_rate_scale")?,
                 "keep_per_pass" => cfg.keep_per_pass = as_bool(value, "keep_per_pass")?,
                 "overwrite_output" => cfg.overwrite_output = as_bool(value, "overwrite_output")?,
@@ -326,6 +339,141 @@ fn parse_subclones(v: &Value) -> Result<SubcloneModel, GenCancerReadsError> {
     }
     SubcloneModel::new(subclones)
         .map_err(|e| GenCancerReadsError::ConfigError(format!("invalid subclones: {e}")))
+}
+
+/// Column-name synonyms accepted in a `subclones_file` cluster table (matched
+/// case-insensitively). Kept tool-agnostic: PyClone/PyClone-VI use
+/// `cellular_prevalence`; PCAWG-11 / DPClust cluster tables use `ccf` + `n_ssms`.
+const CLUSTER_COLS: &[&str] = &["cluster_id", "cluster", "clusterid"];
+const CCF_COLS: &[&str] = &["cellular_prevalence", "ccf", "cancer_cell_fraction", "cp"];
+const WEIGHT_COLS: &[&str] = &[
+    "n_ssms",
+    "size",
+    "weight",
+    "n_mutations",
+    "n_snvs",
+    "n_variants",
+];
+
+/// Build a [`SubcloneModel`] from a deconvolution-tool cluster table (#405, B1).
+///
+/// Accepts a tab-separated file with a header and folds the two shapes real tools
+/// emit into `{ccf, weight}` clusters:
+///
+/// - **Cluster table** (PCAWG-11 / CSR / DPClust): one row per cluster, a `ccf`
+///   column and a size column (`n_ssms` / `size` / `weight`) → used directly.
+/// - **Per-mutation table** (PyClone / PyClone-VI): one row per mutation with
+///   `cluster_id` + `cellular_prevalence` and no size column → grouped by cluster,
+///   `ccf` = mean prevalence, `weight` = mutation count.
+///
+/// Robustness for real files: CCF > 1.0 is clamped to 1.0 (noisy clonal clusters);
+/// rows with non-finite or ≤ 0 CCF are skipped; both are warned once with a count.
+/// Extra columns (std, assignment probability, …) are ignored.
+fn parse_subclones_file(path: &Path) -> Result<SubcloneModel, GenCancerReadsError> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| GenCancerReadsError::ConfigError(format!("subclones_file {path:?}: {e}")))?;
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'));
+
+    let header = lines.next().ok_or_else(|| {
+        GenCancerReadsError::ConfigError(format!("subclones_file {path:?} is empty"))
+    })?;
+    let cols: Vec<String> = header
+        .split('\t')
+        .map(|c| c.trim().to_lowercase())
+        .collect();
+    let find = |names: &[&str]| cols.iter().position(|c| names.contains(&c.as_str()));
+
+    let cluster_idx = find(CLUSTER_COLS).ok_or_else(|| {
+        GenCancerReadsError::ConfigError(format!(
+            "subclones_file {path:?}: no cluster column (one of {CLUSTER_COLS:?})"
+        ))
+    })?;
+    let ccf_idx = find(CCF_COLS).ok_or_else(|| {
+        GenCancerReadsError::ConfigError(format!(
+            "subclones_file {path:?}: no CCF column (one of {CCF_COLS:?})"
+        ))
+    })?;
+    let weight_idx = find(WEIGHT_COLS);
+
+    // Aggregate by cluster id, preserving first-seen order for determinism.
+    struct Acc {
+        ccf_sum: f64,
+        rows: usize,
+        weight_sum: f64,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut accs: HashMap<String, Acc> = HashMap::new();
+    let (mut clamped, mut skipped) = (0usize, 0usize);
+
+    for (n, line) in lines.enumerate() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let get = |i: usize| fields.get(i).map(|s| s.trim());
+        let parse_f = |name: &str, s: Option<&str>| -> Result<f64, GenCancerReadsError> {
+            s.and_then(|s| s.parse::<f64>().ok()).ok_or_else(|| {
+                GenCancerReadsError::ConfigError(format!(
+                    "subclones_file {path:?}: row {} has an unparseable {name}",
+                    n + 2 // +1 header, +1 to 1-index
+                ))
+            })
+        };
+        let cluster = match get(cluster_idx) {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => continue,
+        };
+        let mut ccf = parse_f("ccf", get(ccf_idx))?;
+        if !ccf.is_finite() || ccf <= 0.0 {
+            skipped += 1;
+            continue;
+        }
+        if ccf > 1.0 {
+            ccf = 1.0;
+            clamped += 1;
+        }
+        let weight = match weight_idx {
+            Some(i) => parse_f("weight", get(i))?,
+            None => 1.0,
+        };
+        let acc = accs.entry(cluster.clone()).or_insert_with(|| {
+            order.push(cluster.clone());
+            Acc {
+                ccf_sum: 0.0,
+                rows: 0,
+                weight_sum: 0.0,
+            }
+        });
+        acc.ccf_sum += ccf;
+        acc.rows += 1;
+        acc.weight_sum += weight;
+    }
+
+    if clamped > 0 {
+        warn!("subclones_file {path:?}: clamped {clamped} CCF value(s) > 1.0 to 1.0");
+    }
+    if skipped > 0 {
+        warn!("subclones_file {path:?}: skipped {skipped} row(s) with non-positive/invalid CCF");
+    }
+
+    let subclones: Vec<Subclone> = order
+        .iter()
+        .map(|k| {
+            let a = &accs[k];
+            Subclone {
+                ccf: a.ccf_sum / a.rows as f64,
+                // No size column → this is a per-mutation table; weight = row count.
+                weight: if weight_idx.is_some() {
+                    a.weight_sum
+                } else {
+                    a.rows as f64
+                },
+            }
+        })
+        .collect();
+
+    SubcloneModel::new(subclones)
+        .map_err(|e| GenCancerReadsError::ConfigError(format!("subclones_file {path:?}: {e}")))
 }
 
 #[cfg(test)]
@@ -550,6 +698,144 @@ mod tests {
     fn subclones_reject_empty_list() {
         let mut s = base_scrape();
         s.insert("subclones".into(), Value::Sequence(vec![]));
+        assert!(matches!(
+            CancerConfig::from_scrape(s),
+            Err(GenCancerReadsError::ConfigError(_))
+        ));
+    }
+
+    // ── subclones_file (B1: ingest a deconvolution cluster table) ────────────
+
+    fn write_tmp(name: &str, body: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("eidolon_sctest_{name}.tsv"));
+        fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn subclones_file_pyclone_per_mutation_groups_by_cluster() {
+        // PyClone-VI shape: one row per mutation, no size column → weight = count,
+        // ccf = mean cellular_prevalence. Extra columns are ignored.
+        let tsv = write_tmp(
+            "pyclone",
+            "mutation_id\tsample_id\tcluster_id\tcellular_prevalence\tcluster_assignment_prob\n\
+             m1\tS\t0\t1.0\t0.99\n\
+             m2\tS\t0\t1.0\t0.98\n\
+             m3\tS\t0\t1.0\t0.97\n\
+             m4\tS\t1\t0.4\t0.95\n\
+             m5\tS\t1\t0.4\t0.90\n",
+        );
+        let m = parse_subclones_file(&tsv).unwrap();
+        assert_eq!(m.subclones().len(), 2);
+        assert_eq!(
+            m.subclones()[0],
+            Subclone {
+                ccf: 1.0,
+                weight: 3.0
+            }
+        );
+        assert_eq!(
+            m.subclones()[1],
+            Subclone {
+                ccf: 0.4,
+                weight: 2.0
+            }
+        );
+    }
+
+    #[test]
+    fn subclones_file_pcawg_cluster_table_uses_size_as_weight() {
+        // PCAWG-11 / DPClust shape: one row per cluster with an n_ssms size column.
+        let tsv = write_tmp(
+            "pcawg",
+            "cluster\tn_ssms\tccf\n\
+             1\t1200\t1.0\n\
+             2\t300\t0.55\n\
+             3\t80\t0.2\n",
+        );
+        let m = parse_subclones_file(&tsv).unwrap();
+        assert_eq!(m.subclones().len(), 3);
+        assert_eq!(
+            m.subclones()[0],
+            Subclone {
+                ccf: 1.0,
+                weight: 1200.0
+            }
+        );
+        assert_eq!(
+            m.subclones()[2],
+            Subclone {
+                ccf: 0.2,
+                weight: 80.0
+            }
+        );
+    }
+
+    #[test]
+    fn subclones_file_clamps_ccf_above_one_and_skips_nonpositive() {
+        let tsv = write_tmp(
+            "clamp",
+            "cluster_id\tcellular_prevalence\n\
+             0\t1.03\n\
+             0\t0.97\n\
+             1\t0.0\n\
+             2\t0.5\n",
+        );
+        let m = parse_subclones_file(&tsv).unwrap();
+        // cluster 0: 1.03 clamped to 1.0, mean(1.0, 0.97) = 0.985; cluster 1 skipped
+        // (ccf 0.0); cluster 2 kept.
+        assert_eq!(m.subclones().len(), 2);
+        assert!((m.subclones()[0].ccf - 0.985).abs() < 1e-9);
+        assert_eq!(m.subclones()[0].weight, 2.0);
+        assert_eq!(
+            m.subclones()[1],
+            Subclone {
+                ccf: 0.5,
+                weight: 1.0
+            }
+        );
+    }
+
+    #[test]
+    fn subclones_file_missing_ccf_column_errors() {
+        let tsv = write_tmp("nocol", "cluster_id\tfoo\n0\t1.0\n");
+        assert!(matches!(
+            parse_subclones_file(&tsv),
+            Err(GenCancerReadsError::ConfigError(_))
+        ));
+    }
+
+    #[test]
+    fn subclones_file_lands_on_tumor_pass() {
+        let tsv = write_tmp("wire", "cluster\tn_ssms\tccf\n1\t10\t1.0\n2\t5\t0.3\n");
+        let mut s = base_scrape();
+        s.insert(
+            "subclones_file".into(),
+            Value::String(tsv.to_string_lossy().into()),
+        );
+        let cfg = CancerConfig::from_scrape(s).unwrap();
+        assert_eq!(cfg.subclones.as_ref().unwrap().subclones().len(), 2);
+        assert!(cfg.normal_pass().unwrap().subclone_model.is_none());
+        assert!(
+            cfg.tumor_pass(PathBuf::from("/tmp/g.vcf.gz"))
+                .unwrap()
+                .subclone_model
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn subclones_inline_and_file_are_mutually_exclusive() {
+        let tsv = write_tmp("mutex", "cluster\tccf\n1\t1.0\n");
+        let mut s = base_scrape();
+        s.insert(
+            "subclones".into(),
+            serde_yml::from_str("- {ccf: 1.0}").unwrap(),
+        );
+        s.insert(
+            "subclones_file".into(),
+            Value::String(tsv.to_string_lossy().into()),
+        );
         assert!(matches!(
             CancerConfig::from_scrape(s),
             Err(GenCancerReadsError::ConfigError(_))

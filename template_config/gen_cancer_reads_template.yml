@@ -54,6 +54,16 @@ fragment_st_dev: 50     # required when paired_ended
 #   - {ccf: 1.0, weight: 0.6}   # clonal / truncal — in every tumor cell
 #   - {ccf: 0.4, weight: 0.3}   # major subclone
 #   - {ccf: 0.15, weight: 0.1}  # minor subclone
+#
+# Or build the architecture from real data instead of hand-authoring it: point at
+# a deconvolution-tool cluster table (tab-separated, with a header). Mutually
+# exclusive with the inline `subclones:` list above. Two shapes are accepted:
+#   • per-mutation (PyClone / PyClone-VI): columns `cluster_id` + `cellular_prevalence`
+#     → grouped by cluster (weight = mutation count)
+#   • cluster table (PCAWG-11 / DPClust): columns `cluster` + `ccf` + a size column
+#     (`n_ssms` / `size` / `weight`) → used directly
+# CCF > 1.0 is clamped to 1.0; non-positive-CCF rows are skipped (both warned).
+# subclones_file: /path/to/pyclone_clusters.tsv
 
 # ── Structural variants (optional) ────────────────────────────────────────
 sv_rate_scale: 0.0      # 0 = no de-novo SVs; 1.0 = the tumor model's nominal SV rate

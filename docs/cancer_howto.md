@@ -192,6 +192,31 @@ bcftools view -H -i 'INFO/NEAT_ORIGIN="somatic"' merged_truth.vcf.gz \
   | awk -F'\t' '{match($8,/NEAT_CCF=[0-9.]+/); print substr($8,RSTART+9), $NF}'
 ```
 
+### Building the architecture from real data
+
+Instead of hand-authoring `subclones:`, point at a subclonal-deconvolution tool's
+cluster table with `subclones_file:` (tab-separated, header required; mutually
+exclusive with the inline list). eidolon folds the two shapes real tools emit into
+`{ccf, weight}`:
+
+| Tool | Shape | Columns used |
+|---|---|---|
+| PyClone / PyClone-VI | per-mutation | `cluster_id`, `cellular_prevalence` → grouped by cluster, weight = mutation count |
+| PCAWG-11 / CSR / DPClust | cluster table | `cluster`, `ccf`, size (`n_ssms` / `size` / `weight`) → used directly |
+
+```yaml
+subclones_file: pyclone_clusters.tsv
+```
+
+Other tools convert with a one-liner — emit a header plus the two/three columns
+above. CCF > 1.0 (noisy clonal clusters) is clamped to 1.0 and non-positive-CCF
+rows are dropped, both warned with a count. Extra columns (`cellular_prevalence_std`,
+`cluster_assignment_prob`, …) are ignored.
+
+**Round-trip validation.** Ingest a real tumor's clusters → simulate → the golden
+VCF's `NEAT_CCF` carries exactly those planted CCFs → run the deconvolution tool on
+the *simulated* reads → confirm it recovers the architecture you fed in.
+
 ### One germline, many tumor scenarios
 
 Fix the germline once and sweep purity/depth by pointing each run at the same
