@@ -15,7 +15,7 @@ use crate::file_tools::file_io::{
 };
 use crate::structs::mutated_map::{AdCounter, MutatedMap};
 use crate::structs::nucleotides::sequence_array_to_string;
-use crate::structs::variants::{AlternateType, Variant, VariantError};
+use crate::structs::variants::{AlternateType, Provenance, Variant, VariantError};
 
 #[derive(Debug, Error)]
 pub enum VcfToolsError {
@@ -108,6 +108,21 @@ pub fn write_vcf(
     )?;
     writeln!(
         &mut buffer,
+        "##INFO=<ID=NEAT_CCF,Number=1,Type=Float,\
+        Description=\"Intended cellular fraction of this de-novo variant \
+        (cancer-cell fraction of its assigned subclone; #405). The realized alt \
+        fraction is NEAT_CCF x allele dosage; absent when no subclonal model is set.\">"
+    )?;
+    writeln!(
+        &mut buffer,
+        "##INFO=<ID=NEAT_VAF,Number=1,Type=Float,\
+        Description=\"Intended observed variant allele fraction of this somatic \
+        variant in the tumor/normal-mixed output (purity x dosage x CCF; #405). \
+        Directly comparable to a caller's VAF on the merged reads — unlike FORMAT/AF, \
+        which is measured per-pass (tumor-only). Absent outside cancer somatic runs.\">"
+    )?;
+    writeln!(
+        &mut buffer,
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
     )?;
     writeln!(
@@ -175,7 +190,19 @@ pub fn write_vcf(
                     Some(existing) => format!("{existing};NEAT_PROVENANCE={prov}"),
                 }
             } else {
-                format!("NEAT_PROVENANCE={prov}")
+                // Literal records: NEAT_PROVENANCE is the base INFO. Simulator-emitted
+                // tags (NEAT_CCF, NEAT_VAF) live in `info` on de-novo and reproductive
+                // somatic (SomaticVcf) variants — pass those through. Germline input-VCF
+                // literals deliberately drop their source INFO (only provenance emitted),
+                // so existing golden output for input_vcf: runs is unchanged.
+                match (variant.provenance, variant.info.as_deref()) {
+                    (Provenance::Denovo | Provenance::SomaticVcf, Some(extra))
+                        if !extra.is_empty() && extra != "." =>
+                    {
+                        format!("{extra};NEAT_PROVENANCE={prov}")
+                    }
+                    _ => format!("NEAT_PROVENANCE={prov}"),
+                }
             };
             // SAMPLE: for literal variants, AD/DP/AF come from the per-contig
             // counter populated by the gen-reads fragment loop; positions with

@@ -40,8 +40,41 @@ fragment_st_dev: 50     # required when paired_ended
 # tumor_mutation_rate: 1e-5
 # normal_mutation_rate: <float>           # default: normal model's fitted rate
 
+# ── Subclonal architecture (optional) ─────────────────────────────────────
+# By default somatic VAF is driven by dosage (het/hom) and purity alone.
+# `subclones` splits the somatic burden across cell populations at distinct
+# cancer-cell fractions (CCF): each de-novo somatic variant is assigned a
+# subclone (share ∝ weight). The CCF *composes* — it does not replace the
+# variant's dosage or purity — so the observed VAF in the merged output is
+# `purity × dosage × CCF` (a het somatic at CCF f lands at ~f/2). Yields the
+# realistic somatic VAF spectrum that subclonal-deconvolution tools (PyClone,
+# etc.) expect. ccf ∈ (0, 1]; weight optional (default 1.0, equal share). Omit
+# for the dosage-only default.
+# subclones:
+#   - {ccf: 1.0, weight: 0.6}   # clonal / truncal — in every tumor cell
+#   - {ccf: 0.4, weight: 0.3}   # major subclone
+#   - {ccf: 0.15, weight: 0.1}  # minor subclone
+#
+# Or build the architecture from real data instead of hand-authoring it: point at
+# a deconvolution-tool cluster table (tab-separated, with a header). Mutually
+# exclusive with the inline `subclones:` list above. Two shapes are accepted:
+#   • per-mutation (PyClone / PyClone-VI): columns `cluster_id` + `cellular_prevalence`
+#     → grouped by cluster (weight = mutation count)
+#   • cluster table (PCAWG-11 / DPClust): columns `cluster` + `ccf` + a size column
+#     (`n_ssms` / `size` / `weight`) → used directly
+# CCF > 1.0 is clamped to 1.0; non-positive-CCF rows are skipped (both warned).
+# subclones_file: /path/to/pyclone_clusters.tsv
+
 # ── Structural variants (optional) ────────────────────────────────────────
 sv_rate_scale: 0.0      # 0 = no de-novo SVs; 1.0 = the tumor model's nominal SV rate
+
+# ── Reproductive somatic replay (optional) ────────────────────────────────
+# Replay a real tumor's somatic calls instead of (or on top of) generating them.
+# Each variant is honored at its observed VAF (INFO/AF, else FORMAT/AD), divided
+# by purity so the merged reads reproduce that VAF, and tagged `somatic` in the
+# truth. For pure replay set `tumor_mutation_rate: 0`. A variant with no AF falls
+# back to its genotype dosage. (Observed VAF above purity is clamped to 1.0.)
+# somatic_vcf: /path/to/somatic_calls.vcf.gz
 
 # ── Misc (optional) ───────────────────────────────────────────────────────
 # germline_vcf: /path/to/germline.vcf.gz  # supply a fixed germline instead of de-novo

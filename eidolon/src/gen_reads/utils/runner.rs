@@ -1,7 +1,7 @@
 use eidolon_core::file_tools::block_gz::BlockGzWriter;
 use eidolon_core::file_tools::file_io::create_output_file;
 use eidolon_core::rng::NeatRng;
-use eidolon_core::structs::variants::{Genotype, SvType, VariantType};
+use eidolon_core::structs::variants::{Genotype, Provenance, SvType, VariantType};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -149,6 +149,57 @@ pub fn run_neat(
             Some(filter_input_vcf(raw))
         }
         None => None,
+    };
+
+    // #405 reproductive somatic: replay a supplied somatic VCF in this pass. Tag its
+    // variants `SomaticVcf` (so the tumor/normal merge resolves origin `somatic`, not
+    // `shared`) and scale their allele_fraction by `somatic_af_scale` — the cancer
+    // tumor pass sets 1/purity, so a supplied *observed* VAF reproduces after mixing.
+    let input_variants = if let Some(path) = &config.somatic_vcf {
+        info!("Loading reproductive somatic VCF: {}", path.display());
+        let mut som = filter_input_vcf(read_vcf(path.to_path_buf())?);
+        let mut clamped = 0usize;
+        for variants in som.values_mut() {
+            for v in variants.iter_mut() {
+                v.provenance = Provenance::SomaticVcf;
+                // Drop the source VCF's INFO (like germline input_vcf) so it doesn't
+                // leak into the golden; re-populate only with our own ground-truth tag.
+                v.info = None;
+                if let Some(af) = v.allele_fraction {
+                    let raw = af * config.somatic_af_scale;
+                    let scaled = if raw > 1.0 {
+                        clamped += 1;
+                        1.0
+                    } else {
+                        raw
+                    };
+                    v.allele_fraction = Some(scaled);
+                    // NEAT_VAF = intended observed VAF after mixing = purity × scaled =
+                    // the input observed VAF (or purity, if it was clamped).
+                    if let Some(p) = config.merged_vaf_purity {
+                        append_info_tag(&mut v.info, format!("NEAT_VAF={:.4}", p * scaled));
+                    }
+                }
+            }
+        }
+        if clamped > 0 {
+            warn!(
+                "somatic_vcf: clamped {clamped} scaled allele fraction(s) > 1.0 \
+                 (observed VAF exceeded purity)"
+            );
+        }
+        // Merge the somatic variants into the germline input map (or stand alone).
+        Some(match input_variants {
+            Some(mut germline) => {
+                for (contig, mut vs) in som {
+                    germline.entry(contig).or_default().append(&mut vs);
+                }
+                germline
+            }
+            None => som,
+        })
+    } else {
+        input_variants
     };
 
     info!("Reading fasta file: {}", &config.reference.display());
@@ -1081,7 +1132,32 @@ fn generate_mutated_map(
             &mut rng,
         )?;
         if let Some(vec) = result {
-            for variant in vec {
+            for mut variant in vec {
+                // #405: in the cancer tumor pass, distribute de-novo somatic variants
+                // across subclones. A subclone's CCF is a *cellular-fraction factor*
+                // that composes with the variant's allele dosage — it does not replace
+                // it. So observed alt fraction = dosage × CCF (× purity via the
+                // tumor/normal coverage split at merge time): a heterozygous somatic
+                // SNV at CCF f lands at f/2, which is what subclonal-deconvolution
+                // tools invert. Multiplying (not overwriting) also lets polyploid
+                // dosage (#266/#267) flow in for free once genotype_str carries a real
+                // per-copy spread. `None` elsewhere leaves output byte-identical.
+                if let Some(model) = &config.subclone_model {
+                    let ccf = model.sample_ccf(&mut rng)?;
+                    let base = variant
+                        .allele_fraction
+                        .unwrap_or_else(|| variant.dosage_fraction());
+                    let af = base * ccf;
+                    variant.allele_fraction = Some(af);
+                    // Ground truth in the golden VCF: NEAT_CCF = intended cellular
+                    // fraction (observed AD/AF tracks dosage × CCF within the tumor
+                    // pass); NEAT_VAF = intended observed fraction after tumor/normal
+                    // mixing (purity × af), directly comparable to a caller's VAF.
+                    append_info_tag(&mut variant.info, format!("NEAT_CCF={ccf:.4}"));
+                    if let Some(p) = config.merged_vaf_purity {
+                        append_info_tag(&mut variant.info, format!("NEAT_VAF={:.4}", p * af));
+                    }
+                }
                 if variant.variant_type == VariantType::Deletion
                     && variant.reference.len() - 1 > max_del_len
                 {
@@ -2432,6 +2508,16 @@ fn collect_chunk_result(
 /// Symbolic / structural variants (`<DEL>`, `<DUP>`, `<CNV>`, ...) are also
 /// kept — gen_reads uses them downstream to modulate coverage and to round-
 /// trip into the output VCF; they never go through per-base mutation.
+/// Append a `KEY=value` tag to a variant's optional INFO string, merging with any
+/// existing content (`;`-joined). Used to attach simulator ground-truth tags
+/// (NEAT_CCF, NEAT_VAF) to somatic variants for the golden VCF (#405).
+fn append_info_tag(info: &mut Option<String>, tag: String) {
+    *info = Some(match info.take() {
+        Some(e) if !e.is_empty() && e != "." => format!("{e};{tag}"),
+        _ => tag,
+    });
+}
+
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
     for (contig, variants) in raw {
