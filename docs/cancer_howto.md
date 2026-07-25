@@ -223,6 +223,9 @@ rows are dropped, both warned with a count. Extra columns (`cellular_prevalence_
 **Round-trip validation.** Ingest a real tumor's clusters → simulate → the golden
 VCF's `NEAT_CCF` carries exactly those planted CCFs → run the deconvolution tool on
 the *simulated* reads → confirm it recovers the architecture you fed in.
+`scripts/delta/run_subclonal_vaf_validation.sh` runs the read-level half on real
+data (Delta): it aligns the merged reads and checks the observed VAF at each somatic
+site tracks `NEAT_VAF` (Pearson r + per-decile MAE, PASS/FAIL gated).
 
 ### Reproductive replay (from a real somatic VCF)
 
