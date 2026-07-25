@@ -181,6 +181,17 @@ contamination, dosage = per-copy multiplicity, CCF = subclonal fraction). Germli
 share). Omit the block for the dosage-only default (output is byte-identical to
 pre-subclone runs).
 
+Each somatic record in the golden/merged-truth VCF carries the **intended** CCF as
+`INFO/NEAT_CCF` — ground truth for validation. Measured `AF` should track
+`dosage × NEAT_CCF`, so you can score how well a subclonal-deconvolution caller
+recovers the planted architecture. Germline/shared records never carry it.
+
+```bash
+# planted CCF vs measured AF for somatic sites
+bcftools view -H -i 'INFO/NEAT_ORIGIN="somatic"' merged_truth.vcf.gz \
+  | awk -F'\t' '{match($8,/NEAT_CCF=[0-9.]+/); print substr($8,RSTART+9), $NF}'
+```
+
 ### One germline, many tumor scenarios
 
 Fix the germline once and sweep purity/depth by pointing each run at the same
