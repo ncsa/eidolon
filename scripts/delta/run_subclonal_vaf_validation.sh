@@ -23,17 +23,20 @@
 #
 # PREREQS
 #   * eidolon built from develop (>= #405 merged) via setup.sh -> $EIDOLON_BIN
-#   * a real REFERENCE (bwa-mem2-indexable) and Phase-1 MODELS (model_builders)
+#   * a REFERENCE FASTA (bwa-mem2-indexable) — the ONLY dataset you must stage
+#   * a tumor model — defaults to the BUNDLED tools/cosmic_v104_pancancer_model.json.gz
+#     (committed in the repo; no model_builders run needed). Override with TUMOR_MODEL=
+#     or MODELS=<model_builders output>/models.
 #   * conda `bioinf` env providing bwa-mem2 (as in cancer_pipeline.sbatch)
 #   * ADJUST the `module load` / conda lines below to Delta's current names.
 #
 # USAGE
-#   # generative (self-contained; inline subclones):
-#   REFERENCE=$SCRATCH/neat_data/soy/ref.fa MODELS=$SCRATCH/modelbuild_<JOB>/models \
+#   # generative (self-contained — just a reference + the bundled COSMIC model):
+#   REFERENCE=$SCRATCH/neat_data/soy/soy.fa \
 #     sbatch scripts/delta/run_subclonal_vaf_validation.sh
 #   # reproductive (replay a real somatic VCF; INFO/AF or FORMAT/AD = observed VAF):
-#   REFERENCE=... MODELS=... SOMATIC_VCF=$SCRATCH/data/tumor_somatic.vcf.gz \
-#     PURITY=0.6 sbatch scripts/delta/run_subclonal_vaf_validation.sh
+#   REFERENCE=... SOMATIC_VCF=$SCRATCH/data/tumor_somatic.vcf.gz PURITY=0.6 \
+#     sbatch scripts/delta/run_subclonal_vaf_validation.sh
 
 #SBATCH --job-name=eidolon-subvaf
 #SBATCH --partition=cpu
@@ -53,7 +56,17 @@ source "$REPO_ROOT/scripts/delta/lib_report.sh"
 
 # ── Inputs ───────────────────────────────────────────────────────────────────
 REF="${REFERENCE:?set REFERENCE=<bwa-mem2-indexable FASTA>}"
-MODELS="${MODELS:?set MODELS=<model_builders output>/models}"
+# Tumor model shapes WHICH somatic variants are placed (not their VAF, which is what
+# we validate), so the BUNDLED COSMIC model works out of the box — no model_builders
+# staging needed. Override with a freshly-built one via TUMOR_MODEL=<mut_model.json.gz>
+# or MODELS=<model_builders output>/models.
+if [[ -n "${TUMOR_MODEL:-}" ]]; then
+    :
+elif [[ -n "${MODELS:-}" ]]; then
+    TUMOR_MODEL="$MODELS/mut_model.json.gz"
+else
+    TUMOR_MODEL="$REPO_ROOT/tools/cosmic_v104_pancancer_model.json.gz"
+fi
 SOMATIC_VCF="${SOMATIC_VCF:-}"                 # set → reproductive replay; unset → generative
 PURITY="${PURITY:-0.7}"
 COV="${COV:-80}"                               # total (merged) depth; keep high for tight VAF
@@ -73,16 +86,15 @@ module load htslib/1.22-gcc13.3.1
 module load bcftools/1.22 2>/dev/null || module load bcftools 2>/dev/null || true
 conda_activate bioinf   # bwa-mem2 (not a module; see cancer_pipeline.sbatch)
 
-MUT="$MODELS/mut_model.json.gz"
-[[ -s "$REF" ]]         || { echo "reference not found: $REF" >&2; exit 1; }
-[[ -s "$MUT" ]]         || { echo "mut_model not found: $MUT (run model_builders)" >&2; exit 1; }
-[[ -x "$EIDOLON_BIN" ]] || { echo "eidolon not built: $EIDOLON_BIN (setup.sh on develop)" >&2; exit 1; }
+[[ -s "$REF" ]]          || { echo "reference not found: $REF" >&2; exit 1; }
+[[ -s "$TUMOR_MODEL" ]]  || { echo "tumor model not found: $TUMOR_MODEL (bundled default is tools/cosmic_v104_pancancer_model.json.gz)" >&2; exit 1; }
+[[ -x "$EIDOLON_BIN" ]]  || { echo "eidolon not built: $EIDOLON_BIN (setup.sh on develop)" >&2; exit 1; }
 command -v bwa-mem2 >/dev/null || { echo "bwa-mem2 not on PATH (conda bioinf?)" >&2; exit 1; }
 [[ -z "$SOMATIC_VCF" || -s "$SOMATIC_VCF" ]] || { echo "SOMATIC_VCF set but missing: $SOMATIC_VCF" >&2; exit 1; }
 
 mkdir -p "$OUTDIR"
 if [[ -n "$SOMATIC_VCF" ]]; then MODE="reproductive (somatic_vcf)"; else MODE="generative (subclones=$SUBCLONES)"; fi
-echo "=== banner: mode=$MODE  ref=$REF  purity=$PURITY  cov=$COV  min_depth=$MIN_DEPTH ==="
+echo "=== banner: mode=$MODE  ref=$REF  tumor_model=$TUMOR_MODEL  purity=$PURITY  cov=$COV ==="
 
 # ── Step 1: cancer YAML (subclonal architecture on the tumor pass) ───────────
 YML="$OUTDIR/cancer.yml"
@@ -96,7 +108,7 @@ YML="$OUTDIR/cancer.yml"
   echo "paired_ended: true"
   echo "fragment_mean: 350"
   echo "fragment_st_dev: 50"
-  echo "tumor_model: $MUT"
+  echo "tumor_model: $TUMOR_MODEL"
   echo "overwrite_output: true"
   echo "rng_seed: subvaf-${SLURM_JOB_ID:-manual}"
   if [[ -n "$SOMATIC_VCF" ]]; then
