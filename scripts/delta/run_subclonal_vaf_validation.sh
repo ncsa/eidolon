@@ -71,7 +71,15 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 module load samtools/1.22-cce19.0.0
 module load htslib/1.22-gcc13.3.1
 module load bcftools/1.22 2>/dev/null || module load bcftools 2>/dev/null || true
-conda_activate bioinf   # bwa-mem2 (not a module; see cancer_pipeline.sbatch)
+# bwa-mem2 comes from the `bioinf` conda env OR a module. A batch shell needs the
+# conda profile sourced before `conda activate`, else you get the (non-fatal here)
+# "Run 'conda init'" error. Tolerate failure — we verify bwa-mem2 on PATH below.
+if command -v conda >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    source "$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh" 2>/dev/null || true
+fi
+conda_activate bioinf 2>/dev/null || true
+module load bwa-mem2 2>/dev/null || true   # in case it's a module, not conda
 
 MUT="$MODELS/mut_model.json.gz"
 [[ -s "$REF" ]]         || { echo "reference not found: $REF" >&2; exit 1; }
@@ -98,6 +106,9 @@ YML="$OUTDIR/cancer.yml"
   echo "fragment_st_dev: 50"
   echo "tumor_model: $MUT"
   echo "overwrite_output: true"
+  # Only the MERGED reads are aligned; drop the per-pass FASTQ copies to ~third the
+  # FASTQ footprint (matters at genome scale, where disk is the limiter).
+  echo "keep_per_pass: false"
   echo "rng_seed: subvaf-${SLURM_JOB_ID:-manual}"
   if [[ -n "$SOMATIC_VCF" ]]; then
     # Pure replay: no de-novo somatic, so every somatic site traces to the input VCF.
@@ -152,10 +163,22 @@ if [[ ! -s "${REF}.bwt.2bit.64" ]]; then
   echo "=== bwa-mem2 index (one-time) ==="; bwa-mem2 index "$REF" 2>&1 | tail -3
 fi
 MERGED_BAM="$OUTDIR/merged.bam"
+SORT_TMP="$OUTDIR/sort_tmp"; mkdir -p "$SORT_TMP"
 echo "=== bwa-mem2 mem + sort (merged tumor+normal reads) ==="
-bwa-mem2 mem -t "$THREADS" -R '@RG\tID:subvaf\tSM:merged\tPL:ILLUMINA' "$REF" "$R1" "$R2" \
-    2>"$OUTDIR/bwa.log" \
-  | samtools sort -@ "$THREADS" -o "$MERGED_BAM"
+echo "  scratch free before align: $(df -h "$OUTDIR" | awk 'NR==2{print $4" free ("$5" used)"}')"
+# Explicit -T keeps sort spill files on this scratch dir (a node-local $TMPDIR can be
+# too small or vanish); -m caps per-thread RAM. pipefail turns a bwa-mem2 crash into a
+# hard failure here rather than a downstream "0 sites". A large reference at high COV
+# can exhaust scratch — that surfaces as a samtools write error, so report space + the
+# bwa log on failure (shrink with a single-scaffold REFERENCE and/or lower COV).
+if ! bwa-mem2 mem -t "$THREADS" -R '@RG\tID:subvaf\tSM:merged\tPL:ILLUMINA' "$REF" "$R1" "$R2" \
+      2>"$OUTDIR/bwa.log" \
+    | samtools sort -@ "$THREADS" -m 2G -T "$SORT_TMP/st" -o "$MERGED_BAM"; then
+  echo "ALIGN/SORT FAILED. scratch: $(df -h "$OUTDIR" | awk 'NR==2{print $4" free, "$5" used"}')" >&2
+  echo "--- last 20 lines of bwa.log ---" >&2; tail -20 "$OUTDIR/bwa.log" >&2
+  echo "  If this is a disk/quota issue, re-run with a single-scaffold REFERENCE and/or lower COV." >&2
+  exit 1
+fi
 samtools index "$MERGED_BAM"
 
 # ── Step 4: OBSERVED VAF at the somatic sites (forced genotyping) ─────────────
