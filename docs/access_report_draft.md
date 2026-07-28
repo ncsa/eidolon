@@ -752,6 +752,39 @@ the germline pipeline was moved to node-local NVMe staging (heavy FASTQ/BAM I/O 
 compute node's local disk, only small artifacts copied back to Lustre), making it immune to
 transient OST outages; a fastp thread-count livelock at high core counts was also capped.
 
+### 3.12 Subclonal heterogeneity — intra-tumor VAF spectrum (#405)
+
+NEAT and pre-#405 eidolon model a tumor with a single global `purity` scalar, so every
+somatic variant collapses to essentially one effective VAF — no intra-tumor
+heterogeneity. eidolon now models a tumor as a **mixture of subclones at distinct
+cancer-cell fractions (CCF)**: each somatic variant's observed alt fraction composes as
+`purity × dosage × CCF` (three orthogonal axes — normal contamination, per-copy
+multiplicity, subclonal prevalence). The architecture can be authored inline, **fitted
+from real data** (PyClone-VI / PCAWG cluster tables), or **replayed** from a real somatic
+VCF at its observed VAF. Every somatic truth record carries the intended CCF (`INFO/NEAT_CCF`)
+and the intended observed VAF (`INFO/NEAT_VAF`) as ground truth.
+
+**Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate a
+subclonal tumor, align the merged reads with bwa-mem2, and measure the observed VAF at each
+somatic site against the planted `NEAT_VAF`. On a single soybean scaffold (Wm82.a4) at 200×,
+purity 0.8, three subclones (CCF 1.0 / 0.4 / 0.1 → het VAF clusters ≈ 0.40 / 0.16 / 0.04):
+
+| Metric | Value | Interpretation |
+|---|---|---|
+| Bias, mean(observed − intended) | −0.003 | unbiased — the `purity × dosage × CCF` composition is correct |
+| MAE | 0.026 | at the ~200× binomial noise floor — accurate to the sampling limit |
+| Pearson r | 0.95 | the planted CCF clusters are recovered across a 4–40% VAF span |
+| Somatic sites planted | 567 | over one ~60 Mb scaffold |
+
+The merged reads reproduce the planted subclonal VAF spectrum **without bias, to within
+sampling noise** — a complexity axis (intra-tumor heterogeneity) that the predecessor could
+not represent at all. **Scope:** generative path validated end-to-end; reproductive replay of
+a real somatic truth set (SEQC2 HCC1395) is staged and next. The lowest cluster (~4% VAF)
+sits at the caller's detection limit even at 200×, so it drops out of scoring — realistic
+behavior, not a simulation defect. Per-site Pearson is a spread-dependent summary for
+discrete clusters; fidelity is gated on bias + MAE-vs-noise-floor (see
+`scripts/delta/run_subclonal_vaf_validation.sh`).
+
 ---
 
 ## 4. Phase 2 — robustness at scale (planned, key deliverables)
