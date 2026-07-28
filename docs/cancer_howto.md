@@ -225,7 +225,10 @@ VCF's `NEAT_CCF` carries exactly those planted CCFs → run the deconvolution to
 the *simulated* reads → confirm it recovers the architecture you fed in.
 `scripts/delta/run_subclonal_vaf_validation.sh` runs the read-level half on real
 data (Delta): it aligns the merged reads and checks the observed VAF at each somatic
-site tracks `NEAT_VAF` (Pearson r + per-decile MAE, PASS/FAIL gated).
+site tracks `NEAT_VAF` (fidelity gated on bias + MAE-vs-noise-floor). On a soybean
+scaffold at 200× with three subclones spanning 4–40% VAF, the aligned reads reproduce
+the planted spectrum **unbiased** (mean err −0.003) and **to the sampling-noise floor**
+(MAE 0.026, Pearson r 0.95) — see report §3.12.
 
 ### Reproductive replay (from a real somatic VCF)
 
