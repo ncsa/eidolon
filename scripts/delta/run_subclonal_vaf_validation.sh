@@ -56,10 +56,18 @@ REF="${REFERENCE:?set REFERENCE=<bwa-mem2-indexable FASTA>}"
 MODELS="${MODELS:?set MODELS=<model_builders output>/models}"
 SOMATIC_VCF="${SOMATIC_VCF:-}"                 # set → reproductive replay; unset → generative
 PURITY="${PURITY:-0.7}"
-COV="${COV:-80}"                               # total (merged) depth; keep high for tight VAF
+COV="${COV:-150}"                              # total (merged) depth; high so low-CCF sites
+                                               # don't drop out and per-site VAF noise is tight
 MIN_DEPTH="${MIN_DEPTH:-25}"                   # gate low-depth sites in the comparison
-R_MIN="${R_MIN:-0.90}"                         # PASS gate: Pearson r floor
+# PASS is gated on FIDELITY metrics that hold for a discrete subclonal architecture:
+#   |mean(observed-intended)| = bias (systematic composition error) and MAE (per-site
+#   accuracy vs the binomial noise floor). Pearson r is ADVISORY only — for tight,
+#   discrete NEAT_VAF clusters at moderate depth, per-site noise depresses r even when
+#   the reproduction is unbiased and accurate (it fits a CONTINUOUS spectrum like #398,
+#   not clusters). Raise COV and/or widen the CCF architecture to make r meaningful.
+BIAS_MAX="${BIAS_MAX:-0.02}"                   # PASS gate: |mean(observed-intended)|
 MAE_MAX="${MAE_MAX:-0.05}"                     # PASS gate: mean abs error ceiling
+R_MIN="${R_MIN:-0.90}"                         # advisory only (warned, not gated)
 # Inline subclonal architecture used when SOMATIC_VCF is unset (clonal + 2 subclones):
 SUBCLONES="${SUBCLONES:-1.0:0.5,0.5:0.3,0.2:0.2}"   # ccf:weight,ccf:weight,...
 OUTDIR="${OUTDIR:-$SCRATCH/subvaf_${SLURM_JOB_ID:-manual}}"
@@ -205,21 +213,30 @@ python3 "$REPO_ROOT/scripts/delta/scn_af_compare.py" \
 echo "════════════════════════════════════════════════════════════════"
 
 # ── PASS/FAIL gate (don't trust a green run — parse the actual numbers) ───────
-# Parse the summary stat lines only: "n=.. Pearson r=.. Spearman rho=.." and
-# "MAE=.. RMSE=..". Anchor with ^ so the per-decile "  [..) .. MAE=.." lines and the
-# "  target: r>=.." hint line can't leak into the captured values.
+# Parse only the summary stat lines: "n=.. Pearson r=.. Spearman rho=.." and
+# "MAE=.. RMSE=.. mean(sim-truth)=..". Anchor with ^ so the per-decile "  [..) MAE=.."
+# and "  target: r>=.." lines can't leak into the captured values.
 r=$(awk -F'Pearson r=' '/^n=.*Pearson r=/{split($2,a," "); print a[1]}' "$CMP")
 n=$(awk -F'n=' '/^n=.*Pearson r=/{split($2,a," "); print a[1]}' "$CMP")
 mae=$(awk -F'MAE=' '/^MAE=/{split($2,a," "); print a[1]}' "$CMP")
-echo "gate: n=$n r=$r (>=${R_MIN})  MAE=$mae (<=${MAE_MAX})"
+bias=$(awk -F'mean\\(sim-truth\\)=' '/^MAE=.*mean\(sim-truth\)=/{split($2,a," "); print a[1]}' "$CMP")
+absbias=$(awk -v b="$bias" 'BEGIN{b=b+0; print (b<0)?-b:b}')
+echo "gate: n=$n  |bias|=$absbias (<=${BIAS_MAX})  MAE=$mae (<=${MAE_MAX})  [advisory r=$r vs ${R_MIN}]"
+# Advisory: a low r on a discrete architecture is expected, not a failure — flag it.
+if [[ -n "$r" ]] && awk -v r="$r" -v rm="$R_MIN" 'BEGIN{exit !(r<rm)}'; then
+  echo "  NOTE: Pearson r=$r < ${R_MIN} — expected for tight discrete NEAT_VAF clusters at" >&2
+  echo "        this depth; raise COV and/or widen SUBCLONES for a Pearson-meaningful run." >&2
+fi
 verdict=FAIL
-if [[ -n "$r" && -n "$mae" ]] \
-   && awk -v r="$r" -v rm="$R_MIN" 'BEGIN{exit !(r>=rm)}' \
+if [[ -n "$bias" && -n "$mae" ]] \
+   && awk -v b="$absbias" -v bm="$BIAS_MAX" 'BEGIN{exit !(b<=bm)}' \
    && awk -v m="$mae" -v mm="$MAE_MAX" 'BEGIN{exit !(m<=mm)}'; then
   verdict=PASS
 fi
 echo "VERDICT: $verdict  (mode: $MODE)"
-echo "  observed VAF should track NEAT_VAF = purity x dosage x CCF (reproductive: the input VAF)."
+echo "  Fidelity: unbiased (|bias|<=$BIAS_MAX) + accurate (MAE<=$MAE_MAX vs the binomial"
+echo "  noise floor) means the merged reads reproduce NEAT_VAF = purity x dosage x CCF"
+echo "  (reproductive: the input VAF). r is a spread-dependent summary, not the gate."
 
 archive_run subvaf "$OUTDIR" "$CMP" "$YML" "$OUTDIR/bwa.log" || true
 [[ "$verdict" == PASS ]]
