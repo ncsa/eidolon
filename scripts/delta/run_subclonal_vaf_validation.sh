@@ -44,7 +44,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=48G
+#SBATCH --mem=64G
 #SBATCH --time=8:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
@@ -187,13 +187,15 @@ SORT_TMP="$OUTDIR/sort_tmp"; mkdir -p "$SORT_TMP"
 echo "=== bwa-mem2 mem + sort (merged tumor+normal reads) ==="
 echo "  scratch free before align: $(df -h "$OUTDIR" | awk 'NR==2{print $4" free ("$5" used)"}')"
 # Explicit -T keeps sort spill files on this scratch dir (a node-local $TMPDIR can be
-# too small or vanish); -m caps per-thread RAM. pipefail turns a bwa-mem2 crash into a
-# hard failure here rather than a downstream "0 sites". A large reference at high COV
-# can exhaust scratch — that surfaces as a samtools write error, so report space + the
-# bwa log on failure (shrink with a single-scaffold REFERENCE and/or lower COV).
+# too small or vanish). -m 1G caps per-thread sort RAM: with -@ N that is N GB, which
+# must sit alongside bwa-mem2's index+buffers under --mem (a chr-scale reference's
+# index is several GB — 2G/thread OOM-killed a chr1 job at --mem=48G). pipefail turns a
+# bwa-mem2 crash into a hard failure here rather than a downstream "0 sites". A large
+# reference at high COV can also exhaust scratch — that surfaces as a samtools write
+# error, so report space + the bwa log on failure.
 if ! bwa-mem2 mem -t "$THREADS" -R '@RG\tID:subvaf\tSM:merged\tPL:ILLUMINA' "$REF" "$R1" "$R2" \
       2>"$OUTDIR/bwa.log" \
-    | samtools sort -@ "$THREADS" -m 2G -T "$SORT_TMP/st" -o "$MERGED_BAM"; then
+    | samtools sort -@ "$THREADS" -m 1G -T "$SORT_TMP/st" -o "$MERGED_BAM"; then
   echo "ALIGN/SORT FAILED. scratch: $(df -h "$OUTDIR" | awk 'NR==2{print $4" free, "$5" used"}')" >&2
   echo "--- last 20 lines of bwa.log ---" >&2; tail -20 "$OUTDIR/bwa.log" >&2
   echo "  If this is a disk/quota issue, re-run with a single-scaffold REFERENCE and/or lower COV." >&2
