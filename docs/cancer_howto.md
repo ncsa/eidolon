@@ -254,6 +254,11 @@ from germline even though both come from files. Notes:
 - Observed VAF above `purity` is physically impossible for a somatic variant; it's
   clamped to a tumor-cell fraction of 1.0 with a warning.
 
+Validated on real cancer data: replaying SEQC2 **HCC1395**'s high-confidence somatic
+SNVs (GRCh38 chr1, 200×) reproduces the tumor's full empirical VAF distribution — 2,948
+sites across every decile — at Pearson **r = 0.99**, unbiased (−0.004), MAE 0.024 (see
+report §3.12; harness `scripts/delta/run_hcc1395_reproductive.sh`).
+
 ### One germline, many tumor scenarios
 
 Fix the germline once and sweep purity/depth by pointing each run at the same
