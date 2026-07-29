@@ -20,7 +20,7 @@ Find us on Zenodo:
 one normal-genotype, one tumor — over the same reference and merges them at a
 configurable purity into a single "tumor biopsy" FASTQ that downstream somatic
 callers (Mutect2, Strelka, Manta, …) consume directly, plus an origin-tagged truth
-VCF (`INFO/NEAT_ORIGIN ∈ {germline, somatic, shared}`) for scoring. It also
+VCF (`INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}`) for scoring. It also
 generates the foundational structural-variant types cancer SVs depend on — `<BND>`
 translocations, `<INV>` inversions, and de novo `<INS>` — and ships bundled
 pan-cancer and per-tissue (BRCA / skin / lung) models plus Docker-based benchmark
@@ -40,7 +40,7 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 
 |                                            | **NEAT 2.x** (genReads)        | **NEAT 4.x**                              | **`eidolon`**                                              |
 | ------------------------------------------ | ------------------------------ | ----------------------------------------- | -------------------------------------------------------- |
-| Latest version                             | 2.1                            | 4.5.3                                      | 2.0.0                                                    |
+| Latest version                             | 2.1                            | 4.5.3                                      | 2.1.0                                                    |
 | Language                                   | Python 2                       | Python 3                                  | Rust                                                     |
 | FASTQ reads (single / paired)              | ✅                             | ✅                                        | ✅                                                       |
 | Golden BAM + VCF truth set                 | ✅                             | ✅                                        | ✅                                                       |
@@ -95,7 +95,7 @@ required. If you prefer to build from source or grab a release binary, read on.
 
 You will need to install the rust toolchain to compile `eidolon`, including `cargo`. Check the cargo documentation for instructions (https://doc.rust-lang.org/cargo/getting-started/installation.html). Alternatively, you can try one of the binaries on the release page. Select the one that matches your system and let us know if you run into errors. During compilation, you may run into errors, such as cmake not found. Some of the packages `eidolon` uses have these dependencies. For Debian/Ubuntu this should be a simple `sudo apt install cmake` and for RHEL/Rocky type distros this should be `sudo dnf install cmake`. There may be some other requirements. Drop a comment if you need specific help.
 
-Download the executable in the release (current version 2.0.0).
+Download the executable in the release (current version 2.1.0).
 
 ```bash
 $ eidolon --help
@@ -196,10 +196,10 @@ If you record the output in the logs of Seed string to regenerate these exact re
 
 Fastq Output
 ============
-The fastq output will have a key name that identifies the block where the read was drawn from, for quick comparisons in alignments. The output BAM file will contain the original sequence and cigar string. The name will have the format `RNEAT_generated_<contig short name>_<fragment_start>_<fragment_end>/1` (or `/2` for the second read in a pair), where start and end are zero-padded to 10 digits.
+The fastq output will have a key name that identifies the block where the read was drawn from, for quick comparisons in alignments. The output BAM file will contain the original sequence and cigar string. The name will have the format `EIDOLON_generated_<contig short name>_<fragment_start>_<fragment_end>_<uniq>/1` (or `/2` for the second read in a pair), where start and end are zero-padded to 10 digits and `<uniq>` is a 16-digit hex per-fragment tag that keeps same-position fragments from colliding (see #210).
 
 ```bash
-@RNEAT_generated_Chromosome_0000000000_0000000353/1
+@EIDOLON_generated_Chromosome_0000000000_0000000353_000000000000002a/1
 CTTTTCATTCTGACTGCAACGGGCAATATGTCTCTGTGTGGATTAAAAAAAGAGTGTCTGATAGCAGCTTCTTAACTGGTTACCTGCCGTGAGTAAATTAAAATTTTATTGACTTAGGTCACTAAATACTTTAACCAATATAGGCATAGC
 +
 >AC7<GDEGGGGEFGA<GFCGG;GGGGGF>GEGGEGGGFGFEFGCEGGGGGGCG:AEFGFFGG>FG;GDGA9$GGAGF=GFG=EFFCGGGFGGGGGC$BFGEFFAGGG9F7E@>?GFGGGG>EBFGFDG)DGC6DEDFA2EG:EGG%FFB
@@ -900,7 +900,7 @@ The run produces four files under `output_dir`:
 
 - `comparison_summary.json` — schema-versioned (currently `1.3.0`), machine-readable. Includes TP/FN/FP totals + per-contig breakdown, precision / recall / F1, the FN attribution roll-up (`outside_simulated_contigs`, `outside_mutation_bed`, `outside_target_bed`, `unknown`), per-VCF skip counters (`multiallelic`, `homozygous_ref`, `filtered`, `outside_target_bed`, `outside_simulated_contigs`, `symbolic`), and any chrom-naming-mismatch warnings. Symbolic / structural ALTs (`<DEL>`, `<DUP>`, `<CNV>`, ...) are byte-incomparable, so they're counted into `skipped.symbolic` and excluded from TP/FN/FP classification.
 - `comparison_summary.txt` — same content, human-readable.
-- `FN_with_reasons.vcf` — every surviving FN, annotated with a `NEAT_REASON` INFO tag listing the attribution reasons.
+- `FN_with_reasons.vcf` — every surviving FN, annotated with a `EIDOLON_REASON` INFO tag listing the attribution reasons.
 - `FP.vcf` (optional) — every surviving FP, as-is. Off by default; enable with `write_fp_vcf: true`.
 
 **Equivalence detection.** For each false-positive variant, `compare-vcfs` takes a ±`equivalence_window` bp window of the reference and applies both the FP set and the FN set within that window. If the resulting byte sequences are identical, the two sets are alternative spellings of the same edit and every consumed FN is promoted to TP. Set `fast: true` to skip this pass; the report's `totals.equivalents_promoted` counts how many TPs were rescued by it.

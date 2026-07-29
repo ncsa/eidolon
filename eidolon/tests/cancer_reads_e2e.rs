@@ -73,17 +73,19 @@ fn gen_cancer_reads_produces_tagged_fastqs_and_origin_truth() {
         "no T_-tagged reads"
     );
 
-    // Truth VCF: NEAT_ORIGIN present, with somatic AND shared (germline carried
+    // Truth VCF: EIDOLON_ORIGIN present, with somatic AND shared (germline carried
     // through the tumor pass) classes represented.
     let truth = read_gz_lines(&work.join("ctest_merged_truth.vcf.gz"));
     assert!(
-        truth.iter().any(|l| l.contains("##INFO=<ID=NEAT_ORIGIN")),
-        "truth VCF missing NEAT_ORIGIN header declaration"
+        truth
+            .iter()
+            .any(|l| l.contains("##INFO=<ID=EIDOLON_ORIGIN")),
+        "truth VCF missing EIDOLON_ORIGIN header declaration"
     );
     let body: Vec<&String> = truth.iter().filter(|l| !l.starts_with('#')).collect();
     let has = |tag: &str| {
         body.iter()
-            .any(|l| l.contains(&format!("NEAT_ORIGIN={tag}")))
+            .any(|l| l.contains(&format!("EIDOLON_ORIGIN={tag}")))
     };
     assert!(has("somatic"), "no somatic records in truth");
     assert!(
@@ -92,8 +94,8 @@ fn gen_cancer_reads_produces_tagged_fastqs_and_origin_truth() {
     );
     // every body record must be origin-tagged
     assert!(
-        body.iter().all(|l| l.contains("NEAT_ORIGIN=")),
-        "some truth records lack NEAT_ORIGIN"
+        body.iter().all(|l| l.contains("EIDOLON_ORIGIN=")),
+        "some truth records lack EIDOLON_ORIGIN"
     );
 }
 
@@ -146,7 +148,7 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
     let truth = read_gz_lines(&work.join("sctest_merged_truth.vcf.gz"));
     let somatic_afs: Vec<f64> = truth
         .iter()
-        .filter(|l| !l.starts_with('#') && l.contains("NEAT_ORIGIN=somatic"))
+        .filter(|l| !l.starts_with('#') && l.contains("EIDOLON_ORIGIN=somatic"))
         .filter_map(|l| {
             let sample = l.split('\t').next_back()?;
             sample.split(':').next_back()?.parse::<f64>().ok()
@@ -185,18 +187,18 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
         somatic_afs.len()
     );
 
-    // ── INFO/NEAT_CCF ground-truth tag (#405) ────────────────────────────────
+    // ── INFO/EIDOLON_CCF ground-truth tag (#405) ────────────────────────────────
     // The header must declare it, every somatic record must carry the *intended*
     // CCF (one of the two configured values), and no germline/shared record may.
     assert!(
-        truth.iter().any(|l| l.contains("##INFO=<ID=NEAT_CCF")),
-        "merged truth missing NEAT_CCF header declaration"
+        truth.iter().any(|l| l.contains("##INFO=<ID=EIDOLON_CCF")),
+        "merged truth missing EIDOLON_CCF header declaration"
     );
 
     let ccf_of = |line: &str| -> Option<f64> {
         let info = line.split('\t').nth(7)?;
         info.split(';')
-            .find_map(|kv| kv.strip_prefix("NEAT_CCF="))?
+            .find_map(|kv| kv.strip_prefix("EIDOLON_CCF="))?
             .parse::<f64>()
             .ok()
     };
@@ -229,27 +231,30 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
     let body: Vec<&String> = truth.iter().filter(|l| !l.starts_with('#')).collect();
 
     // Germline / shared records never carry a somatic CCF.
-    for l in body.iter().filter(|l| !l.contains("NEAT_ORIGIN=somatic")) {
+    for l in body
+        .iter()
+        .filter(|l| !l.contains("EIDOLON_ORIGIN=somatic"))
+    {
         assert!(
             ccf_of(l).is_none(),
-            "non-somatic record carries NEAT_CCF: {l}"
+            "non-somatic record carries EIDOLON_CCF: {l}"
         );
     }
 
-    // Every somatic record carries a NEAT_CCF from the configured architecture.
+    // Every somatic record carries a EIDOLON_CCF from the configured architecture.
     let somatic: Vec<&&String> = body
         .iter()
-        .filter(|l| l.contains("NEAT_ORIGIN=somatic"))
+        .filter(|l| l.contains("EIDOLON_ORIGIN=somatic"))
         .collect();
     let mut checked = 0;
     let mut err_sum = 0.0;
     for l in &somatic {
-        let ccf = ccf_of(l).unwrap_or_else(|| panic!("somatic record lacks NEAT_CCF: {l}"));
+        let ccf = ccf_of(l).unwrap_or_else(|| panic!("somatic record lacks EIDOLON_CCF: {l}"));
         assert!(
             (ccf - 1.0).abs() < 1e-6 || (ccf - 0.3).abs() < 1e-6,
-            "unexpected NEAT_CCF {ccf} (configured 1.0 / 0.3): {l}"
+            "unexpected EIDOLON_CCF {ccf} (configured 1.0 / 0.3): {l}"
         );
-        // Ground-truth relationship: measured AF ≈ dosage × NEAT_CCF. Average the
+        // Ground-truth relationship: measured AF ≈ dosage × EIDOLON_CCF. Average the
         // absolute error over adequately-covered sites to stay robust to per-site
         // binomial noise (the assertion is on the aggregate, not each record).
         if let (Some(d), Some(dp)) = (dosage_of(l), dp_of(l))
@@ -268,45 +273,45 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
     let mean_err = err_sum / checked as f64;
     assert!(
         mean_err < 0.05,
-        "measured AF should track dosage × NEAT_CCF; mean |err| = {mean_err:.4} over {checked} sites"
+        "measured AF should track dosage × EIDOLON_CCF; mean |err| = {mean_err:.4} over {checked} sites"
     );
 
-    // ── INFO/NEAT_VAF: intended observed (post-mixing) VAF = purity × dosage × CCF ──
+    // ── INFO/EIDOLON_VAF: intended observed (post-mixing) VAF = purity × dosage × CCF ──
     assert!(
-        truth.iter().any(|l| l.contains("##INFO=<ID=NEAT_VAF")),
-        "merged truth missing NEAT_VAF header declaration"
+        truth.iter().any(|l| l.contains("##INFO=<ID=EIDOLON_VAF")),
+        "merged truth missing EIDOLON_VAF header declaration"
     );
     let vaf_of = |line: &str| -> Option<f64> {
         line.split('\t')
             .nth(7)?
             .split(';')
-            .find_map(|kv| kv.strip_prefix("NEAT_VAF="))?
+            .find_map(|kv| kv.strip_prefix("EIDOLON_VAF="))?
             .parse()
             .ok()
     };
-    // purity 0.5 in this run → NEAT_VAF should equal 0.5 × dosage × NEAT_CCF exactly
+    // purity 0.5 in this run → EIDOLON_VAF should equal 0.5 × dosage × EIDOLON_CCF exactly
     // (it's the intended value, not a measurement — no sampling noise).
     let mut vaf_checked = 0;
     for l in &somatic {
         let (Some(vaf), Some(ccf), Some(d)) = (vaf_of(l), ccf_of(l), dosage_of(l)) else {
-            panic!("somatic record missing NEAT_VAF/NEAT_CCF/GT: {l}");
+            panic!("somatic record missing EIDOLON_VAF/EIDOLON_CCF/GT: {l}");
         };
         assert!(
             (vaf - 0.5 * d * ccf).abs() < 1e-4,
-            "NEAT_VAF {vaf} should equal purity·dosage·CCF = 0.5·{d}·{ccf}: {l}"
+            "EIDOLON_VAF {vaf} should equal purity·dosage·CCF = 0.5·{d}·{ccf}: {l}"
         );
         vaf_checked += 1;
     }
     assert!(
         vaf_checked >= 10,
-        "too few somatic NEAT_VAF checks ({vaf_checked})"
+        "too few somatic EIDOLON_VAF checks ({vaf_checked})"
     );
 }
 
 /// End-to-end contract for #405 reproductive mode: a supplied `somatic_vcf` is
 /// replayed in the tumor pass at its observed VAF. Each variant must land in the
-/// merged truth as `NEAT_ORIGIN=somatic` (not `shared`, despite coming from a
-/// file), tagged `NEAT_PROVENANCE=somatic_input`, with its tumor-pass AF scaled to
+/// merged truth as `EIDOLON_ORIGIN=somatic` (not `shared`, despite coming from a
+/// file), tagged `EIDOLON_PROVENANCE=somatic_input`, with its tumor-pass AF scaled to
 /// `VAF/purity` so the merged reads reproduce the input VAF after mixing.
 #[test]
 fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
@@ -384,11 +389,11 @@ fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
     for pos in ["500", "1200"] {
         let r = record(pos);
         assert!(
-            r.contains("NEAT_ORIGIN=somatic"),
+            r.contains("EIDOLON_ORIGIN=somatic"),
             "replayed somatic {pos} not tagged somatic: {r}"
         );
         assert!(
-            r.contains("NEAT_PROVENANCE=somatic_input"),
+            r.contains("EIDOLON_PROVENANCE=somatic_input"),
             "replayed somatic {pos} not tagged somatic_input: {r}"
         );
     }
@@ -405,24 +410,24 @@ fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
         meas_af(&record("1200"))
     );
 
-    // INFO/NEAT_VAF carries the intended *observed* VAF — the exact input value
+    // INFO/EIDOLON_VAF carries the intended *observed* VAF — the exact input value
     // (purity × scaled AF = the original), not the noisy tumor-only FORMAT/AF.
     let neat_vaf = |l: &str| -> f64 {
         l.split('\t')
             .nth(7)
             .unwrap()
             .split(';')
-            .find_map(|kv| kv.strip_prefix("NEAT_VAF="))
-            .expect("somatic record has NEAT_VAF")
+            .find_map(|kv| kv.strip_prefix("EIDOLON_VAF="))
+            .expect("somatic record has EIDOLON_VAF")
             .parse()
             .unwrap()
     };
     assert!(
         (neat_vaf(&record("500")) - 0.30).abs() < 1e-4,
-        "NEAT_VAF should be the input 0.30"
+        "EIDOLON_VAF should be the input 0.30"
     );
     assert!(
         (neat_vaf(&record("1200")) - 0.18).abs() < 1e-4,
-        "NEAT_VAF should be the input 0.18"
+        "EIDOLON_VAF should be the input 0.18"
     );
 }

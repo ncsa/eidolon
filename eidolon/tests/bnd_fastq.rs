@@ -56,7 +56,7 @@ fn gen_reads_with_bnd_variant_produces_chimeric_reads_in_fastq() {
         r.lines().map(|l| l.unwrap()).collect()
     };
 
-    let has_chimeric = fastq_lines.iter().any(|l| l.contains("RNEAT_chimeric"));
+    let has_chimeric = fastq_lines.iter().any(|l| l.contains("EIDOLON_chimeric"));
     assert!(
         has_chimeric,
         "Expected to find chimeric reads in FASTQ output. Lines: {:?}",

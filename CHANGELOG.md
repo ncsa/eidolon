@@ -1,3 +1,31 @@
+7/28/2026
+=========
+## eidolon v2.1.0 — output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*
+
+**Breaking output-format change** — no behavior change, only the names of emitted tokens.
+Completes decision 1 of `docs/rename_eidolon_scope.md` (the post-2.0.0 output-token
+migration). Downstream code that parses the old names must update.
+
+- **VCF INFO tags:** `NEAT_ORIGIN` → `EIDOLON_ORIGIN`, `NEAT_PROVENANCE` → `EIDOLON_PROVENANCE`,
+  `NEAT_REASON` → `EIDOLON_REASON`, `NEAT_CCF` → `EIDOLON_CCF`, `NEAT_VAF` → `EIDOLON_VAF`.
+- **VCF sample column:** `NEAT_simulated_sample` → `EIDOLON_simulated_sample`.
+- **FASTQ/BAM read-name prefixes:** `RNEAT_generated_*` → `EIDOLON_generated_*`,
+  `RNEAT_chimeric_*` → `EIDOLON_chimeric_*` (these still carried the older `rusty-neat`
+  prefix; now aligned with the tool name).
+- Bundled scripts moved in lockstep (`tools/cancer_simulate.sh`, `cancer_benchmark.sh`,
+  `cancer_sv_benchmark.sh`, `scripts/delta/*`); the `filter_reads` read-name parser updated
+  (now length-agnostic); parity/baseline test assertions re-blessed.
+- **Not changed:** NEAT pedigree in README/`CITATION.cff`/comparison text; the `NEAT_DATA`
+  staging env var; and the benchmark harnesses' env vars that point at the *predecessor*
+  NEAT 4 tool (`NEAT_BIN`, `NEAT_ENV`, `NEAT_SEED`, `NEAT_MAX_GENOME_MB`) — those name NEAT,
+  not eidolon.
+- **Also not changed (deliberate):** the sample-column names in *intermediate corpus* VCFs
+  synthesized by the model-building scripts — `NEAT_tumor_corpus` (`tools/fetch_tumor_corpus.sh`,
+  `fetch_cosmic_corpus.sh`, `fetch_cosmic_per_tissue_corpus.sh`) and `NEAT_pcawg_corpus`
+  (`tools/build_pcawg_sv_vcf.py`). These are emitted tokens, not env vars, but they appear only
+  in throwaway inputs to `gen-mut-model` — never in simulation output — so renaming them would
+  force a re-fetch of every corpus for no downstream benefit.
+
 7/21/2026
 =========
 ## eidolon v2.0.0 — renamed from rusty-neat / rneat

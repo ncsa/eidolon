@@ -174,13 +174,13 @@ index_and_align "${PREFIX}_merged_r1.fastq.gz" "$TUMOR_BAM" "TUMOR"
 # ── Stage 3b: PRE-FLIGHT — inspect + extract the somatic SV truth ────────
 # eidolon's SVs are symbolic records (ALT like <DEL>/<DUP>/<INV>, INFO SVTYPE/
 # SVLEN/END). Print a sample so we can confirm the schema, then extract the
-# somatic SV subset truvari will score. NEAT_ORIGIN=somatic drops germline
+# somatic SV subset truvari will score. EIDOLON_ORIGIN=somatic drops germline
 # carry-through; the symbolic-ALT test keeps only SVs (not SNVs/indels).
 TRUTH_SV="$OUTDIR/truth_sv.vcf.gz"
 echo "[3b/5] Inspecting eidolon SV truth..."
 echo "  --- SV INFO header lines ---"
-bcftools view -h "$TRUTH_VCF" | grep -iE 'INFO=<ID=(SVTYPE|SVLEN|END|NEAT_ORIGIN)' || \
-    echo "  (no SVTYPE/SVLEN/END/NEAT_ORIGIN INFO headers found — schema may differ!)"
+bcftools view -h "$TRUTH_VCF" | grep -iE 'INFO=<ID=(SVTYPE|SVLEN|END|EIDOLON_ORIGIN)' || \
+    echo "  (no SVTYPE/SVLEN/END/EIDOLON_ORIGIN INFO headers found — schema may differ!)"
 echo "  --- first symbolic-ALT (SV) records ---"
 bcftools view -H "$TRUTH_VCF" | awk '$5 ~ /^</' | head -5 || true
 echo "  --- SVTYPE counts in truth (all origins) ---"
@@ -191,7 +191,7 @@ if [[ -f "$TRUTH_SV" ]]; then
 else
     # Permissive SV selector: symbolic ALT OR an SVTYPE INFO tag, AND somatic.
     # If the pre-flight above shows a different schema, adjust this -i expression.
-    bcftools view -i '(ALT[0]~"<" || INFO/SVTYPE!=".") && INFO/NEAT_ORIGIN="somatic"' \
+    bcftools view -i '(ALT[0]~"<" || INFO/SVTYPE!=".") && INFO/EIDOLON_ORIGIN="somatic"' \
         -O z -o "$TRUTH_SV" "$TRUTH_VCF"
     bcftools sort -O z -o "$TRUTH_SV" "$TRUTH_SV" 2>/dev/null || true
     bcftools index -f -t "$TRUTH_SV"

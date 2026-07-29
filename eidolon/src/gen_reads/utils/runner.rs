@@ -174,10 +174,10 @@ pub fn run_neat(
                         raw
                     };
                     v.allele_fraction = Some(scaled);
-                    // NEAT_VAF = intended observed VAF after mixing = purity × scaled =
+                    // EIDOLON_VAF = intended observed VAF after mixing = purity × scaled =
                     // the input observed VAF (or purity, if it was clamped).
                     if let Some(p) = config.merged_vaf_purity {
-                        append_info_tag(&mut v.info, format!("NEAT_VAF={:.4}", p * scaled));
+                        append_info_tag(&mut v.info, format!("EIDOLON_VAF={:.4}", p * scaled));
                     }
                 }
             }
@@ -839,7 +839,7 @@ fn process_chunk(
         None
     };
 
-    let read_name_prefix = format!("RNEAT_generated_{}", current_block.contig);
+    let read_name_prefix = format!("EIDOLON_generated_{}", current_block.contig);
 
     // Resolve 3' adapter sequences once (#125). Empty vecs = disabled, which makes
     // write_block_fastq take its unchanged code path (output byte-identical when off).
@@ -1149,13 +1149,13 @@ fn generate_mutated_map(
                         .unwrap_or_else(|| variant.dosage_fraction());
                     let af = base * ccf;
                     variant.allele_fraction = Some(af);
-                    // Ground truth in the golden VCF: NEAT_CCF = intended cellular
+                    // Ground truth in the golden VCF: EIDOLON_CCF = intended cellular
                     // fraction (observed AD/AF tracks dosage × CCF within the tumor
-                    // pass); NEAT_VAF = intended observed fraction after tumor/normal
+                    // pass); EIDOLON_VAF = intended observed fraction after tumor/normal
                     // mixing (purity × af), directly comparable to a caller's VAF.
-                    append_info_tag(&mut variant.info, format!("NEAT_CCF={ccf:.4}"));
+                    append_info_tag(&mut variant.info, format!("EIDOLON_CCF={ccf:.4}"));
                     if let Some(p) = config.merged_vaf_purity {
-                        append_info_tag(&mut variant.info, format!("NEAT_VAF={:.4}", p * af));
+                        append_info_tag(&mut variant.info, format!("EIDOLON_VAF={:.4}", p * af));
                     }
                 }
                 if variant.variant_type == VariantType::Deletion
@@ -1850,7 +1850,7 @@ fn generate_chimeric_pair(
     // chimeric reads spawned from the same BND (num_frags > 1) would share
     // a QNAME and Picard MarkDuplicates would drop one as a "PCR duplicate".
     let base_name = format!(
-        "RNEAT_chimeric_{}_{}_{}_{}_{:016x}",
+        "EIDOLON_chimeric_{}_{}_{}_{}_{:016x}",
         c1,
         pos,
         c2,
@@ -1949,7 +1949,7 @@ fn generate_inv_pair(
     // frag_idx disambiguates fragments at the same breakpoint when
     // num_frags > 1.
     let base_name = format!(
-        "RNEAT_chimeric_INV_{}_{}_{}_{}_{:016x}",
+        "EIDOLON_chimeric_INV_{}_{}_{}_{}_{:016x}",
         contig,
         location + 1,
         end,
@@ -2043,13 +2043,13 @@ fn generate_del_pair(
     let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
 
     let read_len = ctx.config.read_len;
-    // QNAME format mirrors BND/INV's `RNEAT_chimeric_*` scheme so the
+    // QNAME format mirrors BND/INV's `EIDOLON_chimeric_*` scheme so the
     // FASTQ-validation tests in fastq_validation.rs and the read-name
     // parser in filter_lib.rs handle them uniformly. The `DEL` tag
-    // disambiguates from BND (`RNEAT_chimeric_<c1>_<pos>_<c2>_...`)
-    // and INV (`RNEAT_chimeric_INV_<contig>_<pos>_<end>_<junction>_...`).
+    // disambiguates from BND (`EIDOLON_chimeric_<c1>_<pos>_<c2>_...`)
+    // and INV (`EIDOLON_chimeric_INV_<contig>_<pos>_<end>_<junction>_...`).
     let base_name = format!(
-        "RNEAT_chimeric_DEL_{}_{}_{}_{:016x}",
+        "EIDOLON_chimeric_DEL_{}_{}_{}_{:016x}",
         contig,
         location + 1,
         end,
@@ -2175,7 +2175,7 @@ fn generate_dup_pair(
 
     let read_len = ctx.config.read_len;
     let base_name = format!(
-        "RNEAT_chimeric_DUP_{}_{}_{}_{:016x}",
+        "EIDOLON_chimeric_DUP_{}_{}_{}_{:016x}",
         contig,
         location + 1,
         end,
@@ -2510,7 +2510,7 @@ fn collect_chunk_result(
 /// trip into the output VCF; they never go through per-base mutation.
 /// Append a `KEY=value` tag to a variant's optional INFO string, merging with any
 /// existing content (`;`-joined). Used to attach simulator ground-truth tags
-/// (NEAT_CCF, NEAT_VAF) to somatic variants for the golden VCF (#405).
+/// (EIDOLON_CCF, EIDOLON_VAF) to somatic variants for the golden VCF (#405).
 fn append_info_tag(info: &mut Option<String>, tag: String) {
     *info = Some(match info.take() {
         Some(e) if !e.is_empty() && e != "." => format!("{e};{tag}"),

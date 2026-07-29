@@ -300,7 +300,7 @@ write_config "$TUMOR_CONFIG" "$TUMOR_PREFIX" "$TUMOR_COVERAGE" \
 "$EIDOLON_BIN" gen-reads -c "$TUMOR_CONFIG"
 
 # ── Merge FASTQs ─────────────────────────────────────────────────────────
-# gen-reads names reads by genomic position (`RNEAT_generated_<contig>_
+# gen-reads names reads by genomic position (`EIDOLON_generated_<contig>_
 # <start>_<end>/<mate>`), so if the normal and tumor passes happen to
 # sample reads at the same start coordinate they get IDENTICAL names. On
 # chr22 at 30× combined coverage we observed ~456k collisions out of
@@ -342,13 +342,13 @@ if [[ "$PAIRED_END" == "true" ]]; then
 fi
 
 # ── Merge golden VCFs into a single origin-tagged truth set ─────────────
-# Resolves eidolon's per-pass `INFO/NEAT_PROVENANCE` (which says "denovo or
-# input") into the cancer-specific `INFO/NEAT_ORIGIN` (which says "germline,
+# Resolves eidolon's per-pass `INFO/EIDOLON_PROVENANCE` (which says "denovo or
+# input") into the cancer-specific `INFO/EIDOLON_ORIGIN` (which says "germline,
 # somatic, or shared"):
 #
-#   only in normal_golden                → NEAT_ORIGIN=germline
-#   only in tumor_golden  (denovo there) → NEAT_ORIGIN=somatic
-#   in both passes                       → NEAT_ORIGIN=shared
+#   only in normal_golden                → EIDOLON_ORIGIN=germline
+#   only in tumor_golden  (denovo there) → EIDOLON_ORIGIN=somatic
+#   in both passes                       → EIDOLON_ORIGIN=shared
 #
 # bcftools is required for the set operations. If it isn't installed we
 # leave the per-pass VCFs and warn — the merge is a post-processing step,
@@ -380,7 +380,7 @@ else
     #   0003.vcf.gz — common, drawn from TUMOR_VCF (preferred — preserves tumor's SV INFO)
     bcftools isec -p "$ISEC_DIR" -O z "$NORMAL_VCF" "$TUMOR_VCF" >/dev/null
 
-    # Annotate each disjoint subset with NEAT_ORIGIN and re-bgzip.
+    # Annotate each disjoint subset with EIDOLON_ORIGIN and re-bgzip.
     # awk owns the INFO-column rewrite because we want a stream-pure
     # operation that doesn't require building an annotations file.
     annotate_origin() {
@@ -389,12 +389,12 @@ else
             BEGIN { FS = "\t"; OFS = "\t" }
             /^##/ { print; next }
             /^#CHROM/ {
-                print "##INFO=<ID=NEAT_ORIGIN,Number=1,Type=String,Description=\"" \
+                print "##INFO=<ID=EIDOLON_ORIGIN,Number=1,Type=String,Description=\"" \
                       "Origin of variant in tumor/normal mix: germline | somatic | shared\">"
                 print; next
             }
             {
-                tag = "NEAT_ORIGIN=" origin
+                tag = "EIDOLON_ORIGIN=" origin
                 if ($8 == "." || $8 == "") $8 = tag
                 else                       $8 = $8 ";" tag
                 print
@@ -469,9 +469,9 @@ Outputs (in ${OUTPUT_DIR}):
   Tumor FASTQ:      ${TUMOR_PREFIX}_r1.fastq.gz $( [[ "$PAIRED_END" == "true" ]] && echo ", ${TUMOR_PREFIX}_r2.fastq.gz" )
   Tumor truth:      ${TUMOR_PREFIX}.vcf.gz              (germline + somatic)
   Merged FASTQ:     ${MERGED_PREFIX}_r1.fastq.gz$( [[ "$PAIRED_END" == "true" ]] && echo ", ${MERGED_PREFIX}_r2.fastq.gz" )
-$( [[ "$MERGE_OK" == "true" ]] && echo "  Merged truth:     ${MERGED_PREFIX}_truth.vcf.gz   (INFO/NEAT_ORIGIN = germline | somatic | shared)" )
+$( [[ "$MERGE_OK" == "true" ]] && echo "  Merged truth:     ${MERGED_PREFIX}_truth.vcf.gz   (INFO/EIDOLON_ORIGIN = germline | somatic | shared)" )
 
 The merged FASTQ is what a downstream somatic-variant pipeline should
-consume.$( [[ "$MERGE_OK" == "true" ]] && echo " The merged truth VCF carries INFO/NEAT_ORIGIN tags that distinguish germline, somatic, and shared (germline-carried-through-tumor) variants — feed it to hap.py / som.py / vcfeval as the truth set for somatic-caller benchmarking." || echo " Per-pass golden VCFs are preserved; install bcftools + bgzip to enable the origin-tagged truth merge." )
+consume.$( [[ "$MERGE_OK" == "true" ]] && echo " The merged truth VCF carries INFO/EIDOLON_ORIGIN tags that distinguish germline, somatic, and shared (germline-carried-through-tumor) variants — feed it to hap.py / som.py / vcfeval as the truth set for somatic-caller benchmarking." || echo " Per-pass golden VCFs are preserved; install bcftools + bgzip to enable the origin-tagged truth merge." )
 ────────────────────────────────────────────────────────────────
 EOF

@@ -26,7 +26,7 @@ set -euo pipefail
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"
 
-TRUTH_VCF="${TRUTH_VCF:?set TRUTH_VCF to an eidolon truth VCF (INFO/NEAT_ORIGIN-tagged)}"
+TRUTH_VCF="${TRUTH_VCF:?set TRUTH_VCF to an eidolon truth VCF (INFO/EIDOLON_ORIGIN-tagged)}"
 OUTDIR="${OUTDIR:-$SCRATCH/sigcheck_$(basename "$(dirname "$TRUTH_VCF")")}"
 GENOME="${GENOME:-GRCh38}"
 SIGPROFILER_ENV="${SIGPROFILER_ENV:-sigprofiler}"
@@ -36,7 +36,7 @@ mkdir -p "$OUTDIR/vcf"
 
 # 1. Extract somatic SNVs only (SigProfiler SBS works on single-base substitutions).
 conda_activate bioinf   # bcftools
-bcftools view -v snps -i 'INFO/NEAT_ORIGIN="somatic"' \
+bcftools view -v snps -i 'INFO/EIDOLON_ORIGIN="somatic"' \
     -O v -o "$OUTDIR/vcf/eidolon_somatic_snvs.vcf" "$TRUTH_VCF"
 n=$(grep -vc '^#' "$OUTDIR/vcf/eidolon_somatic_snvs.vcf" || true)
 echo "Somatic SNVs for signature fitting: $n"

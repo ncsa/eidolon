@@ -1,7 +1,7 @@
 //! Tag per-pass read names and concatenate FASTQs (replaces the `awk` step in
 //! `tools/cancer_simulate.sh`).
 //!
-//! gen-reads names reads by genomic position (`RNEAT_generated_<contig>_<start>_
+//! gen-reads names reads by genomic position (`EIDOLON_generated_<contig>_<start>_
 //! <end>/<mate>`), so a normal and a tumor read sampled at the same coordinate
 //! get IDENTICAL names. On chr22 at 30x combined we saw ~456k collisions out of
 //! ~9.6M reads — which Picard MarkDuplicates silently drops (halving effective
@@ -76,10 +76,10 @@ mod tests {
         // leading character.
         write_gz(
             &n,
-            "@RNEAT_generated_chr1_100_170/1\nACGT\n+\nIIII\n\
-             @RNEAT_generated_chr1_200_270/1\nTTTT\n+\n@@@@\n",
+            "@EIDOLON_generated_chr1_100_170/1\nACGT\n+\nIIII\n\
+             @EIDOLON_generated_chr1_200_270/1\nTTTT\n+\n@@@@\n",
         );
-        write_gz(&t, "@RNEAT_generated_chr1_100_170/1\nGGGG\n+\nIIII\n");
+        write_gz(&t, "@EIDOLON_generated_chr1_100_170/1\nGGGG\n+\nIIII\n");
 
         tag_and_concat(&[(&n as &Path, "N"), (&t as &Path, "T")], &out).unwrap();
         let merged = read_gz(&out);
@@ -89,9 +89,9 @@ mod tests {
         assert_eq!(lines.len(), 12, "merged record count");
 
         // Headers (line 1 of each record) are tag-prefixed, normal block first.
-        assert_eq!(lines[0], "@N_RNEAT_generated_chr1_100_170/1");
-        assert_eq!(lines[4], "@N_RNEAT_generated_chr1_200_270/1");
-        assert_eq!(lines[8], "@T_RNEAT_generated_chr1_100_170/1");
+        assert_eq!(lines[0], "@N_EIDOLON_generated_chr1_100_170/1");
+        assert_eq!(lines[4], "@N_EIDOLON_generated_chr1_200_270/1");
+        assert_eq!(lines[8], "@T_EIDOLON_generated_chr1_100_170/1");
 
         // Sequence / separator / quality lines pass through untouched — crucially
         // the "@@@@" quality line is NOT prefixed.
@@ -105,7 +105,7 @@ mod tests {
 
         // The same coordinate (chr1_100_170) appears under both N_ and T_ — which
         // is the whole point: tagging prevents the QNAME collision.
-        assert!(merged.contains("@N_RNEAT_generated_chr1_100_170/1"));
-        assert!(merged.contains("@T_RNEAT_generated_chr1_100_170/1"));
+        assert!(merged.contains("@N_EIDOLON_generated_chr1_100_170/1"));
+        assert!(merged.contains("@T_EIDOLON_generated_chr1_100_170/1"));
     }
 }

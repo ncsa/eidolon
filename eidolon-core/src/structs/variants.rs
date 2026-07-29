@@ -31,7 +31,7 @@ pub enum Genotype {
 
 /// Where a variant came from in the current `gen-reads` run.
 ///
-/// Emitted as `INFO/NEAT_PROVENANCE` in the golden VCF so downstream
+/// Emitted as `INFO/EIDOLON_PROVENANCE` in the golden VCF so downstream
 /// merges (e.g. `tools/cancer_simulate.sh`'s normal/tumor truth merge)
 /// can resolve cancer-specific origin labels (`germline` / `somatic` /
 /// `shared`) without `gen-reads` itself needing any cancer vocabulary.
@@ -48,7 +48,7 @@ pub enum Provenance {
 }
 
 impl Provenance {
-    /// Lowercase string used in `INFO/NEAT_PROVENANCE=` values.
+    /// Lowercase string used in `INFO/EIDOLON_PROVENANCE=` values.
     pub fn as_str(&self) -> &'static str {
         match self {
             Provenance::Denovo => "denovo",
@@ -332,7 +332,7 @@ pub struct Variant {
     // Sample, if present, must be same length as format
     pub sample: Vec<String>,
     // Where this variant came from in the current gen-reads run.
-    // Emitted as INFO/NEAT_PROVENANCE in the golden VCF.
+    // Emitted as INFO/EIDOLON_PROVENANCE in the golden VCF.
     pub provenance: Provenance,
 }
 

@@ -41,7 +41,7 @@ fn load_summary(dir: &Path) -> serde_json::Value {
 }
 
 /// FN_with_reasons.vcf is written unconditionally and contains the surviving
-/// FN records, each annotated with a NEAT_REASON INFO tag.
+/// FN records, each annotated with a EIDOLON_REASON INFO tag.
 #[test]
 fn fn_with_reasons_vcf_is_written_with_neat_reason_tag() {
     let tmp = tempfile::tempdir().unwrap();
@@ -81,9 +81,9 @@ fn fn_with_reasons_vcf_is_written_with_neat_reason_tag() {
     let fn_vcf = out.join("FN_with_reasons.vcf");
     assert!(fn_vcf.is_file(), "FN_with_reasons.vcf was not written");
     let body = std::fs::read_to_string(&fn_vcf).unwrap();
-    assert!(body.contains("##INFO=<ID=NEAT_REASON"));
+    assert!(body.contains("##INFO=<ID=EIDOLON_REASON"));
     assert!(body.contains("#CHROM\tPOS\tID\tREF\tALT"));
-    // Both FNs should have NEAT_REASON=unknown (no mutation/target BED configured).
+    // Both FNs should have EIDOLON_REASON=unknown (no mutation/target BED configured).
     let data_lines: Vec<&str> = body
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -94,7 +94,11 @@ fn fn_with_reasons_vcf_is_written_with_neat_reason_tag() {
         2,
         "expected 2 FN rows, got: {data_lines:?}"
     );
-    assert!(data_lines.iter().all(|l| l.contains("NEAT_REASON=unknown")));
+    assert!(
+        data_lines
+            .iter()
+            .all(|l| l.contains("EIDOLON_REASON=unknown"))
+    );
 
     // outputs section in JSON should point at this file.
     let summary = load_summary(&out);
@@ -159,8 +163,8 @@ fn fp_vcf_written_when_opted_in() {
     assert_eq!(data_lines.len(), 2);
     // INFO column is preserved (one record has DP=42).
     assert!(data_lines.iter().any(|l| l.contains("DP=42")));
-    // No NEAT_REASON tag on FP records.
-    assert!(!body.contains("NEAT_REASON"));
+    // No EIDOLON_REASON tag on FP records.
+    assert!(!body.contains("EIDOLON_REASON"));
 
     let summary = load_summary(&out);
     assert!(
@@ -211,7 +215,7 @@ fn fn_with_reasons_vcf_round_trips_via_existing_reader() {
     // The reader stores the INFO blob; check our annotation made it through.
     let info = v.info.as_deref().unwrap_or("");
     assert!(
-        info.contains("DP=20") && info.contains("NEAT_REASON=unknown"),
+        info.contains("DP=20") && info.contains("EIDOLON_REASON=unknown"),
         "info field was: {info:?}"
     );
 }

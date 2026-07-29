@@ -286,7 +286,7 @@ impl CancerConfig {
             somatic_vcf: self.somatic_vcf.clone(),
             somatic_af_scale: 1.0 / self.purity,
             // #405: record each somatic variant's intended observed VAF
-            // (INFO/NEAT_VAF = purity × allele_fraction) for direct comparison
+            // (INFO/EIDOLON_VAF = purity × allele_fraction) for direct comparison
             // against a caller's VAF on the merged reads.
             merged_vaf_purity: Some(self.purity),
             output_filename: format!("{}_tumor", self.output_prefix),

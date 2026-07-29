@@ -11,7 +11,7 @@
 //!      see `determinism.rs` — so we compare sorted records, not lines).
 //!   2. The per-pass golden VCF bodies match (same gen-reads driven identically).
 //!   3. The origin-tagged truth VCF carries the same
-//!      `(chrom, pos, ref, alt, NEAT_ORIGIN)` set — i.e. the native Rust merge
+//!      `(chrom, pos, ref, alt, EIDOLON_ORIGIN)` set — i.e. the native Rust merge
 //!      classifies germline / somatic / shared exactly as the bcftools+awk merge.
 //!
 //! The bash path needs `bash` (+ `awk`/`gzip`, universally present on the dev/CI
@@ -63,7 +63,7 @@ fn vcf_body_sorted(path: &Path) -> Vec<String> {
 }
 
 /// Set of `(chrom, pos, ref, alt, origin)` for every body record. `origin` is the
-/// `NEAT_ORIGIN=` value parsed out of the INFO column (col 8).
+/// `EIDOLON_ORIGIN=` value parsed out of the INFO column (col 8).
 fn vcf_origin_set(path: &Path) -> BTreeSet<(String, String, String, String, String)> {
     read_gzip_fastq_lines(path)
         .into_iter()
@@ -75,7 +75,7 @@ fn vcf_origin_set(path: &Path) -> BTreeSet<(String, String, String, String, Stri
             }
             let origin = c[7]
                 .split(';')
-                .find_map(|f| f.strip_prefix("NEAT_ORIGIN="))
+                .find_map(|f| f.strip_prefix("EIDOLON_ORIGIN="))
                 .unwrap_or("?")
                 .to_string();
             Some((c[0].into(), c[1].into(), c[3].into(), c[4].into(), origin))
@@ -207,7 +207,7 @@ fn native_gen_cancer_reads_matches_cancer_simulate_sh() {
         assert!(!nat.is_empty(), "native truth VCF has no records");
         assert_eq!(
             nat, bash,
-            "origin-tagged truth VCF (chrom,pos,ref,alt,NEAT_ORIGIN) set differs \
+            "origin-tagged truth VCF (chrom,pos,ref,alt,EIDOLON_ORIGIN) set differs \
              between the native merge and bcftools+awk"
         );
     } else {

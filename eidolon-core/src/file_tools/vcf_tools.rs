@@ -102,20 +102,20 @@ pub fn write_vcf(
     )?;
     writeln!(
         &mut buffer,
-        "##INFO=<ID=NEAT_PROVENANCE,Number=1,Type=String,\
+        "##INFO=<ID=EIDOLON_PROVENANCE,Number=1,Type=String,\
         Description=\"Origin of variant in this gen-reads run: \
         'denovo' = sampled by the simulator, 'input' = supplied via input_vcf:\">"
     )?;
     writeln!(
         &mut buffer,
-        "##INFO=<ID=NEAT_CCF,Number=1,Type=Float,\
+        "##INFO=<ID=EIDOLON_CCF,Number=1,Type=Float,\
         Description=\"Intended cellular fraction of this de-novo variant \
         (cancer-cell fraction of its assigned subclone; #405). The realized alt \
-        fraction is NEAT_CCF x allele dosage; absent when no subclonal model is set.\">"
+        fraction is EIDOLON_CCF x allele dosage; absent when no subclonal model is set.\">"
     )?;
     writeln!(
         &mut buffer,
-        "##INFO=<ID=NEAT_VAF,Number=1,Type=Float,\
+        "##INFO=<ID=EIDOLON_VAF,Number=1,Type=Float,\
         Description=\"Intended observed variant allele fraction of this somatic \
         variant in the tumor/normal-mixed output (purity x dosage x CCF; #405). \
         Directly comparable to a caller's VAF on the merged reads — unlike FORMAT/AF, \
@@ -142,7 +142,7 @@ pub fn write_vcf(
     // Add a neat sample column
     writeln!(
         &mut buffer,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNEAT_simulated_sample"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tEIDOLON_simulated_sample"
     )?;
     // write out mutations
     //
@@ -182,16 +182,16 @@ pub fn write_vcf(
             let prov = variant.provenance.as_str();
             let is_symbolic = variant.alternate.is_symbolic();
             // INFO: symbolic records preserve any pre-existing INFO (SVLEN / END /
-            // CN / SVTYPE) and append NEAT_PROVENANCE. Literal records have no
-            // upstream INFO, so just emit NEAT_PROVENANCE alone.
+            // CN / SVTYPE) and append EIDOLON_PROVENANCE. Literal records have no
+            // upstream INFO, so just emit EIDOLON_PROVENANCE alone.
             let info_str = if is_symbolic {
                 match variant.info.as_deref() {
-                    None | Some(".") | Some("") => format!("NEAT_PROVENANCE={prov}"),
-                    Some(existing) => format!("{existing};NEAT_PROVENANCE={prov}"),
+                    None | Some(".") | Some("") => format!("EIDOLON_PROVENANCE={prov}"),
+                    Some(existing) => format!("{existing};EIDOLON_PROVENANCE={prov}"),
                 }
             } else {
-                // Literal records: NEAT_PROVENANCE is the base INFO. Simulator-emitted
-                // tags (NEAT_CCF, NEAT_VAF) live in `info` on de-novo and reproductive
+                // Literal records: EIDOLON_PROVENANCE is the base INFO. Simulator-emitted
+                // tags (EIDOLON_CCF, EIDOLON_VAF) live in `info` on de-novo and reproductive
                 // somatic (SomaticVcf) variants — pass those through. Germline input-VCF
                 // literals deliberately drop their source INFO (only provenance emitted),
                 // so existing golden output for input_vcf: runs is unchanged.
@@ -199,9 +199,9 @@ pub fn write_vcf(
                     (Provenance::Denovo | Provenance::SomaticVcf, Some(extra))
                         if !extra.is_empty() && extra != "." =>
                     {
-                        format!("{extra};NEAT_PROVENANCE={prov}")
+                        format!("{extra};EIDOLON_PROVENANCE={prov}")
                     }
-                    _ => format!("NEAT_PROVENANCE={prov}"),
+                    _ => format!("EIDOLON_PROVENANCE={prov}"),
                 }
             };
             // SAMPLE: for literal variants, AD/DP/AF come from the per-contig
@@ -549,17 +549,17 @@ mod tests {
         );
 
         // Both variant lines must be present (HashMap iteration order is non-deterministic).
-        // Variants from `Variant::new` carry `Provenance::Denovo` (→ INFO/NEAT_PROVENANCE=denovo)
+        // Variants from `Variant::new` carry `Provenance::Denovo` (→ INFO/EIDOLON_PROVENANCE=denovo)
         // and an empty ad_counter means no reads were simulated (→ AD=0,0 DP=0 AF=`.`).
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t4\t.\tA\tG\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:0,0:0:."),
+                == "chr1\t4\t.\tA\tG\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:0,0:0:."),
             "missing het SNP line; got: {:?}",
             lines
         );
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t8\t.\tT\tG\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,0:0:."),
+                == "chr1\t8\t.\tT\tG\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,0:0:."),
             "missing hom SNP line; got: {:?}",
             lines
         );
@@ -1323,10 +1323,10 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // Symbolic SVs use span-based depth semantics that don't fit the
         // point-based AD/DP/AF counter — they emit `.` placeholders. The
         // `Provenance::Denovo` constructor on the test fixture surfaces as
-        // INFO/NEAT_PROVENANCE=denovo.
+        // INFO/EIDOLON_PROVENANCE=denovo.
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t100\t.\tA\t<DEL>\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:.,.:.:."),
+                == "chr1\t100\t.\tA\t<DEL>\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:.,.:.:."),
             "expected symbolic ALT to round-trip as `<DEL>` with denovo provenance and `.` AD/DP/AF; got: {:?}",
             lines
         );
@@ -1335,7 +1335,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     /// When the per-contig AdCounter has real (ref_count, alt_count) values
     /// at a variant's position, the writer must surface them as AD = a,b,
     /// DP = a+b, AF = b/(a+b) rounded to 4 decimal places. After the #185
-    /// merge, every literal record also carries `NEAT_PROVENANCE=denovo`
+    /// merge, every literal record also carries `EIDOLON_PROVENANCE=denovo`
     /// (since `Variant::new` is the de-novo constructor).
     #[test]
     fn test_write_vcf_emits_ad_dp_af_from_counter() {
@@ -1386,14 +1386,14 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // Het: position 11 (1-based), AD=18,12, DP=30, AF=0.4000
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t11\t.\tA\tG\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:18,12:30:0.4000"),
+                == "chr1\t11\t.\tA\tG\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:18,12:30:0.4000"),
             "missing het record with AD=18,12 DP=30 AF=0.4000; got: {:?}",
             lines
         );
         // Hom: position 21 (1-based), AD=0,30, DP=30, AF=1.0000
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t21\t.\tC\tT\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,30:30:1.0000"),
+                == "chr1\t21\t.\tC\tT\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,30:30:1.0000"),
             "missing hom record with AD=0,30 DP=30 AF=1.0000; got: {:?}",
             lines
         );
@@ -1414,7 +1414,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     }
 
     /// `Provenance::InputVcf` literal variants must surface as
-    /// `NEAT_PROVENANCE=input` in the golden VCF — this is the signal the
+    /// `EIDOLON_PROVENANCE=input` in the golden VCF — this is the signal the
     /// cancer-simulator merge step relies on to detect germline carry-through
     /// (a variant that was supplied via `input_vcf:` and appears in both
     /// passes is the "shared" case).
@@ -1460,8 +1460,8 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // Empty ad_counter → AD=0,0 DP=0 AF=`.`.
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t50\t.\tA\tG\t37\tPASS\tNEAT_PROVENANCE=input\tGT:AD:DP:AF\t0/1:0,0:0:."),
-            "expected NEAT_PROVENANCE=input on InputVcf literal; got: {:?}",
+                == "chr1\t50\t.\tA\tG\t37\tPASS\tEIDOLON_PROVENANCE=input\tGT:AD:DP:AF\t0/1:0,0:0:."),
+            "expected EIDOLON_PROVENANCE=input on InputVcf literal; got: {:?}",
             lines
         );
         // Header line must declare the new INFO field so downstream
@@ -1469,14 +1469,24 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("##INFO=<ID=NEAT_PROVENANCE,")),
-            "missing NEAT_PROVENANCE INFO header line; got: {:?}",
+                .any(|l| l.starts_with("##INFO=<ID=EIDOLON_PROVENANCE,")),
+            "missing EIDOLON_PROVENANCE INFO header line; got: {:?}",
+            lines
+        );
+        // The sample-column name is an emitted output token too (renamed from
+        // NEAT_simulated_sample in v2.1.0). Without this assertion it is the one
+        // renamed token no test would catch being reverted.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("#CHROM") && l.ends_with("\tEIDOLON_simulated_sample")),
+            "missing/incorrect EIDOLON_simulated_sample column header; got: {:?}",
             lines
         );
     }
 
     /// Symbolic SVs typically arrive with a populated INFO column
-    /// (SVLEN, END, SVTYPE, CN). The writer must *append* NEAT_PROVENANCE
+    /// (SVLEN, END, SVTYPE, CN). The writer must *append* EIDOLON_PROVENANCE
     /// to that existing field rather than overwrite it — otherwise span
     /// metadata is lost on the symbolic record's round trip.
     #[test]
@@ -1517,13 +1527,13 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
             .map(|l| l.unwrap())
             .collect();
         // Symbolic SVs always emit `.,.:.:.` for AD/DP/AF (span-based depth,
-        // not point-based). Existing INFO must survive with NEAT_PROVENANCE
+        // not point-based). Existing INFO must survive with EIDOLON_PROVENANCE
         // appended.
         assert!(
             lines.iter().any(|l| l
                 == "chr1\t200\t.\tA\t<DEL>\t37\tPASS\t\
-                 SVTYPE=DEL;END=300;SVLEN=-100;NEAT_PROVENANCE=input\tGT:AD:DP:AF\t1/1:.,.:.:."),
-            "expected SVTYPE/END/SVLEN to survive with NEAT_PROVENANCE appended; got: {:?}",
+                 SVTYPE=DEL;END=300;SVLEN=-100;EIDOLON_PROVENANCE=input\tGT:AD:DP:AF\t1/1:.,.:.:."),
+            "expected SVTYPE/END/SVLEN to survive with EIDOLON_PROVENANCE appended; got: {:?}",
             lines
         );
     }

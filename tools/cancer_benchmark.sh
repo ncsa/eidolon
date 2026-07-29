@@ -52,10 +52,10 @@ DOCKER="docker"
 # Default truth filter: keep only records whose origin is "somatic" — those
 # are the only variants Mutect2 in tumor/normal mode is expected to call.
 # Without this filter, the truth VCF's ~99% germline-carry-through records
-# (NEAT_ORIGIN=shared) inflate the FN count and tank apparent recall even
+# (EIDOLON_ORIGIN=shared) inflate the FN count and tank apparent recall even
 # when the somatic caller is doing fine. Set to empty (--truth-filter '')
 # to skip filtering and score against the full truth as-is.
-TRUTH_FILTER='INFO/NEAT_ORIGIN="somatic"'
+TRUTH_FILTER='INFO/EIDOLON_ORIGIN="somatic"'
 
 usage() {
     cat <<'EOF'
@@ -82,7 +82,7 @@ Resources:
 
 Truth filtering:
   --truth-filter   bcftools view -i expression applied to the truth VCF
-                   before scoring. Default: 'INFO/NEAT_ORIGIN="somatic"'
+                   before scoring. Default: 'INFO/EIDOLON_ORIGIN="somatic"'
                    — keeps only the records Mutect2 in tumor/normal mode
                    is expected to call (germline-carried-through records
                    would otherwise be counted as FN). Pass an empty string
@@ -280,7 +280,7 @@ fi
 # ── 6a. Filter truth VCF before scoring ─────────────────────────────────
 # som.py treats every record in the truth VCF as an expected somatic
 # call. The eidolon-emitted truth carries both germline-carry-through
-# (NEAT_ORIGIN=shared) and somatic (NEAT_ORIGIN=somatic) records, so
+# (EIDOLON_ORIGIN=shared) and somatic (EIDOLON_ORIGIN=somatic) records, so
 # without filtering, Mutect2's (correct) refusal to call the germline
 # carry-through variants shows up as ~99% false negatives. Filter the
 # truth down to just the somatic ground-truth records before scoring.
@@ -292,14 +292,14 @@ if [[ -n "$TRUTH_FILTER" ]]; then
         "bcftools view -i '$TRUTH_FILTER' -O z -o '/work/$SCORING_TRUTH_NAME' '/truth_in/$TRUTH_NAME' \
          && bcftools index -f -t '/work/$SCORING_TRUTH_NAME'"
     # If the filtered truth is empty the filter didn't match anything —
-    # almost always means INFO/NEAT_ORIGIN isn't present on this truth
+    # almost always means INFO/EIDOLON_ORIGIN isn't present on this truth
     # VCF (e.g. a non-eidolon truth set). Point the user at the escape
     # hatch rather than silently scoring against zero records.
     filtered_count=$(run_in "$BCFTOOLS_IMG" sh -c \
         "bcftools view -H '/work/$SCORING_TRUTH_NAME' | wc -l" | tr -d '\r\n')
     if [[ "$filtered_count" == "0" ]]; then
         echo "WARNING: truth filter '$TRUTH_FILTER' matched zero records." >&2
-        echo "  If your truth VCF doesn't have INFO/NEAT_ORIGIN, pass --truth-filter ''" >&2
+        echo "  If your truth VCF doesn't have INFO/EIDOLON_ORIGIN, pass --truth-filter ''" >&2
     else
         echo "    Filtered truth: $filtered_count records retained."
     fi
