@@ -16,9 +16,16 @@
 # fails outright rather than falling back. Converting the file up front is the
 # reliable fix, and it's what this script does.
 #
-# The conversion is IDEMPOTENT and quiet: running it on an already-migrated file
-# (or on a non-eidolon VCF) copies the input through unchanged and exits 0. That
-# means callers can invoke it unconditionally without probing first.
+# The conversion is IDEMPOTENT and quiet: running it on an already-migrated file (or a
+# non-eidolon VCF) leaves every record and declaration untouched and exits 0, so callers
+# can invoke it unconditionally without probing first.
+#
+# "Untouched" is about the DATA, not the bytes — every pass goes through bcftools, which
+# adds a `##bcftools_viewCommand` provenance line and normalizes float formatting
+# (`1.0` -> `1`). Two other cosmetic effects of `--rename-annots`: the tag's
+# `Description=` text is not rewritten, so a converted header can still read
+# "...is NEAT_CCF x allele dosage"; and output is always BGZF even if the input was
+# plain gzip. None of these change record semantics.
 #
 # NOT handled: FASTQ/BAM read-name prefixes (@RNEAT_generated_ / RNEAT_chimeric_).
 # Rewriting those means a full pass over files that are routinely hundreds of GB,
@@ -67,14 +74,27 @@ for tag in "${LEGACY_INFO[@]}"; do
 done
 
 # Sample columns: rename only names we know are ours, never an arbitrary sample.
+#
+# Take the names from the #CHROM line of the header we already captured, NOT from a
+# second `bcftools query -l`. A process substitution's failure is invisible to set -e:
+# if the command died, the loop body would simply never run, `legacy_samples` would
+# stay 0, and we'd rename the INFO tags while silently leaving the sample column as
+# NEAT_simulated_sample — a half-converted file returned with exit 0.
+chrom_line="$(grep -m1 '^#CHROM' <<<"$header")" \
+    || die "no #CHROM header line in $IN — not a VCF?"
 legacy_samples=0
 new_samples=""
-while IFS= read -r s; do
-    case "$s" in
-        NEAT_simulated_sample) new_samples+="EIDOLON_simulated_sample"$'\n'; legacy_samples=1 ;;
-        *)                     new_samples+="$s"$'\n' ;;
-    esac
-done < <(bcftools query -l "$IN")
+# Fields 1-9 are the fixed VCF columns; 10+ are samples (absent in a sites-only VCF).
+n_fields="$(awk -F'\t' '{print NF; exit}' <<<"$chrom_line")"
+if [[ "$n_fields" -gt 9 ]]; then
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        case "$s" in
+            NEAT_simulated_sample) new_samples+="EIDOLON_simulated_sample"$'\n'; legacy_samples=1 ;;
+            *)                     new_samples+="$s"$'\n' ;;
+        esac
+    done < <(cut -f10- <<<"$chrom_line" | tr '\t' '\n')
+fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     if [[ ${#found[@]} -eq 0 && "$legacy_samples" -eq 0 ]]; then
