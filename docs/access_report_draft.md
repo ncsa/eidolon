@@ -761,12 +761,12 @@ cancer-cell fractions (CCF)**: each somatic variant's observed alt fraction comp
 `purity × dosage × CCF` (three orthogonal axes — normal contamination, per-copy
 multiplicity, subclonal prevalence). The architecture can be authored inline, **fitted
 from real data** (PyClone-VI / PCAWG cluster tables), or **replayed** from a real somatic
-VCF at its observed VAF. Every somatic truth record carries the intended CCF (`INFO/NEAT_CCF`)
-and the intended observed VAF (`INFO/NEAT_VAF`) as ground truth.
+VCF at its observed VAF. Every somatic truth record carries the intended CCF (`INFO/EIDOLON_CCF`)
+and the intended observed VAF (`INFO/EIDOLON_VAF`) as ground truth.
 
 **Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate,
 align the merged reads with bwa-mem2, and measure the observed VAF at each somatic site
-against the intended `NEAT_VAF`. Two complementary runs — a *controlled synthetic*
+against the intended `EIDOLON_VAF`. Two complementary runs — a *controlled synthetic*
 architecture and a *real tumor's empirical* spectrum:
 
 | Metric | Generative — soy scaffold | Reproductive — HCC1395 chr1 |

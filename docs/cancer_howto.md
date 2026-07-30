@@ -16,7 +16,7 @@ validate it works as expected. Design rationale and the mutation-rate / SV calib
         merge: tag reads N_/T_, concatenate; combine the two golden VCFs with origin tags
         ▼
   <prefix>_merged_r1.fastq.gz    → aligner + somatic caller
-  <prefix>_merged_truth.vcf.gz   → INFO/NEAT_ORIGIN ∈ {germline, somatic, shared}
+  <prefix>_merged_truth.vcf.gz   → INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}
 ```
 
 The tumor pass consumes the normal pass's golden VCF as its germline (`input_vcf`),
@@ -52,7 +52,7 @@ eidolon gen-cancer-reads -c cancer.yml
 | File | Contents |
 |---|---|
 | `<prefix>_merged_r1.fastq.gz` (+ `_r2`) | `N_`/`T_`-tagged, concatenated reads — the simulated biopsy. Feed to your aligner. |
-| `<prefix>_merged_truth.vcf.gz` | Origin-tagged truth: `INFO/NEAT_ORIGIN ∈ {germline, somatic, shared}`. Score against this. |
+| `<prefix>_merged_truth.vcf.gz` | Origin-tagged truth: `INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}`. Score against this. |
 | `<prefix>_normal.vcf.gz` | Germline-only truth. |
 | `<prefix>_tumor.vcf.gz` | Germline + somatic truth. |
 | `<prefix>_{normal,tumor}_r1.fastq.gz` | Per-pass reads (`keep_per_pass: false` deletes after merge). |
@@ -183,20 +183,20 @@ pre-subclone runs).
 
 Each somatic record in the golden/merged-truth VCF carries two ground-truth INFO tags:
 
-- **`NEAT_CCF`** — the intended cellular fraction (subclone CCF).
-- **`NEAT_VAF`** — the intended **observed** VAF after tumor/normal mixing
+- **`EIDOLON_CCF`** — the intended cellular fraction (subclone CCF).
+- **`EIDOLON_VAF`** — the intended **observed** VAF after tumor/normal mixing
   (`purity × dosage × CCF`; for a reproductive `somatic_vcf` replay, the original
   input VAF). This is the number a somatic caller measures on the merged reads.
 
 Mind the difference from `FORMAT/AF`: that field is measured **per-pass (tumor-only)**,
-so it reads `dosage × CCF` (≈ `NEAT_VAF ÷ purity`) and carries sampling noise.
-For scoring a caller's VAF against ground truth, compare to `NEAT_VAF`; use `FORMAT/AF`
+so it reads `dosage × CCF` (≈ `EIDOLON_VAF ÷ purity`) and carries sampling noise.
+For scoring a caller's VAF against ground truth, compare to `EIDOLON_VAF`; use `FORMAT/AF`
 only if you want the tumor-cell fraction. Germline/shared records carry neither tag.
 
 ```bash
-# planted observed VAF vs caller VAF: score against NEAT_VAF, not FORMAT/AF
-bcftools view -H -i 'INFO/NEAT_ORIGIN="somatic"' merged_truth.vcf.gz \
-  | awk -F'\t' '{match($8,/NEAT_VAF=[0-9.]+/); print $2, substr($8,RSTART+9)}'
+# planted observed VAF vs caller VAF: score against EIDOLON_VAF, not FORMAT/AF
+bcftools view -H -i 'INFO/EIDOLON_ORIGIN="somatic"' merged_truth.vcf.gz \
+  | awk -F'\t' 'match($8,/EIDOLON_VAF=[0-9.]+/){v=substr($8,RSTART,RLENGTH); sub(/^EIDOLON_VAF=/,"",v); print $2, v}'
 ```
 
 ### Building the architecture from real data
@@ -221,11 +221,11 @@ rows are dropped, both warned with a count. Extra columns (`cellular_prevalence_
 `cluster_assignment_prob`, …) are ignored.
 
 **Round-trip validation.** Ingest a real tumor's clusters → simulate → the golden
-VCF's `NEAT_CCF` carries exactly those planted CCFs → run the deconvolution tool on
+VCF's `EIDOLON_CCF` carries exactly those planted CCFs → run the deconvolution tool on
 the *simulated* reads → confirm it recovers the architecture you fed in.
 `scripts/delta/run_subclonal_vaf_validation.sh` runs the read-level half on real
 data (Delta): it aligns the merged reads and checks the observed VAF at each somatic
-site tracks `NEAT_VAF` (fidelity gated on bias + MAE-vs-noise-floor). On a soybean
+site tracks `EIDOLON_VAF` (fidelity gated on bias + MAE-vs-noise-floor). On a soybean
 scaffold at 200× with three subclones spanning 4–40% VAF, the aligned reads reproduce
 the planted spectrum **unbiased** (mean err −0.003) and **to the sampling-noise floor**
 (MAE 0.026, Pearson r 0.95) — see report §3.12.
@@ -245,7 +245,7 @@ somatic_vcf: tumor_somatic.vcf.gz
 Each variant is honored at its **observed VAF** (`INFO/AF`, else derived from
 `FORMAT/AD`), divided by `purity` so the merged reads reproduce that VAF after
 tumor/normal mixing (a raw Mutect2/Strelka VCF works directly). Replayed variants are
-tagged `NEAT_ORIGIN=somatic` / `NEAT_PROVENANCE=somatic_input` in the truth — distinct
+tagged `EIDOLON_ORIGIN=somatic` / `EIDOLON_PROVENANCE=somatic_input` in the truth — distinct
 from germline even though both come from files. Notes:
 
 - Composes with generation: leave `tumor_mutation_rate > 0` (and optional `subclones`)
@@ -295,7 +295,7 @@ tools/cancer_sv_benchmark.sh \
     --output-dir   ./sv_bench
 ```
 
-`INFO/NEAT_ORIGIN` lets you filter the truth to somatic-only before scoring
+`INFO/EIDOLON_ORIGIN` lets you filter the truth to somatic-only before scoring
 (`--truth-filter`).
 
 ## Config knobs

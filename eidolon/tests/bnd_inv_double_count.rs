@@ -5,9 +5,9 @@
 //! breakpoints from the unbroken reference, so a homozygous junction sat at ~2x
 //! coverage. The fix drops the broken-allele fraction of regular pairs that
 //! cross a junction; for a homozygous junction that's all of them, so afterward
-//! NO regular read (`RNEAT_generated_`) should span the breakpoint, while
+//! NO regular read (`EIDOLON_generated_`) should span the breakpoint, while
 //! interior / flank positions keep normal coverage and the chimeric junction
-//! reads (`RNEAT_chimeric_`) are still emitted. (DUP / CNV-gain make a novel
+//! reads (`EIDOLON_chimeric_`) are still emitted. (DUP / CNV-gain make a novel
 //! tandem adjacency that linear reads never reproduce, so they are not
 //! suppressed and aren't tested here.)
 
@@ -73,13 +73,13 @@ fn run_hom_sv(test_name: &str, svtype: &str, sv_start: usize, sv_end: usize) -> 
         .collect()
 }
 
-/// Count regular (`RNEAT_generated_`) reads on H1N1_HA whose span
+/// Count regular (`EIDOLON_generated_`) reads on H1N1_HA whose span
 /// `[abs_start, abs_end)` contains the 0-based position `pos`. Read names are
-/// `RNEAT_generated_H1N1_HA_<abs_start>_<abs_end>_<hex>/1`.
+/// `EIDOLON_generated_H1N1_HA_<abs_start>_<abs_end>_<hex>/1`.
 fn regular_reads_covering(qnames: &[String], pos: usize) -> usize {
     qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_generated_H1N1_HA_"))
+        .filter(|l| l.contains("EIDOLON_generated_H1N1_HA_"))
         .filter_map(|l| {
             // strip leading '@' and trailing '/1'
             let name = l.trim_start_matches('@').split('/').next()?;
@@ -106,7 +106,7 @@ fn homozygous_inv_junctions_have_no_regular_crossing_reads() {
     // the redundant regular reference reads, not the junction signal).
     let chimeric = qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_INV_H1N1_HA_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_INV_H1N1_HA_"))
         .count();
     assert!(chimeric > 0, "expected chimeric INV junction reads, got 0");
 
@@ -144,7 +144,7 @@ fn homozygous_del_breakpoint_has_no_regular_crossing_reads() {
     // Chimeric DEL junction reads are still emitted.
     let chimeric = qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DEL_H1N1_HA_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DEL_H1N1_HA_"))
         .count();
     assert!(chimeric > 0, "expected chimeric DEL junction reads, got 0");
 

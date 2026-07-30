@@ -141,6 +141,6 @@ fn print_summary(cfg: &CancerConfig, truth: &Path) {
         cfg.output_prefix,
         if cfg.paired_ended { " (+ _r2)" } else { "" }
     );
-    info!("  merged truth:  {truth:?} (INFO/NEAT_ORIGIN = germline | somatic | shared)");
+    info!("  merged truth:  {truth:?} (INFO/EIDOLON_ORIGIN = germline | somatic | shared)");
     info!("──────────────────────────────────────────────");
 }

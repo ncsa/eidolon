@@ -268,18 +268,18 @@ fn gen_reads_with_symbolic_del_modulates_depth_and_round_trips_to_vcf() {
     );
 
     // (b) Depth modulation — count read start positions on H1N1_HA. Names look
-    // like `@RNEAT_generated_{contig}_{abs_start:010}_{abs_end:010}`.
+    // like `@EIDOLON_generated_{contig}_{abs_start:010}_{abs_end:010}`.
     let fastq = work.join("sv_run_r1.fastq.gz");
     let lines = read_gzip_fastq_lines(&fastq);
     let mut inside_del = 0usize;
     let mut outside_del = 0usize;
     for chunk in lines.chunks(4) {
         let name = &chunk[0];
-        if !name.starts_with("@RNEAT_generated_H1N1_HA_") {
+        if !name.starts_with("@EIDOLON_generated_H1N1_HA_") {
             continue;
         }
         // Strip leading '@' and prefix; the remainder is "{start}_{end}".
-        let rest = name.trim_start_matches("@RNEAT_generated_H1N1_HA_");
+        let rest = name.trim_start_matches("@EIDOLON_generated_H1N1_HA_");
         let abs_start: usize = rest
             .split('_')
             .next()
@@ -621,14 +621,14 @@ fn gen_reads_with_sv_rate_scale_zero_emits_no_de_novo_svs() {
 //      0.9% at baseline ~13k reads; 15% leaves ample margin while still
 //      catching any sign / off-by-one error in the multiplier arithmetic).
 
-/// Count reads whose names start with `@RNEAT_generated_H1N1_HA_` (i.e., were
+/// Count reads whose names start with `@EIDOLON_generated_H1N1_HA_` (i.e., were
 /// emitted from the H1N1_HA contig). Other test fixtures might add reads from
 /// other contigs to the same FASTQ; this filter keeps the count contig-local.
 fn count_h1n1_reads(fastq: &std::path::Path) -> usize {
     let lines = read_gzip_fastq_lines(fastq);
     lines
         .chunks(4)
-        .filter(|c| c[0].starts_with("@RNEAT_generated_H1N1_HA_"))
+        .filter(|c| c[0].starts_with("@EIDOLON_generated_H1N1_HA_"))
         .count()
 }
 

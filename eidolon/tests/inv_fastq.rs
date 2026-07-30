@@ -52,7 +52,9 @@ fn gen_reads_with_inv_variant_produces_chimeric_reads_in_fastq() {
         r.lines().map(|l| l.unwrap()).collect()
     };
 
-    let has_chimeric = fastq_lines.iter().any(|l| l.contains("RNEAT_chimeric_INV"));
+    let has_chimeric = fastq_lines
+        .iter()
+        .any(|l| l.contains("EIDOLON_chimeric_INV"));
     assert!(
         has_chimeric,
         "Expected to find chimeric INV reads in FASTQ output. Lines: {:?}",
@@ -60,7 +62,7 @@ fn gen_reads_with_inv_variant_produces_chimeric_reads_in_fastq() {
     );
 
     // Check both junctions are represented. QNAMEs now end with
-    //   RNEAT_chimeric_INV_<contig>_<pos>_<end>_<junction>_<16-hex>/<mate>
+    //   EIDOLON_chimeric_INV_<contig>_<pos>_<end>_<junction>_<16-hex>/<mate>
     // (the 16-hex frag_idx tag was added for QNAME-uniqueness per #210).
     // The substring `_<junction>_0` is unambiguous for these synthetic
     // H1N1 fixtures — the hex frag_idx values all start with `0` since

@@ -9,7 +9,7 @@
 #   <prefix>_tumor_r1.fastq.gz  (+ _r2)              tumor-pass reads
 #   <prefix>_tumor.vcf.gz                            germline + somatic truth
 #   <prefix>_merged_r1.fastq.gz (+ _r2)              N_/T_-tagged, concatenated
-#   <prefix>_merged_truth.vcf.gz                     INFO/NEAT_ORIGIN = germline | somatic | shared
+#   <prefix>_merged_truth.vcf.gz                     INFO/EIDOLON_ORIGIN = germline | somatic | shared
 
 # ── Required ──────────────────────────────────────────────────────────────
 reference: /path/to/reference.fa          # .fa or .fa.gz

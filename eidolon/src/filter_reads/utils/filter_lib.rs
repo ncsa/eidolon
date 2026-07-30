@@ -74,19 +74,38 @@ fn open_unzipped(filename: &PathBuf) -> ReaderType {
 
 fn parse_fastq_record_name(line: &str) -> Result<(String, usize, usize), FilterLibError> {
     // gen_reads produces:
-    //   "@RNEAT_generated_<contig>_<10-digit start>_<10-digit end>_<16-hex uniq>/N"
+    //   "@EIDOLON_generated_<contig>_<10-digit start>_<10-digit end>_<16-hex uniq>/N"
     // The trailing 16-char hex disambiguates same-position fragments (see #210
     // for why it's necessary). Parser takes the last three underscore-separated
     // tokens as (start, end, uniq) and ignores uniq.
-    if !line.starts_with("@RNEAT_generated_") {
-        return if line.contains("@RNEAT_generated_") {
+    const PREFIX: &str = "@EIDOLON_generated_";
+    // v2.0.0 and earlier emitted "@RNEAT_generated_" (v2.1.0 renamed the output
+    // tokens). Accept both: FASTQs are far too large to be worth rewriting just to
+    // change a 19-byte prefix, so legacy output stays filterable. Note the two
+    // prefixes differ in length (19 vs 17), hence the matched-prefix slice below.
+    const LEGACY_PREFIX: &str = "@RNEAT_generated_";
+    let prefix = if line.starts_with(PREFIX) {
+        PREFIX
+    } else if line.starts_with(LEGACY_PREFIX) {
+        LEGACY_PREFIX
+    } else {
+        // A line that *embeds* a known prefix without starting with one is a read
+        // name we can't parse: that's a loud MalformedLine. Anything else is
+        // InvalidReadName, which filter_fastq treats as an ordinary data line.
+        // (Note both prefixes include the leading '@', so the "@N_"/"@T_" tagged
+        // names in a merged cancer FASTQ do NOT land here — they are InvalidReadName
+        // and get dropped. Pre-existing behaviour; no harness runs filter-reads on
+        // a merged FASTQ, so it's untouched here.)
+        return if line.contains(PREFIX) || line.contains(LEGACY_PREFIX) {
             Err(FilterLibError::MalformedLine(line.to_string()))
         } else {
             Err(FilterLibError::InvalidReadName)
         };
-    }
-    // Slice off the "@RNEAT_generated_" prefix (17 chars) and "/N" strand suffix (2 chars).
-    let trimmed = &line[17..line.len() - 2];
+    };
+    // Slice off the matched prefix and the "/N" strand suffix (2 chars). Use
+    // prefix.len() rather than a magic number so a future prefix rename can't
+    // silently shift the offset.
+    let trimmed = &line[prefix.len()..line.len() - 2];
     let split_line: Vec<&str> = trimmed.split('_').collect();
     let length = split_line.len();
     if length < 4 {
@@ -230,7 +249,7 @@ mod tests {
     fn test_parse_record_name() {
         // Updated for the per-fragment uniqueness tag introduced in #210.
         let record_name =
-            "@RNEAT_generated_chrom_1_0000001000_0000002000_000000000000002a/1".to_string();
+            "@EIDOLON_generated_chrom_1_0000001000_0000002000_000000000000002a/1".to_string();
         assert_eq!(
             parse_fastq_record_name(&record_name).unwrap(),
             ("chrom_1".to_string(), 1000, 2000),
@@ -242,9 +261,21 @@ mod tests {
     /// clear MalformedLine error rather than silently parsing the contig as
     /// the wrong thing or panicking. This protects users who feed old eidolon
     /// output through a new filter_reads — they'll see a real error.
+    /// v2.0.0-era `@RNEAT_generated_` read names must still parse — FASTQs are too
+    /// large to rewrite just for a prefix rename. The two prefixes differ in length
+    /// (17 vs 19), so this also pins that the slice uses the *matched* prefix.
+    #[test]
+    fn test_parse_record_name_accepts_pre_rename_prefix() {
+        let old = "@RNEAT_generated_chrom_1_0000001000_0000002000_000000000000002a/1".to_string();
+        assert_eq!(
+            parse_fastq_record_name(&old).unwrap(),
+            ("chrom_1".to_string(), 1000, 2000),
+        );
+    }
+
     #[test]
     fn test_parse_record_name_legacy_format_errors() {
-        let legacy = "@RNEAT_generated_chr1_0000001000_0000002000/1".to_string();
+        let legacy = "@EIDOLON_generated_chr1_0000001000_0000002000/1".to_string();
         match parse_fastq_record_name(&legacy) {
             // Legacy split has 3 tokens [chr1, 0000001000, 0000002000]; new
             // parser reads end (parses 1000) and start (parses chr1 — fails).
@@ -265,11 +296,11 @@ mod tests {
         // Two reads: first inside BED chr1:0-2000, second outside.
         // The 16-hex trailer is the per-fragment uniqueness tag (#210).
         let fastq_content = concat!(
-            "@RNEAT_generated_chr1_0000001000_0000002000_0000000000000000/1\n",
+            "@EIDOLON_generated_chr1_0000001000_0000002000_0000000000000000/1\n",
             "ACGTACGT\n",
             "+\n",
             "IIIIIIII\n",
-            "@RNEAT_generated_chr1_0000005000_0000006000_0000000000000001/1\n",
+            "@EIDOLON_generated_chr1_0000005000_0000006000_0000000000000001/1\n",
             "TTTTTTTT\n",
             "+\n",
             "IIIIIIII\n",
@@ -365,11 +396,11 @@ mod tests {
         // FASTQ records.
         let temp_dir: TempDir = tempfile::tempdir().unwrap();
         let fastq_content = concat!(
-            "@RNEAT_generated_chr1_0000001000_0000002000_0000000000000000/1\n",
+            "@EIDOLON_generated_chr1_0000001000_0000002000_0000000000000000/1\n",
             "ACGTACGT\n",
             "+\n",
             "IIIIIIII\n",
-            "@RNEAT_generated_chr1_0000005000_0000006000_0000000000000001/1\n",
+            "@EIDOLON_generated_chr1_0000005000_0000006000_0000000000000001/1\n",
             "TTTTTTTT\n",
             "+\n",
             "IIIIIIII\n",
@@ -440,15 +471,15 @@ mod tests {
         // Read B [2000, 2200) — starts exactly at BED end  → excluded
         // Read C [999,  1001) — straddles BED start        → included
         let fastq_content = concat!(
-            "@RNEAT_generated_chr1_0000000800_0000001000_0000000000000000/1\n",
+            "@EIDOLON_generated_chr1_0000000800_0000001000_0000000000000000/1\n",
             "ACGTACGT\n",
             "+\n",
             "IIIIIIII\n",
-            "@RNEAT_generated_chr1_0000002000_0000002200_0000000000000001/1\n",
+            "@EIDOLON_generated_chr1_0000002000_0000002200_0000000000000001/1\n",
             "TTTTTTTT\n",
             "+\n",
             "IIIIIIII\n",
-            "@RNEAT_generated_chr1_0000000999_0000001001_0000000000000002/1\n",
+            "@EIDOLON_generated_chr1_0000000999_0000001001_0000000000000002/1\n",
             "GGGGGGGG\n",
             "+\n",
             "IIIIIIII\n",

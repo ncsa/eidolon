@@ -323,20 +323,35 @@ if [[ "$RUN_VARSCAN" == "1" ]]; then
 fi
 
 # ── Stage 6: Score each caller with hap.py som.py ───────────────────────
-# Somatic-only truth (NEAT_ORIGIN=somatic); germline carry-through (shared) is
+# Somatic-only truth (EIDOLON_ORIGIN=somatic); germline carry-through (shared) is
 # correctly ignored by T/N callers, so scoring against it would be meaningless.
 # Strelka (5b) may leave us in its conda env (especially on its failure path);
 # scoring needs bioinf (bcftools) + apptainer, so re-activate it here.
 conda_activate bioinf
+# Normalize pre-v2.1.0 NEAT_* tokens if this truth VCF predates the rename (e.g.
+# re-scoring an archived artifact). The converter is idempotent and a no-op on a
+# current file, so calling it unconditionally is safe. It matters because bcftools
+# rejects an undefined INFO tag in the -i expression below at parse time.
+# `|| rc=$?` (not `; echo $?`) so the non-zero --check status is *tested* — under
+# set -e an untested non-zero would abort before we could read it.
+migrate_rc=0
+bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null 2>&1 \
+    || migrate_rc=$?
+if [[ "$migrate_rc" -eq 10 ]]; then
+    MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
+    bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
+    TRUTH_VCF="$MIGRATED_TRUTH"
+fi
+
 SCORE_TRUTH="$OUTDIR/scoring_truth.vcf.gz"
 if [[ ! -f "$SCORE_TRUTH" ]]; then
     echo "[6/6] Filtering truth to somatic records..."
-    bcftools view -i 'INFO/NEAT_ORIGIN="somatic"' -O z -o "$SCORE_TRUTH" "$TRUTH_VCF"
+    bcftools view -i 'INFO/EIDOLON_ORIGIN="somatic"' -O z -o "$SCORE_TRUTH" "$TRUTH_VCF"
     bcftools index -f -t "$SCORE_TRUTH"
 fi
 somatic_count=$(bcftools view -H "$SCORE_TRUTH" | wc -l)
 echo "      Somatic truth records: $somatic_count"
-[[ "$somatic_count" -eq 0 ]] && echo "WARNING: no somatic truth records — check NEAT_ORIGIN." >&2
+[[ "$somatic_count" -eq 0 ]] && echo "WARNING: no somatic truth records — check EIDOLON_ORIGIN." >&2
 [[ -f "$HAPPY_SIF" ]] || { echo "hap.py SIF not found: $HAPPY_SIF — run setup.sh first" >&2; exit 1; }
 
 # hap.py/som.py hardcodes UCSC chr-prefixing of input VCFs (perl s/^([0-9XYM])/chr/),
@@ -398,7 +413,7 @@ Inputs:
 
 Key outputs in $OUTDIR:
   Simulation:     sample_merged_{r1,r2}.fastq.gz
-  Truth VCF:      sample_merged_truth.vcf.gz  (NEAT_ORIGIN-tagged)
+  Truth VCF:      sample_merged_truth.vcf.gz  (EIDOLON_ORIGIN-tagged)
   Somatic truth:  scoring_truth.vcf.gz         (somatic only)
   Mutect2 calls:  mutect2.filtered.vcf.gz   -> scored.stats.csv
   VarScan2 calls: varscan.somatic.vcf.gz    -> scored_varscan.stats.csv  (RUN_VARSCAN=1)

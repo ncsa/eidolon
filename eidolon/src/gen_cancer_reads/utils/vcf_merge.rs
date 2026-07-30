@@ -3,7 +3,7 @@
 //!
 //! Both inputs are eidolon-golden VCFs with identical record representation (the
 //! tumor pass carries normal's germline verbatim via `input_vcf`, tagged
-//! `INFO/NEAT_PROVENANCE=input`; somatic de-novo records are `=denovo`, and
+//! `INFO/EIDOLON_PROVENANCE=input`; somatic de-novo records are `=denovo`, and
 //! reproductive somatic-VCF records (#405) are `=somatic_input`). So an exact
 //! `(contig,pos,ref,alt)` key is sufficient — no positional/normalized matching
 //! needed. Origin rules:
@@ -22,7 +22,7 @@ use flate2::write::GzEncoder;
 
 use crate::gen_cancer_reads::errors::GenCancerReadsError;
 
-const NEAT_ORIGIN_DECL: &str = "##INFO=<ID=NEAT_ORIGIN,Number=1,Type=String,\
+const EIDOLON_ORIGIN_DECL: &str = "##INFO=<ID=EIDOLON_ORIGIN,Number=1,Type=String,\
 Description=\"Origin in tumor/normal mix: germline | somatic | shared\">";
 
 /// SV INFO declarations injected if the per-pass headers don't already carry
@@ -64,7 +64,7 @@ fn key_of(cols: &[&str]) -> Option<Key> {
     ))
 }
 
-/// Origin for a tumor-pass record, from its INFO/NEAT_PROVENANCE.
+/// Origin for a tumor-pass record, from its INFO/EIDOLON_PROVENANCE.
 ///
 /// De-novo-sampled variants and reproductive somatic-VCF variants (#405) are both
 /// tumor-only → `somatic`; anything else in the tumor pass is germline carried
@@ -72,16 +72,16 @@ fn key_of(cols: &[&str]) -> Option<Key> {
 pub fn tumor_origin(info: &str) -> &'static str {
     let is_somatic = info
         .split(';')
-        .any(|f| f == "NEAT_PROVENANCE=denovo" || f == "NEAT_PROVENANCE=somatic_input");
+        .any(|f| f == "EIDOLON_PROVENANCE=denovo" || f == "EIDOLON_PROVENANCE=somatic_input");
     if is_somatic { "somatic" } else { "shared" }
 }
 
-/// Append `NEAT_ORIGIN=<origin>` to an INFO column.
+/// Append `EIDOLON_ORIGIN=<origin>` to an INFO column.
 pub fn append_origin(info: &str, origin: &str) -> String {
     if info == "." || info.is_empty() {
-        format!("NEAT_ORIGIN={origin}")
+        format!("EIDOLON_ORIGIN={origin}")
     } else {
-        format!("{info};NEAT_ORIGIN={origin}")
+        format!("{info};EIDOLON_ORIGIN={origin}")
     }
 }
 
@@ -200,8 +200,8 @@ pub fn merge_goldens(
     for l in &meta {
         writeln!(w, "{l}")?;
     }
-    if !declared.contains("NEAT_ORIGIN") {
-        writeln!(w, "{NEAT_ORIGIN_DECL}")?;
+    if !declared.contains("EIDOLON_ORIGIN") {
+        writeln!(w, "{EIDOLON_ORIGIN_DECL}")?;
     }
     for (id, decl) in SV_INFO_DECLS {
         if !declared.contains(*id) {
@@ -223,26 +223,29 @@ mod tests {
 
     #[test]
     fn tumor_origin_classifies_provenance() {
-        assert_eq!(tumor_origin("NEAT_PROVENANCE=denovo"), "somatic");
-        assert_eq!(tumor_origin("SVTYPE=DEL;NEAT_PROVENANCE=denovo"), "somatic");
-        // #405 reproductive somatic-VCF variants classify as somatic, not shared,
-        // even though (like germline input) they came from a file.
-        assert_eq!(tumor_origin("NEAT_PROVENANCE=somatic_input"), "somatic");
+        assert_eq!(tumor_origin("EIDOLON_PROVENANCE=denovo"), "somatic");
         assert_eq!(
-            tumor_origin("AF=0.3;NEAT_PROVENANCE=somatic_input"),
+            tumor_origin("SVTYPE=DEL;EIDOLON_PROVENANCE=denovo"),
             "somatic"
         );
-        assert_eq!(tumor_origin("NEAT_PROVENANCE=input"), "shared");
+        // #405 reproductive somatic-VCF variants classify as somatic, not shared,
+        // even though (like germline input) they came from a file.
+        assert_eq!(tumor_origin("EIDOLON_PROVENANCE=somatic_input"), "somatic");
+        assert_eq!(
+            tumor_origin("AF=0.3;EIDOLON_PROVENANCE=somatic_input"),
+            "somatic"
+        );
+        assert_eq!(tumor_origin("EIDOLON_PROVENANCE=input"), "shared");
         assert_eq!(tumor_origin("."), "shared");
     }
 
     #[test]
     fn append_origin_handles_empty_and_existing() {
-        assert_eq!(append_origin(".", "somatic"), "NEAT_ORIGIN=somatic");
-        assert_eq!(append_origin("", "germline"), "NEAT_ORIGIN=germline");
+        assert_eq!(append_origin(".", "somatic"), "EIDOLON_ORIGIN=somatic");
+        assert_eq!(append_origin("", "germline"), "EIDOLON_ORIGIN=germline");
         assert_eq!(
             append_origin("SVTYPE=DEL", "shared"),
-            "SVTYPE=DEL;NEAT_ORIGIN=shared"
+            "SVTYPE=DEL;EIDOLON_ORIGIN=shared"
         );
     }
 
@@ -273,8 +276,8 @@ mod tests {
             &normal,
             "##fileformat=VCFv4.2\n\
              #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n\
-             chr1\t100\t.\tA\tG\t.\tPASS\tNEAT_PROVENANCE=denovo\tGT\t0/1\n\
-             chr1\t200\t.\tC\tT\t.\tPASS\tNEAT_PROVENANCE=denovo\tGT\t0/1\n",
+             chr1\t100\t.\tA\tG\t.\tPASS\tEIDOLON_PROVENANCE=denovo\tGT\t0/1\n\
+             chr1\t200\t.\tC\tT\t.\tPASS\tEIDOLON_PROVENANCE=denovo\tGT\t0/1\n",
         );
         // tumor: pos100 carried (input→shared), pos200 dropped (germline-only),
         // pos300 somatic (denovo).
@@ -282,8 +285,8 @@ mod tests {
             &tumor,
             "##fileformat=VCFv4.2\n\
              #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n\
-             chr1\t100\t.\tA\tG\t.\tPASS\tNEAT_PROVENANCE=input\tGT\t0/1\n\
-             chr1\t300\t.\tT\tA\t.\tPASS\tNEAT_PROVENANCE=denovo\tGT\t1/1\n",
+             chr1\t100\t.\tA\tG\t.\tPASS\tEIDOLON_PROVENANCE=input\tGT\t0/1\n\
+             chr1\t300\t.\tT\tA\t.\tPASS\tEIDOLON_PROVENANCE=denovo\tGT\t1/1\n",
         );
 
         merge_goldens(&normal, &tumor, &out).unwrap();
@@ -296,22 +299,22 @@ mod tests {
                 .unwrap()
         };
         assert!(
-            line("100").contains("NEAT_ORIGIN=shared"),
+            line("100").contains("EIDOLON_ORIGIN=shared"),
             "pos100 = {}",
             line("100")
         );
         assert!(
-            line("200").contains("NEAT_ORIGIN=germline"),
+            line("200").contains("EIDOLON_ORIGIN=germline"),
             "pos200 = {}",
             line("200")
         );
         assert!(
-            line("300").contains("NEAT_ORIGIN=somatic"),
+            line("300").contains("EIDOLON_ORIGIN=somatic"),
             "pos300 = {}",
             line("300")
         );
-        // header declares NEAT_ORIGIN and is position-sorted (100<200<300)
-        assert!(body.contains("##INFO=<ID=NEAT_ORIGIN"));
+        // header declares EIDOLON_ORIGIN and is position-sorted (100<200<300)
+        assert!(body.contains("##INFO=<ID=EIDOLON_ORIGIN"));
         let p100 = body.find("chr1\t100").unwrap();
         let p200 = body.find("chr1\t200").unwrap();
         let p300 = body.find("chr1\t300").unwrap();

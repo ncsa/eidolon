@@ -4,10 +4,10 @@
 # The soy validation proved eidolon reproduces a SYNTHETIC subclonal VAF spectrum. This
 # proves it on a REAL tumor's EMPIRICAL spectrum: take HCC1395's high-confidence somatic
 # SNVs with their observed VAF, replay them through gen-cancer-reads, align the merged
-# reads, and confirm the observed VAF tracks NEAT_VAF (= the input VAF).
+# reads, and confirm the observed VAF tracks EIDOLON_VAF (= the input VAF).
 #
 #   HCC1395 somatic SNVs + observed VAF  --somatic_vcf-->  gen-cancer-reads (reproductive)
-#     --bwa-mem2--> merged BAM --> observed VAF  ≈  NEAT_VAF (= the real tumor VAF)
+#     --bwa-mem2--> merged BAM --> observed VAF  ≈  EIDOLON_VAF (= the real tumor VAF)
 #
 # Unlike the synthetic run, the input is a real tumor's full, continuous VAF distribution
 # (real subclonal structure), so Pearson r is meaningful here too — this is the reproductive

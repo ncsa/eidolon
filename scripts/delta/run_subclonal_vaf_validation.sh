@@ -2,23 +2,23 @@
 # SLURM job: real-data validation of subclonal / somatic VAF reproduction (#405).
 #
 # The unit + H1N1 e2e tests prove gen-cancer-reads STAMPS the composed fraction
-# (purity x dosage x CCF) and records it as INFO/NEAT_VAF. What they cannot prove —
+# (purity x dosage x CCF) and records it as INFO/EIDOLON_VAF. What they cannot prove —
 # because it needs a real aligner at real coverage — is that the emitted READS
 # actually pile up to that fraction once aligned. This job closes that loop:
 #
 #   architecture (inline subclones OR a real somatic VCF)
-#     --gen-cancer-reads--> merged FASTQ + merged_truth.vcf.gz (carries NEAT_VAF)
+#     --gen-cancer-reads--> merged FASTQ + merged_truth.vcf.gz (carries EIDOLON_VAF)
 #     --bwa-mem2--> merged BAM
 #     --mpileup at the somatic sites--> OBSERVED VAF
-#     compare OBSERVED VAF  vs  NEAT_VAF (the intended observed VAF)
+#     compare OBSERVED VAF  vs  EIDOLON_VAF (the intended observed VAF)
 #
 # A high correlation + low MAE means the mixed-sample reads reproduce the planted
-# VAF spectrum, i.e. NEAT_VAF is the ground truth a caller will measure. This is
+# VAF spectrum, i.e. EIDOLON_VAF is the ground truth a caller will measure. This is
 # the generative composition (#405) and, with SOMATIC_VCF, the reproductive replay.
 #
-# WHY NEAT_VAF, NOT FORMAT/AF: FORMAT/AF in the truth is measured per-pass
+# WHY EIDOLON_VAF, NOT FORMAT/AF: FORMAT/AF in the truth is measured per-pass
 # (tumor-only) = dosage x CCF; the observed sample VAF after tumor/normal mixing is
-# purity x that = NEAT_VAF. We map NEAT_VAF -> INFO/AF on the truth side so the
+# purity x that = EIDOLON_VAF. We map EIDOLON_VAF -> INFO/AF on the truth side so the
 # existing scn_af_compare.py (truth INFO/AF vs sim FORMAT/AD) does the comparison.
 #
 # PREREQS
@@ -75,7 +75,7 @@ MIN_DEPTH="${MIN_DEPTH:-25}"                   # gate low-depth sites in the com
 # PASS is gated on FIDELITY metrics that hold for a discrete subclonal architecture:
 #   |mean(observed-intended)| = bias (systematic composition error) and MAE (per-site
 #   accuracy vs the binomial noise floor). Pearson r is ADVISORY only — for tight,
-#   discrete NEAT_VAF clusters at moderate depth, per-site noise depresses r even when
+#   discrete EIDOLON_VAF clusters at moderate depth, per-site noise depresses r even when
 #   the reproduction is unbiased and accurate (it fits a CONTINUOUS spectrum like #398,
 #   not clusters). Raise COV and/or widen the CCF architecture to make r meaningful.
 BIAS_MAX="${BIAS_MAX:-0.02}"                   # PASS gate: |mean(observed-intended)|
@@ -153,23 +153,23 @@ R1="$OUTDIR/subvaf_merged_r1.fastq.gz"
 R2="$OUTDIR/subvaf_merged_r2.fastq.gz"
 for f in "$TRUTH" "$R1" "$R2"; do [[ -s "$f" ]] || { echo "missing output: $f" >&2; exit 1; }; done
 
-# ── Step 2: somatic sites, with NEAT_VAF surfaced as INFO/AF (the truth) ──────
-# scn_af_compare.py reads INFO/AF; NEAT_VAF is the intended OBSERVED VAF.
+# ── Step 2: somatic sites, with EIDOLON_VAF surfaced as INFO/AF (the truth) ──────
+# scn_af_compare.py reads INFO/AF; EIDOLON_VAF is the intended OBSERVED VAF.
 SITES="$OUTDIR/somatic_sites.vcf.gz"
 {
   echo '##fileformat=VCFv4.2'
-  echo '##INFO=<ID=AF,Number=A,Type=Float,Description="intended observed VAF (from NEAT_VAF)">'
+  echo '##INFO=<ID=AF,Number=A,Type=Float,Description="intended observed VAF (from EIDOLON_VAF)">'
   echo -e '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO'
-  bcftools view -H -i 'INFO/NEAT_ORIGIN="somatic"' "$TRUTH" \
-    | awk -F'\t' 'match($8,/NEAT_VAF=[0-9.]+/){v=substr($8,RSTART+9,RLENGTH-9);
+  bcftools view -H -i 'INFO/EIDOLON_ORIGIN="somatic"' "$TRUTH" \
+    | awk -F'\t' 'match($8,/EIDOLON_VAF=[0-9.]+/){v=substr($8,RSTART,RLENGTH); sub(/^EIDOLON_VAF=/,"",v);
         print $1"\t"$2"\t.\t"$4"\t"$5"\t.\tPASS\tAF="v}'
 } | bgzip > "$SITES"
 bcftools index -t "$SITES"
 nsom=$(bcftools view -H "$SITES" | wc -l)
-echo "somatic sites carrying NEAT_VAF: $nsom"
-[[ "$nsom" -gt 0 ]] || { echo "ABORT: 0 somatic NEAT_VAF sites — is this build >= #405?" >&2; exit 1; }
-# Read-the-artifact guard: NEAT_VAF must span a spectrum, not pile at one value.
-echo "NEAT_VAF spread (should span deciles for a subclonal architecture):"
+echo "somatic sites carrying EIDOLON_VAF: $nsom"
+[[ "$nsom" -gt 0 ]] || { echo "ABORT: 0 somatic EIDOLON_VAF sites — is this build >= #405?" >&2; exit 1; }
+# Read-the-artifact guard: EIDOLON_VAF must span a spectrum, not pile at one value.
+echo "EIDOLON_VAF spread (should span deciles for a subclonal architecture):"
 bcftools query -f '%INFO/AF\n' "$SITES" \
   | awk '{b=int($1*10); if(b>9)b=9; c[b]++} END{for(i=0;i<10;i++)printf "  [%.1f,%.1f) %d\n",i/10,(i+1)/10,c[i]+0}'
 
@@ -216,10 +216,10 @@ nsim=$(bcftools view -H "$SIM" | wc -l)
 echo "sites genotyped in merged BAM: $nsim"
 [[ "$nsim" -gt 0 ]] || { echo "ABORT: 0 sites genotyped — check alignment / -C alleles." >&2; exit 1; }
 
-# ── Step 5: compare intended NEAT_VAF (truth) vs observed merged-BAM VAF ──────
+# ── Step 5: compare intended EIDOLON_VAF (truth) vs observed merged-BAM VAF ──────
 echo
 echo "════════════════════════════════════════════════════════════════"
-echo "#405 subclonal VAF reproduction — intended NEAT_VAF vs observed merged VAF"
+echo "#405 subclonal VAF reproduction — intended EIDOLON_VAF vs observed merged VAF"
 echo "════════════════════════════════════════════════════════════════"
 CMP="$OUTDIR/compare.txt"
 python3 "$REPO_ROOT/scripts/delta/scn_af_compare.py" \
@@ -238,7 +238,7 @@ absbias=$(awk -v b="$bias" 'BEGIN{b=b+0; print (b<0)?-b:b}')
 echo "gate: n=$n  |bias|=$absbias (<=${BIAS_MAX})  MAE=$mae (<=${MAE_MAX})  [advisory r=$r vs ${R_MIN}]"
 # Advisory: a low r on a discrete architecture is expected, not a failure — flag it.
 if [[ -n "$r" ]] && awk -v r="$r" -v rm="$R_MIN" 'BEGIN{exit !(r<rm)}'; then
-  echo "  NOTE: Pearson r=$r < ${R_MIN} — expected for tight discrete NEAT_VAF clusters at" >&2
+  echo "  NOTE: Pearson r=$r < ${R_MIN} — expected for tight discrete EIDOLON_VAF clusters at" >&2
   echo "        this depth; raise COV and/or widen SUBCLONES for a Pearson-meaningful run." >&2
 fi
 verdict=FAIL
@@ -249,7 +249,7 @@ if [[ -n "$bias" && -n "$mae" ]] \
 fi
 echo "VERDICT: $verdict  (mode: $MODE)"
 echo "  Fidelity: unbiased (|bias|<=$BIAS_MAX) + accurate (MAE<=$MAE_MAX vs the binomial"
-echo "  noise floor) means the merged reads reproduce NEAT_VAF = purity x dosage x CCF"
+echo "  noise floor) means the merged reads reproduce EIDOLON_VAF = purity x dosage x CCF"
 echo "  (reproductive: the input VAF). r is a spread-dependent summary, not the gate."
 
 archive_run subvaf "$OUTDIR" "$CMP" "$YML" "$OUTDIR/bwa.log" || true
