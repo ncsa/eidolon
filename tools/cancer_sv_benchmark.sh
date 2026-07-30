@@ -296,6 +296,26 @@ SCORING_TRUTH_NAME="$(basename "$SCORING_TRUTH")"
 if [[ -f "$SCORING_TRUTH" ]]; then
     echo ">> Filtered truth-SV VCF already present — skipping."
 else
+    # See cancer_benchmark.sh: bcftools rejects an undefined INFO tag in a -i
+    # expression at parse time, so probe the header first — otherwise the advice
+    # below is unreachable for a truth VCF that simply lacks the tag.
+    if [[ -n "$TRUTH_FILTER" && "$TRUTH_FILTER" == *EIDOLON_ORIGIN* ]]; then
+        truth_header="$(run_in "$BCFTOOLS_IMG" bcftools view -h "/truth_in/$TRUTH_NAME")"
+        if ! grep -q '^##INFO=<ID=EIDOLON_ORIGIN,' <<<"$truth_header"; then
+            if grep -q '^##INFO=<ID=NEAT_ORIGIN,' <<<"$truth_header"; then
+                echo "ERROR: $TRUTH_NAME carries the pre-v2.1.0 NEAT_ORIGIN tag." >&2
+                echo "  eidolon v2.1.0 renamed the emitted output tokens. Convert it once:" >&2
+                echo "    tools/migrate_legacy_tokens.sh '$TRUTH_VCF' migrated_truth.vcf.gz" >&2
+                echo "    $0 --truth-vcf migrated_truth.vcf.gz ..." >&2
+            else
+                echo "ERROR: $TRUTH_NAME has no INFO/EIDOLON_ORIGIN tag." >&2
+                echo "  If this is a non-eidolon truth set, pass --truth-filter '' or a" >&2
+                echo "  custom expression." >&2
+            fi
+            exit 1
+        fi
+    fi
+
     if [[ -n "$TRUTH_FILTER" ]]; then
         echo ">> Filtering truth VCF for SVs with: $TRUTH_FILTER"
         run_in "$BCFTOOLS_IMG" sh -c \

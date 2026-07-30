@@ -187,7 +187,10 @@ pub fn write_vcf(
             let info_str = if is_symbolic {
                 match variant.info.as_deref() {
                     None | Some(".") | Some("") => format!("EIDOLON_PROVENANCE={prov}"),
-                    Some(existing) => format!("{existing};EIDOLON_PROVENANCE={prov}"),
+                    Some(existing) => match strip_legacy_output_tokens(existing) {
+                        Some(kept) => format!("{kept};EIDOLON_PROVENANCE={prov}"),
+                        None => format!("EIDOLON_PROVENANCE={prov}"),
+                    },
                 }
             } else {
                 // Literal records: EIDOLON_PROVENANCE is the base INFO. Simulator-emitted
@@ -199,7 +202,12 @@ pub fn write_vcf(
                     (Provenance::Denovo | Provenance::SomaticVcf, Some(extra))
                         if !extra.is_empty() && extra != "." =>
                     {
-                        format!("{extra};EIDOLON_PROVENANCE={prov}")
+                        // SomaticVcf variants come from a user-supplied `somatic_vcf:`,
+                        // which may itself be v2.0.0 eidolon output — so strip here too.
+                        match strip_legacy_output_tokens(extra) {
+                            Some(kept) => format!("{kept};EIDOLON_PROVENANCE={prov}"),
+                            None => format!("EIDOLON_PROVENANCE={prov}"),
+                        }
                     }
                     _ => format!("EIDOLON_PROVENANCE={prov}"),
                 }
@@ -240,6 +248,46 @@ pub fn write_vcf(
         }
     }
     Ok(())
+}
+
+/// Drop eidolon's own **pre-v2.1.0** output tokens from an INFO field that is about
+/// to be passed through into new output.
+///
+/// v2.0.0 and earlier emitted `NEAT_*` names. When such a VCF is fed back in (via
+/// `input_vcf:` or `somatic_vcf:`), `write_vcf` preserves the source INFO verbatim on
+/// symbolic and de-novo/somatic literal records — which would reproduce those tokens
+/// in a file whose header only declares the `EIDOLON_*` names. bcftools tolerates that
+/// when streaming VCF→VCF but hard-fails on BCF translation (`bcftools concat | sort`
+/// does exactly that internally), so the record must not carry them.
+///
+/// Dropping rather than renaming is deliberate: this writer re-emits the current
+/// equivalents itself, so a stale `NEAT_PROVENANCE=denovo` would *contradict* the
+/// fresh `EIDOLON_PROVENANCE=input` describing how this pass actually used the record.
+///
+/// Returns `None` when nothing is left to keep, so callers can emit provenance alone
+/// instead of a leading `;`. Only these exact eidolon-emitted keys are removed —
+/// third-party INFO (`DP`, `AF`, `SVTYPE`, …) is untouched.
+fn strip_legacy_output_tokens(info: &str) -> Option<String> {
+    const LEGACY_KEYS: [&str; 5] = [
+        "NEAT_PROVENANCE",
+        "NEAT_ORIGIN",
+        "NEAT_CCF",
+        "NEAT_VAF",
+        "NEAT_REASON",
+    ];
+    let kept: Vec<&str> = info
+        .split(';')
+        .filter(|field| {
+            let key = field.split('=').next().unwrap_or(field);
+            !LEGACY_KEYS.contains(&key)
+        })
+        .filter(|field| !field.is_empty())
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(";"))
+    }
 }
 
 pub fn read_vcf(vcf_file: PathBuf) -> Result<HashMap<String, Vec<Variant>>, VcfToolsError> {
@@ -1482,6 +1530,45 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
                 .any(|l| l.starts_with("#CHROM") && l.ends_with("\tEIDOLON_simulated_sample")),
             "missing/incorrect EIDOLON_simulated_sample column header; got: {:?}",
             lines
+        );
+    }
+
+    #[test]
+    fn strip_legacy_output_tokens_drops_only_pre_rename_eidolon_keys() {
+        // Third-party / SV INFO must survive untouched.
+        assert_eq!(
+            strip_legacy_output_tokens("SVTYPE=DEL;END=200;DP=30").as_deref(),
+            Some("SVTYPE=DEL;END=200;DP=30")
+        );
+        // Each pre-v2.1.0 key is removed, order of the rest preserved.
+        assert_eq!(
+            strip_legacy_output_tokens("SVTYPE=DEL;NEAT_PROVENANCE=denovo;END=200").as_deref(),
+            Some("SVTYPE=DEL;END=200")
+        );
+        assert_eq!(
+            strip_legacy_output_tokens(
+                "NEAT_ORIGIN=somatic;NEAT_CCF=1.0;NEAT_VAF=0.3;NEAT_REASON=unknown;AF=0.5"
+            )
+            .as_deref(),
+            Some("AF=0.5")
+        );
+        // Nothing left to keep -> None, so the caller emits provenance alone
+        // rather than a record starting with ';'.
+        assert_eq!(strip_legacy_output_tokens("NEAT_PROVENANCE=input"), None);
+        // Current-generation tags must NOT be caught by the legacy filter.
+        assert_eq!(
+            strip_legacy_output_tokens("EIDOLON_CCF=1.0;EIDOLON_VAF=0.3").as_deref(),
+            Some("EIDOLON_CCF=1.0;EIDOLON_VAF=0.3")
+        );
+        // Exact-key matching: a lookalike key is not a legacy token.
+        assert_eq!(
+            strip_legacy_output_tokens("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y").as_deref(),
+            Some("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y")
+        );
+        // Bare flags (no '=') are preserved.
+        assert_eq!(
+            strip_legacy_output_tokens("IMPRECISE;NEAT_VAF=0.1").as_deref(),
+            Some("IMPRECISE")
         );
     }
 

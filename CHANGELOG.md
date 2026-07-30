@@ -15,6 +15,32 @@ migration). Downstream code that parses the old names must update.
 - Bundled scripts moved in lockstep (`tools/cancer_simulate.sh`, `cancer_benchmark.sh`,
   `cancer_sv_benchmark.sh`, `scripts/delta/*`); the `filter_reads` read-name parser updated
   (now length-agnostic); parity/baseline test assertions re-blessed.
+- **Migration path for pre-v2.1.0 files.** The rename would otherwise strand existing
+  artifacts, so:
+  - **`tools/migrate_legacy_tokens.sh`** converts a v2.0.0 VCF in place of a manual fix-up
+    (`--rename-annots` for the INFO tags, `reheader -s` for the sample column). It is
+    **idempotent** — a no-op on an already-current or non-eidolon VCF — so call sites can
+    invoke it unconditionally. A `--check` mode reports without converting (exit 10 = legacy
+    tokens present). Note a dual-name bcftools filter is *not* a workable alternative:
+    bcftools rejects an undefined tag in a `-i` expression at parse time, so even
+    `EIDOLON_ORIGIN=… || NEAT_ORIGIN=…` fails outright on a file carrying only one of them.
+  - `scripts/delta/{cancer_pipeline,sv_pipeline}.sbatch` run that converter automatically when
+    the truth VCF predates the rename. `tools/cancer_benchmark.sh` and `cancer_sv_benchmark.sh`
+    run bcftools inside a container (the host needn't have it), so they instead pre-flight the
+    truth header and print an actionable message naming the converter. That check also makes
+    the pre-existing "pass `--truth-filter ''`" hint reachable — bcftools' parse-time tag
+    error previously aborted the run before it could be printed.
+  - **`eidolon filter-reads` accepts both `@EIDOLON_generated_` and the v2.0.0
+    `@RNEAT_generated_` read-name prefix**, so legacy FASTQs need no conversion at all —
+    rewriting hundreds of GB to change a 19-byte prefix is not a reasonable ask. (The two
+    prefixes differ in length, so the parser slices by the *matched* prefix.)
+  - `write_vcf` now **drops eidolon's own pre-v2.1.0 INFO tokens** from a passed-through INFO
+    column instead of reproducing them. Feeding a v2.0.0 golden VCF back in via `input_vcf:`
+    or `somatic_vcf:` previously preserved e.g. `NEAT_PROVENANCE` verbatim on symbolic records
+    while the header declared only the `EIDOLON_*` names — an undeclared tag, which streams
+    fine VCF→VCF but hard-fails BCF translation (`bcftools concat | sort` does that
+    internally). Dropping rather than renaming is deliberate: the writer re-emits the current
+    equivalent, so a stale tag would contradict it.
 - **Not changed:** NEAT pedigree in README/`CITATION.cff`/comparison text; the `NEAT_DATA`
   staging env var; and the benchmark harnesses' env vars that point at the *predecessor*
   NEAT 4 tool (`NEAT_BIN`, `NEAT_ENV`, `NEAT_SEED`, `NEAT_MAX_GENOME_MB`) — those name NEAT,

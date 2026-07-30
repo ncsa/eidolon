@@ -176,6 +176,19 @@ index_and_align "${PREFIX}_merged_r1.fastq.gz" "$TUMOR_BAM" "TUMOR"
 # SVLEN/END). Print a sample so we can confirm the schema, then extract the
 # somatic SV subset truvari will score. EIDOLON_ORIGIN=somatic drops germline
 # carry-through; the symbolic-ALT test keeps only SVs (not SNVs/indels).
+# Normalize pre-v2.1.0 NEAT_* tokens if this truth VCF predates the rename (e.g.
+# re-scoring an archived artifact). Idempotent and a no-op on a current file, so
+# the unconditional call is safe. `|| rc=$?` (not `; echo $?`) so the non-zero
+# --check status is *tested* — under set -e an untested non-zero would abort here.
+migrate_rc=0
+bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null 2>&1 \
+    || migrate_rc=$?
+if [[ "$migrate_rc" -eq 10 ]]; then
+    MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
+    bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
+    TRUTH_VCF="$MIGRATED_TRUTH"
+fi
+
 TRUTH_SV="$OUTDIR/truth_sv.vcf.gz"
 echo "[3b/5] Inspecting eidolon SV truth..."
 echo "  --- SV INFO header lines ---"

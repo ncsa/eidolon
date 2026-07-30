@@ -286,6 +286,29 @@ fi
 # truth down to just the somatic ground-truth records before scoring.
 SCORING_TRUTH="$OUTPUT_DIR/scoring_truth.vcf.gz"
 SCORING_TRUTH_NAME="$(basename "$SCORING_TRUTH")"
+# Pre-flight the filter's tag against the truth header. bcftools rejects an
+# undefined INFO tag in a -i expression at PARSE time (exit 255), so without this
+# a truth VCF that lacks the tag dies on a raw "not defined in the header" error
+# *before* the zero-record check below can offer any guidance — which made that
+# advice unreachable for the exact case it describes.
+if [[ -n "$TRUTH_FILTER" && "$TRUTH_FILTER" == *EIDOLON_ORIGIN* ]]; then
+    truth_header="$(run_in "$BCFTOOLS_IMG" bcftools view -h "/truth_in/$TRUTH_NAME")"
+    if ! grep -q '^##INFO=<ID=EIDOLON_ORIGIN,' <<<"$truth_header"; then
+        if grep -q '^##INFO=<ID=NEAT_ORIGIN,' <<<"$truth_header"; then
+            echo "ERROR: $TRUTH_NAME carries the pre-v2.1.0 NEAT_ORIGIN tag." >&2
+            echo "  eidolon v2.1.0 renamed the emitted output tokens. Convert the truth" >&2
+            echo "  VCF once, then re-run against the converted copy:" >&2
+            echo "    tools/migrate_legacy_tokens.sh '$TRUTH_VCF' migrated_truth.vcf.gz" >&2
+            echo "    $0 --truth-vcf migrated_truth.vcf.gz ..." >&2
+        else
+            echo "ERROR: $TRUTH_NAME has no INFO/EIDOLON_ORIGIN tag." >&2
+            echo "  If this is a non-eidolon truth set, pass --truth-filter '' to score" >&2
+            echo "  against the full truth VCF instead." >&2
+        fi
+        exit 1
+    fi
+fi
+
 if [[ -n "$TRUTH_FILTER" ]]; then
     echo ">> Filtering truth VCF with: $TRUTH_FILTER"
     run_in "$BCFTOOLS_IMG" sh -c \

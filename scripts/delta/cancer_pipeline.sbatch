@@ -328,6 +328,21 @@ fi
 # Strelka (5b) may leave us in its conda env (especially on its failure path);
 # scoring needs bioinf (bcftools) + apptainer, so re-activate it here.
 conda_activate bioinf
+# Normalize pre-v2.1.0 NEAT_* tokens if this truth VCF predates the rename (e.g.
+# re-scoring an archived artifact). The converter is idempotent and a no-op on a
+# current file, so calling it unconditionally is safe. It matters because bcftools
+# rejects an undefined INFO tag in the -i expression below at parse time.
+# `|| rc=$?` (not `; echo $?`) so the non-zero --check status is *tested* — under
+# set -e an untested non-zero would abort before we could read it.
+migrate_rc=0
+bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null 2>&1 \
+    || migrate_rc=$?
+if [[ "$migrate_rc" -eq 10 ]]; then
+    MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
+    bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
+    TRUTH_VCF="$MIGRATED_TRUTH"
+fi
+
 SCORE_TRUTH="$OUTDIR/scoring_truth.vcf.gz"
 if [[ ! -f "$SCORE_TRUTH" ]]; then
     echo "[6/6] Filtering truth to somatic records..."

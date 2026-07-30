@@ -80,23 +80,32 @@ fn parse_fastq_record_name(line: &str) -> Result<(String, usize, usize), FilterL
     // tokens as (start, end, uniq) and ignores uniq.
     const PREFIX: &str = "@EIDOLON_generated_";
     // v2.0.0 and earlier emitted "@RNEAT_generated_" (v2.1.0 renamed the output
-    // tokens). Such a name is a *read name we recognize but cannot parse*, so it
-    // must not fall through to InvalidReadName — that variant means "not a read
-    // name at all" and makes filter_fastq drop the record silently, which would
-    // turn a whole legacy FASTQ into an empty output with a success exit code.
-    // MalformedLine aborts loudly with the offending line instead.
+    // tokens). Accept both: FASTQs are far too large to be worth rewriting just to
+    // change a 19-byte prefix, so legacy output stays filterable. Note the two
+    // prefixes differ in length (19 vs 17), hence the matched-prefix slice below.
     const LEGACY_PREFIX: &str = "@RNEAT_generated_";
-    if !line.starts_with(PREFIX) {
-        return if line.contains(PREFIX) || line.starts_with(LEGACY_PREFIX) {
+    let prefix = if line.starts_with(PREFIX) {
+        PREFIX
+    } else if line.starts_with(LEGACY_PREFIX) {
+        LEGACY_PREFIX
+    } else {
+        // A line that *embeds* a known prefix without starting with one is a read
+        // name we can't parse: that's a loud MalformedLine. Anything else is
+        // InvalidReadName, which filter_fastq treats as an ordinary data line.
+        // (Note both prefixes include the leading '@', so the "@N_"/"@T_" tagged
+        // names in a merged cancer FASTQ do NOT land here — they are InvalidReadName
+        // and get dropped. Pre-existing behaviour; no harness runs filter-reads on
+        // a merged FASTQ, so it's untouched here.)
+        return if line.contains(PREFIX) || line.contains(LEGACY_PREFIX) {
             Err(FilterLibError::MalformedLine(line.to_string()))
         } else {
             Err(FilterLibError::InvalidReadName)
         };
-    }
-    // Slice off the "@EIDOLON_generated_" prefix and the "/N" strand suffix (2 chars).
-    // Use PREFIX.len() rather than a magic number so a future prefix rename can't
+    };
+    // Slice off the matched prefix and the "/N" strand suffix (2 chars). Use
+    // prefix.len() rather than a magic number so a future prefix rename can't
     // silently shift the offset.
-    let trimmed = &line[PREFIX.len()..line.len() - 2];
+    let trimmed = &line[prefix.len()..line.len() - 2];
     let split_line: Vec<&str> = trimmed.split('_').collect();
     let length = split_line.len();
     if length < 4 {
@@ -252,17 +261,16 @@ mod tests {
     /// clear MalformedLine error rather than silently parsing the contig as
     /// the wrong thing or panicking. This protects users who feed old eidolon
     /// output through a new filter_reads — they'll see a real error.
-    /// A v2.0.0-era `@RNEAT_generated_` read name must produce MalformedLine, not
-    /// InvalidReadName. filter_fastq treats InvalidReadName as "not a read name",
-    /// which silently drops the record — so getting this wrong turns an entire
-    /// legacy FASTQ into an empty output that still exits 0.
+    /// v2.0.0-era `@RNEAT_generated_` read names must still parse — FASTQs are too
+    /// large to rewrite just for a prefix rename. The two prefixes differ in length
+    /// (17 vs 19), so this also pins that the slice uses the *matched* prefix.
     #[test]
-    fn test_parse_record_name_pre_rename_prefix_errors_loudly() {
-        let old = "@RNEAT_generated_chr1_0000001000_0000002000_000000000000002a/1".to_string();
-        match parse_fastq_record_name(&old) {
-            Err(FilterLibError::MalformedLine(l)) => assert_eq!(l, old),
-            other => panic!("expected MalformedLine for the pre-v2.1.0 prefix; got {other:?}"),
-        }
+    fn test_parse_record_name_accepts_pre_rename_prefix() {
+        let old = "@RNEAT_generated_chrom_1_0000001000_0000002000_000000000000002a/1".to_string();
+        assert_eq!(
+            parse_fastq_record_name(&old).unwrap(),
+            ("chrom_1".to_string(), 1000, 2000),
+        );
     }
 
     #[test]
