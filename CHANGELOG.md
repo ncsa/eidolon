@@ -1,6 +1,6 @@
 7/28/2026
 =========
-## eidolon v3.0.0 — output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*; adopting SemVer
+## eidolon v3.0.0 — subclonal heterogeneity (#405); output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*; adopting SemVer
 
 **Breaking output-format change** — no behavior change, only the names of emitted tokens.
 Completes decision 1 of `docs/rename_eidolon_scope.md` (the post-2.0.0 output-token
@@ -39,6 +39,61 @@ For a read simulator the emitted format is the interface downstream code actuall
 to, which is why it heads the list. That is also the reasoning that makes this release
 major: renaming the tokens is a breaking change to that interface, notwithstanding that
 it was pre-announced and that no behavior changed.
+
+### New feature — subclonal heterogeneity for gen-cancer-reads (#405)
+
+The tumor is no longer a single global purity split, which collapsed every somatic variant
+to ~one effective VAF. A tumor is now a mixture of **subclones** at distinct cancer-cell
+fractions (CCF), and each somatic variant's observed alt fraction composes as
+`purity × dosage × CCF` — the CCF *composes* with the variant's dosage and purity rather
+than replacing them, so a het somatic at CCF *f* lands at ~*f*/2 in the merged output.
+This is the intra-tumor heterogeneity axis the predecessor could not represent at all.
+
+Three ways to specify the architecture (mutually exclusive):
+
+- **Inline** — `subclones:`, a list of `{ccf, weight}`; the somatic burden is split across
+  populations in proportion to `weight` (default 1.0 = equal share), `ccf ∈ (0, 1]`.
+- **Fitted from real data** — `subclones_file:` accepts a **PyClone-VI** per-mutation table
+  (grouped by cluster, weight = mutation count) or a **PCAWG-11 / DPClust** cluster table
+  (`cluster` + `ccf` + a size column: `n_ssms` / `size` / `weight`).
+- **Replayed** — `somatic_vcf:` honors a real tumor's *observed* VAF per site: each input
+  site's VAF is divided by purity so the merged reads reproduce it, and the record is
+  tagged `somatic`. Observed VAF above purity is clamped to 1.0; sites with no usable VAF
+  fall back to genotype dosage.
+
+**Ground truth in the truth VCF.** Every somatic record carries `INFO/EIDOLON_CCF` (the
+intended CCF) and `INFO/EIDOLON_VAF` (the intended *observed* VAF — what a caller should
+measure on the merged sample). Note `FORMAT/AF` in the truth is measured per-pass
+(tumor-only, = dosage × CCF); `EIDOLON_VAF` is that × purity, so `EIDOLON_VAF` is the
+correct target when scoring a somatic caller against the merged output.
+
+**Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate, align
+the merged reads with bwa-mem2, and measure the observed VAF at each somatic site against
+the intended `EIDOLON_VAF`. Two complementary runs:
+
+| Metric | Generative — soy scaffold | Reproductive — HCC1395 chr1 |
+|---|---|---|
+| Input VAF spectrum | 3 synthetic CCF clusters (≈0.04 / 0.16 / 0.40) | real tumor's empirical VAF, all deciles 0.1–1.0 |
+| Coverage / purity | 200× / 0.8 | 200× / 0.9 |
+| Somatic sites (compared) | 567 planted (387 scored) | 2,948 (2,698 scored) |
+| Bias, mean(observed − intended) | −0.003 | −0.004 |
+| MAE (vs ~200× noise floor) | 0.026 | 0.024 |
+| Pearson r | 0.95 | **0.99** |
+
+The generative run confirms the `purity × dosage × CCF` composition is unbiased and
+accurate to the sampling limit; per-site Pearson is a spread-dependent summary for tight
+discrete clusters, so fidelity is gated on bias + MAE-vs-noise-floor rather than r. The
+reproductive run replays SEQC2 **HCC1395** (a triple-negative breast cancer cell line) at
+its observed VAF over GRCh38 chr1 — a real tumor's full *continuous* distribution, where
+Pearson is fully meaningful: r = 0.99, unbiased (−0.004), per-decile MAE uniform at
+0.009–0.027 across the whole 0.1–1.0 range.
+
+Harnesses: `scripts/delta/run_subclonal_vaf_validation.sh` (generative) and
+`scripts/delta/run_hcc1395_reproductive.sh` (reproductive). Config template:
+`template_config/gen_cancer_reads_template.yml`; details in `docs/cancer_simulator.md` and
+`docs/cancer_howto.md`.
+
+### Output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*
 
 - **VCF INFO tags:** `NEAT_ORIGIN` → `EIDOLON_ORIGIN`, `NEAT_PROVENANCE` → `EIDOLON_PROVENANCE`,
   `NEAT_REASON` → `EIDOLON_REASON`, `NEAT_CCF` → `EIDOLON_CCF`, `NEAT_VAF` → `EIDOLON_VAF`.
