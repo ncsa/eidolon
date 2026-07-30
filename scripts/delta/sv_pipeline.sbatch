@@ -180,14 +180,22 @@ index_and_align "${PREFIX}_merged_r1.fastq.gz" "$TUMOR_BAM" "TUMOR"
 # re-scoring an archived artifact). Idempotent and a no-op on a current file, so
 # the unconditional call is safe. `|| rc=$?` (not `; echo $?`) so the non-zero
 # --check status is *tested* — under set -e an untested non-zero would abort here.
+# Only 0 and 10 are meaningful: any other status means the pre-flight itself failed
+# (missing input, no bcftools, bad converter path) and must NOT be mistaken for
+# "already current", or the auto-convert silently no-ops and the run dies later on a
+# raw undefined-tag error. stderr is deliberately not suppressed.
 migrate_rc=0
-bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null 2>&1 \
+bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null \
     || migrate_rc=$?
-if [[ "$migrate_rc" -eq 10 ]]; then
-    MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
-    bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
-    TRUTH_VCF="$MIGRATED_TRUTH"
-fi
+case "$migrate_rc" in
+    0) ;;   # already current
+    10) MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
+        bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
+        TRUTH_VCF="$MIGRATED_TRUTH" ;;
+    *)  echo "ERROR: legacy-token pre-flight failed (rc=$migrate_rc) on $TRUTH_VCF" >&2
+        echo "  Not proceeding: an unconverted truth VCF would fail the filter below." >&2
+        exit 1 ;;
+esac
 
 TRUTH_SV="$OUTDIR/truth_sv.vcf.gz"
 echo "[3b/5] Inspecting eidolon SV truth..."

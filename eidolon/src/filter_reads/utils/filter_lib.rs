@@ -7,7 +7,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Lines, Write};
 use std::path::PathBuf;
+use std::sync::Once;
 use thiserror::Error;
+
+/// Guards the one-time pre-v2.1.0 read-name-prefix warning in
+/// `parse_fastq_record_name` — it is called once per FASTQ record, and a per-read
+/// warning on a multi-million-read file would be worse than silence.
+static LEGACY_PREFIX_WARNED: Once = Once::new();
 
 use eidolon_core::file_tools::file_io::{create_output_file, read_gzip_lines, read_lines};
 /// The purpose of this module is to filter a eidolon-generated fastq and vcf file, so that they only show regions
@@ -87,6 +93,22 @@ fn parse_fastq_record_name(line: &str) -> Result<(String, usize, usize), FilterL
     let prefix = if line.starts_with(PREFIX) {
         PREFIX
     } else if line.starts_with(LEGACY_PREFIX) {
+        // Warn once. Accepting the old prefix silently is the only remaining path where
+        // a user's pre-v2.1.0 data flows through v2.1.0 with no signal that the output
+        // format changed — and a user's own `grep '^@RNEAT_generated_'` over the same
+        // file returns zero rows with exit 0. This is the cheapest place to make that
+        // discoverable, so say it out loud (once, not per read).
+        LEGACY_PREFIX_WARNED.call_once(|| {
+            warn!(
+                "input uses the pre-v2.1.0 read-name prefix \"{}\" (v2.1.0 renamed it to \
+                 \"{}\"). Accepting it for compatibility. Note eidolon does NOT rewrite \
+                 read names — any of your own scripts matching the old prefix will \
+                 silently match nothing. See the \"Upgrading from 2.0.0\" section in the \
+                 README.",
+                LEGACY_PREFIX.trim_start_matches('@'),
+                PREFIX.trim_start_matches('@'),
+            );
+        });
         LEGACY_PREFIX
     } else {
         // A line that *embeds* a known prefix without starting with one is a read

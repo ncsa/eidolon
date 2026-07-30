@@ -187,7 +187,7 @@ pub fn write_vcf(
             let info_str = if is_symbolic {
                 match variant.info.as_deref() {
                     None | Some(".") | Some("") => format!("EIDOLON_PROVENANCE={prov}"),
-                    Some(existing) => match strip_legacy_output_tokens(existing) {
+                    Some(existing) => match strip_own_output_tokens(existing) {
                         Some(kept) => format!("{kept};EIDOLON_PROVENANCE={prov}"),
                         None => format!("EIDOLON_PROVENANCE={prov}"),
                     },
@@ -202,9 +202,13 @@ pub fn write_vcf(
                     (Provenance::Denovo | Provenance::SomaticVcf, Some(extra))
                         if !extra.is_empty() && extra != "." =>
                     {
-                        // SomaticVcf variants come from a user-supplied `somatic_vcf:`,
-                        // which may itself be v2.0.0 eidolon output — so strip here too.
-                        match strip_legacy_output_tokens(extra) {
+                        // Denovo `info` is generated fresh (EIDOLON_CCF / EIDOLON_VAF),
+                        // so in practice there is nothing to strip on this path — the
+                        // SomaticVcf arm never carries source INFO either, since
+                        // gen_reads::runner clears it on ingest. Kept as a cheap
+                        // invariant so a future path that does populate `info` from a
+                        // file can't reintroduce a duplicate provenance key.
+                        match strip_own_output_tokens(extra) {
                             Some(kept) => format!("{kept};EIDOLON_PROVENANCE={prov}"),
                             None => format!("EIDOLON_PROVENANCE={prov}"),
                         }
@@ -250,25 +254,46 @@ pub fn write_vcf(
     Ok(())
 }
 
-/// Drop eidolon's own **pre-v2.1.0** output tokens from an INFO field that is about
-/// to be passed through into new output.
+/// Drop the eidolon-emitted routing tokens that this writer owns, from an INFO field
+/// about to be passed through into new output.
 ///
-/// v2.0.0 and earlier emitted `NEAT_*` names. When such a VCF is fed back in (via
-/// `input_vcf:` or `somatic_vcf:`), `write_vcf` preserves the source INFO verbatim on
-/// symbolic and de-novo/somatic literal records — which would reproduce those tokens
-/// in a file whose header only declares the `EIDOLON_*` names. bcftools tolerates that
-/// when streaming VCF→VCF but hard-fails on BCF translation (`bcftools concat | sort`
-/// does exactly that internally), so the record must not carry them.
+/// `write_vcf` preserves a source record's INFO verbatim on symbolic (and de-novo
+/// literal) records, so feeding a golden VCF back in via `input_vcf:` reproduces
+/// whatever tokens it carried. Two classes must not survive that round trip:
 ///
-/// Dropping rather than renaming is deliberate: this writer re-emits the current
-/// equivalents itself, so a stale `NEAT_PROVENANCE=denovo` would *contradict* the
-/// fresh `EIDOLON_PROVENANCE=input` describing how this pass actually used the record.
+/// * **`*_PROVENANCE`** — this writer re-emits it from `variant.provenance`. A stale
+///   copy yields a duplicate key with *contradictory* values (`=denovo` from the source
+///   next to the fresh `=input` describing how this pass actually used the record).
+///   Worse, `vcf_merge::tumor_origin` tests for the exact field
+///   `EIDOLON_PROVENANCE=denovo`, so a stale copy makes it label a variant present in
+///   **both** passes as `somatic` — putting a germline carry-through into the somatic
+///   ground truth that every bundled benchmark scores against.
+/// * **`*_ORIGIN`** — added *after* this writer by `vcf_merge`, which is also the only
+///   place that declares it. Passing one through emits an undeclared INFO tag: fine when
+///   streaming VCF→VCF, but a hard failure on BCF translation, which
+///   `bcftools concat | sort` does internally.
+///
+/// Both the current `EIDOLON_*` spellings and the pre-v2.1.0 `NEAT_*` ones are stripped.
+/// Scoping this to only the legacy names would fix the shrinking half of the problem
+/// (v2.0.0 goldens) and leave the growing half (v2.1.0 goldens, which is what users
+/// produce from now on).
+///
+/// **`EIDOLON_CCF` / `EIDOLON_VAF` are deliberately kept.** Unlike provenance, they are
+/// #405's ground truth and live *in* `variant.info` — `gen_reads::runner` appends them
+/// there before the write — so stripping them would destroy the tags on every de-novo
+/// somatic record. They are declared by this writer, so passing one through is harmless.
+/// `NEAT_CCF`/`NEAT_VAF`/`NEAT_REASON` are still dropped: those spellings are never
+/// re-emitted, so a survivor would be an undeclared tag.
 ///
 /// Returns `None` when nothing is left to keep, so callers can emit provenance alone
-/// instead of a leading `;`. Only these exact eidolon-emitted keys are removed —
-/// third-party INFO (`DP`, `AF`, `SVTYPE`, …) is untouched.
-fn strip_legacy_output_tokens(info: &str) -> Option<String> {
-    const LEGACY_KEYS: [&str; 5] = [
+/// instead of a leading `;`. Only these exact keys are removed — third-party INFO
+/// (`DP`, `AF`, `SVTYPE`, …) is untouched.
+fn strip_own_output_tokens(info: &str) -> Option<String> {
+    const OWNED_KEYS: [&str; 7] = [
+        // Current spellings: re-emitted here, or declared only downstream.
+        "EIDOLON_PROVENANCE",
+        "EIDOLON_ORIGIN",
+        // Pre-v2.1.0 spellings: never re-emitted, so any survivor is undeclared.
         "NEAT_PROVENANCE",
         "NEAT_ORIGIN",
         "NEAT_CCF",
@@ -279,7 +304,7 @@ fn strip_legacy_output_tokens(info: &str) -> Option<String> {
         .split(';')
         .filter(|field| {
             let key = field.split('=').next().unwrap_or(field);
-            !LEGACY_KEYS.contains(&key)
+            !OWNED_KEYS.contains(&key)
         })
         .filter(|field| !field.is_empty())
         .collect();
@@ -1534,19 +1559,19 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     }
 
     #[test]
-    fn strip_legacy_output_tokens_drops_only_pre_rename_eidolon_keys() {
+    fn strip_own_output_tokens_drops_routing_keys_both_spellings() {
         // Third-party / SV INFO must survive untouched.
         assert_eq!(
-            strip_legacy_output_tokens("SVTYPE=DEL;END=200;DP=30").as_deref(),
+            strip_own_output_tokens("SVTYPE=DEL;END=200;DP=30").as_deref(),
             Some("SVTYPE=DEL;END=200;DP=30")
         );
-        // Each pre-v2.1.0 key is removed, order of the rest preserved.
+        // Pre-v2.1.0 keys removed, order of the rest preserved.
         assert_eq!(
-            strip_legacy_output_tokens("SVTYPE=DEL;NEAT_PROVENANCE=denovo;END=200").as_deref(),
+            strip_own_output_tokens("SVTYPE=DEL;NEAT_PROVENANCE=denovo;END=200").as_deref(),
             Some("SVTYPE=DEL;END=200")
         );
         assert_eq!(
-            strip_legacy_output_tokens(
+            strip_own_output_tokens(
                 "NEAT_ORIGIN=somatic;NEAT_CCF=1.0;NEAT_VAF=0.3;NEAT_REASON=unknown;AF=0.5"
             )
             .as_deref(),
@@ -1554,20 +1579,45 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         );
         // Nothing left to keep -> None, so the caller emits provenance alone
         // rather than a record starting with ';'.
-        assert_eq!(strip_legacy_output_tokens("NEAT_PROVENANCE=input"), None);
-        // Current-generation tags must NOT be caught by the legacy filter.
+        assert_eq!(strip_own_output_tokens("NEAT_PROVENANCE=input"), None);
+
+        // The CURRENT spellings must be stripped too. Round-tripping a v2.1.0 golden
+        // through input_vcf: is the common case, not the legacy one.
         assert_eq!(
-            strip_legacy_output_tokens("EIDOLON_CCF=1.0;EIDOLON_VAF=0.3").as_deref(),
-            Some("EIDOLON_CCF=1.0;EIDOLON_VAF=0.3")
+            strip_own_output_tokens("SVTYPE=DEL;EIDOLON_PROVENANCE=denovo;END=200").as_deref(),
+            Some("SVTYPE=DEL;END=200")
         );
-        // Exact-key matching: a lookalike key is not a legacy token.
         assert_eq!(
-            strip_legacy_output_tokens("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y").as_deref(),
-            Some("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y")
+            strip_own_output_tokens("SVTYPE=DEL;EIDOLON_ORIGIN=somatic").as_deref(),
+            Some("SVTYPE=DEL")
+        );
+        // A stale EIDOLON_PROVENANCE=denovo surviving here is what made
+        // vcf_merge::tumor_origin label a germline carry-through as `somatic`.
+        assert_eq!(
+            strip_own_output_tokens("EIDOLON_PROVENANCE=denovo;EIDOLON_ORIGIN=shared"),
+            None
+        );
+
+        // #405 ground truth is KEPT: gen_reads::runner puts EIDOLON_CCF/EIDOLON_VAF in
+        // `variant.info` before the write, so stripping them would destroy the tags on
+        // every de-novo somatic record. This writer declares both.
+        assert_eq!(
+            strip_own_output_tokens("EIDOLON_CCF=1.0000;EIDOLON_VAF=0.3000").as_deref(),
+            Some("EIDOLON_CCF=1.0000;EIDOLON_VAF=0.3000")
+        );
+        assert_eq!(
+            strip_own_output_tokens("EIDOLON_CCF=1.0000;EIDOLON_PROVENANCE=denovo").as_deref(),
+            Some("EIDOLON_CCF=1.0000")
+        );
+
+        // Exact-key matching: lookalikes are not owned tokens.
+        assert_eq!(
+            strip_own_output_tokens("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y;EIDOLON_ORIGINS=z").as_deref(),
+            Some("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y;EIDOLON_ORIGINS=z")
         );
         // Bare flags (no '=') are preserved.
         assert_eq!(
-            strip_legacy_output_tokens("IMPRECISE;NEAT_VAF=0.1").as_deref(),
+            strip_own_output_tokens("IMPRECISE;NEAT_VAF=0.1").as_deref(),
             Some("IMPRECISE")
         );
     }

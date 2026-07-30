@@ -4,6 +4,10 @@
 > NEAT lineage; the `rneat` command still works as a deprecated alias for one transition
 > release. See `CHANGELOG.md`.
 
+> **Upgrading from 2.0.0 → 2.1.0? The names of emitted output tokens changed.**
+> See [Upgrading from 2.0.0](#upgrading-from-200) below — **read it if you have any
+> script that parses eidolon VCFs or FASTQ/BAM read names.**
+
 Welcome to `eidolon`, a Rust port of NEAT (https://github.com/ncsa/neat), a genetic simulation program that creates fastq that appear to be from sequencers, carry the same statistical properties as your data, and generate a golden bam and fastq that gives you ideal alignments and what variants were inserted. In addition, `eidolon` generates "noise" in the form of sequencing errors as it is writing out files. These features can help you hone in your alignment and variant calling software to your data. Training models on your data will allow `eidolon` to faithfully reproduce the statistical properties of your dataset.
 
 We have spent some dedicated time toward gearing the current version of `eidolon` to simulate cancer genetics, including adding structural variant simulations (CNV, BND, SVs, and others), and creating a wrapper that simulates purity levels and then stitches the results back together. We've geared this software with an aim at keeping memory usage as low and CPU time as short as possible. Let us know your real world experience by creating a Feedback issue, if you have something that's not quite a bug, or have a positive experience to share. As always, let us know if you find a bug and give as many details as you can to help us troubleshoot.
@@ -79,6 +83,63 @@ when you want:
 - **Easy deployment** — a single self-contained binary with no Python
   environment to manage, installable via Bioconda
   (`conda install -c bioconda eidolon`).
+
+## Upgrading from 2.0.0
+
+v2.1.0 renamed the tokens eidolon **emits**. There is no behavior change — the same
+reads and variants are produced — but anything that *parses* eidolon output needs
+attention. In-tree consumers were all migrated; your own scripts were not.
+
+| Surface | v2.0.0 and earlier | v2.1.0+ | Migration |
+|---|---|---|---|
+| VCF INFO tags | `NEAT_ORIGIN`, `NEAT_PROVENANCE`, `NEAT_REASON`, `NEAT_CCF`, `NEAT_VAF` | `EIDOLON_*` | **converter provided** |
+| VCF sample column | `NEAT_simulated_sample` | `EIDOLON_simulated_sample` | **converter provided** |
+| FASTQ read names | `@RNEAT_generated_*`, `RNEAT_chimeric_*` | `@EIDOLON_generated_*`, `EIDOLON_chimeric_*` | **not converted** — see below |
+| BAM read names (QNAME) | `RNEAT_generated_*` | `EIDOLON_generated_*` | **not converted** — see below |
+
+### VCFs — convert them
+
+```bash
+tools/migrate_legacy_tokens.sh old_truth.vcf.gz new_truth.vcf.gz
+tools/migrate_legacy_tokens.sh --check old_truth.vcf.gz   # report only; exit 10 = legacy
+```
+
+Idempotent: safe to run on a file that's already current, or on a non-eidolon VCF, so
+you can call it unconditionally in a pipeline. It rewrites the header declarations and
+the record fields together, so the result is a valid VCF.
+
+Note you **cannot** work around this with a dual-name bcftools filter — bcftools rejects
+an undefined tag in a `-i` expression at parse time, so even
+`INFO/EIDOLON_ORIGIN="somatic" || INFO/NEAT_ORIGIN="somatic"` fails outright on a file
+that carries only one of the two. Convert the file instead.
+
+### Read names — NOT converted, and this is the part that can bite you
+
+Read names are **not** rewritten, in either FASTQ or BAM. Rewriting files that are
+routinely hundreds of GB to change ~19 bytes per record isn't a reasonable ask, so
+instead `eidolon filter-reads` accepts **both** prefixes natively — legacy FASTQs keep
+working with no conversion step, and it warns once when it sees an old prefix.
+
+**Nothing protects your own scripts.** A `grep '^@RNEAT_generated_'`, `awk` field split,
+or regex over read names will match **zero records and exit 0** against v2.1.0 output —
+a silent empty result, not an error. Audit for the old prefix before upgrading:
+
+```bash
+grep -rn 'RNEAT_generated_\|RNEAT_chimeric_' your_scripts/
+```
+
+If you must rewrite existing files rather than update the scripts:
+
+```bash
+# FASTQ (expensive — a full re-compress; prefer updating your scripts)
+zcat old_r1.fastq.gz | sed 's/^@RNEAT_generated_/@EIDOLON_generated_/' | gzip > new_r1.fastq.gz
+
+# BAM QNAMEs
+samtools view -h old.bam | sed 's/^RNEAT_generated_/EIDOLON_generated_/' | samtools view -b -o new.bam
+```
+
+BAM QNAMEs are covered by no in-tree tooling at all — `filter-reads` reads FASTQ, and the
+converter is VCF-only. If you parse BAM read names, the `sed` above is the whole story.
 
 # How to use `eidolon`
 
