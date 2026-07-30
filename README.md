@@ -155,18 +155,41 @@ a silent empty result, not an error. Audit for the old prefix before upgrading:
 grep -rn 'RNEAT_generated_\|RNEAT_chimeric_' your_scripts/
 ```
 
-If you must rewrite existing files rather than update the scripts:
+#### Best fix: make your parser prefix-agnostic
+
+**Only the prefix changed.** Everything after `_generated_` —
+`<contig>_<start>_<end>_<uniq>/<mate>` — is byte-for-byte identical between versions
+(verified across every read of a golden BAM re-prefixed both ways). So rather than
+rewriting files, strip the prefix and your script works against *either* version, and
+against any future rename:
 
 ```bash
-# FASTQ (expensive — a full re-compress; prefer updating your scripts)
+# version-proof: drop whatever prefix is present, keep the encoded fields
+samtools view x.bam | cut -f1 | sed -E 's/^[A-Z]+_generated_//'
+zcat x_r1.fastq.gz  | awk 'NR%4==1' | sed -E 's/^@[A-Z]+_generated_//'
+```
+
+Same trick for chimeric reads: `sed -E 's/^@?[A-Z]+_chimeric_//'`.
+
+If you are joining an old artifact against a new one on read name, normalize both sides
+this way. One unrelated gotcha for QNAME joins: eidolon's golden BAM **keeps** the `/1`
+`/2` mate suffix, while bwa strips it from aligned BAMs — so strip that too
+(`sed 's|/[12]$||'`) when joining a golden BAM to an aligner's output. That mismatch
+predates this release.
+
+#### If you must rewrite the files instead
+
+```bash
+# FASTQ (expensive — a full re-compress; prefer the prefix-agnostic parse above)
 zcat old_r1.fastq.gz | sed 's/^@RNEAT_generated_/@EIDOLON_generated_/' | gzip > new_r1.fastq.gz
 
-# BAM QNAMEs
+# BAM QNAMEs (QNAME is field 1, and no header line contains the prefix, so ^ is safe)
 samtools view -h old.bam | sed 's/^RNEAT_generated_/EIDOLON_generated_/' | samtools view -b -o new.bam
 ```
 
-BAM QNAMEs are covered by no in-tree tooling at all — `filter-reads` reads FASTQ, and the
-converter is VCF-only. If you parse BAM read names, the `sed` above is the whole story.
+BAM QNAMEs are covered by no in-tree tooling — `filter-reads` reads FASTQ, and the
+converter is bcftools-based so it cannot touch a BAM. Nothing eidolon ships parses BAM
+read names either, so this only affects your own scripts.
 
 # How to use `eidolon`
 
