@@ -764,26 +764,34 @@ from real data** (PyClone-VI / PCAWG cluster tables), or **replayed** from a rea
 VCF at its observed VAF. Every somatic truth record carries the intended CCF (`INFO/NEAT_CCF`)
 and the intended observed VAF (`INFO/NEAT_VAF`) as ground truth.
 
-**Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate a
-subclonal tumor, align the merged reads with bwa-mem2, and measure the observed VAF at each
-somatic site against the planted `NEAT_VAF`. On a single soybean scaffold (Wm82.a4) at 200×,
-purity 0.8, three subclones (CCF 1.0 / 0.4 / 0.1 → het VAF clusters ≈ 0.40 / 0.16 / 0.04):
+**Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate,
+align the merged reads with bwa-mem2, and measure the observed VAF at each somatic site
+against the intended `NEAT_VAF`. Two complementary runs — a *controlled synthetic*
+architecture and a *real tumor's empirical* spectrum:
 
-| Metric | Value | Interpretation |
+| Metric | Generative — soy scaffold | Reproductive — HCC1395 chr1 |
 |---|---|---|
-| Bias, mean(observed − intended) | −0.003 | unbiased — the `purity × dosage × CCF` composition is correct |
-| MAE | 0.026 | at the ~200× binomial noise floor — accurate to the sampling limit |
-| Pearson r | 0.95 | the planted CCF clusters are recovered across a 4–40% VAF span |
-| Somatic sites planted | 567 | over one ~60 Mb scaffold |
+| Input VAF spectrum | 3 synthetic CCF clusters (≈0.04 / 0.16 / 0.40) | real tumor's empirical VAF, all deciles 0.1–1.0 |
+| Coverage / purity | 200× / 0.8 | 200× / 0.9 |
+| Somatic sites (compared) | 567 planted (387 scored) | 2,948 (2,698 scored) |
+| Bias, mean(observed − intended) | −0.003 | −0.004 |
+| MAE (vs ~200× noise floor) | 0.026 | 0.024 |
+| Pearson r | 0.95 | **0.99** |
 
-The merged reads reproduce the planted subclonal VAF spectrum **without bias, to within
-sampling noise** — a complexity axis (intra-tumor heterogeneity) that the predecessor could
-not represent at all. **Scope:** generative path validated end-to-end; reproductive replay of
-a real somatic truth set (SEQC2 HCC1395) is staged and next. The lowest cluster (~4% VAF)
-sits at the caller's detection limit even at 200×, so it drops out of scoring — realistic
-behavior, not a simulation defect. Per-site Pearson is a spread-dependent summary for
-discrete clusters; fidelity is gated on bias + MAE-vs-noise-floor (see
-`scripts/delta/run_subclonal_vaf_validation.sh`).
+The **generative** run (SEQC2-agnostic, single soybean scaffold, three subclones)
+confirms the `purity × dosage × CCF` composition is unbiased and accurate to the sampling
+limit; per-site Pearson is a spread-dependent summary for tight discrete clusters, so
+fidelity is gated on bias + MAE-vs-noise-floor rather than r.
+
+The **reproductive** run replays SEQC2 **HCC1395** (a triple-negative breast cancer cell
+line) — its high-confidence somatic SNVs honored at their observed VAF over GRCh38 chr1.
+This is a real tumor's full *continuous* VAF distribution (2,948 sites spanning every
+decile), so Pearson is fully meaningful: the aligned reads reproduce it at **r = 0.99**,
+unbiased (−0.004), with per-decile MAE uniform at 0.009–0.027 across the whole 0.1–1.0
+range. Together these show eidolon reproduces both a *designed* subclonal architecture and
+a *real tumor's* empirical VAF spectrum — a complexity axis (intra-tumor heterogeneity) the
+predecessor could not represent at all. Harnesses: `scripts/delta/run_subclonal_vaf_validation.sh`
+(generative) and `scripts/delta/run_hcc1395_reproductive.sh` (reproductive).
 
 ---
 
