@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 use thiserror::Error;
 
-/// Guards the one-time pre-v2.1.0 read-name-prefix warning in
+/// Guards the one-time pre-v3.0.0 read-name-prefix warning in
 /// `parse_fastq_record_name` — it is called once per FASTQ record, and a per-read
 /// warning on a multi-million-read file would be worse than silence.
 static LEGACY_PREFIX_WARNED: Once = Once::new();
@@ -85,7 +85,7 @@ fn parse_fastq_record_name(line: &str) -> Result<(String, usize, usize), FilterL
     // for why it's necessary). Parser takes the last three underscore-separated
     // tokens as (start, end, uniq) and ignores uniq.
     const PREFIX: &str = "@EIDOLON_generated_";
-    // v2.0.0 and earlier emitted "@RNEAT_generated_" (v2.1.0 renamed the output
+    // v2.0.0 and earlier emitted "@RNEAT_generated_" (v3.0.0 renamed the output
     // tokens). Accept both: FASTQs are far too large to be worth rewriting just to
     // change a 19-byte prefix, so legacy output stays filterable. Note the two
     // prefixes differ in length (19 vs 17), hence the matched-prefix slice below.
@@ -94,13 +94,13 @@ fn parse_fastq_record_name(line: &str) -> Result<(String, usize, usize), FilterL
         PREFIX
     } else if line.starts_with(LEGACY_PREFIX) {
         // Warn once. Accepting the old prefix silently is the only remaining path where
-        // a user's pre-v2.1.0 data flows through v2.1.0 with no signal that the output
+        // a user's pre-v3.0.0 data flows through v3.0.0 with no signal that the output
         // format changed — and a user's own `grep '^@RNEAT_generated_'` over the same
         // file returns zero rows with exit 0. This is the cheapest place to make that
         // discoverable, so say it out loud (once, not per read).
         LEGACY_PREFIX_WARNED.call_once(|| {
             warn!(
-                "input uses the pre-v2.1.0 read-name prefix \"{}\" (v2.1.0 renamed it to \
+                "input uses the pre-v3.0.0 read-name prefix \"{}\" (v3.0.0 renamed it to \
                  \"{}\"). Accepting it for compatibility. Note eidolon does NOT rewrite \
                  read names — any of your own scripts matching the old prefix will \
                  silently match nothing. See the \"Upgrading from 2.0.0\" section in the \

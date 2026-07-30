@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# migrate_legacy_tokens.sh — normalize a pre-v2.1.0 eidolon VCF to the EIDOLON_* tokens.
+# migrate_legacy_tokens.sh — normalize a pre-v3.0.0 eidolon VCF to the EIDOLON_* tokens.
 #
-# v2.1.0 renamed eidolon's emitted output tokens (see CHANGELOG):
+# v3.0.0 renamed eidolon's emitted output tokens (see CHANGELOG):
 #
 #   INFO tags      NEAT_ORIGIN / NEAT_PROVENANCE / NEAT_REASON / NEAT_CCF / NEAT_VAF
 #                    -> EIDOLON_*
@@ -98,7 +98,7 @@ fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     if [[ ${#found[@]} -eq 0 && "$legacy_samples" -eq 0 ]]; then
-        echo "already current: no pre-v2.1.0 tokens in $IN"
+        echo "already current: no pre-v3.0.0 tokens in $IN"
         exit 0
     fi
     echo "legacy tokens in $IN:"
@@ -117,7 +117,7 @@ if [[ ${#found[@]} -eq 0 && "$legacy_samples" -eq 0 ]]; then
     exit 0
 fi
 
-echo "migrate_legacy_tokens: converting pre-v2.1.0 tokens in $(basename "$IN")" >&2
+echo "migrate_legacy_tokens: converting pre-v3.0.0 tokens in $(basename "$IN")" >&2
 [[ ${#found[@]} -gt 0 ]] && echo "  INFO: ${found[*]} -> EIDOLON_*" >&2
 [[ "$legacy_samples" -eq 1 ]] && echo "  sample: NEAT_simulated_sample -> EIDOLON_simulated_sample" >&2
 

@@ -303,8 +303,8 @@ else
         truth_header="$(run_in "$BCFTOOLS_IMG" bcftools view -h "/truth_in/$TRUTH_NAME")"
         if ! grep -q '^##INFO=<ID=EIDOLON_ORIGIN,' <<<"$truth_header"; then
             if grep -q '^##INFO=<ID=NEAT_ORIGIN,' <<<"$truth_header"; then
-                echo "ERROR: $TRUTH_NAME carries the pre-v2.1.0 NEAT_ORIGIN tag." >&2
-                echo "  eidolon v2.1.0 renamed the emitted output tokens. Convert it once:" >&2
+                echo "ERROR: $TRUTH_NAME carries the pre-v3.0.0 NEAT_ORIGIN tag." >&2
+                echo "  eidolon v3.0.0 renamed the emitted output tokens. Convert it once:" >&2
                 echo "    tools/migrate_legacy_tokens.sh '$TRUTH_VCF' migrated_truth.vcf.gz" >&2
                 echo "    $0 --truth-vcf migrated_truth.vcf.gz ..." >&2
             else
