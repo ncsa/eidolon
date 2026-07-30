@@ -273,9 +273,9 @@ pub fn write_vcf(
 ///   streaming VCF→VCF, but a hard failure on BCF translation, which
 ///   `bcftools concat | sort` does internally.
 ///
-/// Both the current `EIDOLON_*` spellings and the pre-v2.1.0 `NEAT_*` ones are stripped.
+/// Both the current `EIDOLON_*` spellings and the pre-v3.0.0 `NEAT_*` ones are stripped.
 /// Scoping this to only the legacy names would fix the shrinking half of the problem
-/// (v2.0.0 goldens) and leave the growing half (v2.1.0 goldens, which is what users
+/// (v2.0.0 goldens) and leave the growing half (v3.0.0 goldens, which is what users
 /// produce from now on).
 ///
 /// **`EIDOLON_CCF` / `EIDOLON_VAF` are deliberately kept.** Unlike provenance, they are
@@ -293,7 +293,7 @@ fn strip_own_output_tokens(info: &str) -> Option<String> {
         // Current spellings: re-emitted here, or declared only downstream.
         "EIDOLON_PROVENANCE",
         "EIDOLON_ORIGIN",
-        // Pre-v2.1.0 spellings: never re-emitted, so any survivor is undeclared.
+        // Pre-v3.0.0 spellings: never re-emitted, so any survivor is undeclared.
         "NEAT_PROVENANCE",
         "NEAT_ORIGIN",
         "NEAT_CCF",
@@ -1547,7 +1547,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
             lines
         );
         // The sample-column name is an emitted output token too (renamed from
-        // NEAT_simulated_sample in v2.1.0). Without this assertion it is the one
+        // NEAT_simulated_sample in v3.0.0). Without this assertion it is the one
         // renamed token no test would catch being reverted.
         assert!(
             lines
@@ -1565,7 +1565,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
             strip_own_output_tokens("SVTYPE=DEL;END=200;DP=30").as_deref(),
             Some("SVTYPE=DEL;END=200;DP=30")
         );
-        // Pre-v2.1.0 keys removed, order of the rest preserved.
+        // Pre-v3.0.0 keys removed, order of the rest preserved.
         assert_eq!(
             strip_own_output_tokens("SVTYPE=DEL;NEAT_PROVENANCE=denovo;END=200").as_deref(),
             Some("SVTYPE=DEL;END=200")
@@ -1581,7 +1581,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // rather than a record starting with ';'.
         assert_eq!(strip_own_output_tokens("NEAT_PROVENANCE=input"), None);
 
-        // The CURRENT spellings must be stripped too. Round-tripping a v2.1.0 golden
+        // The CURRENT spellings must be stripped too. Round-tripping a v3.0.0 golden
         // through input_vcf: is the common case, not the legacy one.
         assert_eq!(
             strip_own_output_tokens("SVTYPE=DEL;EIDOLON_PROVENANCE=denovo;END=200").as_deref(),

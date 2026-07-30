@@ -4,7 +4,7 @@
 > NEAT lineage; the `rneat` command still works as a deprecated alias for one transition
 > release. See `CHANGELOG.md`.
 
-> **Upgrading from 2.0.0 → 2.1.0? The names of emitted output tokens changed.**
+> **Upgrading from 2.0.0 → 3.0.0? The names of emitted output tokens changed.**
 > See [Upgrading from 2.0.0](#upgrading-from-200) below — **read it if you have any
 > script that parses eidolon VCFs or FASTQ/BAM read names.**
 
@@ -44,7 +44,7 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 
 |                                            | **NEAT 2.x** (genReads)        | **NEAT 4.x**                              | **`eidolon`**                                              |
 | ------------------------------------------ | ------------------------------ | ----------------------------------------- | -------------------------------------------------------- |
-| Latest version                             | 2.1                            | 4.5.3                                      | 2.1.0                                                    |
+| Latest version                             | 2.1                            | 4.5.3                                      | 3.0.0                                                    |
 | Language                                   | Python 2                       | Python 3                                  | Rust                                                     |
 | FASTQ reads (single / paired)              | ✅                             | ✅                                        | ✅                                                       |
 | Golden BAM + VCF truth set                 | ✅                             | ✅                                        | ✅                                                       |
@@ -84,13 +84,40 @@ when you want:
   environment to manage, installable via Bioconda
   (`conda install -c bioconda eidolon`).
 
+## Versioning and the public API
+
+As of **v3.0.0**, eidolon follows [Semantic Versioning 2.0.0](https://semver.org): a
+MAJOR bump means something you may depend on changed incompatibly, a MINOR bump adds
+functionality compatibly, and a PATCH bump is fixes only. Releases before v3.0.0 were
+versioned less strictly — notably v1.11.0 and v1.12.0 changed the FASTQ read-name format
+in minor bumps.
+
+SemVer requires a project to say what its public API is. For eidolon:
+
+**Public API — a change here means a MAJOR bump:**
+- Names and semantics of emitted VCF INFO tags, the VCF sample-column name, and the
+  `FILTER` / `FORMAT` fields eidolon writes
+- FASTQ/BAM **read-name (QNAME) format** — the `EIDOLON_generated_` /
+  `EIDOLON_chimeric_` prefixes and the positional fields encoded after them
+- CLI subcommand names, flags, and configuration-YAML keys
+- Model-file compatibility (a model built by one version staying readable by the next)
+
+**Not public API — may change in a MINOR or PATCH release:**
+- The `eidolon-core` Rust library surface; it exists to serve the binary
+- Log output, progress reporting, and human-readable messages
+- The exact simulated *content* for a given seed — reads are a random draw, so sampler
+  and model changes legitimately alter output while preserving the format
+
+If you parse eidolon's output, the first list is what you are relying on, and a major
+version bump is your signal to check this file before upgrading.
+
 ## Upgrading from 2.0.0
 
-v2.1.0 renamed the tokens eidolon **emits**. There is no behavior change — the same
+v3.0.0 renamed the tokens eidolon **emits**. There is no behavior change — the same
 reads and variants are produced — but anything that *parses* eidolon output needs
 attention. In-tree consumers were all migrated; your own scripts were not.
 
-| Surface | v2.0.0 and earlier | v2.1.0+ | Migration |
+| Surface | v2.0.0 and earlier | v3.0.0+ | Migration |
 |---|---|---|---|
 | VCF INFO tags | `NEAT_ORIGIN`, `NEAT_PROVENANCE`, `NEAT_REASON`, `NEAT_CCF`, `NEAT_VAF` | `EIDOLON_*` | **converter provided** |
 | VCF sample column | `NEAT_simulated_sample` | `EIDOLON_simulated_sample` | **converter provided** |
@@ -121,7 +148,7 @@ instead `eidolon filter-reads` accepts **both** prefixes natively — legacy FAS
 working with no conversion step, and it warns once when it sees an old prefix.
 
 **Nothing protects your own scripts.** A `grep '^@RNEAT_generated_'`, `awk` field split,
-or regex over read names will match **zero records and exit 0** against v2.1.0 output —
+or regex over read names will match **zero records and exit 0** against v3.0.0 output —
 a silent empty result, not an error. Audit for the old prefix before upgrading:
 
 ```bash
@@ -156,7 +183,7 @@ required. If you prefer to build from source or grab a release binary, read on.
 
 You will need to install the rust toolchain to compile `eidolon`, including `cargo`. Check the cargo documentation for instructions (https://doc.rust-lang.org/cargo/getting-started/installation.html). Alternatively, you can try one of the binaries on the release page. Select the one that matches your system and let us know if you run into errors. During compilation, you may run into errors, such as cmake not found. Some of the packages `eidolon` uses have these dependencies. For Debian/Ubuntu this should be a simple `sudo apt install cmake` and for RHEL/Rocky type distros this should be `sudo dnf install cmake`. There may be some other requirements. Drop a comment if you need specific help.
 
-Download the executable in the release (current version 2.1.0).
+Download the executable in the release (current version 3.0.0).
 
 ```bash
 $ eidolon --help

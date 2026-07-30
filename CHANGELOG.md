@@ -1,10 +1,44 @@
 7/28/2026
 =========
-## eidolon v2.1.0 — output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*
+## eidolon v3.0.0 — output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*; adopting SemVer
 
 **Breaking output-format change** — no behavior change, only the names of emitted tokens.
 Completes decision 1 of `docs/rename_eidolon_scope.md` (the post-2.0.0 output-token
 migration). Downstream code that parses the old names must update.
+
+### Why 3.0.0, and a versioning policy going forward
+
+This release is **3.0.0**, not 2.1.0, and from here on eidolon follows
+[Semantic Versioning 2.0.0](https://semver.org).
+
+Earlier releases were versioned by feel, and by that habit this would have been a minor
+bump: it completes a rename announced back in v2.0.0, and three prior releases shipped
+breaking output changes as minor bumps (v1.11.0 and v1.12.0 both changed the FASTQ
+read-name format; v1.6.0 removed config fields under a bolded "Breaking change"). That
+pattern was not doing users any favours — a minor bump tells you it is safe to upgrade
+without reading anything, and for these releases that was not true.
+
+SemVer requires a project to **declare what its public API is**, so eidolon's is now
+stated explicitly (also in the README):
+
+**Part of the public API** — changes here require a MAJOR bump:
+- Names and semantics of emitted VCF INFO tags, the VCF sample-column name, and the
+  `FILTER`/`FORMAT` fields eidolon writes
+- FASTQ/BAM **read-name (QNAME) format**, including the `EIDOLON_generated_` /
+  `EIDOLON_chimeric_` prefixes and the positional fields encoded after them
+- CLI subcommand names, flags, and configuration-YAML keys
+- Model-file format compatibility (a model built by version *N* being readable by *N+1*)
+
+**Not part of the public API** — these may change in a MINOR or PATCH release:
+- The Rust library (`eidolon-core`) API surface; this crate exists to serve the binary
+- Log output, progress reporting, and human-readable messages
+- Exact simulated *content* for a given seed — reads are a random draw, and any change
+  to the sampler or models legitimately changes output while preserving the format
+
+For a read simulator the emitted format is the interface downstream code actually binds
+to, which is why it heads the list. That is also the reasoning that makes this release
+major: renaming the tokens is a breaking change to that interface, notwithstanding that
+it was pre-announced and that no behavior changed.
 
 - **VCF INFO tags:** `NEAT_ORIGIN` → `EIDOLON_ORIGIN`, `NEAT_PROVENANCE` → `EIDOLON_PROVENANCE`,
   `NEAT_REASON` → `EIDOLON_REASON`, `NEAT_CCF` → `EIDOLON_CCF`, `NEAT_VAF` → `EIDOLON_VAF`.
