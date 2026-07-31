@@ -1,5 +1,5 @@
 {% set name = "eidolon" %}
-{% set version = "2.0.0" %}
+{% set version = "3.0.0" %}
 
 package:
   name: {{ name }}
@@ -9,7 +9,7 @@ source:
   url: https://github.com/ncsa/eidolon/archive/refs/tags/v{{ version }}.tar.gz
   # Update on each release:
   #   curl -sL https://github.com/ncsa/eidolon/archive/refs/tags/v{{ version }}.tar.gz | sha256sum
-  sha256: 288c80e1b9eafbd9579ad614d046a48e7a95e083539a499548078118e62b064a
+  sha256: 72db57a181255efb983c06d87e6e2d43a58cced61cee01a15cad2f7d3ffaa01e
 
 build:
   number: 0
