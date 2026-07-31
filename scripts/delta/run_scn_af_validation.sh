@@ -79,6 +79,9 @@ mkdir -p "$OUTDIR"
 # stage_scn.sh emits AD (mpileup -a FORMAT/AD); VCFs staged before that fix lack it, so fall
 # back to re-deriving AD from the BAM at just the SNV sites (fast, -R restricted). POOL_AF is
 # BOTH the gen-reads input and the truth, so the comparison stays self-consistent either way.
+# mpileup max per-site depth; its default of 250 would silently downsample a
+# deep pool. Explicit so any cap is deliberate.
+MPILEUP_MAX_DEPTH="${MPILEUP_MAX_DEPTH:-2000}"
 POOL_AF="$OUTDIR/pool.af.vcf.gz"
 if bcftools view -h "$POOL_VCF" | grep -q '##FORMAT=<ID=AD,'; then
     echo "pool VCF carries FORMAT/AD — using AD-based fraction directly"
@@ -88,9 +91,14 @@ elif [[ -s "$BAM" ]]; then
     SITES="$OUTDIR/snv_sites.vcf.gz"
     bcftools view -v snps "$POOL_VCF" -Oz -o "$SITES"
     bcftools index -t "$SITES"
-    bcftools mpileup -a FORMAT/AD -f "$REF" -R "$SITES" "$BAM" 2>/dev/null \
-      | bcftools call -m -Oz 2>/dev/null \
-      | bcftools view -v snps -Oz -o "$POOL_AF"
+    # No `bcftools call` here (#450). `call -m` makes a diploid ML genotype call and a
+    # hom-ref call discards the uncalled allele TOGETHER WITH ITS READ COUNT, so the
+    # low-AF end of a pool spectrum — the part this harness exists to validate — was
+    # being destroyed before the comparison saw it. Worse than the subclonal case,
+    # which at least passed -C alleles. Measuring a fraction needs no genotype call;
+    # scn_af_compare.py reads the per-allele AD directly.
+    bcftools mpileup -a FORMAT/AD -d "$MPILEUP_MAX_DEPTH" -f "$REF" -R "$SITES" \
+        "$BAM" -Oz -o "$POOL_AF" 2>/dev/null
 else
     echo "ABORT: $POOL_VCF has no FORMAT/AD and no BAM at $BAM to re-derive it." >&2
     echo "       Re-stage with the current stage_scn.sh (emits FORMAT/AD), or set INPUT_BAM." >&2

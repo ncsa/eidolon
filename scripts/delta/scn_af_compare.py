@@ -35,44 +35,64 @@ def _field_index(fmt, key):
     return parts.index(key) if key in parts else None
 
 
-def _af_from_record(info, fmt, sample):
-    """Extract an alt fraction from one VCF record's INFO/FORMAT/SAMPLE.
+def _pick_per_allele(raw, alt_idx, n_alts, kind):
+    """Select one allele's value from a per-allele VCF field.
 
-    Order: FORMAT/AF, then INFO/AF, then FORMAT/AD (sum alt / total). Returns
-    (af, depth) — depth is total AD when available (for min-depth gating), else
-    None. Returns (None, None) when no fraction can be derived.
+    `kind` is "A" (one value per ALT, e.g. AF) or "R" (ref first, then one per ALT,
+    e.g. AD). Returns None unless the field's arity actually matches the ALT count:
+    a field of the wrong length cannot be indexed safely, and guessing would
+    silently attribute one allele's number to another. The previous code took
+    `[0]` unconditionally, which reported the FIRST allele's fraction for every
+    allele of a multi-allelic record.
     """
-    # FORMAT/AF
+    parts = raw.split(",")
+    want = n_alts if kind == "A" else n_alts + 1
+    if len(parts) != want:
+        return None
+    try:
+        return float(parts[alt_idx if kind == "A" else alt_idx + 1])
+    except ValueError:
+        return None
+
+
+def _af_for_allele(info, fmt, sample, alt_idx, n_alts):
+    """Alt fraction for the ALT at 0-based `alt_idx`, and the site's total depth.
+
+    Order: FORMAT/AF, INFO/AF, then FORMAT/AD. Returns (None, depth) when no
+    fraction can be derived for this allele.
+    """
+    depth = _depth_from_ad(fmt, sample)
     if fmt and sample:
         af_i = _field_index(fmt, "AF")
         if af_i is not None:
             vals = sample.split(":")
             if af_i < len(vals):
-                try:
-                    return float(vals[af_i].split(",")[0]), _depth_from_ad(fmt, sample)
-                except ValueError:
-                    pass
-    # INFO/AF
+                v = _pick_per_allele(vals[af_i], alt_idx, n_alts, "A")
+                if v is not None:
+                    return v, depth
     for kv in info.split(";"):
         if kv.startswith("AF="):
-            try:
-                return float(kv[3:].split(",")[0]), _depth_from_ad(fmt, sample)
-            except ValueError:
-                pass
-    # FORMAT/AD
+            v = _pick_per_allele(kv[3:], alt_idx, n_alts, "A")
+            if v is not None:
+                return v, depth
+    # FORMAT/AD (Number=R). This is the path #450 depends on: reading the observed
+    # side straight from `bcftools mpileup` means AD carries one count per allele,
+    # so this allele's own count divided by the site total is its observed fraction.
     if fmt and sample:
         ad_i = _field_index(fmt, "AD")
         if ad_i is not None:
             vals = sample.split(":")
             if ad_i < len(vals):
-                try:
-                    counts = [float(x) for x in vals[ad_i].split(",")]
+                parts = vals[ad_i].split(",")
+                if len(parts) == n_alts + 1:
+                    try:
+                        counts = [float(x) for x in parts]
+                    except ValueError:
+                        return None, depth
                     total = sum(counts)
-                    if len(counts) >= 2 and total > 0:
-                        return sum(counts[1:]) / total, total
-                except ValueError:
-                    pass
-    return None, None
+                    if total > 0:
+                        return counts[alt_idx + 1] / total, total
+    return None, depth
 
 
 def _depth_from_ad(fmt, sample):
@@ -91,8 +111,22 @@ def _depth_from_ad(fmt, sample):
 
 
 def load_af(path):
-    """Map (chrom, pos, ref, alt) -> (af, depth) for every usable record."""
-    out = OrderedDict()
+    """Return (alleles, sites) from a VCF.
+
+    `alleles` maps (chrom, pos, ref, alt) -> (af, depth), with **multi-allelic
+    records expanded one entry per literal ALT**. That expansion is what makes the
+    mpileup-derived observed side joinable (#450): `bcftools mpileup` reports
+    `ALT=T,<*>` with `AD=93,7,0`, so the truth's single ALT `T` has to be matched
+    against the ALT *list* and its own AD element selected. Keying on the whole ALT
+    string could never match, and skipping any record containing a symbolic
+    alternative discarded the real base sitting beside `<*>`.
+
+    `sites` maps (chrom, pos, ref) -> total depth, for every record with coverage.
+    The caller uses it to score a truth ALT the observed side never listed as
+    **0.0 observed** rather than as a missing site — see main().
+    """
+    alleles = OrderedDict()
+    sites = {}
     with _open(path) as fh:
         for line in fh:
             if line.startswith("#"):
@@ -100,16 +134,24 @@ def load_af(path):
             f = line.rstrip("\n").split("\t")
             if len(f) < 5:
                 continue
-            chrom, pos, ref, alt = f[0], f[1], f[3], f[4]
-            if alt.startswith("<") or "[" in alt or "]" in alt:
-                continue  # symbolic / breakend — not a literal-fraction site
+            chrom, pos, ref, alt_field = f[0], f[1], f[3], f[4]
             info = f[7] if len(f) > 7 else "."
             fmt = f[8] if len(f) > 8 else ""
             sample = f[9] if len(f) > 9 else ""
-            af, depth = _af_from_record(info, fmt, sample)
-            if af is not None:
-                out[(chrom, pos, ref, alt)] = (af, depth)
-    return out
+            alts = alt_field.split(",")
+            depth = _depth_from_ad(fmt, sample)
+            if depth is not None:
+                sites[(chrom, pos, ref)] = depth
+            for i, alt in enumerate(alts):
+                # Skip symbolic / breakend ALTERNATIVES but keep literal ones from
+                # the same record: mpileup's `<*>` non-ref placeholder sits beside a
+                # real base, and dropping the whole record over it was the bug.
+                if alt.startswith("<") or "[" in alt or "]" in alt or alt == ".":
+                    continue
+                af, dp = _af_for_allele(info, fmt, sample, i, len(alts))
+                if af is not None:
+                    alleles[(chrom, pos, ref, alt)] = (af, dp)
+    return alleles, sites
 
 
 def pearson(xs, ys):
@@ -154,8 +196,26 @@ def main():
                     help="skip sites whose total AD is below this on either side (default 0)")
     args = ap.parse_args()
 
-    a, b = load_af(args.truth), load_af(args.sim)
-    shared = [k for k in a if k in b]
+    a, _a_sites = load_af(args.truth)
+    b, b_sites = load_af(args.sim)
+
+    # A truth ALT the observed side never listed, at a position it DID cover, means
+    # zero reads carried that allele — an observed fraction of 0.0, which is a
+    # measurement. Dropping those would recreate exactly the VAF-dependent exclusion
+    # this fixes (#450), just at a lower threshold: the sites most likely to have no
+    # alt reads at all are the lowest-VAF ones, so excluding them biases the result
+    # optimistically. Fill them in and report how many.
+    shared, zero_filled = [], 0
+    for k in a:
+        if k in b:
+            shared.append(k)
+            continue
+        chrom, pos, ref, _alt = k
+        dp = b_sites.get((chrom, pos, ref))
+        if dp is not None and dp > 0:
+            b[k] = (0.0, dp)
+            shared.append(k)
+            zero_filled += 1
     only_a = len(a) - len(shared)
     only_b = len(b) - len(shared)
 
@@ -173,6 +233,13 @@ def main():
 
     print(f"truth sites={len(a)}  sim sites={len(b)}  shared={len(shared)}"
           f"  (only-truth={only_a}, only-sim={only_b})")
+    if zero_filled:
+        print(f"  {zero_filled} truth allele(s) had coverage but zero observed reads "
+              "-> scored as observed AF 0.0 (not dropped)")
+    if only_a:
+        print(f"  WARNING: {only_a} truth allele(s) had NO coverage on the observed "
+              "side and are excluded — if this is a large fraction, the comparison "
+              "does not cover the full planted set.", file=sys.stderr)
     if args.min_depth > 0:
         print(f"min-depth {args.min_depth:g}: {gated} shared sites gated, {len(xs)} compared")
     if len(xs) < 2:

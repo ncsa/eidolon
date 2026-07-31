@@ -72,6 +72,9 @@ PURITY="${PURITY:-0.7}"
 COV="${COV:-150}"                              # total (merged) depth; high so low-CCF sites
                                                # don't drop out and per-site VAF noise is tight
 MIN_DEPTH="${MIN_DEPTH:-25}"                   # gate low-depth sites in the comparison
+# mpileup's max per-site depth. Its default of 250 would silently downsample a
+# 200x+ run; set explicitly so any cap is deliberate and visible.
+MPILEUP_MAX_DEPTH="${MPILEUP_MAX_DEPTH:-2000}"
 # PASS is gated on FIDELITY metrics that hold for a discrete subclonal architecture:
 #   |mean(observed-intended)| = bias (systematic composition error) and MAE (per-site
 #   accuracy vs the binomial noise floor). Pearson r is ADVISORY only — for tight,
@@ -173,10 +176,6 @@ echo "EIDOLON_VAF spread (should span deciles for a subclonal architecture):"
 bcftools query -f '%INFO/AF\n' "$SITES" \
   | awk '{b=int($1*10); if(b>9)b=9; c[b]++} END{for(i=0;i<10;i++)printf "  [%.1f,%.1f) %d\n",i/10,(i+1)/10,c[i]+0}'
 
-# Tab-delimited allele list for forced genotyping (-C alleles): CHROM POS REF,ALT.
-ALLELES="$OUTDIR/alleles.tsv.gz"
-bcftools query -f '%CHROM\t%POS\t%REF,%ALT\n' "$SITES" | bgzip > "$ALLELES"
-tabix -s1 -b2 -e2 "$ALLELES"
 
 # ── Step 3: align the MERGED (mixed) reads — the sample a caller sees ─────────
 if [[ ! -s "${REF}.bwt.2bit.64" ]]; then
@@ -203,18 +202,42 @@ if ! bwa-mem2 mem -t "$THREADS" -R '@RG\tID:subvaf\tSM:merged\tPL:ILLUMINA' "$RE
 fi
 samtools index "$MERGED_BAM"
 
-# ── Step 4: OBSERVED VAF at the somatic sites (forced genotyping) ─────────────
-# -C alleles -T $ALLELES forces the KNOWN alt allele so AD is measured even for
-# low-VAF subclonal sites that a de-novo caller's LoD would drop — exactly the
-# sites #405 is about. FORMAT/AD then carries the observed alt fraction.
+# ── Step 4: OBSERVED VAF at the somatic sites (mpileup AD, no genotype call) ──
+# Read FORMAT/AD straight from mpileup. NO `bcftools call` (#450).
+#
+# The previous version piped mpileup into `bcftools call -m -C alleles`, on the
+# reasoning that -C alleles "forces the KNOWN alt allele so AD is measured even for
+# low-VAF subclonal sites that a de-novo caller's LoD would drop". -C alleles does
+# constrain which alleles are considered, but `call -m` still makes a diploid ML
+# GENOTYPE call — and a hom-ref call discards the uncalled allele together with its
+# read count. Measured in isolation at 7% VAF:
+#
+#   mpileup alone          REF=G ALT=T,<*>   AD=93,7,0     <- 7/100 = 0.07, correct
+#   mpileup | call -m      REF=G ALT=.       AD=93         <- allele and count gone
+#
+# Coverage cannot rescue it: identical at 100x, 300x and 600x, because the decision
+# is driven by the allele FRACTION against a diploid model — no diploid genotype
+# predicts 7%. So the step meant to preserve low-VAF sites was destroying exactly
+# them, and 160 of 567 planted sites (the entire lowest CCF cluster) never reached
+# the comparison. Measuring an allele fraction needs no genotype call at all.
+#
+# scn_af_compare.py selects this allele's own AD element from the ALT list, so
+# mpileup's `<*>` non-ref placeholder beside the real base is handled.
 SIM="$OUTDIR/observed.vcf.gz"
-echo "=== mpileup + forced-allele genotyping at the somatic sites ==="
-bcftools mpileup -a FORMAT/AD -f "$REF" -R "$SITES" "$MERGED_BAM" -Ou 2>/dev/null \
-  | bcftools call -m -C alleles -T "$ALLELES" -Oz -o "$SIM" 2>/dev/null
+echo "=== mpileup at the somatic sites (AD only, no genotype calling) ==="
+# -d: mpileup's default max depth is 250, which would silently downsample a 200x+
+# run. Set it explicitly so the cap is visible and generous.
+bcftools mpileup -a FORMAT/AD -d "$MPILEUP_MAX_DEPTH" -f "$REF" -R "$SITES" \
+    "$MERGED_BAM" -Oz -o "$SIM" 2>/dev/null
 bcftools index -t "$SIM"
 nsim=$(bcftools view -H "$SIM" | wc -l)
-echo "sites genotyped in merged BAM: $nsim"
-[[ "$nsim" -gt 0 ]] || { echo "ABORT: 0 sites genotyped — check alignment / -C alleles." >&2; exit 1; }
+echo "sites piled up in merged BAM: $nsim"
+[[ "$nsim" -gt 0 ]] || { echo "ABORT: 0 sites piled up — check alignment / -R sites." >&2; exit 1; }
+# Read-the-artifact guard: a site with coverage must carry a per-allele AD. If AD is
+# absent the comparison would silently find nothing to join.
+nad=$(bcftools query -f '%CHROM\t%POS\t[%AD]\n' "$SIM" 2>/dev/null | awk -F'\t' '$3!="" && $3!="."' | wc -l)
+echo "sites carrying FORMAT/AD: $nad"
+[[ "$nad" -gt 0 ]] || { echo "ABORT: no site carries FORMAT/AD — mpileup -a FORMAT/AD failed." >&2; exit 1; }
 
 # ── Step 5: compare intended EIDOLON_VAF (truth) vs observed merged-BAM VAF ──────
 echo
