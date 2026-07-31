@@ -99,6 +99,9 @@ module load htslib/1.22-gcc13.3.1
 setup_conda
 
 mkdir -p "$OUTDIR"
+# Refuse to run concurrently in an OUTDIR another job already owns —
+# interleaved writes yield results computed from corrupted intermediates.
+lock_outdir "$OUTDIR" || exit 1
 REF_NAME="$(basename "$REFERENCE")"
 
 echo "=== eidolon SV validation pipeline: $SLURM_JOB_ID ==="
@@ -152,11 +155,8 @@ index_and_align() {
     # Guard on -s, not -f: a build killed mid-write leaves a 0-byte .bwt.2bit.64
     # that -f treats as present, poisoning every later run (bwa-mem2: "Unexpected
     # end of file"). -s rebuilds on empty/missing.
-    if [[ ! -s "${REFERENCE}.bwt.2bit.64" ]] && [[ ! -s "${REFERENCE}.bwt" ]]; then
-        echo "  Indexing reference for BWA-MEM2 (one-time)..."
-        bwa-mem2 index "$REFERENCE" 2>&1 | tail -3
-    fi
-    [[ -f "${REFERENCE}.fai" ]] || samtools faidx "$REFERENCE"
+    # Serialized: concurrent jobs must not race the shared index (lib_report.sh).
+    index_reference_locked "$REFERENCE"
     echo "  Aligning $sample..."
     local rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
     if [[ "$PAIRED" == "true" ]]; then
