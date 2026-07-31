@@ -166,11 +166,11 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
     };
 
     // BND chimeric reads: QNAME format is
-    //   RNEAT_chimeric_<c1>_<pos>_<c2>_<mate>_<16-hex>/<mate-id>
+    //   EIDOLON_chimeric_<c1>_<pos>_<c2>_<mate>_<16-hex>/<mate-id>
     // (NOT prefixed with INV — that's INV's format).
     let bnd_chimeric = fastq_names
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_") && !l.contains("RNEAT_chimeric_INV_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_") && !l.contains("EIDOLON_chimeric_INV_"))
         .count();
     assert!(
         bnd_chimeric > 0,
@@ -178,12 +178,12 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
         fastq_names.len()
     );
 
-    // INV chimeric reads: QNAME starts with RNEAT_chimeric_INV_. Both
+    // INV chimeric reads: QNAME starts with EIDOLON_chimeric_INV_. Both
     // junctions (start `_1_` and end `_2_`) should be represented since the
     // INV is homozygous in input (1/1 → full coverage on each junction).
     let inv_chimeric = fastq_names
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_INV_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_INV_"))
         .count();
     assert!(
         inv_chimeric > 0,
@@ -191,10 +191,10 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
     );
     let has_junction_1 = fastq_names
         .iter()
-        .any(|l| l.contains("RNEAT_chimeric_INV_") && l.contains("_1_0"));
+        .any(|l| l.contains("EIDOLON_chimeric_INV_") && l.contains("_1_0"));
     let has_junction_2 = fastq_names
         .iter()
-        .any(|l| l.contains("RNEAT_chimeric_INV_") && l.contains("_2_0"));
+        .any(|l| l.contains("EIDOLON_chimeric_INV_") && l.contains("_2_0"));
     assert!(has_junction_1, "missing INV junction-1 reads");
     assert!(has_junction_2, "missing INV junction-2 reads");
 

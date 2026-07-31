@@ -1,7 +1,8 @@
 # Rename scope — `rusty-neat` / `rneat` → `eidolon`
 
 Planning doc for the project rename. **Status: Phase A DONE (PR #425, merged to `develop`;
-ships in the v2.0.0 release PR #426). Phases B–C pending.**
+ships in the v2.0.0 release PR #426). Phases B–C pending. Decision-1 output-token migration
+DONE (v3.0.0) — see Decisions §1.**
 Target release for the rename: **v2.0.0**, cut *after* v1.21.1 is fully released. Do not
 entangle the rename with any behavior change.
 
@@ -34,22 +35,23 @@ treated differently:
 |---|---|---|
 | **Identity** | `rneat`, `rusty-neat`, `RNEAT_BIN`, `RNEAT_REPO`, `rusty-neat-tests.yml` | → rename to `eidolon` / `EIDOLON_` |
 | **Pedigree** (keep) | `NEAT`, `NEAT2`, `NEAT4`, `neat-genreads`, comparison text | → **leave untouched** |
-| **Output-format tokens** | `NEAT_PROVENANCE`, `NEAT_simulated_sample`, `NEAT_ORIGIN`, `RNEAT_chimeric_*` | → **keep for v2.0.0**, migrate in a later release (decision 1) |
+| **Output-format tokens** | `NEAT_PROVENANCE`, `NEAT_simulated_sample`, `NEAT_ORIGIN`, `RNEAT_chimeric_*` | → kept for v2.0.0; **migrated to `EIDOLON_*` in v3.0.0** (decision 1) |
 
 Codebase inventory at scoping time: `rneat` 866× / 129 files, `rusty-neat` 93× / 32 files,
 `RNEAT` 204× / 46 files (mostly `RNEAT_BIN`/`RNEAT_REPO` env vars + `RNEAT_chimeric_` prefixes).
 
 ## Decisions (locked)
 
-1. **Output-format tokens — keep in v2.0.0, migrate later.** The `NEAT_*` INFO tags
-   (`NEAT_PROVENANCE`, `NEAT_ORIGIN`), the `NEAT_simulated_sample` VCF sample column, and the
-   `RNEAT_chimeric_*` FASTQ read-name prefixes appear in generated output, are asserted
-   byte-for-byte in tests (`vcf_tools.rs`, `dup_chimeric.rs`), and are parsed downstream
-   (`cancer_benchmark.sh` filters `INFO/NEAT_ORIGIN`). v2.0.0 **keeps them as-is** for output
-   stability. A **follow-up release (post-2.0.0)** migrates these output identifiers to
-   `EIDOLON_*` as a deliberate, separately-versioned format change (re-bless the affected
-   parity assertions then). *(Interpreting "change the file names, but after a release" as this
-   output-token migration — confirm if something else was meant.)*
+1. **Output-format tokens — keep in v2.0.0, migrate later. → DONE (v3.0.0).** The `NEAT_*` INFO tags
+   (`NEAT_PROVENANCE`, `NEAT_ORIGIN`, plus the later `NEAT_REASON`/`NEAT_CCF`/`NEAT_VAF`), the
+   `NEAT_simulated_sample` VCF sample column, and the `RNEAT_generated_*` / `RNEAT_chimeric_*`
+   FASTQ read-name prefixes appear in generated output, are asserted byte-for-byte in tests
+   (`vcf_tools.rs`, `dup_chimeric.rs`), and are parsed downstream (`cancer_benchmark.sh` filters
+   `INFO/NEAT_ORIGIN`). v2.0.0 kept them as-is for output stability; **v3.0.0 migrates all of
+   them to `EIDOLON_*`** as a deliberate, separately-versioned breaking format change — bundled
+   scripts and the `filter_reads` read-name parser moved in lockstep and the parity/baseline
+   assertions re-blessed. Pedigree `NEAT`/`NEAT2`/`NEAT4` and internal env vars (`NEAT_DATA`,
+   `NEAT_tumor_corpus`) are intentionally out of scope and unchanged.
 2. **Ship a deprecation shim.** A `rneat` alias binary that prints a "renamed to `eidolon`"
    warning and forwards all args to `eidolon`, kept for at least one release as a safety net.
 3. **Version: v2.0.0.** A CLI/crate identity change is breaking, even though there is no
@@ -66,7 +68,8 @@ Codebase inventory at scoping time: `rneat` 866× / 129 files, `rusty-neat` 93×
 - Tests: `assert_cmd::cargo_bin("rneat")` → `"eidolon"` (`cancer_parity.rs`,
   `tests/common/mod.rs`); fixture path references.
 - Source: log/help/`about` strings; `RNEAT_*` → `EIDOLON_*` env-var names in `scripts/` + `tools/`.
-- Leave all `NEAT_*` / `RNEAT_chimeric_*` output tokens untouched (decision 1).
+- Leave all `NEAT_*` / `RNEAT_chimeric_*` output tokens untouched **in this phase** (decision 1);
+  they were migrated later, in v3.0.0.
 - CI: `rust_binaries.yml` (artifact names/paths), `rusty-neat-tests.yml` → `eidolon-tests.yml`
   (job name + filename), `thirdparty-licenses.yml`.
 - Docs: `README.md` (keep the NEAT-pedigree section; add a "formerly rusty-neat / rneat" line),

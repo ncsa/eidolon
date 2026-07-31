@@ -18,7 +18,7 @@
 #   4. Filter the truth VCF to SV records (symbolic ALTs and long literal
 #      indels with |ILEN| >= 50 — including v1.12.0's de novo INS records
 #      that are emitted as literal-ALT) and optionally restrict to
-#      INFO/NEAT_ORIGIN="somatic" so we measure somatic-SV-calling
+#      INFO/EIDOLON_ORIGIN="somatic" so we measure somatic-SV-calling
 #      performance, not germline-subtraction quality.
 #   5. Score Manta's somatic SV calls against the filtered truth using
 #      truvari bench.
@@ -68,8 +68,8 @@ DOCKER="docker"
 # scored by the SNV/indel benchmark (cancer_benchmark.sh), and a structural
 # caller like Manta is not expected to emit them — leaving them in tanks the
 # apparent recall (they all become false negatives). Set --truth-filter '' to
-# score against the full truth (e.g. when the truth has no NEAT_ORIGIN/SVTYPE).
-TRUTH_FILTER='INFO/SVTYPE!="." && INFO/NEAT_ORIGIN="somatic"'
+# score against the full truth (e.g. when the truth has no EIDOLON_ORIGIN/SVTYPE).
+TRUTH_FILTER='INFO/SVTYPE!="." && INFO/EIDOLON_ORIGIN="somatic"'
 
 usage() {
     cat <<'EOF'
@@ -104,7 +104,7 @@ Resources:
 Truth filtering:
   --truth-filter   bcftools view -i expression applied to the truth VCF
                    before scoring. Default:
-                     (TYPE="other" || abs(ILEN) >= 50) && INFO/NEAT_ORIGIN="somatic"
+                     (TYPE="other" || abs(ILEN) >= 50) && INFO/EIDOLON_ORIGIN="somatic"
                    — keeps SV records that Manta in tumor/normal mode is
                    expected to call. Pass an empty string to skip filtering.
 
@@ -296,6 +296,26 @@ SCORING_TRUTH_NAME="$(basename "$SCORING_TRUTH")"
 if [[ -f "$SCORING_TRUTH" ]]; then
     echo ">> Filtered truth-SV VCF already present — skipping."
 else
+    # See cancer_benchmark.sh: bcftools rejects an undefined INFO tag in a -i
+    # expression at parse time, so probe the header first — otherwise the advice
+    # below is unreachable for a truth VCF that simply lacks the tag.
+    if [[ -n "$TRUTH_FILTER" && "$TRUTH_FILTER" == *EIDOLON_ORIGIN* ]]; then
+        truth_header="$(run_in "$BCFTOOLS_IMG" bcftools view -h "/truth_in/$TRUTH_NAME")"
+        if ! grep -q '^##INFO=<ID=EIDOLON_ORIGIN,' <<<"$truth_header"; then
+            if grep -q '^##INFO=<ID=NEAT_ORIGIN,' <<<"$truth_header"; then
+                echo "ERROR: $TRUTH_NAME carries the pre-v3.0.0 NEAT_ORIGIN tag." >&2
+                echo "  eidolon v3.0.0 renamed the emitted output tokens. Convert it once:" >&2
+                echo "    tools/migrate_legacy_tokens.sh '$TRUTH_VCF' migrated_truth.vcf.gz" >&2
+                echo "    $0 --truth-vcf migrated_truth.vcf.gz ..." >&2
+            else
+                echo "ERROR: $TRUTH_NAME has no INFO/EIDOLON_ORIGIN tag." >&2
+                echo "  If this is a non-eidolon truth set, pass --truth-filter '' or a" >&2
+                echo "  custom expression." >&2
+            fi
+            exit 1
+        fi
+    fi
+
     if [[ -n "$TRUTH_FILTER" ]]; then
         echo ">> Filtering truth VCF for SVs with: $TRUTH_FILTER"
         run_in "$BCFTOOLS_IMG" sh -c \
@@ -304,9 +324,14 @@ else
         filtered_count=$(run_in "$BCFTOOLS_IMG" sh -c \
             "bcftools view -H '/work/$SCORING_TRUTH_NAME' | wc -l" | tr -d '\r\n')
         if [[ "$filtered_count" == "0" ]]; then
-            echo "WARNING: truth filter matched zero SV records." >&2
-            echo "  If your truth VCF doesn't carry SVs (or doesn't have INFO/NEAT_ORIGIN)," >&2
+            # Fatal, not a warning: truvari against an empty truth yields recall=0 for
+            # every caller, which reads as a caller/simulator problem rather than a
+            # filter mistake.
+            echo "ERROR: truth filter matched zero SV records." >&2
+            echo "  Refusing to score against an empty truth set." >&2
+            echo "  If your truth VCF doesn't carry SVs (or doesn't have INFO/EIDOLON_ORIGIN)," >&2
             echo "  pass --truth-filter '' or a custom expression." >&2
+            exit 1
         else
             echo "    Filtered truth: $filtered_count SV records retained."
         fi
@@ -367,7 +392,7 @@ score_positional() {  # svtype  check_end(0|1)
     local svtype="$1" check_end="$2"
     local truth_pos="$OUTPUT_DIR/truth_${svtype}_pos.txt"
     run_in "$BCFTOOLS_IMG" sh -c \
-        "bcftools view -H -i 'INFO/SVTYPE=\"$svtype\" && INFO/NEAT_ORIGIN=\"somatic\"' '/truth_in/$TRUTH_NAME' \
+        "bcftools view -H -i 'INFO/SVTYPE=\"$svtype\" && INFO/EIDOLON_ORIGIN=\"somatic\"' '/truth_in/$TRUTH_NAME' \
          | awk '{p=\$2; e=p; if(match(\$8,/END=[0-9]+/))e=substr(\$8,RSTART+4,RLENGTH-4); print \$1\"\t\"p\"\t\"e}'" \
         > "$truth_pos" || true
     awk -v W="$BP_WINDOW" -v CE="$check_end" '

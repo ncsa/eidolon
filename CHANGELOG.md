@@ -1,3 +1,146 @@
+7/28/2026
+=========
+## eidolon v3.0.0 — subclonal heterogeneity (#405); output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*; adopting SemVer
+
+**Breaking output-format change** — no behavior change, only the names of emitted tokens.
+Completes decision 1 of `docs/rename_eidolon_scope.md` (the post-2.0.0 output-token
+migration). Downstream code that parses the old names must update.
+
+### Why 3.0.0, and a versioning policy going forward
+
+This release is **3.0.0**, not 2.1.0, and from here on eidolon follows
+[Semantic Versioning 2.0.0](https://semver.org).
+
+Earlier releases were versioned by feel, and by that habit this would have been a minor
+bump: it completes a rename announced back in v2.0.0, and three prior releases shipped
+breaking output changes as minor bumps (v1.11.0 and v1.12.0 both changed the FASTQ
+read-name format; v1.6.0 removed config fields under a bolded "Breaking change"). That
+pattern was not doing users any favours — a minor bump tells you it is safe to upgrade
+without reading anything, and for these releases that was not true.
+
+SemVer requires a project to **declare what its public API is**, so eidolon's is now
+stated explicitly (also in the README):
+
+**Part of the public API** — changes here require a MAJOR bump:
+- Names and semantics of emitted VCF INFO tags, the VCF sample-column name, and the
+  `FILTER`/`FORMAT` fields eidolon writes
+- FASTQ/BAM **read-name (QNAME) format**, including the `EIDOLON_generated_` /
+  `EIDOLON_chimeric_` prefixes and the positional fields encoded after them
+- CLI subcommand names, flags, and configuration-YAML keys
+- Model-file format compatibility (a model built by version *N* being readable by *N+1*)
+
+**Not part of the public API** — these may change in a MINOR or PATCH release:
+- The Rust library (`eidolon-core`) API surface; this crate exists to serve the binary
+- Log output, progress reporting, and human-readable messages
+- Exact simulated *content* for a given seed — reads are a random draw, and any change
+  to the sampler or models legitimately changes output while preserving the format
+
+For a read simulator the emitted format is the interface downstream code actually binds
+to, which is why it heads the list. That is also the reasoning that makes this release
+major: renaming the tokens is a breaking change to that interface, notwithstanding that
+it was pre-announced and that no behavior changed.
+
+### New feature — subclonal heterogeneity for gen-cancer-reads (#405)
+
+The tumor is no longer a single global purity split, which collapsed every somatic variant
+to ~one effective VAF. A tumor is now a mixture of **subclones** at distinct cancer-cell
+fractions (CCF), and each somatic variant's observed alt fraction composes as
+`purity × dosage × CCF` — the CCF *composes* with the variant's dosage and purity rather
+than replacing them, so a het somatic at CCF *f* lands at ~*f*/2 in the merged output.
+This is the intra-tumor heterogeneity axis the predecessor could not represent at all.
+
+Three ways to specify the architecture (mutually exclusive):
+
+- **Inline** — `subclones:`, a list of `{ccf, weight}`; the somatic burden is split across
+  populations in proportion to `weight` (default 1.0 = equal share), `ccf ∈ (0, 1]`.
+- **Fitted from real data** — `subclones_file:` accepts a **PyClone-VI** per-mutation table
+  (grouped by cluster, weight = mutation count) or a **PCAWG-11 / DPClust** cluster table
+  (`cluster` + `ccf` + a size column: `n_ssms` / `size` / `weight`).
+- **Replayed** — `somatic_vcf:` honors a real tumor's *observed* VAF per site: each input
+  site's VAF is divided by purity so the merged reads reproduce it, and the record is
+  tagged `somatic`. Observed VAF above purity is clamped to 1.0; sites with no usable VAF
+  fall back to genotype dosage.
+
+**Ground truth in the truth VCF.** Every somatic record carries `INFO/EIDOLON_CCF` (the
+intended CCF) and `INFO/EIDOLON_VAF` (the intended *observed* VAF — what a caller should
+measure on the merged sample). Note `FORMAT/AF` in the truth is measured per-pass
+(tumor-only, = dosage × CCF); `EIDOLON_VAF` is that × purity, so `EIDOLON_VAF` is the
+correct target when scoring a somatic caller against the merged output.
+
+**Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate, align
+the merged reads with bwa-mem2, and measure the observed VAF at each somatic site against
+the intended `EIDOLON_VAF`. Two complementary runs:
+
+| Metric | Generative — soy scaffold | Reproductive — HCC1395 chr1 |
+|---|---|---|
+| Input VAF spectrum | 3 synthetic CCF clusters (≈0.04 / 0.16 / 0.40) | real tumor's empirical VAF, all deciles 0.1–1.0 |
+| Coverage / purity | 200× / 0.8 | 200× / 0.9 |
+| Somatic sites (compared) | 567 planted (387 scored) | 2,948 (2,698 scored) |
+| Bias, mean(observed − intended) | −0.003 | −0.004 |
+| MAE (vs ~200× noise floor) | 0.026 | 0.024 |
+| Pearson r | 0.95 | **0.99** |
+
+The generative run confirms the `purity × dosage × CCF` composition is unbiased and
+accurate to the sampling limit; per-site Pearson is a spread-dependent summary for tight
+discrete clusters, so fidelity is gated on bias + MAE-vs-noise-floor rather than r. The
+reproductive run replays SEQC2 **HCC1395** (a triple-negative breast cancer cell line) at
+its observed VAF over GRCh38 chr1 — a real tumor's full *continuous* distribution, where
+Pearson is fully meaningful: r = 0.99, unbiased (−0.004), per-decile MAE uniform at
+0.009–0.027 across the whole 0.1–1.0 range.
+
+Harnesses: `scripts/delta/run_subclonal_vaf_validation.sh` (generative) and
+`scripts/delta/run_hcc1395_reproductive.sh` (reproductive). Config template:
+`template_config/gen_cancer_reads_template.yml`; details in `docs/cancer_simulator.md` and
+`docs/cancer_howto.md`.
+
+### Output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*
+
+- **VCF INFO tags:** `NEAT_ORIGIN` → `EIDOLON_ORIGIN`, `NEAT_PROVENANCE` → `EIDOLON_PROVENANCE`,
+  `NEAT_REASON` → `EIDOLON_REASON`, `NEAT_CCF` → `EIDOLON_CCF`, `NEAT_VAF` → `EIDOLON_VAF`.
+- **VCF sample column:** `NEAT_simulated_sample` → `EIDOLON_simulated_sample`.
+- **FASTQ/BAM read-name prefixes:** `RNEAT_generated_*` → `EIDOLON_generated_*`,
+  `RNEAT_chimeric_*` → `EIDOLON_chimeric_*` (these still carried the older `rusty-neat`
+  prefix; now aligned with the tool name).
+- Bundled scripts moved in lockstep (`tools/cancer_simulate.sh`, `cancer_benchmark.sh`,
+  `cancer_sv_benchmark.sh`, `scripts/delta/*`); the `filter_reads` read-name parser updated
+  (now length-agnostic); parity/baseline test assertions re-blessed.
+- **Migration path for pre-v2.1.0 files.** The rename would otherwise strand existing
+  artifacts, so:
+  - **`tools/migrate_legacy_tokens.sh`** converts a v2.0.0 VCF in place of a manual fix-up
+    (`--rename-annots` for the INFO tags, `reheader -s` for the sample column). It is
+    **idempotent** — a no-op on an already-current or non-eidolon VCF — so call sites can
+    invoke it unconditionally. A `--check` mode reports without converting (exit 10 = legacy
+    tokens present). Note a dual-name bcftools filter is *not* a workable alternative:
+    bcftools rejects an undefined tag in a `-i` expression at parse time, so even
+    `EIDOLON_ORIGIN=… || NEAT_ORIGIN=…` fails outright on a file carrying only one of them.
+  - `scripts/delta/{cancer_pipeline,sv_pipeline}.sbatch` run that converter automatically when
+    the truth VCF predates the rename. `tools/cancer_benchmark.sh` and `cancer_sv_benchmark.sh`
+    run bcftools inside a container (the host needn't have it), so they instead pre-flight the
+    truth header and print an actionable message naming the converter. That check also makes
+    the pre-existing "pass `--truth-filter ''`" hint reachable — bcftools' parse-time tag
+    error previously aborted the run before it could be printed.
+  - **`eidolon filter-reads` accepts both `@EIDOLON_generated_` and the v2.0.0
+    `@RNEAT_generated_` read-name prefix**, so legacy FASTQs need no conversion at all —
+    rewriting hundreds of GB to change a 19-byte prefix is not a reasonable ask. (The two
+    prefixes differ in length, so the parser slices by the *matched* prefix.)
+  - `write_vcf` now **drops eidolon's own pre-v2.1.0 INFO tokens** from a passed-through INFO
+    column instead of reproducing them. Feeding a v2.0.0 golden VCF back in via `input_vcf:`
+    or `somatic_vcf:` previously preserved e.g. `NEAT_PROVENANCE` verbatim on symbolic records
+    while the header declared only the `EIDOLON_*` names — an undeclared tag, which streams
+    fine VCF→VCF but hard-fails BCF translation (`bcftools concat | sort` does that
+    internally). Dropping rather than renaming is deliberate: the writer re-emits the current
+    equivalent, so a stale tag would contradict it.
+- **Not changed:** NEAT pedigree in README/`CITATION.cff`/comparison text; the `NEAT_DATA`
+  staging env var; and the benchmark harnesses' env vars that point at the *predecessor*
+  NEAT 4 tool (`NEAT_BIN`, `NEAT_ENV`, `NEAT_SEED`, `NEAT_MAX_GENOME_MB`) — those name NEAT,
+  not eidolon.
+- **Also not changed (deliberate):** the sample-column names in *intermediate corpus* VCFs
+  synthesized by the model-building scripts — `NEAT_tumor_corpus` (`tools/fetch_tumor_corpus.sh`,
+  `fetch_cosmic_corpus.sh`, `fetch_cosmic_per_tissue_corpus.sh`) and `NEAT_pcawg_corpus`
+  (`tools/build_pcawg_sv_vcf.py`). These are emitted tokens, not env vars, but they appear only
+  in throwaway inputs to `gen-mut-model` — never in simulation output — so renaming them would
+  force a re-fetch of every corpus for no downstream benefit.
+
 7/21/2026
 =========
 ## eidolon v2.0.0 — renamed from rusty-neat / rneat

@@ -99,6 +99,9 @@ module load htslib/1.22-gcc13.3.1
 setup_conda
 
 mkdir -p "$OUTDIR"
+# Refuse to run concurrently in an OUTDIR another job already owns —
+# interleaved writes yield results computed from corrupted intermediates.
+lock_outdir "$OUTDIR" || exit 1
 REF_NAME="$(basename "$REFERENCE")"
 
 echo "=== eidolon SV validation pipeline: $SLURM_JOB_ID ==="
@@ -114,7 +117,11 @@ MERGED_R1="${PREFIX}_merged_r1.fastq.gz"
 NORMAL_R1="${PREFIX}_normal_r1.fastq.gz"
 TRUTH_VCF="${PREFIX}_merged_truth.vcf.gz"
 
-if [[ -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
+# Refuse to score fresh caller output against a truth VCF written by a different
+# build of eidolon (see lib_report.sh::check_outdir_version).
+check_outdir_version "$EIDOLON_BIN" "$OUTDIR" || exit 1
+
+if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
     echo "[1/5] Simulation outputs already present — skipping."
 else
     echo "[1/5] Simulating SV-rich tumor/normal reads..."
@@ -133,6 +140,7 @@ else
         --eidolon-bin "$EIDOLON_BIN" \
         $PAIRED_FLAG
     echo "[1/5] Simulation complete."
+    stamp_outdir_version "$OUTDIR"
 fi
 
 # ── Stage 2 & 3: Index reference, align ──────────────────────────────────
@@ -147,11 +155,8 @@ index_and_align() {
     # Guard on -s, not -f: a build killed mid-write leaves a 0-byte .bwt.2bit.64
     # that -f treats as present, poisoning every later run (bwa-mem2: "Unexpected
     # end of file"). -s rebuilds on empty/missing.
-    if [[ ! -s "${REFERENCE}.bwt.2bit.64" ]] && [[ ! -s "${REFERENCE}.bwt" ]]; then
-        echo "  Indexing reference for BWA-MEM2 (one-time)..."
-        bwa-mem2 index "$REFERENCE" 2>&1 | tail -3
-    fi
-    [[ -f "${REFERENCE}.fai" ]] || samtools faidx "$REFERENCE"
+    # Serialized: concurrent jobs must not race the shared index (lib_report.sh).
+    index_reference_locked "$REFERENCE"
     echo "  Aligning $sample..."
     local rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
     if [[ "$PAIRED" == "true" ]]; then
@@ -174,13 +179,34 @@ index_and_align "${PREFIX}_merged_r1.fastq.gz" "$TUMOR_BAM" "TUMOR"
 # ── Stage 3b: PRE-FLIGHT — inspect + extract the somatic SV truth ────────
 # eidolon's SVs are symbolic records (ALT like <DEL>/<DUP>/<INV>, INFO SVTYPE/
 # SVLEN/END). Print a sample so we can confirm the schema, then extract the
-# somatic SV subset truvari will score. NEAT_ORIGIN=somatic drops germline
+# somatic SV subset truvari will score. EIDOLON_ORIGIN=somatic drops germline
 # carry-through; the symbolic-ALT test keeps only SVs (not SNVs/indels).
+# Normalize pre-v2.1.0 NEAT_* tokens if this truth VCF predates the rename (e.g.
+# re-scoring an archived artifact). Idempotent and a no-op on a current file, so
+# the unconditional call is safe. `|| rc=$?` (not `; echo $?`) so the non-zero
+# --check status is *tested* — under set -e an untested non-zero would abort here.
+# Only 0 and 10 are meaningful: any other status means the pre-flight itself failed
+# (missing input, no bcftools, bad converter path) and must NOT be mistaken for
+# "already current", or the auto-convert silently no-ops and the run dies later on a
+# raw undefined-tag error. stderr is deliberately not suppressed.
+migrate_rc=0
+bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null \
+    || migrate_rc=$?
+case "$migrate_rc" in
+    0) ;;   # already current
+    10) MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
+        bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
+        TRUTH_VCF="$MIGRATED_TRUTH" ;;
+    *)  echo "ERROR: legacy-token pre-flight failed (rc=$migrate_rc) on $TRUTH_VCF" >&2
+        echo "  Not proceeding: an unconverted truth VCF would fail the filter below." >&2
+        exit 1 ;;
+esac
+
 TRUTH_SV="$OUTDIR/truth_sv.vcf.gz"
 echo "[3b/5] Inspecting eidolon SV truth..."
 echo "  --- SV INFO header lines ---"
-bcftools view -h "$TRUTH_VCF" | grep -iE 'INFO=<ID=(SVTYPE|SVLEN|END|NEAT_ORIGIN)' || \
-    echo "  (no SVTYPE/SVLEN/END/NEAT_ORIGIN INFO headers found — schema may differ!)"
+bcftools view -h "$TRUTH_VCF" | grep -iE 'INFO=<ID=(SVTYPE|SVLEN|END|EIDOLON_ORIGIN)' || \
+    echo "  (no SVTYPE/SVLEN/END/EIDOLON_ORIGIN INFO headers found — schema may differ!)"
 echo "  --- first symbolic-ALT (SV) records ---"
 bcftools view -H "$TRUTH_VCF" | awk '$5 ~ /^</' | head -5 || true
 echo "  --- SVTYPE counts in truth (all origins) ---"
@@ -191,7 +217,7 @@ if [[ -f "$TRUTH_SV" ]]; then
 else
     # Permissive SV selector: symbolic ALT OR an SVTYPE INFO tag, AND somatic.
     # If the pre-flight above shows a different schema, adjust this -i expression.
-    bcftools view -i '(ALT[0]~"<" || INFO/SVTYPE!=".") && INFO/NEAT_ORIGIN="somatic"' \
+    bcftools view -i '(ALT[0]~"<" || INFO/SVTYPE!=".") && INFO/EIDOLON_ORIGIN="somatic"' \
         -O z -o "$TRUTH_SV" "$TRUTH_VCF"
     bcftools sort -O z -o "$TRUTH_SV" "$TRUTH_SV" 2>/dev/null || true
     bcftools index -f -t "$TRUTH_SV"

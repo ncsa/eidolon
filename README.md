@@ -4,6 +4,10 @@
 > NEAT lineage; the `rneat` command still works as a deprecated alias for one transition
 > release. See `CHANGELOG.md`.
 
+> **Upgrading from 2.0.0 → 3.0.0? The names of emitted output tokens changed.**
+> See [Upgrading from 2.0.0](#upgrading-from-200) below — **read it if you have any
+> script that parses eidolon VCFs or FASTQ/BAM read names.**
+
 Welcome to `eidolon`, a Rust port of NEAT (https://github.com/ncsa/neat), a genetic simulation program that creates fastq that appear to be from sequencers, carry the same statistical properties as your data, and generate a golden bam and fastq that gives you ideal alignments and what variants were inserted. In addition, `eidolon` generates "noise" in the form of sequencing errors as it is writing out files. These features can help you hone in your alignment and variant calling software to your data. Training models on your data will allow `eidolon` to faithfully reproduce the statistical properties of your dataset.
 
 We have spent some dedicated time toward gearing the current version of `eidolon` to simulate cancer genetics, including adding structural variant simulations (CNV, BND, SVs, and others), and creating a wrapper that simulates purity levels and then stitches the results back together. We've geared this software with an aim at keeping memory usage as low and CPU time as short as possible. Let us know your real world experience by creating a Feedback issue, if you have something that's not quite a bug, or have a positive experience to share. As always, let us know if you find a bug and give as many details as you can to help us troubleshoot.
@@ -20,7 +24,7 @@ Find us on Zenodo:
 one normal-genotype, one tumor — over the same reference and merges them at a
 configurable purity into a single "tumor biopsy" FASTQ that downstream somatic
 callers (Mutect2, Strelka, Manta, …) consume directly, plus an origin-tagged truth
-VCF (`INFO/NEAT_ORIGIN ∈ {germline, somatic, shared}`) for scoring. It also
+VCF (`INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}`) for scoring. It also
 generates the foundational structural-variant types cancer SVs depend on — `<BND>`
 translocations, `<INV>` inversions, and de novo `<INS>` — and ships bundled
 pan-cancer and per-tissue (BRCA / skin / lung) models plus Docker-based benchmark
@@ -40,7 +44,7 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 
 |                                            | **NEAT 2.x** (genReads)        | **NEAT 4.x**                              | **`eidolon`**                                              |
 | ------------------------------------------ | ------------------------------ | ----------------------------------------- | -------------------------------------------------------- |
-| Latest version                             | 2.1                            | 4.5.3                                      | 2.0.0                                                    |
+| Latest version                             | 2.1                            | 4.5.3                                      | 3.0.0                                                    |
 | Language                                   | Python 2                       | Python 3                                  | Rust                                                     |
 | FASTQ reads (single / paired)              | ✅                             | ✅                                        | ✅                                                       |
 | Golden BAM + VCF truth set                 | ✅                             | ✅                                        | ✅                                                       |
@@ -80,6 +84,113 @@ when you want:
   environment to manage, installable via Bioconda
   (`conda install -c bioconda eidolon`).
 
+## Versioning and the public API
+
+As of **v3.0.0**, eidolon follows [Semantic Versioning 2.0.0](https://semver.org): a
+MAJOR bump means something you may depend on changed incompatibly, a MINOR bump adds
+functionality compatibly, and a PATCH bump is fixes only. Releases before v3.0.0 were
+versioned less strictly — notably v1.11.0 and v1.12.0 changed the FASTQ read-name format
+in minor bumps.
+
+SemVer requires a project to say what its public API is. For eidolon:
+
+**Public API — a change here means a MAJOR bump:**
+- Names and semantics of emitted VCF INFO tags, the VCF sample-column name, and the
+  `FILTER` / `FORMAT` fields eidolon writes
+- FASTQ/BAM **read-name (QNAME) format** — the `EIDOLON_generated_` /
+  `EIDOLON_chimeric_` prefixes and the positional fields encoded after them
+- CLI subcommand names, flags, and configuration-YAML keys
+- Model-file compatibility (a model built by one version staying readable by the next)
+
+**Not public API — may change in a MINOR or PATCH release:**
+- The `eidolon-core` Rust library surface; it exists to serve the binary
+- Log output, progress reporting, and human-readable messages
+- The exact simulated *content* for a given seed — reads are a random draw, so sampler
+  and model changes legitimately alter output while preserving the format
+
+If you parse eidolon's output, the first list is what you are relying on, and a major
+version bump is your signal to check this file before upgrading.
+
+## Upgrading from 2.0.0
+
+v3.0.0 renamed the tokens eidolon **emits**. There is no behavior change — the same
+reads and variants are produced — but anything that *parses* eidolon output needs
+attention. In-tree consumers were all migrated; your own scripts were not.
+
+| Surface | v2.0.0 and earlier | v3.0.0+ | Migration |
+|---|---|---|---|
+| VCF INFO tags | `NEAT_ORIGIN`, `NEAT_PROVENANCE`, `NEAT_REASON`, `NEAT_CCF`, `NEAT_VAF` | `EIDOLON_*` | **converter provided** |
+| VCF sample column | `NEAT_simulated_sample` | `EIDOLON_simulated_sample` | **converter provided** |
+| FASTQ read names | `@RNEAT_generated_*`, `RNEAT_chimeric_*` | `@EIDOLON_generated_*`, `EIDOLON_chimeric_*` | **not converted** — see below |
+| BAM read names (QNAME) | `RNEAT_generated_*` | `EIDOLON_generated_*` | **not converted** — see below |
+
+### VCFs — convert them
+
+```bash
+tools/migrate_legacy_tokens.sh old_truth.vcf.gz new_truth.vcf.gz
+tools/migrate_legacy_tokens.sh --check old_truth.vcf.gz   # report only; exit 10 = legacy
+```
+
+Idempotent: safe to run on a file that's already current, or on a non-eidolon VCF, so
+you can call it unconditionally in a pipeline. It rewrites the header declarations and
+the record fields together, so the result is a valid VCF.
+
+Note you **cannot** work around this with a dual-name bcftools filter — bcftools rejects
+an undefined tag in a `-i` expression at parse time, so even
+`INFO/EIDOLON_ORIGIN="somatic" || INFO/NEAT_ORIGIN="somatic"` fails outright on a file
+that carries only one of the two. Convert the file instead.
+
+### Read names — NOT converted, and this is the part that can bite you
+
+Read names are **not** rewritten, in either FASTQ or BAM. Rewriting files that are
+routinely hundreds of GB to change ~19 bytes per record isn't a reasonable ask, so
+instead `eidolon filter-reads` accepts **both** prefixes natively — legacy FASTQs keep
+working with no conversion step, and it warns once when it sees an old prefix.
+
+**Nothing protects your own scripts.** A `grep '^@RNEAT_generated_'`, `awk` field split,
+or regex over read names will match **zero records and exit 0** against v3.0.0 output —
+a silent empty result, not an error. Audit for the old prefix before upgrading:
+
+```bash
+grep -rn 'RNEAT_generated_\|RNEAT_chimeric_' your_scripts/
+```
+
+#### Best fix: make your parser prefix-agnostic
+
+**Only the prefix changed.** Everything after `_generated_` —
+`<contig>_<start>_<end>_<uniq>/<mate>` — is byte-for-byte identical between versions
+(verified across every read of a golden BAM re-prefixed both ways). So rather than
+rewriting files, strip the prefix and your script works against *either* version, and
+against any future rename:
+
+```bash
+# version-proof: drop whatever prefix is present, keep the encoded fields
+samtools view x.bam | cut -f1 | sed -E 's/^[A-Z]+_generated_//'
+zcat x_r1.fastq.gz  | awk 'NR%4==1' | sed -E 's/^@[A-Z]+_generated_//'
+```
+
+Same trick for chimeric reads: `sed -E 's/^@?[A-Z]+_chimeric_//'`.
+
+If you are joining an old artifact against a new one on read name, normalize both sides
+this way. One unrelated gotcha for QNAME joins: eidolon's golden BAM **keeps** the `/1`
+`/2` mate suffix, while bwa strips it from aligned BAMs — so strip that too
+(`sed 's|/[12]$||'`) when joining a golden BAM to an aligner's output. That mismatch
+predates this release.
+
+#### If you must rewrite the files instead
+
+```bash
+# FASTQ (expensive — a full re-compress; prefer the prefix-agnostic parse above)
+zcat old_r1.fastq.gz | sed 's/^@RNEAT_generated_/@EIDOLON_generated_/' | gzip > new_r1.fastq.gz
+
+# BAM QNAMEs (QNAME is field 1, and no header line contains the prefix, so ^ is safe)
+samtools view -h old.bam | sed 's/^RNEAT_generated_/EIDOLON_generated_/' | samtools view -b -o new.bam
+```
+
+BAM QNAMEs are covered by no in-tree tooling — `filter-reads` reads FASTQ, and the
+converter is bcftools-based so it cannot touch a BAM. Nothing eidolon ships parses BAM
+read names either, so this only affects your own scripts.
+
 # How to use `eidolon`
 
 ## Prerequisites
@@ -95,7 +206,7 @@ required. If you prefer to build from source or grab a release binary, read on.
 
 You will need to install the rust toolchain to compile `eidolon`, including `cargo`. Check the cargo documentation for instructions (https://doc.rust-lang.org/cargo/getting-started/installation.html). Alternatively, you can try one of the binaries on the release page. Select the one that matches your system and let us know if you run into errors. During compilation, you may run into errors, such as cmake not found. Some of the packages `eidolon` uses have these dependencies. For Debian/Ubuntu this should be a simple `sudo apt install cmake` and for RHEL/Rocky type distros this should be `sudo dnf install cmake`. There may be some other requirements. Drop a comment if you need specific help.
 
-Download the executable in the release (current version 2.0.0).
+Download the executable in the release (current version 3.0.0).
 
 ```bash
 $ eidolon --help
@@ -196,10 +307,10 @@ If you record the output in the logs of Seed string to regenerate these exact re
 
 Fastq Output
 ============
-The fastq output will have a key name that identifies the block where the read was drawn from, for quick comparisons in alignments. The output BAM file will contain the original sequence and cigar string. The name will have the format `RNEAT_generated_<contig short name>_<fragment_start>_<fragment_end>/1` (or `/2` for the second read in a pair), where start and end are zero-padded to 10 digits.
+The fastq output will have a key name that identifies the block where the read was drawn from, for quick comparisons in alignments. The output BAM file will contain the original sequence and cigar string. The name will have the format `EIDOLON_generated_<contig short name>_<fragment_start>_<fragment_end>_<uniq>/1` (or `/2` for the second read in a pair), where start and end are zero-padded to 10 digits and `<uniq>` is a 16-digit hex per-fragment tag that keeps same-position fragments from colliding (see #210).
 
 ```bash
-@RNEAT_generated_Chromosome_0000000000_0000000353/1
+@EIDOLON_generated_Chromosome_0000000000_0000000353_000000000000002a/1
 CTTTTCATTCTGACTGCAACGGGCAATATGTCTCTGTGTGGATTAAAAAAAGAGTGTCTGATAGCAGCTTCTTAACTGGTTACCTGCCGTGAGTAAATTAAAATTTTATTGACTTAGGTCACTAAATACTTTAACCAATATAGGCATAGC
 +
 >AC7<GDEGGGGEFGA<GFCGG;GGGGGF>GEGGEGGGFGFEFGCEGGGGGGCG:AEFGFFGG>FG;GDGA9$GGAGF=GFG=EFFCGGGFGGGGGC$BFGEFFAGGG9F7E@>?GFGGGG>EBFGFDG)DGC6DEDFA2EG:EGG%FFB
@@ -900,7 +1011,7 @@ The run produces four files under `output_dir`:
 
 - `comparison_summary.json` — schema-versioned (currently `1.3.0`), machine-readable. Includes TP/FN/FP totals + per-contig breakdown, precision / recall / F1, the FN attribution roll-up (`outside_simulated_contigs`, `outside_mutation_bed`, `outside_target_bed`, `unknown`), per-VCF skip counters (`multiallelic`, `homozygous_ref`, `filtered`, `outside_target_bed`, `outside_simulated_contigs`, `symbolic`), and any chrom-naming-mismatch warnings. Symbolic / structural ALTs (`<DEL>`, `<DUP>`, `<CNV>`, ...) are byte-incomparable, so they're counted into `skipped.symbolic` and excluded from TP/FN/FP classification.
 - `comparison_summary.txt` — same content, human-readable.
-- `FN_with_reasons.vcf` — every surviving FN, annotated with a `NEAT_REASON` INFO tag listing the attribution reasons.
+- `FN_with_reasons.vcf` — every surviving FN, annotated with a `EIDOLON_REASON` INFO tag listing the attribution reasons.
 - `FP.vcf` (optional) — every surviving FP, as-is. Off by default; enable with `write_fp_vcf: true`.
 
 **Equivalence detection.** For each false-positive variant, `compare-vcfs` takes a ±`equivalence_window` bp window of the reference and applies both the FP set and the FN set within that window. If the resulting byte sequences are identical, the two sets are alternative spellings of the same edit and every consumed FN is promoted to TP. Set `fast: true` to skip this pass; the report's `totals.equivalents_promoted` counts how many TPs were rescued by it.

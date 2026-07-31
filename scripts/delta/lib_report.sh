@@ -159,3 +159,116 @@ archive_run() {
 
     echo "[archive] $kind -> $dest  (core_hours=${core_hours:-0.0}, files: $*)"
 }
+
+# ── OUTDIR provenance guard ─────────────────────────────────────────────────
+# Reusing an OUTDIR across a rebuild silently mixes artifacts from two code
+# versions: fresh caller VCFs scored against a truth VCF written by the OLD
+# binary. The per-script "simulation regenerated — invalidating stale downstream
+# outputs" logic only fires when the simulation RE-RUNS, so nothing catches the
+# inverse (new binary, skipped simulation). That is a wrong answer with no
+# warning, which is the failure mode this repo keeps hitting.
+#
+# check_outdir_version sets EIDOLON_VERSION and FORCE_RESIM (0/1).
+# Call it before the simulation stage; call stamp_outdir_version after a
+# successful simulation.
+check_outdir_version() {
+    local bin="$1" outdir="$2"
+    EIDOLON_VERSION="$("$bin" --version 2>/dev/null | tr -d '\r\n')"
+    if [[ -z "$EIDOLON_VERSION" ]]; then
+        echo "ERROR: could not read '$bin --version' — is it built?" >&2
+        return 1
+    fi
+    FORCE_RESIM=0
+    local stamp="$outdir/.eidolon_version"
+    if [[ ! -f "$stamp" ]]; then
+        # No stamp: either a fresh OUTDIR, or one predating this guard. If it
+        # already holds simulation outputs we cannot know what produced them —
+        # say so rather than assume, but don't force an expensive redo of a
+        # legacy directory the user may know is fine.
+        if compgen -G "$outdir"/*_merged_truth.vcf.gz >/dev/null 2>&1; then
+            echo "WARNING: $outdir has simulation outputs but no .eidolon_version stamp," >&2
+            echo "         so their provenance is unknown. If they predate your last" >&2
+            echo "         rebuild, the truth VCF and the caller inputs come from" >&2
+            echo "         different code. Use a fresh OUTDIR if in doubt." >&2
+        fi
+        return 0
+    fi
+    local prev
+    prev="$(tr -d '\r\n' < "$stamp")"
+    [[ "$prev" == "$EIDOLON_VERSION" ]] && return 0
+    if [[ "${ALLOW_VERSION_MISMATCH:-0}" == "1" ]]; then
+        echo "WARNING: $outdir was built by '$prev' but this binary is" >&2
+        echo "         '$EIDOLON_VERSION'; ALLOW_VERSION_MISMATCH=1 — reusing anyway." >&2
+        return 0
+    fi
+    echo "  OUTDIR was built by '$prev' but this binary is '$EIDOLON_VERSION'."
+    echo "  Regenerating the simulation so the truth VCF and the caller inputs come"
+    echo "  from the same code. Set ALLOW_VERSION_MISMATCH=1 to reuse as-is."
+    FORCE_RESIM=1
+    return 0
+}
+
+stamp_outdir_version() {
+    printf '%s\n' "$EIDOLON_VERSION" > "$1/.eidolon_version"
+}
+
+# ── OUTDIR concurrency lock ─────────────────────────────────────────────────
+# Two jobs pointed at one OUTDIR silently interleave their writes — the same
+# FASTQ, BAM, truth-VCF and caller-output paths — and still produce numbers,
+# derived from corrupted intermediates. Observed with SLURM jobs 20635663 and
+# 20636020, which both simulated into $SCRATCH/t6_sv_v3 concurrently; neither
+# reported anything wrong.
+#
+# The lock is held for the life of the job because fd 9 stays open. flock is
+# released by the kernel when the holder exits, so a killed job leaves NO stale
+# lock to clean up — the lockfile persisting on disk is harmless.
+lock_outdir() {
+    local outdir="$1" lockfile="$1/.lock"
+    mkdir -p "$outdir"
+    # <> not > : opening for write would TRUNCATE the holder's identity before we
+    # even try to acquire, so a rejected job couldn't report who has it.
+    if ! exec 9<>"$lockfile"; then
+        echo "ERROR: cannot open lock file $lockfile" >&2
+        return 1
+    fi
+    if ! flock -n 9; then
+        local holder
+        holder="$(tr -d '\r' < "$lockfile" 2>/dev/null | head -1)"
+        echo "ERROR: another job is already running in $outdir" >&2
+        echo "       held by: ${holder:-<unknown>}" >&2
+        echo "  Concurrent runs sharing an OUTDIR interleave their writes and yield" >&2
+        echo "  results computed from corrupted intermediates — with no warning." >&2
+        echo "  Use a different OUTDIR, or wait for that job to finish." >&2
+        return 1
+    fi
+    printf 'SLURM job %s on %s since %s\n' \
+        "${SLURM_JOB_ID:-manual}" "$(hostname)" "$(date -Is 2>/dev/null || date)" \
+        > "$lockfile"
+    return 0
+}
+
+# Serialize the shared bwa-mem2 index build. Two jobs that both see no index will
+# both run `bwa-mem2 index` against the SAME path and interleave writes, poisoning
+# it for both — the 0-byte .bwt.2bit.64 state the call sites already guard against
+# after the fact. Blocking lock: the second job waits, then finds the index present
+# and skips. Degrades to the unlocked check if the reference dir isn't writable.
+index_reference_locked() {
+    local ref="$1"
+    if exec 8<>"${ref}.index.lock" 2>/dev/null; then
+        flock 8
+        if [[ ! -s "${ref}.bwt.2bit.64" ]] && [[ ! -s "${ref}.bwt" ]]; then
+            echo "  Indexing reference for BWA-MEM2 (one-time, lock held)..."
+            bwa-mem2 index "$ref" 2>&1 | tail -3
+        fi
+        flock -u 8
+        exec 8>&-
+    else
+        echo "  NOTE: cannot create ${ref}.index.lock (read-only dir?) — indexing" >&2
+        echo "        unserialized; do not run concurrent jobs against a fresh reference." >&2
+        if [[ ! -s "${ref}.bwt.2bit.64" ]] && [[ ! -s "${ref}.bwt" ]]; then
+            echo "  Indexing reference for BWA-MEM2 (one-time)..."
+            bwa-mem2 index "$ref" 2>&1 | tail -3
+        fi
+    fi
+    [[ -f "${ref}.fai" ]] || samtools faidx "$ref"
+}

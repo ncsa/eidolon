@@ -99,6 +99,9 @@ setup_conda
 conda_activate bioinf   # provides bwa-mem2, gatk4, bcftools (not available as modules)
 
 mkdir -p "$OUTDIR"
+# Refuse to run concurrently in an OUTDIR another job already owns —
+# interleaved writes yield results computed from corrupted intermediates.
+lock_outdir "$OUTDIR" || exit 1
 REF_DIR="$(dirname "$REFERENCE")"
 REF_NAME="$(basename "$REFERENCE")"
 
@@ -114,8 +117,12 @@ MERGED_R1="${PREFIX}_merged_r1.fastq.gz"
 NORMAL_R1="${PREFIX}_normal_r1.fastq.gz"
 TRUTH_VCF="${PREFIX}_merged_truth.vcf.gz"
 
+# Refuse to score fresh caller output against a truth VCF written by a different
+# build of eidolon (see lib_report.sh::check_outdir_version).
+check_outdir_version "$EIDOLON_BIN" "$OUTDIR" || exit 1
+
 SIM_REGENERATED=0
-if [[ -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
+if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
     echo "[1/6] Simulation outputs already present — skipping."
 else
     echo "[1/6] Simulating tumor/normal reads..."
@@ -141,6 +148,7 @@ else
         $PAIRED_FLAG
     echo "[1/6] Simulation complete."
     SIM_REGENERATED=1
+    stamp_outdir_version "$OUTDIR"
 fi
 
 # ── Stage 2 & 3: Index reference, align FASTQs ──────────────────────────
@@ -169,16 +177,10 @@ index_and_align() {
         return 0
     fi
 
-    # Index reference once (idempotent). Guard on -s, not -f: a build killed
-    # mid-write leaves a 0-byte .bwt.2bit.64 that -f treats as present, poisoning
-    # every later run (bwa-mem2: "Unexpected end of file"). -s rebuilds on empty.
-    if [[ ! -s "${REFERENCE}.bwt.2bit.64" ]] && [[ ! -s "${REFERENCE}.bwt" ]]; then
-        echo "  Indexing reference for BWA-MEM2 (one-time, ~2 min)..."
-        bwa-mem2 index "$REFERENCE" 2>&1 | tail -3
-    fi
-    if [[ ! -f "${REFERENCE}.fai" ]]; then
-        samtools faidx "$REFERENCE"
-    fi
+    # Index reference once, serialized so concurrent jobs can't race the shared
+    # index. The -s (not -f) guard against a 0-byte .bwt.2bit.64 from a build
+    # killed mid-write lives in index_reference_locked (lib_report.sh).
+    index_reference_locked "$REFERENCE"
 
     echo "  Aligning $sample..."
     local rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
@@ -323,20 +325,52 @@ if [[ "$RUN_VARSCAN" == "1" ]]; then
 fi
 
 # ── Stage 6: Score each caller with hap.py som.py ───────────────────────
-# Somatic-only truth (NEAT_ORIGIN=somatic); germline carry-through (shared) is
+# Somatic-only truth (EIDOLON_ORIGIN=somatic); germline carry-through (shared) is
 # correctly ignored by T/N callers, so scoring against it would be meaningless.
 # Strelka (5b) may leave us in its conda env (especially on its failure path);
 # scoring needs bioinf (bcftools) + apptainer, so re-activate it here.
 conda_activate bioinf
+# Normalize pre-v2.1.0 NEAT_* tokens if this truth VCF predates the rename (e.g.
+# re-scoring an archived artifact). The converter is idempotent and a no-op on a
+# current file, so calling it unconditionally is safe. It matters because bcftools
+# rejects an undefined INFO tag in the -i expression below at parse time.
+# `|| rc=$?` (not `; echo $?`) so the non-zero --check status is *tested* — under
+# set -e an untested non-zero would abort before we could read it. Only 0 and 10 are
+# meaningful: any other status means the pre-flight itself failed (missing input, no
+# bcftools, bad converter path) and must NOT be mistaken for "already current", or the
+# auto-convert silently no-ops and the run dies later on a raw undefined-tag error.
+# stderr is deliberately not suppressed so the reason is visible.
+migrate_rc=0
+bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" --check "$TRUTH_VCF" >/dev/null \
+    || migrate_rc=$?
+case "$migrate_rc" in
+    0) ;;   # already current
+    10) MIGRATED_TRUTH="$OUTDIR/truth_migrated.vcf.gz"
+        bash "$REPO_ROOT/tools/migrate_legacy_tokens.sh" "$TRUTH_VCF" "$MIGRATED_TRUTH"
+        TRUTH_VCF="$MIGRATED_TRUTH" ;;
+    *)  echo "ERROR: legacy-token pre-flight failed (rc=$migrate_rc) on $TRUTH_VCF" >&2
+        echo "  Not proceeding: an unconverted truth VCF would fail the filter below." >&2
+        exit 1 ;;
+esac
+
 SCORE_TRUTH="$OUTDIR/scoring_truth.vcf.gz"
 if [[ ! -f "$SCORE_TRUTH" ]]; then
     echo "[6/6] Filtering truth to somatic records..."
-    bcftools view -i 'INFO/NEAT_ORIGIN="somatic"' -O z -o "$SCORE_TRUTH" "$TRUTH_VCF"
+    bcftools view -i 'INFO/EIDOLON_ORIGIN="somatic"' -O z -o "$SCORE_TRUTH" "$TRUTH_VCF"
     bcftools index -f -t "$SCORE_TRUTH"
 fi
 somatic_count=$(bcftools view -H "$SCORE_TRUTH" | wc -l)
 echo "      Somatic truth records: $somatic_count"
-[[ "$somatic_count" -eq 0 ]] && echo "WARNING: no somatic truth records — check NEAT_ORIGIN." >&2
+if [[ "$somatic_count" -eq 0 ]]; then
+    echo "ERROR: no somatic truth records after filtering with:" >&2
+    echo "         INFO/EIDOLON_ORIGIN=\"somatic\"" >&2
+    echo "  Scoring against an empty truth would report every caller as 0 recall with" >&2
+    echo "  no indication why, so this is fatal. Check INFO/EIDOLON_ORIGIN is present" >&2
+    echo "  in $TRUTH_VCF (pre-v3.0.0 truth VCFs use NEAT_ORIGIN — convert with" >&2
+    echo "  tools/migrate_legacy_tokens.sh), or that the tumor pass planted somatic" >&2
+    echo "  variants at all (raise TUMOR_MUTATION_RATE / coverage)." >&2
+    exit 1
+fi
 [[ -f "$HAPPY_SIF" ]] || { echo "hap.py SIF not found: $HAPPY_SIF — run setup.sh first" >&2; exit 1; }
 
 # hap.py/som.py hardcodes UCSC chr-prefixing of input VCFs (perl s/^([0-9XYM])/chr/),
@@ -346,7 +380,13 @@ echo "      Somatic truth records: $somatic_count"
 # chr-prefixed copy for scoring so the renamed VCFs match. (chr22.fa etc. pass
 # through unchanged.) Alignment/Mutect2 already used $REFERENCE as-is — unaffected.
 SCORE_REF_DIR="$REF_DIR"; SCORE_REF_NAME="$REF_NAME"
-if ! head -1 "${REFERENCE}.fai" 2>/dev/null | grep -q '^chr'; then
+# Only build the chr-prefixed copy when som.py will ACTUALLY rename the VCF contigs.
+# Its perl is `s/^([0-9XYM])/chr/`, so it renames 1/2/X/Y/MT but leaves anything else
+# alone — including GenBank accession names (CM000851.4, soybean). Keying off "not
+# chr-prefixed" lumped those in with Ensembl-numeric and prefixed the REFERENCE while
+# som.py left the VCF unprefixed, so scoring died with a contig mismatch
+# ("Error running BCFTOOLS ... vcfcheck") on a reference that needed no help at all.
+if head -1 "${REFERENCE}.fai" 2>/dev/null | grep -qE '^[0-9XYM]'; then
     SCORE_REF="${REFERENCE%.fa}.chr.fa"
     if [[ ! -f "$SCORE_REF" ]]; then
         echo "[6/6] Reference is Ensembl-named; building chr-prefixed copy for som.py..."
@@ -398,7 +438,7 @@ Inputs:
 
 Key outputs in $OUTDIR:
   Simulation:     sample_merged_{r1,r2}.fastq.gz
-  Truth VCF:      sample_merged_truth.vcf.gz  (NEAT_ORIGIN-tagged)
+  Truth VCF:      sample_merged_truth.vcf.gz  (EIDOLON_ORIGIN-tagged)
   Somatic truth:  scoring_truth.vcf.gz         (somatic only)
   Mutect2 calls:  mutect2.filtered.vcf.gz   -> scored.stats.csv
   VarScan2 calls: varscan.somatic.vcf.gz    -> scored_varscan.stats.csv  (RUN_VARSCAN=1)

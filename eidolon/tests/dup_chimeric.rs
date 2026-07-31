@@ -77,12 +77,12 @@ fn gen_reads_with_symbolic_dup_emits_chimeric_junction_reads() {
 
     let dup_chimeric: Vec<&String> = fastq_qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DUP_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DUP_"))
         .collect();
 
     assert!(
         !dup_chimeric.is_empty(),
-        "expected ≥1 RNEAT_chimeric_DUP_ read in FASTQ for a homozygous \
+        "expected ≥1 EIDOLON_chimeric_DUP_ read in FASTQ for a homozygous \
          400bp DUP at 100× coverage; got 0 of {} total reads",
         fastq_qnames.len()
     );
@@ -90,7 +90,7 @@ fn gen_reads_with_symbolic_dup_emits_chimeric_junction_reads() {
     // QNAME shape pins POS=400 END=799.
     let qname_has_coords = dup_chimeric
         .iter()
-        .any(|q| q.contains("RNEAT_chimeric_DUP_H1N1_HA_400_799_"));
+        .any(|q| q.contains("EIDOLON_chimeric_DUP_H1N1_HA_400_799_"));
     assert!(
         qname_has_coords,
         "DUP chimeric QNAMEs must carry POS=400 END=799. Got: {:?}",

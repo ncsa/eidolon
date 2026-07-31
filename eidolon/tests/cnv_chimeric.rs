@@ -3,8 +3,8 @@
 //! CNV chimeric reads dispatch to the DEL or DUP path based on whether
 //! INFO/CN is below or above the diploid baseline. This test exercises
 //! both directions:
-//!   - CN=0 (homozygous loss) → DEL-like RNEAT_chimeric_DEL_ reads
-//!   - CN=4 (amplification, +2 vs diploid) → DUP-like RNEAT_chimeric_DUP_ reads
+//!   - CN=0 (homozygous loss) → DEL-like EIDOLON_chimeric_DEL_ reads
+//!   - CN=4 (amplification, +2 vs diploid) → DUP-like EIDOLON_chimeric_DUP_ reads
 //!
 //! Note: the QNAMEs reuse the DEL/DUP tags rather than introducing a
 //! separate `CNV` tag because the underlying junction shape is identical
@@ -87,7 +87,7 @@ fn cnv_with_cn_below_ploidy_emits_del_like_chimeric() {
     let qnames = run_cnv("cnv_loss", 0);
     let chimeric: Vec<&String> = qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DEL_H1N1_HA_400_799_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DEL_H1N1_HA_400_799_"))
         .collect();
     assert!(
         !chimeric.is_empty(),
@@ -97,7 +97,7 @@ fn cnv_with_cn_below_ploidy_emits_del_like_chimeric() {
     // Ensure NO DUP-tagged reads appear (CN < ploidy is a loss, not a gain).
     let wrong: Vec<&String> = qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DUP_H1N1_HA_400_799_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DUP_H1N1_HA_400_799_"))
         .collect();
     assert!(
         wrong.is_empty(),
@@ -111,7 +111,7 @@ fn cnv_with_cn_above_ploidy_emits_dup_like_chimeric() {
     let qnames = run_cnv("cnv_gain", 4);
     let chimeric: Vec<&String> = qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DUP_H1N1_HA_400_799_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DUP_H1N1_HA_400_799_"))
         .collect();
     assert!(
         !chimeric.is_empty(),
@@ -122,7 +122,7 @@ fn cnv_with_cn_above_ploidy_emits_dup_like_chimeric() {
     // No DEL-tagged reads either.
     let wrong: Vec<&String> = qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DEL_H1N1_HA_400_799_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DEL_H1N1_HA_400_799_"))
         .collect();
     assert!(
         wrong.is_empty(),

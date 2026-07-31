@@ -446,8 +446,13 @@ impl SvModel {
         let max_retries = ((n_sv as f64 * 10.0 * retry_mult) as usize).max(20);
         let mut out: Vec<Variant> = Vec::with_capacity(n_sv);
         let mut retries = 0usize;
+        // Count placed *events*, not emitted records: a BND is one event that
+        // emits a mate PAIR (two records, see below). Gating the loop on
+        // out.len() would let each BND consume two slots and halve the number of
+        // SVs actually placed. For every other type events == out.len().
+        let mut events = 0usize;
 
-        while out.len() < n_sv && retries < max_retries {
+        while events < n_sv && retries < max_retries {
             retries += 1;
 
             let sv_type = match weighted_pick_with(&types, &type_cum, rng) {
@@ -598,8 +603,12 @@ impl SvModel {
                         // this BND rather than emit an unrecoverable truth.
                         continue;
                     }
+                    // The BND ALT embeds the reference base at THIS breakend
+                    // (VCF 4.2 §5.4). A literal "N" contradicts the REF column,
+                    // which carries the real base — see #451.
+                    let anchor_char: char = anchor_base.into();
                     (
-                        format!("N]{contig_name}:{mp_candidate}]"),
+                        format!("{anchor_char}]{contig_name}:{mp_candidate}]"),
                         Some(contig_name.to_string()),
                         Some(mp_candidate),
                     )
@@ -625,6 +634,39 @@ impl SvModel {
 
             let info_field = build_info_field(sv_type, sv_end_1based, length, copy_number);
 
+            // A BND is a two-sided event. VCF 4.2 §5.4 represents a novel
+            // adjacency as a mate PAIR — one record per breakend, cross-linked by
+            // MATEID — and that is what callers emit, so a one-sided truth record
+            // is unmatchable by any comparison tool (#451). Build stable IDs from
+            // the junction's own coordinates so they're deterministic and unique.
+            let bnd_pair = if sv_type == SvType::Bnd {
+                match (
+                    sv_data.mate_pos,
+                    sequence.get(sv_data.mate_pos.unwrap_or(0).saturating_sub(1)),
+                ) {
+                    (Some(mate_1based), Some(&mate_base)) if mate_base != Nucleotide::N => {
+                        let anchor_1based = anchor_0based + 1;
+                        Some((
+                            format!("eidolon_bnd_{contig_name}_{anchor_1based}_{mate_1based}_1"),
+                            format!("eidolon_bnd_{contig_name}_{anchor_1based}_{mate_1based}_2"),
+                            anchor_1based,
+                            mate_1based,
+                            mate_base,
+                        ))
+                    }
+                    // Mate base unusable (out of range / N). Emitting a lone
+                    // breakend would recreate #451, so drop the whole event.
+                    _ => continue,
+                }
+            } else {
+                None
+            };
+
+            let (info_1, id_1) = match &bnd_pair {
+                Some((id1, id2, ..)) => (format!("{info_field};MATEID={id2}"), Some(id1.clone())),
+                None => (info_field, None),
+            };
+
             occupied.push((affected_start, affected_end));
             out.push(Variant {
                 variant_type: VariantType::Complex,
@@ -632,28 +674,65 @@ impl SvModel {
                 reference: vec![anchor_base],
                 alternate: AlternateType::Symbolic(sv_data),
                 genotype_str: genotype_str.clone(),
-                genotype,
+                genotype: genotype.clone(),
                 allele_fraction: None,
-                id: None,
+                id: id_1,
                 quality_score: None,
                 filter: None,
-                info: Some(info_field),
+                info: Some(info_1),
                 format: vec!["GT".to_string()],
-                sample: vec![genotype_str],
+                sample: vec![genotype_str.clone()],
                 provenance: Provenance::Denovo,
             });
+
+            // The mate breakend. Reciprocal `t]p]` form, matching the spec's own
+            // worked example (`G]17:198982]` <-> `A]2:321681]`) — keeping this
+            // orientation means the junction sequence the chimeric read generator
+            // builds is unchanged; only the record representation is fixed.
+            if let Some((id1, id2, anchor_1based, mate_1based, mate_base)) = bnd_pair {
+                let mate_char: char = mate_base.into();
+                let mut mate_sv = SvData::new(
+                    format!("{mate_char}]{contig_name}:{anchor_1based}]"),
+                    SvType::Bnd,
+                );
+                mate_sv.end = Some(mate_1based);
+                mate_sv.svlen = None;
+                mate_sv.copy_number = None;
+                mate_sv.mate_contig = Some(contig_name.to_string());
+                mate_sv.mate_pos = Some(anchor_1based);
+                let mate_info = format!(
+                    "{};MATEID={id1}",
+                    build_info_field(SvType::Bnd, mate_1based, 1, None)
+                );
+                out.push(Variant {
+                    variant_type: VariantType::Complex,
+                    location: mate_1based.saturating_sub(1),
+                    reference: vec![mate_base],
+                    alternate: AlternateType::Symbolic(mate_sv),
+                    genotype_str: genotype_str.clone(),
+                    genotype,
+                    allele_fraction: None,
+                    id: Some(id2),
+                    quality_score: None,
+                    filter: None,
+                    info: Some(mate_info),
+                    format: vec!["GT".to_string()],
+                    sample: vec![genotype_str],
+                    provenance: Provenance::Denovo,
+                });
+            }
+
+            events += 1;
         }
 
-        if out.len() < n_sv {
+        // Compare EVENTS, not records — a BND emits two records for one event, so
+        // out.len() would mask an under-placement.
+        if events < n_sv {
             warn!(
                 "SvModel: requested {} de novo SV(s) but only placed {} after {} retries \
                  (overlap / N-anchor rejection saturated; cap = {}bp at \
                  max_length_fraction={:.2}). On small contigs, raise sv_max_length_fraction.",
-                n_sv,
-                out.len(),
-                retries,
-                upper_len,
-                frac
+                n_sv, events, retries, upper_len, frac
             );
         } else {
             info!(
@@ -1325,6 +1404,111 @@ mod tests {
         let mut rng = deterministic_rng();
         let out = m.sample_variants("chr1", MIN_SV_LENGTH_BP, &[], &seq, 2, 1.0, 0.25, &mut rng);
         assert!(out.is_empty());
+    }
+
+    /// A BND is a two-sided event: VCF 4.2 §5.4 wants a mate PAIR, cross-linked by
+    /// MATEID, with each record's ALT embedding the reference base at *its own*
+    /// breakend. Before #451 the sampler emitted a single record with `id: None`,
+    /// no MATEID, and a hardcoded `N` in the ALT — unmatchable by any comparison
+    /// tool, and `sample_variants_emits_all_supported_types` passed anyway because
+    /// it only asserts the BND *type appears*.
+    #[test]
+    fn denovo_bnd_emits_a_cross_linked_mate_pair() {
+        let mut m = SvModel::default();
+        m.per_base_rate = 5e-3;
+        m.homozygous_frequency = 0.5;
+        m.type_probabilities.clear();
+        m.type_probabilities.insert(SvType::Bnd, 1.0);
+        m.length_log_normal.insert(SvType::Bnd, (7.0, 0.3));
+        let seq = acgt_sequence(50_000);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", 50_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+
+        let bnds: Vec<&Variant> = out
+            .iter()
+            .filter(|v| {
+                v.alternate
+                    .as_symbolic()
+                    .map(|s| s.sv_type == SvType::Bnd)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(!bnds.is_empty(), "expected at least one de novo BND");
+        assert_eq!(
+            bnds.len() % 2,
+            0,
+            "BND records must come in pairs: {bnds:?}"
+        );
+
+        // Every record has an ID, and MATEID resolves to a record that points back.
+        let by_id: std::collections::HashMap<&str, &Variant> = bnds
+            .iter()
+            .map(|v| (v.id.as_deref().expect("BND must carry an ID"), *v))
+            .collect();
+        assert_eq!(by_id.len(), bnds.len(), "BND IDs must be unique");
+
+        for v in &bnds {
+            let info = v.info.as_deref().unwrap_or("");
+            let mateid = info
+                .split(';')
+                .find_map(|f| f.strip_prefix("MATEID="))
+                .unwrap_or_else(|| panic!("BND record has no MATEID: {info}"));
+            let mate = by_id
+                .get(mateid)
+                .unwrap_or_else(|| panic!("MATEID={mateid} does not resolve to a record"));
+            let back = mate
+                .info
+                .as_deref()
+                .unwrap_or("")
+                .split(';')
+                .find_map(|f| f.strip_prefix("MATEID="))
+                .unwrap_or("");
+            assert_eq!(
+                back,
+                v.id.as_deref().unwrap(),
+                "MATEID linkage is not reciprocal"
+            );
+
+            // The ALT's embedded breakend base must equal this record's REF.
+            let alt = v.alternate.as_symbolic().unwrap().raw_alt.clone();
+            let ref_char: char = v.reference[0].into();
+            assert_eq!(
+                alt.chars().next().unwrap(),
+                ref_char,
+                "BND ALT must embed its own REF base (not a literal N): REF={ref_char} ALT={alt}"
+            );
+
+            // And the mate's position must be the mate record's own location.
+            let mate_pos_1based = v.alternate.as_symbolic().unwrap().mate_pos.unwrap();
+            assert_eq!(
+                mate_pos_1based.saturating_sub(1),
+                mate.location,
+                "mate_pos must point at the mate record's location"
+            );
+        }
+    }
+
+    /// The sampling loop is gated on placed *events*, not emitted records — a BND
+    /// emits two records, so gating on `out.len()` would halve the SV count.
+    #[test]
+    fn bnd_pair_counts_as_one_event_toward_n_sv() {
+        let mut m = SvModel::default();
+        m.per_base_rate = 5e-3;
+        m.homozygous_frequency = 0.5;
+        m.type_probabilities.clear();
+        m.type_probabilities.insert(SvType::Bnd, 1.0);
+        m.length_log_normal.insert(SvType::Bnd, (7.0, 0.3));
+        let seq = acgt_sequence(50_000);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", 50_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+        // Junctions, not records.
+        let junctions = out.len() / 2;
+        assert!(
+            junctions >= 2,
+            "an all-BND model should place multiple junctions, got {junctions} \
+             ({} records) — a loop gated on out.len() would halve this",
+            out.len()
+        );
     }
 
     #[test]

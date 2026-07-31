@@ -752,6 +752,47 @@ the germline pipeline was moved to node-local NVMe staging (heavy FASTQ/BAM I/O 
 compute node's local disk, only small artifacts copied back to Lustre), making it immune to
 transient OST outages; a fastp thread-count livelock at high core counts was also capped.
 
+### 3.12 Subclonal heterogeneity — intra-tumor VAF spectrum (#405)
+
+NEAT and pre-#405 eidolon model a tumor with a single global `purity` scalar, so every
+somatic variant collapses to essentially one effective VAF — no intra-tumor
+heterogeneity. eidolon now models a tumor as a **mixture of subclones at distinct
+cancer-cell fractions (CCF)**: each somatic variant's observed alt fraction composes as
+`purity × dosage × CCF` (three orthogonal axes — normal contamination, per-copy
+multiplicity, subclonal prevalence). The architecture can be authored inline, **fitted
+from real data** (PyClone-VI / PCAWG cluster tables), or **replayed** from a real somatic
+VCF at its observed VAF. Every somatic truth record carries the intended CCF (`INFO/EIDOLON_CCF`)
+and the intended observed VAF (`INFO/EIDOLON_VAF`) as ground truth.
+
+**Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate,
+align the merged reads with bwa-mem2, and measure the observed VAF at each somatic site
+against the intended `EIDOLON_VAF`. Two complementary runs — a *controlled synthetic*
+architecture and a *real tumor's empirical* spectrum:
+
+| Metric | Generative — soy scaffold | Reproductive — HCC1395 chr1 |
+|---|---|---|
+| Input VAF spectrum | 3 synthetic CCF clusters (≈0.04 / 0.16 / 0.40) | real tumor's empirical VAF, all deciles 0.1–1.0 |
+| Coverage / purity | 200× / 0.8 | 200× / 0.9 |
+| Somatic sites (compared) | 567 planted (387 scored) | 2,948 (2,698 scored) |
+| Bias, mean(observed − intended) | −0.003 | −0.004 |
+| MAE (vs ~200× noise floor) | 0.026 | 0.024 |
+| Pearson r | 0.95 | **0.99** |
+
+The **generative** run (SEQC2-agnostic, single soybean scaffold, three subclones)
+confirms the `purity × dosage × CCF` composition is unbiased and accurate to the sampling
+limit; per-site Pearson is a spread-dependent summary for tight discrete clusters, so
+fidelity is gated on bias + MAE-vs-noise-floor rather than r.
+
+The **reproductive** run replays SEQC2 **HCC1395** (a triple-negative breast cancer cell
+line) — its high-confidence somatic SNVs honored at their observed VAF over GRCh38 chr1.
+This is a real tumor's full *continuous* VAF distribution (2,948 sites spanning every
+decile), so Pearson is fully meaningful: the aligned reads reproduce it at **r = 0.99**,
+unbiased (−0.004), with per-decile MAE uniform at 0.009–0.027 across the whole 0.1–1.0
+range. Together these show eidolon reproduces both a *designed* subclonal architecture and
+a *real tumor's* empirical VAF spectrum — a complexity axis (intra-tumor heterogeneity) the
+predecessor could not represent at all. Harnesses: `scripts/delta/run_subclonal_vaf_validation.sh`
+(generative) and `scripts/delta/run_hcc1395_reproductive.sh` (reproductive).
+
 ---
 
 ## 4. Phase 2 — robustness at scale (planned, key deliverables)
@@ -857,4 +898,9 @@ constraint.
 
 _Run-level metrics and provenance for every job (version, git commit, reference,
 core-hours) are archived under the project results directory and assembled by
-`scripts/delta/collect_report.sh`._
+`scripts/delta/collect_report.sh`. Note the archive spans **two roots** because the
+project was renamed `rusty-neat`/`rneat` → `eidolon` partway through (v2.0.0): Phase 1
+runs — everything backing §3.1–§3.11 — are under
+`/projects/bhrd/jallen17/rneat-access-results/`, while runs from v2.0.0 onward are under
+`/projects/bhrd/jallen17/eidolon-access-results/`. Each job directory records its own
+version and git commit, so provenance is per-run regardless of which root holds it._

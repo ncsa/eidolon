@@ -31,7 +31,7 @@ pub enum Genotype {
 
 /// Where a variant came from in the current `gen-reads` run.
 ///
-/// Emitted as `INFO/NEAT_PROVENANCE` in the golden VCF so downstream
+/// Emitted as `INFO/EIDOLON_PROVENANCE` in the golden VCF so downstream
 /// merges (e.g. `tools/cancer_simulate.sh`'s normal/tumor truth merge)
 /// can resolve cancer-specific origin labels (`germline` / `somatic` /
 /// `shared`) without `gen-reads` itself needing any cancer vocabulary.
@@ -41,14 +41,19 @@ pub enum Provenance {
     Denovo,
     /// Variant was carried through from the user's `input_vcf:` file.
     InputVcf,
+    /// Variant was supplied via a reproductive somatic VCF (#405). Distinct from
+    /// `InputVcf` (germline) so a tumor/normal merge resolves it to `somatic`, not
+    /// `shared`, even though — like `InputVcf` — it came from a file.
+    SomaticVcf,
 }
 
 impl Provenance {
-    /// Lowercase string used in `INFO/NEAT_PROVENANCE=` values.
+    /// Lowercase string used in `INFO/EIDOLON_PROVENANCE=` values.
     pub fn as_str(&self) -> &'static str {
         match self {
             Provenance::Denovo => "denovo",
             Provenance::InputVcf => "input",
+            Provenance::SomaticVcf => "somatic_input",
         }
     }
 }
@@ -327,7 +332,7 @@ pub struct Variant {
     // Sample, if present, must be same length as format
     pub sample: Vec<String>,
     // Where this variant came from in the current gen-reads run.
-    // Emitted as INFO/NEAT_PROVENANCE in the golden VCF.
+    // Emitted as INFO/EIDOLON_PROVENANCE in the golden VCF.
     pub provenance: Provenance,
 }
 
@@ -523,6 +528,39 @@ impl Variant {
 
     pub fn get_loc(&self) -> Result<usize, VariantError> {
         Ok(self.location)
+    }
+
+    /// Allele **dosage** as a fraction: alt-copy count over total called copies,
+    /// derived from the N-wide `genotype_str` (`0/1` → 0.5, `1/1` → 1.0,
+    /// `0/0/0/1` → 0.25). Any non-zero allele index counts as alt; missing (`.`)
+    /// alleles are excluded from the total. This is the biological "what fraction
+    /// of this cell's homologous copies carry the variant" and, for a diploid,
+    /// reproduces the read sampler's het-0.5 / hom-1.0 default.
+    ///
+    /// It is the composable **base** for `allele_fraction`: a subclonal CCF (#405)
+    /// or other cellular-fraction factor multiplies onto it, and polyploid dosage
+    /// (#266/#267) flows in automatically once `genotype_str` carries a real
+    /// per-copy spread. Falls back to the coarse `Genotype` label (Hom → 1.0,
+    /// Het → 0.5) if `genotype_str` has no parseable alleles.
+    pub fn dosage_fraction(&self) -> f64 {
+        let (mut alt, mut total) = (0usize, 0usize);
+        for allele in self.genotype_str.split(['/', '|']) {
+            match allele.trim() {
+                "" | "." => {}
+                "0" => total += 1,
+                _ => {
+                    alt += 1;
+                    total += 1;
+                }
+            }
+        }
+        if total == 0 {
+            return match self.genotype {
+                Genotype::Homozygous => 1.0,
+                Genotype::Heterozygous => 0.5,
+            };
+        }
+        alt as f64 / total as f64
     }
 }
 
@@ -823,6 +861,41 @@ mod tests {
         // can rely on Denovo as the default provenance for unannotated
         // outputs.
         assert_eq!(variant.provenance, Provenance::Denovo);
+    }
+
+    #[test]
+    fn dosage_fraction_from_genotype_string() {
+        let snp = |gt: &mut Vec<usize>| {
+            Variant::new(SNP, 10, &vec![Nucleotide::A], &vec![Nucleotide::T], gt).unwrap()
+        };
+        // Diploid: het → 0.5, hom → 1.0 (reproduces the read-sampler default).
+        assert_eq!(snp(&mut vec![0, 1]).dosage_fraction(), 0.5);
+        assert_eq!(snp(&mut vec![1, 1]).dosage_fraction(), 1.0);
+        // Polyploid dosage classes fall straight out of the N-wide GT string.
+        assert_eq!(snp(&mut vec![0, 0, 0, 1]).dosage_fraction(), 0.25);
+        assert_eq!(snp(&mut vec![0, 1, 1, 1]).dosage_fraction(), 0.75);
+    }
+
+    #[test]
+    fn dosage_fraction_handles_missing_and_phased_alleles() {
+        let v = Variant {
+            variant_type: SNP,
+            location: 1,
+            reference: vec![Nucleotide::A],
+            alternate: AlternateType::Literal(vec![Nucleotide::T]),
+            // Phased with a missing allele: alt=1 over called=2 → 0.5.
+            genotype_str: "0|1|.".to_string(),
+            genotype: Genotype::Heterozygous,
+            allele_fraction: None,
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: Vec::new(),
+            sample: Vec::new(),
+            provenance: Provenance::Denovo,
+        };
+        assert_eq!(v.dosage_fraction(), 0.5);
     }
 
     #[test]

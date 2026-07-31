@@ -15,7 +15,7 @@ use crate::file_tools::file_io::{
 };
 use crate::structs::mutated_map::{AdCounter, MutatedMap};
 use crate::structs::nucleotides::sequence_array_to_string;
-use crate::structs::variants::{AlternateType, Variant, VariantError};
+use crate::structs::variants::{AlternateType, Provenance, Variant, VariantError};
 
 #[derive(Debug, Error)]
 pub enum VcfToolsError {
@@ -100,11 +100,33 @@ pub fn write_vcf(
         &mut buffer,
         "##INFO=<ID=CN,Number=1,Type=Integer,Description=\"Copy number of segment\">"
     )?;
+    // BND mate pairs cross-reference each other by ID. Declared here because this
+    // writer emits it on de-novo breakends and passes it through from input VCFs —
+    // an undeclared INFO tag streams fine VCF->VCF but hard-fails BCF translation.
     writeln!(
         &mut buffer,
-        "##INFO=<ID=NEAT_PROVENANCE,Number=1,Type=String,\
+        "##INFO=<ID=MATEID,Number=.,Type=String,Description=\"ID of mate breakend(s)\">"
+    )?;
+    writeln!(
+        &mut buffer,
+        "##INFO=<ID=EIDOLON_PROVENANCE,Number=1,Type=String,\
         Description=\"Origin of variant in this gen-reads run: \
         'denovo' = sampled by the simulator, 'input' = supplied via input_vcf:\">"
+    )?;
+    writeln!(
+        &mut buffer,
+        "##INFO=<ID=EIDOLON_CCF,Number=1,Type=Float,\
+        Description=\"Intended cellular fraction of this de-novo variant \
+        (cancer-cell fraction of its assigned subclone; #405). The realized alt \
+        fraction is EIDOLON_CCF x allele dosage; absent when no subclonal model is set.\">"
+    )?;
+    writeln!(
+        &mut buffer,
+        "##INFO=<ID=EIDOLON_VAF,Number=1,Type=Float,\
+        Description=\"Intended observed variant allele fraction of this somatic \
+        variant in the tumor/normal-mixed output (purity x dosage x CCF; #405). \
+        Directly comparable to a caller's VAF on the merged reads — unlike FORMAT/AF, \
+        which is measured per-pass (tumor-only). Absent outside cancer somatic runs.\">"
     )?;
     writeln!(
         &mut buffer,
@@ -127,7 +149,7 @@ pub fn write_vcf(
     // Add a neat sample column
     writeln!(
         &mut buffer,
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNEAT_simulated_sample"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tEIDOLON_simulated_sample"
     )?;
     // write out mutations
     //
@@ -167,15 +189,39 @@ pub fn write_vcf(
             let prov = variant.provenance.as_str();
             let is_symbolic = variant.alternate.is_symbolic();
             // INFO: symbolic records preserve any pre-existing INFO (SVLEN / END /
-            // CN / SVTYPE) and append NEAT_PROVENANCE. Literal records have no
-            // upstream INFO, so just emit NEAT_PROVENANCE alone.
+            // CN / SVTYPE) and append EIDOLON_PROVENANCE. Literal records have no
+            // upstream INFO, so just emit EIDOLON_PROVENANCE alone.
             let info_str = if is_symbolic {
                 match variant.info.as_deref() {
-                    None | Some(".") | Some("") => format!("NEAT_PROVENANCE={prov}"),
-                    Some(existing) => format!("{existing};NEAT_PROVENANCE={prov}"),
+                    None | Some(".") | Some("") => format!("EIDOLON_PROVENANCE={prov}"),
+                    Some(existing) => match strip_own_output_tokens(existing) {
+                        Some(kept) => format!("{kept};EIDOLON_PROVENANCE={prov}"),
+                        None => format!("EIDOLON_PROVENANCE={prov}"),
+                    },
                 }
             } else {
-                format!("NEAT_PROVENANCE={prov}")
+                // Literal records: EIDOLON_PROVENANCE is the base INFO. Simulator-emitted
+                // tags (EIDOLON_CCF, EIDOLON_VAF) live in `info` on de-novo and reproductive
+                // somatic (SomaticVcf) variants — pass those through. Germline input-VCF
+                // literals deliberately drop their source INFO (only provenance emitted),
+                // so existing golden output for input_vcf: runs is unchanged.
+                match (variant.provenance, variant.info.as_deref()) {
+                    (Provenance::Denovo | Provenance::SomaticVcf, Some(extra))
+                        if !extra.is_empty() && extra != "." =>
+                    {
+                        // Denovo `info` is generated fresh (EIDOLON_CCF / EIDOLON_VAF),
+                        // so in practice there is nothing to strip on this path — the
+                        // SomaticVcf arm never carries source INFO either, since
+                        // gen_reads::runner clears it on ingest. Kept as a cheap
+                        // invariant so a future path that does populate `info` from a
+                        // file can't reintroduce a duplicate provenance key.
+                        match strip_own_output_tokens(extra) {
+                            Some(kept) => format!("{kept};EIDOLON_PROVENANCE={prov}"),
+                            None => format!("EIDOLON_PROVENANCE={prov}"),
+                        }
+                    }
+                    _ => format!("EIDOLON_PROVENANCE={prov}"),
+                }
             };
             // SAMPLE: for literal variants, AD/DP/AF come from the per-contig
             // counter populated by the gen-reads fragment loop; positions with
@@ -200,10 +246,18 @@ pub fn write_vcf(
                     variant.genotype_str, ref_count, alt_count, depth, af_str
                 )
             };
+            // The ID column was previously hardcoded to "." — which silently
+            // discarded every record's ID, including the ones an input VCF
+            // supplied. That breaks any INFO field that references an ID by name:
+            // a BND mate pair carries MATEID=<other side's ID>, so dropping IDs
+            // left the linkage dangling on both input-supplied and (post-#451)
+            // de-novo breakends. Emit the ID when the record has one.
+            let id_str = variant.id.as_deref().unwrap_or(".");
             let line = format!(
-                "{}\t{}\t.\t{}\t{}\t37\tPASS\t{}\tGT:AD:DP:AF\t{}",
+                "{}\t{}\t{}\t{}\t{}\t37\tPASS\t{}\tGT:AD:DP:AF\t{}",
                 contig,
                 variant.location + 1,
+                id_str,
                 sequence_array_to_string(&variant.reference),
                 alt_str,
                 info_str,
@@ -213,6 +267,67 @@ pub fn write_vcf(
         }
     }
     Ok(())
+}
+
+/// Drop the eidolon-emitted routing tokens that this writer owns, from an INFO field
+/// about to be passed through into new output.
+///
+/// `write_vcf` preserves a source record's INFO verbatim on symbolic (and de-novo
+/// literal) records, so feeding a golden VCF back in via `input_vcf:` reproduces
+/// whatever tokens it carried. Two classes must not survive that round trip:
+///
+/// * **`*_PROVENANCE`** — this writer re-emits it from `variant.provenance`. A stale
+///   copy yields a duplicate key with *contradictory* values (`=denovo` from the source
+///   next to the fresh `=input` describing how this pass actually used the record).
+///   Worse, `vcf_merge::tumor_origin` tests for the exact field
+///   `EIDOLON_PROVENANCE=denovo`, so a stale copy makes it label a variant present in
+///   **both** passes as `somatic` — putting a germline carry-through into the somatic
+///   ground truth that every bundled benchmark scores against.
+/// * **`*_ORIGIN`** — added *after* this writer by `vcf_merge`, which is also the only
+///   place that declares it. Passing one through emits an undeclared INFO tag: fine when
+///   streaming VCF→VCF, but a hard failure on BCF translation, which
+///   `bcftools concat | sort` does internally.
+///
+/// Both the current `EIDOLON_*` spellings and the pre-v3.0.0 `NEAT_*` ones are stripped.
+/// Scoping this to only the legacy names would fix the shrinking half of the problem
+/// (v2.0.0 goldens) and leave the growing half (v3.0.0 goldens, which is what users
+/// produce from now on).
+///
+/// **`EIDOLON_CCF` / `EIDOLON_VAF` are deliberately kept.** Unlike provenance, they are
+/// #405's ground truth and live *in* `variant.info` — `gen_reads::runner` appends them
+/// there before the write — so stripping them would destroy the tags on every de-novo
+/// somatic record. They are declared by this writer, so passing one through is harmless.
+/// `NEAT_CCF`/`NEAT_VAF`/`NEAT_REASON` are still dropped: those spellings are never
+/// re-emitted, so a survivor would be an undeclared tag.
+///
+/// Returns `None` when nothing is left to keep, so callers can emit provenance alone
+/// instead of a leading `;`. Only these exact keys are removed — third-party INFO
+/// (`DP`, `AF`, `SVTYPE`, …) is untouched.
+fn strip_own_output_tokens(info: &str) -> Option<String> {
+    const OWNED_KEYS: [&str; 7] = [
+        // Current spellings: re-emitted here, or declared only downstream.
+        "EIDOLON_PROVENANCE",
+        "EIDOLON_ORIGIN",
+        // Pre-v3.0.0 spellings: never re-emitted, so any survivor is undeclared.
+        "NEAT_PROVENANCE",
+        "NEAT_ORIGIN",
+        "NEAT_CCF",
+        "NEAT_VAF",
+        "NEAT_REASON",
+    ];
+    let kept: Vec<&str> = info
+        .split(';')
+        .filter(|field| {
+            let key = field.split('=').next().unwrap_or(field);
+            !OWNED_KEYS.contains(&key)
+        })
+        .filter(|field| !field.is_empty())
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(";"))
+    }
 }
 
 pub fn read_vcf(vcf_file: PathBuf) -> Result<HashMap<String, Vec<Variant>>, VcfToolsError> {
@@ -522,17 +637,17 @@ mod tests {
         );
 
         // Both variant lines must be present (HashMap iteration order is non-deterministic).
-        // Variants from `Variant::new` carry `Provenance::Denovo` (→ INFO/NEAT_PROVENANCE=denovo)
+        // Variants from `Variant::new` carry `Provenance::Denovo` (→ INFO/EIDOLON_PROVENANCE=denovo)
         // and an empty ad_counter means no reads were simulated (→ AD=0,0 DP=0 AF=`.`).
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t4\t.\tA\tG\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:0,0:0:."),
+                == "chr1\t4\t.\tA\tG\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:0,0:0:."),
             "missing het SNP line; got: {:?}",
             lines
         );
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t8\t.\tT\tG\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,0:0:."),
+                == "chr1\t8\t.\tT\tG\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,0:0:."),
             "missing hom SNP line; got: {:?}",
             lines
         );
@@ -1296,10 +1411,10 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // Symbolic SVs use span-based depth semantics that don't fit the
         // point-based AD/DP/AF counter — they emit `.` placeholders. The
         // `Provenance::Denovo` constructor on the test fixture surfaces as
-        // INFO/NEAT_PROVENANCE=denovo.
+        // INFO/EIDOLON_PROVENANCE=denovo.
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t100\t.\tA\t<DEL>\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:.,.:.:."),
+                == "chr1\t100\t.\tA\t<DEL>\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:.,.:.:."),
             "expected symbolic ALT to round-trip as `<DEL>` with denovo provenance and `.` AD/DP/AF; got: {:?}",
             lines
         );
@@ -1308,7 +1423,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     /// When the per-contig AdCounter has real (ref_count, alt_count) values
     /// at a variant's position, the writer must surface them as AD = a,b,
     /// DP = a+b, AF = b/(a+b) rounded to 4 decimal places. After the #185
-    /// merge, every literal record also carries `NEAT_PROVENANCE=denovo`
+    /// merge, every literal record also carries `EIDOLON_PROVENANCE=denovo`
     /// (since `Variant::new` is the de-novo constructor).
     #[test]
     fn test_write_vcf_emits_ad_dp_af_from_counter() {
@@ -1359,14 +1474,14 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // Het: position 11 (1-based), AD=18,12, DP=30, AF=0.4000
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t11\t.\tA\tG\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:18,12:30:0.4000"),
+                == "chr1\t11\t.\tA\tG\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t0/1:18,12:30:0.4000"),
             "missing het record with AD=18,12 DP=30 AF=0.4000; got: {:?}",
             lines
         );
         // Hom: position 21 (1-based), AD=0,30, DP=30, AF=1.0000
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t21\t.\tC\tT\t37\tPASS\tNEAT_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,30:30:1.0000"),
+                == "chr1\t21\t.\tC\tT\t37\tPASS\tEIDOLON_PROVENANCE=denovo\tGT:AD:DP:AF\t1/1:0,30:30:1.0000"),
             "missing hom record with AD=0,30 DP=30 AF=1.0000; got: {:?}",
             lines
         );
@@ -1387,7 +1502,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     }
 
     /// `Provenance::InputVcf` literal variants must surface as
-    /// `NEAT_PROVENANCE=input` in the golden VCF — this is the signal the
+    /// `EIDOLON_PROVENANCE=input` in the golden VCF — this is the signal the
     /// cancer-simulator merge step relies on to detect germline carry-through
     /// (a variant that was supplied via `input_vcf:` and appears in both
     /// passes is the "shared" case).
@@ -1433,8 +1548,8 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         // Empty ad_counter → AD=0,0 DP=0 AF=`.`.
         assert!(
             lines.iter().any(|l| l
-                == "chr1\t50\t.\tA\tG\t37\tPASS\tNEAT_PROVENANCE=input\tGT:AD:DP:AF\t0/1:0,0:0:."),
-            "expected NEAT_PROVENANCE=input on InputVcf literal; got: {:?}",
+                == "chr1\t50\t.\tA\tG\t37\tPASS\tEIDOLON_PROVENANCE=input\tGT:AD:DP:AF\t0/1:0,0:0:."),
+            "expected EIDOLON_PROVENANCE=input on InputVcf literal; got: {:?}",
             lines
         );
         // Header line must declare the new INFO field so downstream
@@ -1442,14 +1557,149 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("##INFO=<ID=NEAT_PROVENANCE,")),
-            "missing NEAT_PROVENANCE INFO header line; got: {:?}",
+                .any(|l| l.starts_with("##INFO=<ID=EIDOLON_PROVENANCE,")),
+            "missing EIDOLON_PROVENANCE INFO header line; got: {:?}",
+            lines
+        );
+        // MATEID must be declared: BND mate pairs reference each other by ID, and an
+        // undeclared INFO tag hard-fails BCF translation.
+        assert!(
+            lines.iter().any(|l| l.starts_with("##INFO=<ID=MATEID,")),
+            "missing MATEID INFO header line; got: {:?}",
+            lines
+        );
+        // The sample-column name is an emitted output token too (renamed from
+        // NEAT_simulated_sample in v3.0.0). Without this assertion it is the one
+        // renamed token no test would catch being reverted.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("#CHROM") && l.ends_with("\tEIDOLON_simulated_sample")),
+            "missing/incorrect EIDOLON_simulated_sample column header; got: {:?}",
             lines
         );
     }
 
+    #[test]
+    fn strip_own_output_tokens_drops_routing_keys_both_spellings() {
+        // Third-party / SV INFO must survive untouched.
+        assert_eq!(
+            strip_own_output_tokens("SVTYPE=DEL;END=200;DP=30").as_deref(),
+            Some("SVTYPE=DEL;END=200;DP=30")
+        );
+        // Pre-v3.0.0 keys removed, order of the rest preserved.
+        assert_eq!(
+            strip_own_output_tokens("SVTYPE=DEL;NEAT_PROVENANCE=denovo;END=200").as_deref(),
+            Some("SVTYPE=DEL;END=200")
+        );
+        assert_eq!(
+            strip_own_output_tokens(
+                "NEAT_ORIGIN=somatic;NEAT_CCF=1.0;NEAT_VAF=0.3;NEAT_REASON=unknown;AF=0.5"
+            )
+            .as_deref(),
+            Some("AF=0.5")
+        );
+        // Nothing left to keep -> None, so the caller emits provenance alone
+        // rather than a record starting with ';'.
+        assert_eq!(strip_own_output_tokens("NEAT_PROVENANCE=input"), None);
+
+        // The CURRENT spellings must be stripped too. Round-tripping a v3.0.0 golden
+        // through input_vcf: is the common case, not the legacy one.
+        assert_eq!(
+            strip_own_output_tokens("SVTYPE=DEL;EIDOLON_PROVENANCE=denovo;END=200").as_deref(),
+            Some("SVTYPE=DEL;END=200")
+        );
+        assert_eq!(
+            strip_own_output_tokens("SVTYPE=DEL;EIDOLON_ORIGIN=somatic").as_deref(),
+            Some("SVTYPE=DEL")
+        );
+        // A stale EIDOLON_PROVENANCE=denovo surviving here is what made
+        // vcf_merge::tumor_origin label a germline carry-through as `somatic`.
+        assert_eq!(
+            strip_own_output_tokens("EIDOLON_PROVENANCE=denovo;EIDOLON_ORIGIN=shared"),
+            None
+        );
+
+        // #405 ground truth is KEPT: gen_reads::runner puts EIDOLON_CCF/EIDOLON_VAF in
+        // `variant.info` before the write, so stripping them would destroy the tags on
+        // every de-novo somatic record. This writer declares both.
+        assert_eq!(
+            strip_own_output_tokens("EIDOLON_CCF=1.0000;EIDOLON_VAF=0.3000").as_deref(),
+            Some("EIDOLON_CCF=1.0000;EIDOLON_VAF=0.3000")
+        );
+        assert_eq!(
+            strip_own_output_tokens("EIDOLON_CCF=1.0000;EIDOLON_PROVENANCE=denovo").as_deref(),
+            Some("EIDOLON_CCF=1.0000")
+        );
+
+        // Exact-key matching: lookalikes are not owned tokens.
+        assert_eq!(
+            strip_own_output_tokens("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y;EIDOLON_ORIGINS=z").as_deref(),
+            Some("XNEAT_ORIGIN=x;NEAT_ORIGINAL=y;EIDOLON_ORIGINS=z")
+        );
+        // Bare flags (no '=') are preserved.
+        assert_eq!(
+            strip_own_output_tokens("IMPRECISE;NEAT_VAF=0.1").as_deref(),
+            Some("IMPRECISE")
+        );
+    }
+
+    /// The ID column was hardcoded to "." for every record, so a BND's MATEID
+    /// pointed at an ID that never appeared in the file. Nothing asserted on it.
+    #[test]
+    fn test_write_vcf_emits_the_record_id_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut sv = SvData::new("G]chr1:1500]", SvType::Bnd);
+        sv.end = Some(500);
+        sv.mate_contig = Some("chr1".to_string());
+        sv.mate_pos = Some(1500);
+        let v = Variant {
+            variant_type: VariantType::Complex,
+            location: 499,
+            reference: vec![Nucleotide::G],
+            alternate: AlternateType::Symbolic(sv),
+            genotype_str: "0/1".to_string(),
+            genotype: Genotype::Heterozygous,
+            allele_fraction: None,
+            id: Some("eidolon_bnd_chr1_500_1500_1".to_string()),
+            quality_score: None,
+            filter: None,
+            info: Some("SVTYPE=BND;MATEID=eidolon_bnd_chr1_500_1500_2".to_string()),
+            format: vec!["GT".to_string()],
+            sample: vec!["0/1".to_string()],
+            provenance: Provenance::Denovo,
+        };
+        let mutated_map = MutatedMap::from_interval(0, 2000, vec![v]).unwrap();
+        let mut mutated_maps = HashMap::new();
+        mutated_maps.insert("chr1".to_string(), vec![mutated_map]);
+        let output_path = temp_dir.path().join("bnd_id.vcf");
+        write_vcf(
+            &mutated_maps,
+            &vec!["chr1".to_string()],
+            &HashMap::from([("chr1".to_string(), 2000usize)]),
+            &PathBuf::from("ref.fa"),
+            false,
+            &output_path,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let lines: Vec<String> = crate::file_tools::file_io::read_gzip_lines(&output_path)
+            .unwrap()
+            .map(|l| l.unwrap())
+            .collect();
+        let rec = lines
+            .iter()
+            .find(|l| !l.starts_with('#'))
+            .expect("no record written");
+        let cols: Vec<&str> = rec.split('\t').collect();
+        assert_eq!(
+            cols[2], "eidolon_bnd_chr1_500_1500_1",
+            "ID column must carry variant.id, not \".\": {rec}"
+        );
+    }
+
     /// Symbolic SVs typically arrive with a populated INFO column
-    /// (SVLEN, END, SVTYPE, CN). The writer must *append* NEAT_PROVENANCE
+    /// (SVLEN, END, SVTYPE, CN). The writer must *append* EIDOLON_PROVENANCE
     /// to that existing field rather than overwrite it — otherwise span
     /// metadata is lost on the symbolic record's round trip.
     #[test]
@@ -1490,13 +1740,13 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
             .map(|l| l.unwrap())
             .collect();
         // Symbolic SVs always emit `.,.:.:.` for AD/DP/AF (span-based depth,
-        // not point-based). Existing INFO must survive with NEAT_PROVENANCE
+        // not point-based). Existing INFO must survive with EIDOLON_PROVENANCE
         // appended.
         assert!(
             lines.iter().any(|l| l
                 == "chr1\t200\t.\tA\t<DEL>\t37\tPASS\t\
-                 SVTYPE=DEL;END=300;SVLEN=-100;NEAT_PROVENANCE=input\tGT:AD:DP:AF\t1/1:.,.:.:."),
-            "expected SVTYPE/END/SVLEN to survive with NEAT_PROVENANCE appended; got: {:?}",
+                 SVTYPE=DEL;END=300;SVLEN=-100;EIDOLON_PROVENANCE=input\tGT:AD:DP:AF\t1/1:.,.:.:."),
+            "expected SVTYPE/END/SVLEN to survive with EIDOLON_PROVENANCE appended; got: {:?}",
             lines
         );
     }

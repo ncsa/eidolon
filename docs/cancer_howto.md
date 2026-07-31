@@ -16,7 +16,7 @@ validate it works as expected. Design rationale and the mutation-rate / SV calib
         merge: tag reads N_/T_, concatenate; combine the two golden VCFs with origin tags
         ▼
   <prefix>_merged_r1.fastq.gz    → aligner + somatic caller
-  <prefix>_merged_truth.vcf.gz   → INFO/NEAT_ORIGIN ∈ {germline, somatic, shared}
+  <prefix>_merged_truth.vcf.gz   → INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}
 ```
 
 The tumor pass consumes the normal pass's golden VCF as its germline (`input_vcf`),
@@ -52,7 +52,7 @@ eidolon gen-cancer-reads -c cancer.yml
 | File | Contents |
 |---|---|
 | `<prefix>_merged_r1.fastq.gz` (+ `_r2`) | `N_`/`T_`-tagged, concatenated reads — the simulated biopsy. Feed to your aligner. |
-| `<prefix>_merged_truth.vcf.gz` | Origin-tagged truth: `INFO/NEAT_ORIGIN ∈ {germline, somatic, shared}`. Score against this. |
+| `<prefix>_merged_truth.vcf.gz` | Origin-tagged truth: `INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}`. Score against this. |
 | `<prefix>_normal.vcf.gz` | Germline-only truth. |
 | `<prefix>_tumor.vcf.gz` | Germline + somatic truth. |
 | `<prefix>_{normal,tumor}_r1.fastq.gz` | Per-pass reads (`keep_per_pass: false` deletes after merge). |
@@ -150,6 +150,115 @@ tumor_model: tools/cosmic_per_tissue_BRCA.json.gz
 sv_rate_scale: 1.0       # 1.0 = the model's nominal rate; higher stress-tests SV callers
 ```
 
+### Subclonal architecture (somatic VAF spectrum)
+
+By default the somatic burden sits at ~one effective VAF, set by `purity` alone.
+Real tumors are mixtures of subclones at distinct **cancer-cell fractions (CCF)**.
+Add a `subclones:` list to spread de-novo somatic variants across those fractions —
+each variant is assigned a subclone (share ∝ `weight`) and takes its `ccf`:
+
+```yaml
+purity: 0.8
+subclones:
+  - {ccf: 1.0, weight: 0.6}   # clonal / truncal — present in every tumor cell
+  - {ccf: 0.4, weight: 0.3}   # major subclone
+  - {ccf: 0.15, weight: 0.1}  # minor subclone
+```
+
+CCF is a **cellular-fraction factor** that composes with the variant's dosage and with
+purity — it does not replace them:
+
+```text
+observed VAF = purity · dosage · CCF
+```
+
+`dosage` is the alt-copy fraction from the genotype (0.5 for a heterozygous SNV, 1.0 for
+homozygous; `alt_copies/ploidy` in general). So a heterozygous somatic variant at CCF `f`
+is observed at `~purity·f/2` — the value a subclonal-deconvolution tool (PyClone,
+SciClone, …) inverts back to `f`. These are orthogonal axes (purity = normal
+contamination, dosage = per-copy multiplicity, CCF = subclonal fraction). Germline
+(shared) variants are unaffected. `ccf ∈ (0, 1]`; `weight` defaults to `1.0` (equal
+share). Omit the block for the dosage-only default (output is byte-identical to
+pre-subclone runs).
+
+Each somatic record in the golden/merged-truth VCF carries two ground-truth INFO tags:
+
+- **`EIDOLON_CCF`** — the intended cellular fraction (subclone CCF).
+- **`EIDOLON_VAF`** — the intended **observed** VAF after tumor/normal mixing
+  (`purity × dosage × CCF`; for a reproductive `somatic_vcf` replay, the original
+  input VAF). This is the number a somatic caller measures on the merged reads.
+
+Mind the difference from `FORMAT/AF`: that field is measured **per-pass (tumor-only)**,
+so it reads `dosage × CCF` (≈ `EIDOLON_VAF ÷ purity`) and carries sampling noise.
+For scoring a caller's VAF against ground truth, compare to `EIDOLON_VAF`; use `FORMAT/AF`
+only if you want the tumor-cell fraction. Germline/shared records carry neither tag.
+
+```bash
+# planted observed VAF vs caller VAF: score against EIDOLON_VAF, not FORMAT/AF
+bcftools view -H -i 'INFO/EIDOLON_ORIGIN="somatic"' merged_truth.vcf.gz \
+  | awk -F'\t' 'match($8,/EIDOLON_VAF=[0-9.]+/){v=substr($8,RSTART,RLENGTH); sub(/^EIDOLON_VAF=/,"",v); print $2, v}'
+```
+
+### Building the architecture from real data
+
+Instead of hand-authoring `subclones:`, point at a subclonal-deconvolution tool's
+cluster table with `subclones_file:` (tab-separated, header required; mutually
+exclusive with the inline list). eidolon folds the two shapes real tools emit into
+`{ccf, weight}`:
+
+| Tool | Shape | Columns used |
+|---|---|---|
+| PyClone / PyClone-VI | per-mutation | `cluster_id`, `cellular_prevalence` → grouped by cluster, weight = mutation count |
+| PCAWG-11 / CSR / DPClust | cluster table | `cluster`, `ccf`, size (`n_ssms` / `size` / `weight`) → used directly |
+
+```yaml
+subclones_file: pyclone_clusters.tsv
+```
+
+Other tools convert with a one-liner — emit a header plus the two/three columns
+above. CCF > 1.0 (noisy clonal clusters) is clamped to 1.0 and non-positive-CCF
+rows are dropped, both warned with a count. Extra columns (`cellular_prevalence_std`,
+`cluster_assignment_prob`, …) are ignored.
+
+**Round-trip validation.** Ingest a real tumor's clusters → simulate → the golden
+VCF's `EIDOLON_CCF` carries exactly those planted CCFs → run the deconvolution tool on
+the *simulated* reads → confirm it recovers the architecture you fed in.
+`scripts/delta/run_subclonal_vaf_validation.sh` runs the read-level half on real
+data (Delta): it aligns the merged reads and checks the observed VAF at each somatic
+site tracks `EIDOLON_VAF` (fidelity gated on bias + MAE-vs-noise-floor). On a soybean
+scaffold at 200× with three subclones spanning 4–40% VAF, the aligned reads reproduce
+the planted spectrum **unbiased** (mean err −0.003) and **to the sampling-noise floor**
+(MAE 0.026, Pearson r 0.95) — see report §3.12.
+
+### Reproductive replay (from a real somatic VCF)
+
+The subclonal options above are *generative* — they invent somatic variants matching
+a target architecture. To instead **replay a specific real tumor's somatic calls**,
+point at a somatic VCF:
+
+```yaml
+purity: 0.6
+tumor_mutation_rate: 0.0      # pure replay — no de-novo somatic on top
+somatic_vcf: tumor_somatic.vcf.gz
+```
+
+Each variant is honored at its **observed VAF** (`INFO/AF`, else derived from
+`FORMAT/AD`), divided by `purity` so the merged reads reproduce that VAF after
+tumor/normal mixing (a raw Mutect2/Strelka VCF works directly). Replayed variants are
+tagged `EIDOLON_ORIGIN=somatic` / `EIDOLON_PROVENANCE=somatic_input` in the truth — distinct
+from germline even though both come from files. Notes:
+
+- Composes with generation: leave `tumor_mutation_rate > 0` (and optional `subclones`)
+  to layer de-novo somatic variants on top of the replayed set.
+- A variant with no AF falls back to its genotype dosage (het ≈ 0.5, hom = 1.0).
+- Observed VAF above `purity` is physically impossible for a somatic variant; it's
+  clamped to a tumor-cell fraction of 1.0 with a warning.
+
+Validated on real cancer data: replaying SEQC2 **HCC1395**'s high-confidence somatic
+SNVs (GRCh38 chr1, 200×) reproduces the tumor's full empirical VAF distribution — 2,948
+sites across every decile — at Pearson **r = 0.99**, unbiased (−0.004), MAE 0.024 (see
+report §3.12; harness `scripts/delta/run_hcc1395_reproductive.sh`).
+
 ### One germline, many tumor scenarios
 
 Fix the germline once and sweep purity/depth by pointing each run at the same
@@ -186,7 +295,7 @@ tools/cancer_sv_benchmark.sh \
     --output-dir   ./sv_bench
 ```
 
-`INFO/NEAT_ORIGIN` lets you filter the truth to somatic-only before scoring
+`INFO/EIDOLON_ORIGIN` lets you filter the truth to somatic-only before scoring
 (`--truth-filter`).
 
 ## Config knobs
@@ -198,6 +307,7 @@ tools/cancer_sv_benchmark.sh \
 | `tumor_mutation_rate` | per-base somatic rate. Default `1e-5`. `model` = use the model's fitted rate. |
 | `normal_mutation_rate` | per-base germline rate. Default = the model's fitted rate. |
 | `sv_rate_scale` | de novo SV multiplier; `0` = off, `1.0` = the model's `sv_model` rate. |
+| `subclones` | optional list of `{ccf, weight}` subclones; spreads somatic variants across CCFs → observed VAF = `purity · dosage · ccf`. Omit for the dosage-only default. |
 | `germline_vcf` | fixed shared germline instead of de-novo generation. |
 | `rng_seed` | seeds both passes (suffixed `-normal`/`-tumor`); printed to the log. |
 | `keep_per_pass` | keep per-pass FASTQs (`false` = merged only). |

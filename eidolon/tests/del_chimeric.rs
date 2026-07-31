@@ -14,7 +14,7 @@
 //!
 //! This test exercises a single forced <DEL> on H1N1_HA (a 2 kb segment)
 //! at high coverage and pins:
-//!   1. The FASTQ contains `RNEAT_chimeric_DEL_*` reads.
+//!   1. The FASTQ contains `EIDOLON_chimeric_DEL_*` reads.
 //!   2. Their QNAME encodes the POS and END the test injected (so a
 //!      future refactor that drops the DEL tag or shifts coordinates
 //!      fails loudly).
@@ -94,25 +94,25 @@ fn gen_reads_with_symbolic_del_emits_chimeric_junction_reads() {
 
     let del_chimeric: Vec<&String> = fastq_qnames
         .iter()
-        .filter(|l| l.contains("RNEAT_chimeric_DEL_"))
+        .filter(|l| l.contains("EIDOLON_chimeric_DEL_"))
         .collect();
 
     assert!(
         !del_chimeric.is_empty(),
-        "expected ≥1 RNEAT_chimeric_DEL_ read in FASTQ for a homozygous \
+        "expected ≥1 EIDOLON_chimeric_DEL_ read in FASTQ for a homozygous \
          300bp DEL at 100× coverage; got 0 of {} total reads. \
          Symbolic-DEL chimeric path may be silently emitting zero reads.",
         fastq_qnames.len()
     );
 
-    // QNAME shape: RNEAT_chimeric_DEL_<contig>_<pos>_<end>_<16-hex>/<mate>.
+    // QNAME shape: EIDOLON_chimeric_DEL_<contig>_<pos>_<end>_<16-hex>/<mate>.
     // The injected DEL is at H1N1_HA POS=500 END=799, so QNAMEs should
     // carry "_500_799_" as a substring. This pins the coordinate encoding
     // so a future refactor that shifts position or end by ±1 fails the
     // test directly instead of silently moving the junction.
     let qname_has_coords = del_chimeric
         .iter()
-        .any(|q| q.contains("RNEAT_chimeric_DEL_H1N1_HA_500_799_"));
+        .any(|q| q.contains("EIDOLON_chimeric_DEL_H1N1_HA_500_799_"));
     assert!(
         qname_has_coords,
         "DEL chimeric QNAMEs must carry the injected POS=500 END=799 \

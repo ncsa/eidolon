@@ -2,7 +2,7 @@
 //!
 //! Two artifacts:
 //!   - `FN_with_reasons.vcf` — every surviving FN annotated with a
-//!     `NEAT_REASON` INFO tag listing the attribution reasons.
+//!     `EIDOLON_REASON` INFO tag listing the attribution reasons.
 //!   - `FP.vcf` — every surviving FP, as-is. Optional; gated on
 //!     `write_fp_vcf` in the config because some pipelines accumulate
 //!     large FP sets and the user may not want the extra artifact.
@@ -27,11 +27,11 @@ const HEADER_BASE: &str = "\
 ##source=eidolon compare-vcfs
 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
 ";
-const NEAT_REASON_INFO: &str = "##INFO=<ID=NEAT_REASON,Number=.,Type=String,\
+const EIDOLON_REASON_INFO: &str = "##INFO=<ID=EIDOLON_REASON,Number=.,Type=String,\
 Description=\"Comma-separated NEAT-aware false-negative attribution reasons\">\n";
 const COLUMN_HEADER: &str = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n";
 
-/// Write FN records with NEAT_REASON annotations to
+/// Write FN records with EIDOLON_REASON annotations to
 /// `<output_dir>/FN_with_reasons.vcf`. Returns the written path.
 ///
 /// If `attribution.per_fn` is empty, the file is still written (header
@@ -45,7 +45,7 @@ pub fn write_fn_with_reasons(
     check_overwrite(&path, overwrite_output)?;
     let mut file = fs::File::create(&path)?;
     file.write_all(HEADER_BASE.as_bytes())?;
-    file.write_all(NEAT_REASON_INFO.as_bytes())?;
+    file.write_all(EIDOLON_REASON_INFO.as_bytes())?;
     file.write_all(COLUMN_HEADER.as_bytes())?;
     for (chrom, variant, reasons) in &attribution.per_fn {
         let line = format_record(chrom, variant, Some(reasons));
@@ -84,7 +84,7 @@ fn check_overwrite(path: &Path, allow: bool) -> Result<(), CompareVcfsError> {
 }
 
 /// Serialize one Variant as a tab-separated VCF record. If `reasons` is
-/// `Some`, append `NEAT_REASON=<csv>` to the INFO column.
+/// `Some`, append `EIDOLON_REASON=<csv>` to the INFO column.
 fn format_record(chrom: &str, v: &Variant, reasons: Option<&[Reason]>) -> String {
     let id = v.id.as_deref().unwrap_or(".");
     let ref_str = sequence_array_to_string(&v.reference);
@@ -104,9 +104,9 @@ fn format_record(chrom: &str, v: &Variant, reasons: Option<&[Reason]>) -> String
             // Preserve an existing INFO blob if present; replace bare "." since
             // it's the "no info" sentinel.
             if info_base == "." || info_base.is_empty() {
-                format!("NEAT_REASON={reason_csv}")
+                format!("EIDOLON_REASON={reason_csv}")
             } else {
-                format!("{info_base};NEAT_REASON={reason_csv}")
+                format!("{info_base};EIDOLON_REASON={reason_csv}")
             }
         }
         _ => info_base.to_string(),
@@ -157,9 +157,9 @@ mod tests {
     fn format_record_adds_neat_reason_when_info_is_dot() {
         let v = snp_with(100, Some("."));
         let line = format_record("chr1", &v, Some(&[Reason::Unknown]));
-        assert!(line.contains("\tNEAT_REASON=unknown\t"));
-        // Original "." should be replaced, not preserved as ".;NEAT_REASON=...".
-        assert!(!line.contains(".;NEAT_REASON"));
+        assert!(line.contains("\tEIDOLON_REASON=unknown\t"));
+        // Original "." should be replaced, not preserved as ".;EIDOLON_REASON=...".
+        assert!(!line.contains(".;EIDOLON_REASON"));
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
             Some(&[Reason::OutsideMutationBed, Reason::OutsideTargetBed]),
         );
         assert!(
-            line.contains("DP=30;AF=0.5;NEAT_REASON=outside_mutation_bed,outside_target_bed"),
+            line.contains("DP=30;AF=0.5;EIDOLON_REASON=outside_mutation_bed,outside_target_bed"),
             "got: {line}"
         );
     }
@@ -181,7 +181,7 @@ mod tests {
         let v = snp_with(100, Some("DP=30"));
         let line = format_record("chr1", &v, None);
         assert!(line.contains("\tDP=30\tGT\t0/1"));
-        assert!(!line.contains("NEAT_REASON"));
+        assert!(!line.contains("EIDOLON_REASON"));
     }
 
     #[test]
@@ -205,9 +205,9 @@ mod tests {
         let path = write_fn_with_reasons(&attribution, dir.path(), false).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("##fileformat=VCFv4.2"));
-        assert!(body.contains("##INFO=<ID=NEAT_REASON"));
+        assert!(body.contains("##INFO=<ID=EIDOLON_REASON"));
         assert!(body.contains("#CHROM\tPOS"));
-        assert!(body.contains("NEAT_REASON=unknown"));
+        assert!(body.contains("EIDOLON_REASON=unknown"));
     }
 
     #[test]
@@ -239,7 +239,7 @@ mod tests {
         let fps: Vec<(String, &Variant)> = vec![("chr2".to_string(), &v)];
         let path = write_fp_vcf(&fps, dir.path(), false).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(!body.contains("NEAT_REASON"));
+        assert!(!body.contains("EIDOLON_REASON"));
         assert!(body.contains("chr2\t200"));
     }
 
