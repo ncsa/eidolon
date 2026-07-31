@@ -324,9 +324,14 @@ else
         filtered_count=$(run_in "$BCFTOOLS_IMG" sh -c \
             "bcftools view -H '/work/$SCORING_TRUTH_NAME' | wc -l" | tr -d '\r\n')
         if [[ "$filtered_count" == "0" ]]; then
-            echo "WARNING: truth filter matched zero SV records." >&2
+            # Fatal, not a warning: truvari against an empty truth yields recall=0 for
+            # every caller, which reads as a caller/simulator problem rather than a
+            # filter mistake.
+            echo "ERROR: truth filter matched zero SV records." >&2
+            echo "  Refusing to score against an empty truth set." >&2
             echo "  If your truth VCF doesn't carry SVs (or doesn't have INFO/EIDOLON_ORIGIN)," >&2
             echo "  pass --truth-filter '' or a custom expression." >&2
+            exit 1
         else
             echo "    Filtered truth: $filtered_count SV records retained."
         fi

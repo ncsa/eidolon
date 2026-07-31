@@ -359,7 +359,16 @@ if [[ ! -f "$SCORE_TRUTH" ]]; then
 fi
 somatic_count=$(bcftools view -H "$SCORE_TRUTH" | wc -l)
 echo "      Somatic truth records: $somatic_count"
-[[ "$somatic_count" -eq 0 ]] && echo "WARNING: no somatic truth records — check EIDOLON_ORIGIN." >&2
+if [[ "$somatic_count" -eq 0 ]]; then
+    echo "ERROR: no somatic truth records after filtering with:" >&2
+    echo "         INFO/EIDOLON_ORIGIN=\"somatic\"" >&2
+    echo "  Scoring against an empty truth would report every caller as 0 recall with" >&2
+    echo "  no indication why, so this is fatal. Check INFO/EIDOLON_ORIGIN is present" >&2
+    echo "  in $TRUTH_VCF (pre-v3.0.0 truth VCFs use NEAT_ORIGIN — convert with" >&2
+    echo "  tools/migrate_legacy_tokens.sh), or that the tumor pass planted somatic" >&2
+    echo "  variants at all (raise TUMOR_MUTATION_RATE / coverage)." >&2
+    exit 1
+fi
 [[ -f "$HAPPY_SIF" ]] || { echo "hap.py SIF not found: $HAPPY_SIF — run setup.sh first" >&2; exit 1; }
 
 # hap.py/som.py hardcodes UCSC chr-prefixing of input VCFs (perl s/^([0-9XYM])/chr/),
@@ -369,7 +378,13 @@ echo "      Somatic truth records: $somatic_count"
 # chr-prefixed copy for scoring so the renamed VCFs match. (chr22.fa etc. pass
 # through unchanged.) Alignment/Mutect2 already used $REFERENCE as-is — unaffected.
 SCORE_REF_DIR="$REF_DIR"; SCORE_REF_NAME="$REF_NAME"
-if ! head -1 "${REFERENCE}.fai" 2>/dev/null | grep -q '^chr'; then
+# Only build the chr-prefixed copy when som.py will ACTUALLY rename the VCF contigs.
+# Its perl is `s/^([0-9XYM])/chr/`, so it renames 1/2/X/Y/MT but leaves anything else
+# alone — including GenBank accession names (CM000851.4, soybean). Keying off "not
+# chr-prefixed" lumped those in with Ensembl-numeric and prefixed the REFERENCE while
+# som.py left the VCF unprefixed, so scoring died with a contig mismatch
+# ("Error running BCFTOOLS ... vcfcheck") on a reference that needed no help at all.
+if head -1 "${REFERENCE}.fai" 2>/dev/null | grep -qE '^[0-9XYM]'; then
     SCORE_REF="${REFERENCE%.fa}.chr.fa"
     if [[ ! -f "$SCORE_REF" ]]; then
         echo "[6/6] Reference is Ensembl-named; building chr-prefixed copy for som.py..."
