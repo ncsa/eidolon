@@ -30,6 +30,10 @@ TRUTH_VCF="${TRUTH_VCF:?set TRUTH_VCF to an eidolon truth VCF (INFO/EIDOLON_ORIG
 OUTDIR="${OUTDIR:-$SCRATCH/sigcheck_$(basename "$(dirname "$TRUTH_VCF")")}"
 GENOME="${GENOME:-GRCh38}"
 SIGPROFILER_ENV="${SIGPROFILER_ENV:-sigprofiler}"
+# Minimum somatic SNVs before a signature fit is meaningful. Keeps the historical 50
+# so this change enforces the existing bar rather than silently moving it — but note
+# SBS-96 has 96 contexts, so 50 is a hard floor and not a sufficiency threshold.
+MIN_SNVS="${MIN_SNVS:-50}"
 
 setup_conda
 mkdir -p "$OUTDIR/vcf"
@@ -40,7 +44,27 @@ bcftools view -v snps -i 'INFO/EIDOLON_ORIGIN="somatic"' \
     -O v -o "$OUTDIR/vcf/eidolon_somatic_snvs.vcf" "$TRUTH_VCF"
 n=$(grep -vc '^#' "$OUTDIR/vcf/eidolon_somatic_snvs.vcf" || true)
 echo "Somatic SNVs for signature fitting: $n"
-[[ "$n" -ge 50 ]] || echo "WARNING: few SNVs ($n) — fit will be noisy; use a larger/higher-coverage run." >&2
+# Fatal, not a warning. This harness produces exactly one thing — a signature fit —
+# so too few SNVs is not a degraded result, it is not a result: SBS-96 has 96
+# trinucleotide contexts, and a spectrum built from fewer mutations than contexts
+# cannot populate them. SigProfiler will still return an assignment, and that
+# assignment would be reported as though it measured something. The report's own
+# signature analysis (§3.9) used 6,225 SNVs; MIN_SNVS is a floor, not a target.
+if [[ "$n" -lt "$MIN_SNVS" ]]; then
+    echo "ERROR: only $n somatic SNV(s) — below MIN_SNVS=$MIN_SNVS." >&2
+    echo "  A COSMIC SBS fit needs to populate 96 trinucleotide contexts; below that" >&2
+    echo "  floor the assignment is noise that would be reported as a measurement." >&2
+    if [[ "$n" -eq 0 ]]; then
+        echo "  0 SNVs usually means the truth VCF has no somatic SNVs at all — raise" >&2
+        echo "  TUMOR_MUTATION_RATE or coverage. (A pre-v3.0.0 truth VCF uses" >&2
+        echo "  NEAT_ORIGIN and would have failed the filter above instead; convert it" >&2
+        echo "  with tools/migrate_legacy_tokens.sh.)" >&2
+    else
+        echo "  Use a larger / higher-coverage run, or set MIN_SNVS to accept the" >&2
+        echo "  noise deliberately." >&2
+    fi
+    exit 1
+fi
 
 # 2. SigProfiler: install the reference genome once (no-op if present), then fit.
 conda_activate "$SIGPROFILER_ENV"
