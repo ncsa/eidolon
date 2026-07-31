@@ -26,6 +26,10 @@
 #   bash scripts/delta/setup.sh              # reference build + bioinf env
 #   conda create -y -n manta   -c bioconda -c conda-forge manta
 #   conda create -y -n truvari -c bioconda -c conda-forge truvari
+#   truvari now installs into `bioinf` alongside bcftools (solve verified clean), so
+#   scoring no longer switches envs — that split existed only because Manta needs
+#   python2, and it forced per-type subsets to be pre-generated in an earlier stage
+#   since bcftools was absent during scoring.
 #   (override env names with MANTA_ENV / TRUVARI_ENV if you named them differently)
 #
 # Usage:
@@ -70,7 +74,7 @@ TUMOR_MODEL="${TUMOR_MODEL:-$REPO_ROOT/tools/cosmic_v104_pancancer_model.json.gz
 
 MANTA_ENV="${MANTA_ENV:-manta}"
 DELLY_ENV="${DELLY_ENV:-delly}"
-TRUVARI_ENV="${TRUVARI_ENV:-truvari}"
+TRUVARI_ENV="${TRUVARI_ENV:-bioinf}"   # truvari lives in bioinf; see prereqs
 # Run Delly as a 2nd somatic SV caller alongside Manta (cross-validation; the
 # BND-recovery question). Set RUN_DELLY=0 to skip.
 RUN_DELLY="${RUN_DELLY:-1}"
@@ -80,12 +84,16 @@ RUN_DELLY="${RUN_DELLY:-1}"
 RUN_CNV="${RUN_CNV:-1}"
 # eidolon SVs reach ~1 Mb; truvari's default --sizemax is 50 kb, which would silently
 # EXCLUDE most large eidolon SVs from scoring. Raise it to cover the full range.
-TRUVARI_SIZEMAX="${TRUVARI_SIZEMAX:-5000000}"
-# Max per-breakpoint offset when matching a truth BND junction to a caller junction.
-# 200bp is generous relative to short-read breakpoint precision but tight relative to
-# the inter-junction spacing at realistic SV rates, so it will not cross-match
-# neighbouring junctions.
-BND_WINDOW="${BND_WINDOW:-200}"
+# truvari DISCARDS any record larger than this before comparison. The previous 5Mb
+# default silently removed every SV above it — and sv_max_length_fraction (0.25)
+# permits 14Mb events on a 56Mb scaffold, while BND mate positions are drawn across
+# the whole contig, so junction spans reach tens of Mb. Default is now effectively
+# unlimited; what it would exclude is logged before scoring.
+TRUVARI_SIZEMAX="${TRUVARI_SIZEMAX:-100000000}"
+# Passed to truvari as --bnddist: max per-breakpoint offset when matching BND-to-BND.
+# Generous against short-read breakpoint precision, tight against inter-junction
+# spacing at realistic SV rates.
+BND_DIST="${BND_DIST:-500}"
 
 THREADS=$SLURM_CPUS_PER_TASK
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRATCH/cargo-target/eidolon}"
@@ -251,6 +259,19 @@ done
 # END==POS, and CNV is a copy-ratio call — truvari matches neither, so including
 # them made every aggregate a guaranteed partial miss (#457). They are scored
 # separately: BND by breakpoint proximity, CNV by the stage-4c direction check.
+# Derive comparable junction spans from the BND pairs (see build_bnd_spans).
+if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
+    build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
+        || echo "  (BND span derivation produced nothing — no intra-contig junctions?)"
+fi
+
+# What would --sizemax silently discard? Truvari drops oversized records BEFORE
+# comparison, so an unreported ceiling turns real events into guaranteed misses.
+n_over=$(bcftools query -f '%INFO/SVLEN\n' "$TRUTH_SV" 2>/dev/null \
+         | awk -v m="$TRUVARI_SIZEMAX" '{v=($1<0?-$1:$1)+0; if (v>m) n++} END{print n+0}')
+echo "  truth records exceeding --sizemax=$TRUVARI_SIZEMAX: $n_over"
+[[ "$n_over" -gt 0 ]] && echo "    NOTE: those would be discarded before comparison — raise TRUVARI_SIZEMAX." >&2
+
 TRUTH_SCOREABLE="$OUTDIR/truth_sv_scoreable.vcf.gz"
 bcftools view -i 'INFO/SVTYPE!="BND" && INFO/SVTYPE!="CNV"' \
     -O z -o "$TRUTH_SCOREABLE" "$TRUTH_SV" 2>/dev/null || true
@@ -380,40 +401,33 @@ elif [[ "$RUN_CNV" == "1" ]]; then
     echo "[4c] no CNV truth (truth_sv_CNV.vcf.gz) — skipping CNV validation (raise SV_RATE_SCALE / coverage)."
 fi
 
-# ── Stage 4d: pre-split caller VCFs by SV type ───────────────────────────
-# Per-type scoring must filter the QUERY as well as the truth (#457), and that
-# needs bcftools — which the truvari env does not necessarily provide (the same
-# reason the per-type TRUTH subsets are pre-generated above). So split here, while
-# bioinf is still active, and let stage 5 read only pre-made files.
-conda_activate bioinf
-presplit_calls() {  # <caller> <comp.vcf.gz>
-    local caller="$1" comp="$2"
-    [[ -f "$comp" ]] || return 0
-    for svt in DEL DUP INV INS; do
-        local q="$OUTDIR/${caller}_calls_${svt}.vcf.gz"
-        bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$q" "$comp" 2>/dev/null || continue
-        bcftools index -f -t "$q" 2>/dev/null || true
-        local n; n=$(bcftools view -H "$q" 2>/dev/null | wc -l)
-        [[ "$n" -eq 0 ]] && rm -f "$q" "${q}.tbi"
-    done
-}
-presplit_calls manta "$MANTA_SV"
-[[ -n "${DELLY_SV:-}" ]] && presplit_calls delly "$DELLY_SV"
-
 # ── Stage 5: Score each caller with truvari (overall + per SV type) ──────
 echo "[5/5] Scoring SVs with truvari..."
 conda_activate "$TRUVARI_ENV"
 
-run_truvari() {  # <truth.vcf.gz> <out-label> <comp.vcf.gz>
+# Pick the tumor sample from a caller VCF. truvari otherwise takes the FIRST sample,
+# which for Manta's somaticSV is NORMAL — so every somatic comparison was reading the
+# normal sample's genotypes.
+comp_sample() {  # <comp.vcf.gz>
+    local s
+    s=$(bcftools query -l "$1" 2>/dev/null | grep -ixm1 -E 'tumor|tumour' || true)
+    [[ -n "$s" ]] || s=$(bcftools query -l "$1" 2>/dev/null | tail -1)
+    printf '%s' "$s"
+}
+
+run_truvari() {  # <truth.vcf.gz> <out-label> <comp.vcf.gz> [extra truvari args...]
     # Separate `local`s on purpose: a combined `local a=$1 b=$2 c=...$b` expands
     # $b before it's assigned, which trips `set -u` (unbound variable).
     local truth="$1"
     local label="$2"
     local comp="$3"
+    shift 3
     local out="$OUTDIR/truvari_$label"
+    local csample; csample=$(comp_sample "$comp")
     rm -rf "$out"   # truvari requires the output dir not pre-exist
     truvari bench -b "$truth" -c "$comp" -f "$REFERENCE" -o "$out" \
-        --passonly --sizemax "$TRUVARI_SIZEMAX" 2>&1 | tail -3 || true
+        --passonly --sizemax "$TRUVARI_SIZEMAX" \
+        ${csample:+--cSample "$csample"} "$@" 2>&1 | tail -3 || true
     if [[ -f "$out/summary.json" ]]; then
         python3 - "$out/summary.json" "$label" <<'PY'
 import json, sys
@@ -428,27 +442,120 @@ PY
     fi
 }
 
-# Score one caller's VCF against the truth — overall + each per-type subset (#457).
+# ── BND junction spans: a comparable representation ──────────────────────
+# A BND pair at (A,B) and a caller's <DUP:TANDEM>/<DEL>/<INV> spanning A..B describe the
+# SAME event, but truvari matches variants as INTERVALS and these are not
+# interval-equivalent: the BND record is a point (END==POS) while the caller's is a span
+# of tens of Mb. No similarity threshold or --typeignore can bridge that — verified on
+# job 20636298, where Manta called a truth junction as <DUP:TANDEM> at POS 1bp away with
+# END exactly on the mate, and truvari still reported TP=0 with --typeignore --pctsize 0
+# --pctseq 0 --sizemax 100000000.
 #
-# Three things this gets right that the earlier version did not:
+# So convert the truth: emit ONE record per junction, POS=min, END=max. That is a derived
+# COMPARISON artifact, not an output format — END on a real BND must equal POS. Only
+# intra-contig junctions can become spans; inter-contig ones are counted and skipped.
+build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
+    local src="$1" dst="$2"
+    [[ -f "$src" ]] || return 1
+    local body="$OUTDIR/.bnd_span_body"
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' "$src" \
+      | awk -F'\t' 'BEGIN{OFS="\t"}
+          { alt=$4; gsub(/[][]/, "|", alt); n=split(alt, p, "|"); loc=""
+            for (i=1;i<=n;i++) if (p[i] ~ /:/) { loc=p[i]; break }
+            if (loc == "") { bad++; next }
+            split(loc, m, ":"); mc=m[1]; mp=m[2]+0
+            if (mc != $1) { inter++; next }
+            lo = ($2+0 < mp) ? $2+0 : mp; hi = ($2+0 < mp) ? mp : $2+0
+            key = $1 ":" lo "-" hi
+            if (key in seen) { dup++; next }
+            seen[key]=1
+            print $1, lo, ".", $3, "<BND_SPAN>", 37, "PASS", \
+                  "SVTYPE=BND;END=" hi ";SVLEN=" (hi-lo), "GT", "0/1" }
+          END{ printf("  BND spans: %d junction(s) from %d record(s) "\
+                      "(inter-contig skipped=%d, unparsable ALT=%d)\n",
+                      length(seen), length(seen)+dup+inter+bad, inter+0, bad+0) > "/dev/stderr" }' \
+      > "$body"
+    if [[ ! -s "$body" ]]; then rm -f "$body"; return 1; fi
+    { bcftools view -h "$src" | grep -vE '^#CHROM'
+      echo '##ALT=<ID=BND_SPAN,Description="Derived: intra-contig BND junction as a span (comparison only)">'
+      echo '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Junction span">'
+      bcftools view -h "$src" | grep -E '^#CHROM'
+      cat "$body"; } | bcftools sort -O z -o "$dst" 2>/dev/null
+    bcftools index -f -t "$dst" 2>/dev/null || true
+    rm -f "$body"
+}
+
+# ── Rule 0: calibrate the scorer before believing it ────────────────────
+# A scorer must reproduce a PERFECT score against itself in the configuration the real
+# run uses. If truth-vs-truth is not 1.000, the configuration is broken and nothing it
+# reports about a caller means anything. This check, run once, would have immediately
+# localised the BND problem that instead took a week and five wrong explanations:
+# `truvari bench -b truth -c truth --sizemax 5000000` cannot match a 29Mb junction to
+# itself, because sizemax discards it before comparison.
+selftest_truvari() {  # <truth.vcf.gz> <label> [extra args...]
+    local truth="$1" label="$2"; shift 2
+    local out="$OUTDIR/truvari_selftest_$label"
+    rm -rf "$out"
+    truvari bench -b "$truth" -c "$truth" -f "$REFERENCE" -o "$out" \
+        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >/dev/null 2>&1 || true
+    local r=0
+    [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
+    if awk -v r="$r" 'BEGIN{exit !(r > 0.999)}'; then
+        echo "  selftest $label: PASS (truth vs truth recall=$r)"
+        return 0
+    fi
+    echo "ERROR: scorer selftest FAILED for $label — truth vs truth recall=$r, expected 1.000." >&2
+    echo "  The scoring configuration cannot match the truth to ITSELF, so any recall it" >&2
+    echo "  reports against a caller is meaningless. Usual causes: --sizemax discarding" >&2
+    echo "  records before comparison, or a size/sequence similarity threshold that a" >&2
+    echo "  point-like record cannot satisfy. See $out." >&2
+    return 1
+}
+
+# Negative control: the same truth shifted far enough that nothing should match. Guards
+# against a configuration so permissive it matches anything.
+decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
+    local truth="$1" label="$2"; shift 2
+    local decoy="$OUTDIR/.decoy_${label}.vcf.gz" out="$OUTDIR/truvari_decoy_$label"
+    { bcftools view -h "$truth"
+      bcftools view -H "$truth" | awk -F'\t' 'BEGIN{OFS="\t"}{$2=$2+2000000; print}'; } \
+      | bcftools sort -O z -o "$decoy" 2>/dev/null || { echo "  decoy $label: could not build (skipped)"; return 0; }
+    bcftools index -f -t "$decoy" 2>/dev/null || true
+    rm -rf "$out"
+    truvari bench -b "$truth" -c "$decoy" -f "$REFERENCE" -o "$out" \
+        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >/dev/null 2>&1 || true
+    local r=0
+    [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
+    if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then
+        echo "  decoy    $label: PASS (shifted truth recall=$r, expected 0)"
+    else
+        echo "  WARNING: decoy control for $label matched (recall=$r) — the configuration" >&2
+        echo "  is matching on position far more loosely than intended. See $out." >&2
+    fi
+    return 0
+}
+
+# Score one caller's VCF against the truth — aggregate + per-type + BND (#457).
 #
-#  1. Per-type runs filter the QUERY as well as the truth. Passing the full caller
-#     VCF against a type-filtered truth counted every record of another type as a
-#     false positive, which produced arithmetically impossible output —
-#     manta_BND FP=39 against manta_overall FP=20. A subset cannot have more false
-#     positives than the whole.
-#  2. The aggregate scores only types truvari can actually match. BND (no SVLEN,
-#     END==POS) and CNV are unmatchable by truvari, so leaving them in capped the
-#     aggregate near 0.5 regardless of caller quality — and made a CORRECT fix look
-#     like a regression when #453 started emitting more BND records.
-#  3. BND is scored separately by breakpoint proximity, and CNV by the direction
-#     check in stage 4c. Both report junctions/events, not records.
+# What this fixes, all of which produced numbers that were not measurements:
+#
+#  1. Per-type runs now filter the QUERY as well as the truth. Passing the full caller
+#     VCF against a type-filtered truth counted every record of another type as a false
+#     positive, giving arithmetically impossible output — manta_BND FP=39 against
+#     manta_overall FP=20. A subset cannot have more false positives than the whole.
+#  2. BND is scored TWO ways, because callers represent junctions two ways: BND-to-BND
+#     via --bnddist for callers that emit breakends, and span-to-span against the derived
+#     junction spans for callers that re-represent a junction as <DUP:TANDEM>/<DEL>/<INV>.
+#     Reported separately and labelled; the span comparison is what recovers Manta.
+#  3. CNV stays out of truvari entirely — it is a copy-ratio call, scored by the stage-4c
+#     direction check instead. The aggregate covers types truvari can match, and the log
+#     states what was excluded and where it went.
+#  4. Every scorer is calibrated first (selftest + decoy). See selftest_truvari.
 score_caller() {  # <caller> <comp.vcf.gz>
     local caller="$1" comp="$2"
     [[ -f "$comp" ]] || { echo "  ($caller: no calls to score)"; return 0; }
-    echo "  === $caller ==="
+    echo "  === $caller (cSample=$(comp_sample "$comp")) ==="
 
-    # Aggregate over the truvari-scoreable subset only.
     if [[ -f "$TRUTH_SCOREABLE" ]]; then
         run_truvari "$TRUTH_SCOREABLE" "${caller}_overall" "$comp"
     else
@@ -459,29 +566,52 @@ score_caller() {  # <caller> <comp.vcf.gz>
         [[ -f "$typed" ]] || continue
         local svt; svt=$(basename "$typed" .vcf.gz); svt=${svt#truth_sv_}
         case "$svt" in
-            # Scored separately below / in stage 4c — truvari cannot match either.
-            BND|CNV|scoreable) continue ;;
+            BND|BNDspan|CNV|scoreable) continue ;;   # handled separately below / 4c
         esac
-        # Type-filtered query, pre-split in stage 4d (bcftools may be absent here).
         local q="$OUTDIR/${caller}_calls_${svt}.vcf.gz"
-        if [[ -f "$q" ]]; then
+        bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$q" "$comp" 2>/dev/null || true
+        if [[ -f "$q" ]] && [[ "$(bcftools view -H "$q" 2>/dev/null | wc -l)" -gt 0 ]]; then
+            bcftools index -f -t "$q" 2>/dev/null || true
             run_truvari "$typed" "${caller}_${svt}" "$q"
         else
-            # No calls of this type at all: recall is 0 by definition, but say so
-            # rather than emitting a precision figure computed from nothing.
+            rm -f "$q" "${q}.tbi"
+            # Recall is 0 by definition; say so rather than emit a precision figure
+            # computed from an empty query.
             echo "  ${caller}_${svt} recall=0.000  (caller emitted no $svt records)"
         fi
     done
 
-    # BND: proximity-scored, junction-level (truvari cannot match breakends).
+    # BND, representation 1: breakend-to-breakend.
     if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
-        python3 "$REPO_ROOT/scripts/delta/bnd_proximity.py" \
-            --truth "$OUTDIR/truth_sv_BND.vcf.gz" \
-            --calls "$comp" \
-            --window "$BND_WINDOW" \
-            --label "$caller" || true
+        run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$comp" \
+            --bnddist "$BND_DIST"
+    fi
+    # BND, representation 2: junction spans vs whatever type the caller used. -t
+    # (--typeignore) is required: the caller legitimately calls a junction a DUP.
+    if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
+        run_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$comp" -t
     fi
 }
+
+# ── Rule 0: calibrate every scorer before believing any of it ────────────
+echo "[5/5] Calibrating scorers (truth-vs-truth must be perfect; decoy must be zero)..."
+CAL_FAIL=0
+if [[ -f "$TRUTH_SCOREABLE" ]]; then
+    selftest_truvari "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
+    decoy_truvari    "$TRUTH_SCOREABLE" scoreable
+fi
+if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
+    selftest_truvari "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST" || CAL_FAIL=1
+fi
+if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
+    selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
+fi
+if [[ "$CAL_FAIL" -ne 0 ]]; then
+    echo "ERROR: at least one scorer cannot match the truth to itself — refusing to" >&2
+    echo "  report caller results computed with a configuration that demonstrably" >&2
+    echo "  cannot score a perfect answer." >&2
+    exit 1
+fi
 
 score_caller manta "$MANTA_SV"
 [[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
