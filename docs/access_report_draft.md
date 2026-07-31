@@ -898,4 +898,9 @@ constraint.
 
 _Run-level metrics and provenance for every job (version, git commit, reference,
 core-hours) are archived under the project results directory and assembled by
-`scripts/delta/collect_report.sh`._
+`scripts/delta/collect_report.sh`. Note the archive spans **two roots** because the
+project was renamed `rusty-neat`/`rneat` → `eidolon` partway through (v2.0.0): Phase 1
+runs — everything backing §3.1–§3.11 — are under
+`/projects/bhrd/jallen17/rneat-access-results/`, while runs from v2.0.0 onward are under
+`/projects/bhrd/jallen17/eidolon-access-results/`. Each job directory records its own
+version and git commit, so provenance is per-run regardless of which root holds it._

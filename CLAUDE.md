@@ -60,7 +60,15 @@ contributed the *fragility* (see the footguns below), not the blind spots.
 ## Delta / HPC (`scripts/delta/`)
 - Real-data validation runs on **NCSA Delta** (SLURM, account `bhrd-delta-cpu`). The
   cluster filesystem is **not reachable from this workstation** — the user runs jobs
-  and pastes results; artifacts archive to `/projects/bhrd/jallen17/eidolon-access-results/`.
+  and pastes results. Artifacts archive to **two** roots — the project was renamed
+  partway through, so Phase 1 / pre-v2.0.0 runs are under
+  `/projects/bhrd/jallen17/rneat-access-results/` (germline, cancer, sv, benchmark,
+  baseline, tune, threadscale, ppn, modelbuild — the corpus behind the ACCESS report's
+  §3.1–3.11) and v2.0.0-onward runs under
+  `/projects/bhrd/jallen17/eidolon-access-results/`. `lib_report.sh` writes only to the
+  latter (`RESULTS_DIR`, overridable), and `collect_report.sh` scans one root at a time —
+  so pass `RESULTS_DIR=` explicitly when looking for historical runs, or you will
+  conclude they are missing.
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.
