@@ -99,6 +99,9 @@ setup_conda
 conda_activate bioinf   # provides bwa-mem2, gatk4, bcftools (not available as modules)
 
 mkdir -p "$OUTDIR"
+# Refuse to run concurrently in an OUTDIR another job already owns —
+# interleaved writes yield results computed from corrupted intermediates.
+lock_outdir "$OUTDIR" || exit 1
 REF_DIR="$(dirname "$REFERENCE")"
 REF_NAME="$(basename "$REFERENCE")"
 
@@ -174,16 +177,10 @@ index_and_align() {
         return 0
     fi
 
-    # Index reference once (idempotent). Guard on -s, not -f: a build killed
-    # mid-write leaves a 0-byte .bwt.2bit.64 that -f treats as present, poisoning
-    # every later run (bwa-mem2: "Unexpected end of file"). -s rebuilds on empty.
-    if [[ ! -s "${REFERENCE}.bwt.2bit.64" ]] && [[ ! -s "${REFERENCE}.bwt" ]]; then
-        echo "  Indexing reference for BWA-MEM2 (one-time, ~2 min)..."
-        bwa-mem2 index "$REFERENCE" 2>&1 | tail -3
-    fi
-    if [[ ! -f "${REFERENCE}.fai" ]]; then
-        samtools faidx "$REFERENCE"
-    fi
+    # Index reference once, serialized so concurrent jobs can't race the shared
+    # index. The -s (not -f) guard against a 0-byte .bwt.2bit.64 from a build
+    # killed mid-write lives in index_reference_locked (lib_report.sh).
+    index_reference_locked "$REFERENCE"
 
     echo "  Aligning $sample..."
     local rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"

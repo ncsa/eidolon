@@ -211,3 +211,64 @@ check_outdir_version() {
 stamp_outdir_version() {
     printf '%s\n' "$EIDOLON_VERSION" > "$1/.eidolon_version"
 }
+
+# ── OUTDIR concurrency lock ─────────────────────────────────────────────────
+# Two jobs pointed at one OUTDIR silently interleave their writes — the same
+# FASTQ, BAM, truth-VCF and caller-output paths — and still produce numbers,
+# derived from corrupted intermediates. Observed with SLURM jobs 20635663 and
+# 20636020, which both simulated into $SCRATCH/t6_sv_v3 concurrently; neither
+# reported anything wrong.
+#
+# The lock is held for the life of the job because fd 9 stays open. flock is
+# released by the kernel when the holder exits, so a killed job leaves NO stale
+# lock to clean up — the lockfile persisting on disk is harmless.
+lock_outdir() {
+    local outdir="$1" lockfile="$1/.lock"
+    mkdir -p "$outdir"
+    # <> not > : opening for write would TRUNCATE the holder's identity before we
+    # even try to acquire, so a rejected job couldn't report who has it.
+    if ! exec 9<>"$lockfile"; then
+        echo "ERROR: cannot open lock file $lockfile" >&2
+        return 1
+    fi
+    if ! flock -n 9; then
+        local holder
+        holder="$(tr -d '\r' < "$lockfile" 2>/dev/null | head -1)"
+        echo "ERROR: another job is already running in $outdir" >&2
+        echo "       held by: ${holder:-<unknown>}" >&2
+        echo "  Concurrent runs sharing an OUTDIR interleave their writes and yield" >&2
+        echo "  results computed from corrupted intermediates — with no warning." >&2
+        echo "  Use a different OUTDIR, or wait for that job to finish." >&2
+        return 1
+    fi
+    printf 'SLURM job %s on %s since %s\n' \
+        "${SLURM_JOB_ID:-manual}" "$(hostname)" "$(date -Is 2>/dev/null || date)" \
+        > "$lockfile"
+    return 0
+}
+
+# Serialize the shared bwa-mem2 index build. Two jobs that both see no index will
+# both run `bwa-mem2 index` against the SAME path and interleave writes, poisoning
+# it for both — the 0-byte .bwt.2bit.64 state the call sites already guard against
+# after the fact. Blocking lock: the second job waits, then finds the index present
+# and skips. Degrades to the unlocked check if the reference dir isn't writable.
+index_reference_locked() {
+    local ref="$1"
+    if exec 8<>"${ref}.index.lock" 2>/dev/null; then
+        flock 8
+        if [[ ! -s "${ref}.bwt.2bit.64" ]] && [[ ! -s "${ref}.bwt" ]]; then
+            echo "  Indexing reference for BWA-MEM2 (one-time, lock held)..."
+            bwa-mem2 index "$ref" 2>&1 | tail -3
+        fi
+        flock -u 8
+        exec 8>&-
+    else
+        echo "  NOTE: cannot create ${ref}.index.lock (read-only dir?) — indexing" >&2
+        echo "        unserialized; do not run concurrent jobs against a fresh reference." >&2
+        if [[ ! -s "${ref}.bwt.2bit.64" ]] && [[ ! -s "${ref}.bwt" ]]; then
+            echo "  Indexing reference for BWA-MEM2 (one-time)..."
+            bwa-mem2 index "$ref" 2>&1 | tail -3
+        fi
+    fi
+    [[ -f "${ref}.fai" ]] || samtools faidx "$ref"
+}
