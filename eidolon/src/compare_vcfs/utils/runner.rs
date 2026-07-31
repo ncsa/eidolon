@@ -255,10 +255,13 @@ pub fn runner(config: &RunConfiguration) -> Result<(), CompareVcfsError> {
     // Write per-record VCF artifacts before the JSON/TXT report so the
     // report's `outputs` section can name them. FN_with_reasons.vcf is
     // always written; FP.vcf is gated on the config flag.
+    // Each artifact inherits declarations from the VCF ITS records came from:
+    // FNs are golden-VCF records, FPs are called-VCF records (#444).
     let fn_vcf_path = write_fn_with_reasons(
         &attribution_result,
         &config.output_dir,
         config.overwrite_output,
+        &config.golden_vcf,
     )?;
     info!("Wrote {}", fn_vcf_path.display());
 
@@ -269,7 +272,12 @@ pub fn runner(config: &RunConfiguration) -> Result<(), CompareVcfsError> {
                 fp_pairs.push((chrom.clone(), v));
             }
         }
-        let p = write_fp_vcf(&fp_pairs, &config.output_dir, config.overwrite_output)?;
+        let p = write_fp_vcf(
+            &fp_pairs,
+            &config.output_dir,
+            config.overwrite_output,
+            &config.called_vcf,
+        )?;
         info!("Wrote {}", p.display());
         Some(p)
     } else {
