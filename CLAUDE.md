@@ -57,6 +57,28 @@ contributed the *fragility* (see the footguns below), not the blind spots.
   moment a token is renamed. Anchor on the token (`sub(/^EIDOLON_VAF=/,"",v)`) or use
   `PREFIX.len()`.
 
+## Languages: Rust, bash, and (reluctantly) Python
+- **The shipped artifact is pure Rust** and must stay that way: the binary invokes no
+  interpreter, `Cargo.lock` has no `pyo3`/`cpython`, and `conda-recipe/meta.yaml`
+  declares **no runtime requirements** (build-only). Verify before adding anything that
+  would change that.
+- **Do not introduce new Python.** Product logic is Rust; harness orchestration is bash.
+  Python is acceptable only where an **external tool forces it** — truvari and
+  SigProfiler are Python packages, so parsing their output in their own env is fine.
+- **Vet what exists** (all validation/prep only, none shipped):
+  `scripts/delta/{scn_af_compare,sbs96_compare}.py` are per-validation measurement
+  helpers — they determine numbers the ACCESS report cites and are **not covered by CI**
+  (#466). `tools/{build_pcawg_sv_vcf,normalize_pcawg_sv_model,graft_sv_model}.py` are
+  offline corpus prep. `tools/inject_cancer_sv_model.py` is **dead** — deprecated in
+  v1.14.0, no live caller, safe to delete.
+- Before writing a helper that works *around* a third-party tool, **check that tool's
+  actual capabilities and version.** A `bnd_proximity.py` was written on the inherited
+  belief that "truvari cannot benchmark breakends" — true of truvari v4, and explicitly
+  reversed by v5.0.0 ("BNDs which were always filtered are now analyzed"). The deployed
+  version was v5.4.0 with `--bnddist`. The helper was redundant; reading the changelog
+  was the whole job. The claim still sits uncorrected in
+  `docs/access_report_draft.md` §3.7.
+
 ## Delta / HPC (`scripts/delta/`)
 - Real-data validation runs on **NCSA Delta** (SLURM, account `bhrd-delta-cpu`). The
   cluster filesystem is **not reachable from this workstation** — the user runs jobs
