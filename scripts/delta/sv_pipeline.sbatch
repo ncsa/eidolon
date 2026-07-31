@@ -114,7 +114,11 @@ MERGED_R1="${PREFIX}_merged_r1.fastq.gz"
 NORMAL_R1="${PREFIX}_normal_r1.fastq.gz"
 TRUTH_VCF="${PREFIX}_merged_truth.vcf.gz"
 
-if [[ -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
+# Refuse to score fresh caller output against a truth VCF written by a different
+# build of eidolon (see lib_report.sh::check_outdir_version).
+check_outdir_version "$EIDOLON_BIN" "$OUTDIR" || exit 1
+
+if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
     echo "[1/5] Simulation outputs already present — skipping."
 else
     echo "[1/5] Simulating SV-rich tumor/normal reads..."
@@ -133,6 +137,7 @@ else
         --eidolon-bin "$EIDOLON_BIN" \
         $PAIRED_FLAG
     echo "[1/5] Simulation complete."
+    stamp_outdir_version "$OUTDIR"
 fi
 
 # ── Stage 2 & 3: Index reference, align ──────────────────────────────────

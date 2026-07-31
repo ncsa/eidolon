@@ -159,3 +159,55 @@ archive_run() {
 
     echo "[archive] $kind -> $dest  (core_hours=${core_hours:-0.0}, files: $*)"
 }
+
+# ── OUTDIR provenance guard ─────────────────────────────────────────────────
+# Reusing an OUTDIR across a rebuild silently mixes artifacts from two code
+# versions: fresh caller VCFs scored against a truth VCF written by the OLD
+# binary. The per-script "simulation regenerated — invalidating stale downstream
+# outputs" logic only fires when the simulation RE-RUNS, so nothing catches the
+# inverse (new binary, skipped simulation). That is a wrong answer with no
+# warning, which is the failure mode this repo keeps hitting.
+#
+# check_outdir_version sets EIDOLON_VERSION and FORCE_RESIM (0/1).
+# Call it before the simulation stage; call stamp_outdir_version after a
+# successful simulation.
+check_outdir_version() {
+    local bin="$1" outdir="$2"
+    EIDOLON_VERSION="$("$bin" --version 2>/dev/null | tr -d '\r\n')"
+    if [[ -z "$EIDOLON_VERSION" ]]; then
+        echo "ERROR: could not read '$bin --version' — is it built?" >&2
+        return 1
+    fi
+    FORCE_RESIM=0
+    local stamp="$outdir/.eidolon_version"
+    if [[ ! -f "$stamp" ]]; then
+        # No stamp: either a fresh OUTDIR, or one predating this guard. If it
+        # already holds simulation outputs we cannot know what produced them —
+        # say so rather than assume, but don't force an expensive redo of a
+        # legacy directory the user may know is fine.
+        if compgen -G "$outdir"/*_merged_truth.vcf.gz >/dev/null 2>&1; then
+            echo "WARNING: $outdir has simulation outputs but no .eidolon_version stamp," >&2
+            echo "         so their provenance is unknown. If they predate your last" >&2
+            echo "         rebuild, the truth VCF and the caller inputs come from" >&2
+            echo "         different code. Use a fresh OUTDIR if in doubt." >&2
+        fi
+        return 0
+    fi
+    local prev
+    prev="$(tr -d '\r\n' < "$stamp")"
+    [[ "$prev" == "$EIDOLON_VERSION" ]] && return 0
+    if [[ "${ALLOW_VERSION_MISMATCH:-0}" == "1" ]]; then
+        echo "WARNING: $outdir was built by '$prev' but this binary is" >&2
+        echo "         '$EIDOLON_VERSION'; ALLOW_VERSION_MISMATCH=1 — reusing anyway." >&2
+        return 0
+    fi
+    echo "  OUTDIR was built by '$prev' but this binary is '$EIDOLON_VERSION'."
+    echo "  Regenerating the simulation so the truth VCF and the caller inputs come"
+    echo "  from the same code. Set ALLOW_VERSION_MISMATCH=1 to reuse as-is."
+    FORCE_RESIM=1
+    return 0
+}
+
+stamp_outdir_version() {
+    printf '%s\n' "$EIDOLON_VERSION" > "$1/.eidolon_version"
+}
