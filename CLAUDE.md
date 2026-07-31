@@ -61,6 +61,20 @@ the negative case has to be built deliberately:
 A feature demonstrated only by "it emitted something plausible" has not been validated,
 it has been exercised.
 
+### Status vocabulary
+**Nothing is "done" until there is evidence it works as intended. Until then it is
+in progress.** This governs how work is reported, not just how it is tested:
+
+- Do not write "done", "complete", "verified" or a green check for work whose evidence
+  is "it ran", "tests pass" in isolation, or "the code looks right".
+- Say what level of evidence exists and what is still missing — e.g. *"locally vetted on
+  a known-answer fixture; not yet run against real data"*. That is an honest in-progress
+  status, and it is more useful than a checkmark.
+- A merged PR is not evidence. A tagged release is not evidence. Passing CI is evidence
+  about the tests, which is only as good as the tests.
+- This applies to milestones too: a release whose fixes have not been observed working
+  on real data is in progress, however many PRs are merged.
+
 ## Don't trust a green result — read the artifact
 - Harness "overall: PASS" / summary lines can be **false passes** — e.g. a run that
   found no inputs still printed PASS over an empty `summary.tsv` (job 19887446). Open
