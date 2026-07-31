@@ -12,6 +12,38 @@ Hand-written guidance below; the GitNexus block that follows is auto-generated
   `git merge-base --is-ancestor <sha> origin/develop`; recover a missed commit with
   `git cherry-pick`.
 
+## Vetting standard for new work (standing requirement)
+"It ran and produced output" is not evidence of correctness, and it is the bar this repo
+keeps accidentally settling for. Before calling anything done:
+
+1. **Assert on content, not existence.** A file existing, a non-zero record count, or
+   exit 0 proves nothing. The `nsom -gt 0` guard passed while every value was the
+   malformed string `AF=AF=0.3000`; `truth $svt: N` counted records while two of three
+   VAF clusters were being discarded downstream.
+2. **Prove the test fails without the fix.** Every check added this cycle was verified
+   non-vacuous by reverting the fix and watching it fail. That is what exposed an
+   `##ALT` assertion of mine that could never fail, because `compare-vcfs` excludes
+   symbolic ALTs by design.
+3. **Vet the premise, not just the implementation.** `bnd_proximity.py` was correct
+   code that should not have existed: it was built on an inherited claim that "truvari
+   cannot benchmark breakends", true of truvari v4 and explicitly reversed in v5.0.0.
+   Check a third-party tool's actual version and capabilities before writing anything
+   that works around its supposed limits.
+4. **Check coverage of the inputs, not just the metric.** Report `n_scored` vs
+   `n_planted` per stratum. A metric over an unknown denominator is not a result — #450
+   reported a clean bias while silently excluding the sites it existed to test.
+5. **Chase the evidence past the first plausible story.** `BND recall=0.000` got three
+   confident explanations in sequence (unpaired truth, then truvari's inability, then
+   ALT orientation) before the actual cause: the truth was fine, the reads were fine,
+   truvari was fine — Manta had not called those junctions. Each wrong answer was
+   plausible enough to stop at.
+6. **Say what was NOT verified.** If something was checked by hand rather than by CI,
+   or on a fixture rather than real data, state it. `scripts/delta/*.py` determine
+   numbers the ACCESS report cites and are exercised by nothing automatic (#466).
+
+Applies to features as much as fixes: a new capability needs correctness evidence, not
+a demonstration that it emits something.
+
 ## Don't trust a green result — read the artifact
 - Harness "overall: PASS" / summary lines can be **false passes** — e.g. a run that
   found no inputs still printed PASS over an empty `summary.tsv` (job 19887446). Open
