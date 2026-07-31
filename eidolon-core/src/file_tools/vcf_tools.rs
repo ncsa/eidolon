@@ -100,6 +100,13 @@ pub fn write_vcf(
         &mut buffer,
         "##INFO=<ID=CN,Number=1,Type=Integer,Description=\"Copy number of segment\">"
     )?;
+    // BND mate pairs cross-reference each other by ID. Declared here because this
+    // writer emits it on de-novo breakends and passes it through from input VCFs —
+    // an undeclared INFO tag streams fine VCF->VCF but hard-fails BCF translation.
+    writeln!(
+        &mut buffer,
+        "##INFO=<ID=MATEID,Number=.,Type=String,Description=\"ID of mate breakend(s)\">"
+    )?;
     writeln!(
         &mut buffer,
         "##INFO=<ID=EIDOLON_PROVENANCE,Number=1,Type=String,\
@@ -239,10 +246,18 @@ pub fn write_vcf(
                     variant.genotype_str, ref_count, alt_count, depth, af_str
                 )
             };
+            // The ID column was previously hardcoded to "." — which silently
+            // discarded every record's ID, including the ones an input VCF
+            // supplied. That breaks any INFO field that references an ID by name:
+            // a BND mate pair carries MATEID=<other side's ID>, so dropping IDs
+            // left the linkage dangling on both input-supplied and (post-#451)
+            // de-novo breakends. Emit the ID when the record has one.
+            let id_str = variant.id.as_deref().unwrap_or(".");
             let line = format!(
-                "{}\t{}\t.\t{}\t{}\t37\tPASS\t{}\tGT:AD:DP:AF\t{}",
+                "{}\t{}\t{}\t{}\t{}\t37\tPASS\t{}\tGT:AD:DP:AF\t{}",
                 contig,
                 variant.location + 1,
+                id_str,
                 sequence_array_to_string(&variant.reference),
                 alt_str,
                 info_str,
@@ -1546,6 +1561,13 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
             "missing EIDOLON_PROVENANCE INFO header line; got: {:?}",
             lines
         );
+        // MATEID must be declared: BND mate pairs reference each other by ID, and an
+        // undeclared INFO tag hard-fails BCF translation.
+        assert!(
+            lines.iter().any(|l| l.starts_with("##INFO=<ID=MATEID,")),
+            "missing MATEID INFO header line; got: {:?}",
+            lines
+        );
         // The sample-column name is an emitted output token too (renamed from
         // NEAT_simulated_sample in v3.0.0). Without this assertion it is the one
         // renamed token no test would catch being reverted.
@@ -1619,6 +1641,60 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
         assert_eq!(
             strip_own_output_tokens("IMPRECISE;NEAT_VAF=0.1").as_deref(),
             Some("IMPRECISE")
+        );
+    }
+
+    /// The ID column was hardcoded to "." for every record, so a BND's MATEID
+    /// pointed at an ID that never appeared in the file. Nothing asserted on it.
+    #[test]
+    fn test_write_vcf_emits_the_record_id_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut sv = SvData::new("G]chr1:1500]", SvType::Bnd);
+        sv.end = Some(500);
+        sv.mate_contig = Some("chr1".to_string());
+        sv.mate_pos = Some(1500);
+        let v = Variant {
+            variant_type: VariantType::Complex,
+            location: 499,
+            reference: vec![Nucleotide::G],
+            alternate: AlternateType::Symbolic(sv),
+            genotype_str: "0/1".to_string(),
+            genotype: Genotype::Heterozygous,
+            allele_fraction: None,
+            id: Some("eidolon_bnd_chr1_500_1500_1".to_string()),
+            quality_score: None,
+            filter: None,
+            info: Some("SVTYPE=BND;MATEID=eidolon_bnd_chr1_500_1500_2".to_string()),
+            format: vec!["GT".to_string()],
+            sample: vec!["0/1".to_string()],
+            provenance: Provenance::Denovo,
+        };
+        let mutated_map = MutatedMap::from_interval(0, 2000, vec![v]).unwrap();
+        let mut mutated_maps = HashMap::new();
+        mutated_maps.insert("chr1".to_string(), vec![mutated_map]);
+        let output_path = temp_dir.path().join("bnd_id.vcf");
+        write_vcf(
+            &mutated_maps,
+            &vec!["chr1".to_string()],
+            &HashMap::from([("chr1".to_string(), 2000usize)]),
+            &PathBuf::from("ref.fa"),
+            false,
+            &output_path,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let lines: Vec<String> = crate::file_tools::file_io::read_gzip_lines(&output_path)
+            .unwrap()
+            .map(|l| l.unwrap())
+            .collect();
+        let rec = lines
+            .iter()
+            .find(|l| !l.starts_with('#'))
+            .expect("no record written");
+        let cols: Vec<&str> = rec.split('\t').collect();
+        assert_eq!(
+            cols[2], "eidolon_bnd_chr1_500_1500_1",
+            "ID column must carry variant.id, not \".\": {rec}"
         );
     }
 

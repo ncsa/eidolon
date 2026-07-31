@@ -165,3 +165,90 @@ fn homozygous_del_breakpoint_has_no_regular_crossing_reads() {
         "deleted interior (600) must have no regular reads (coverage-zeroed)"
     );
 }
+
+/// Run a homozygous BND junction between two H1N1_HA positions, supplying either
+/// one side or the full mate pair, and return the chimeric read names.
+fn run_bnd(test_name: &str, paired: bool) -> Vec<String> {
+    let (_dir, work) = fresh_workdir();
+    let input_vcf = work.join("input_bnd.vcf");
+    {
+        let mut f = std::fs::File::create(&input_vcf).unwrap();
+        writeln!(f, "##fileformat=VCFv4.2").unwrap();
+        writeln!(
+            f,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"GT\">"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"t\">"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "##INFO=<ID=MATEID,Number=.,Type=String,Description=\"m\">"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "H1N1_HA\t500\tbnd_A\tG\tG]H1N1_HA:1500]\t60\tPASS\tSVTYPE=BND;MATEID=bnd_B\tGT\t1/1"
+        )
+        .unwrap();
+        if paired {
+            writeln!(
+                f,
+                "H1N1_HA\t1500\tbnd_B\tC\tC]H1N1_HA:500]\t60\tPASS\tSVTYPE=BND;MATEID=bnd_A\tGT\t1/1"
+            )
+            .unwrap();
+        }
+    }
+
+    let mut config = GenReadsConfig::new(h1n1_reference(), work.clone(), test_name);
+    config.coverage = 100;
+    config.read_len = READ_LEN;
+    config.produce_fastq = true;
+    config.input_vcf = Some(input_vcf);
+    let yaml = config.write_yaml();
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(yaml.path())
+        .assert()
+        .success();
+
+    let out = work.join(format!("{test_name}_r1.fastq.gz"));
+    let r = BufReader::new(MultiGzDecoder::new(std::fs::File::open(&out).unwrap()));
+    r.lines()
+        .enumerate()
+        .filter(|(i, _)| i % 4 == 0)
+        .map(|(_, l)| l.unwrap())
+        .filter(|l| l.contains("EIDOLON_chimeric_"))
+        .collect()
+}
+
+/// A BND mate PAIR describes ONE junction from both sides, so it must produce the
+/// same number of chimeric reads as supplying a single side — not double.
+///
+/// The dedup key in the chimeric pass canonicalizes `(contig,pos,mate_contig,mate_pos)`
+/// so both sides collapse to one entry, but `location` is 0-based while `mate_pos` is
+/// 1-based; mixing them made the two sides hash to different keys and the junction was
+/// emitted twice (2x coverage at the breakpoint). This file previously tested only INV
+/// and DEL despite its name, so nothing caught it.
+#[test]
+fn bnd_mate_pair_does_not_double_the_junction_reads() {
+    let single = run_bnd("bnd_dc_single", false).len();
+    let paired = run_bnd("bnd_dc_paired", true).len();
+    assert!(
+        single > 0,
+        "expected chimeric reads for a homozygous BND, got none"
+    );
+    assert_eq!(
+        paired, single,
+        "a BND mate pair must not double the junction's chimeric reads \
+         (paired={paired}, single={single}) — the pair describes one junction"
+    );
+}

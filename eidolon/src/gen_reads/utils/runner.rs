@@ -1206,19 +1206,29 @@ fn process_chimeric_variants(
                 // lexicographically) and the same-contig case (compare
                 // positions) uniformly. Stored in `processed_ids` keyed by
                 // type-prefixed string so BND and INV share one HashSet.
+                //
+                // BOTH sides must be expressed in the SAME coordinate base or the
+                // two records canonicalize to different keys and the junction is
+                // processed twice (2x chimeric reads). `sv_rec.location` is
+                // 0-based; `sv.mate_pos` is 1-based (it comes from the VCF ALT
+                // string, and line ~2333 does saturating_sub(1) before indexing
+                // the sequence). Normalize the mate to 0-based here.
                 let here = (contig_name.as_str(), sv_rec.location);
-                let mate = (mate_contig.as_str(), mate_pos);
+                let mate_pos_0based = mate_pos.saturating_sub(1);
+                let mate = (mate_contig.as_str(), mate_pos_0based);
+                // The key body must also use the normalized coordinate, not the
+                // 1-based mate_pos, or the two sides still produce different keys.
                 let bnd_id = if here <= mate {
                     (
                         contig_name.clone(),
                         sv_rec.location,
                         mate_contig.clone(),
-                        mate_pos,
+                        mate_pos_0based,
                     )
                 } else {
                     (
                         mate_contig.clone(),
-                        mate_pos,
+                        mate_pos_0based,
                         contig_name.clone(),
                         sv_rec.location,
                     )
