@@ -321,8 +321,12 @@ if [[ -n "$TRUTH_FILTER" ]]; then
     filtered_count=$(run_in "$BCFTOOLS_IMG" sh -c \
         "bcftools view -H '/work/$SCORING_TRUTH_NAME' | wc -l" | tr -d '\r\n')
     if [[ "$filtered_count" == "0" ]]; then
-        echo "WARNING: truth filter '$TRUTH_FILTER' matched zero records." >&2
+        # Fatal, not a warning: scoring against an empty truth reports every caller as
+        # 0 recall and looks like a caller failure rather than a filter mistake.
+        echo "ERROR: truth filter '$TRUTH_FILTER' matched zero records." >&2
+        echo "  Refusing to score against an empty truth set." >&2
         echo "  If your truth VCF doesn't have INFO/EIDOLON_ORIGIN, pass --truth-filter ''" >&2
+        exit 1
     else
         echo "    Filtered truth: $filtered_count records retained."
     fi
