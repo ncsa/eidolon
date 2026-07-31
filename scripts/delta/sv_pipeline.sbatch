@@ -81,6 +81,11 @@ RUN_CNV="${RUN_CNV:-1}"
 # eidolon SVs reach ~1 Mb; truvari's default --sizemax is 50 kb, which would silently
 # EXCLUDE most large eidolon SVs from scoring. Raise it to cover the full range.
 TRUVARI_SIZEMAX="${TRUVARI_SIZEMAX:-5000000}"
+# Max per-breakpoint offset when matching a truth BND junction to a caller junction.
+# 200bp is generous relative to short-read breakpoint precision but tight relative to
+# the inter-junction spacing at realistic SV rates, so it will not cross-match
+# neighbouring junctions.
+BND_WINDOW="${BND_WINDOW:-200}"
 
 THREADS=$SLURM_CPUS_PER_TASK
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRATCH/cargo-target/eidolon}"
@@ -242,6 +247,24 @@ for svt in DEL DUP INV INS BND CNV; do
     [[ "$n" -eq 0 ]] && rm -f "$typed" "${typed}.tbi"
 done
 
+# The aggregate must cover only what truvari can match. A BND has no SVLEN and
+# END==POS, and CNV is a copy-ratio call — truvari matches neither, so including
+# them made every aggregate a guaranteed partial miss (#457). They are scored
+# separately: BND by breakpoint proximity, CNV by the stage-4c direction check.
+TRUTH_SCOREABLE="$OUTDIR/truth_sv_scoreable.vcf.gz"
+bcftools view -i 'INFO/SVTYPE!="BND" && INFO/SVTYPE!="CNV"' \
+    -O z -o "$TRUTH_SCOREABLE" "$TRUTH_SV" 2>/dev/null || true
+if [[ -f "$TRUTH_SCOREABLE" ]]; then
+    bcftools index -f -t "$TRUTH_SCOREABLE" 2>/dev/null || true
+    n_score=$(bcftools view -H "$TRUTH_SCOREABLE" | wc -l)
+    n_bnd=$(bcftools view -H "$TRUTH_SV" -i 'INFO/SVTYPE="BND"' 2>/dev/null | wc -l)
+    n_cnv=$(bcftools view -H "$TRUTH_SV" -i 'INFO/SVTYPE="CNV"' 2>/dev/null | wc -l)
+    echo "  truvari-scoreable truth: $n_score record(s)"
+    echo "    excluded from the aggregate: $n_bnd BND record(s) (= $((n_bnd / 2)) junction(s)), $n_cnv CNV"
+    echo "    -> BND scored by proximity below; CNV by the stage-4c direction check."
+    [[ "$n_score" -eq 0 ]] && rm -f "$TRUTH_SCOREABLE" "${TRUTH_SCOREABLE}.tbi"
+fi
+
 # ── Stage 4: Manta somatic SV calling ────────────────────────────────────
 MANTA_DIR="$OUTDIR/manta"
 MANTA_SV="$MANTA_DIR/results/variants/somaticSV.vcf.gz"
@@ -357,6 +380,26 @@ elif [[ "$RUN_CNV" == "1" ]]; then
     echo "[4c] no CNV truth (truth_sv_CNV.vcf.gz) — skipping CNV validation (raise SV_RATE_SCALE / coverage)."
 fi
 
+# ── Stage 4d: pre-split caller VCFs by SV type ───────────────────────────
+# Per-type scoring must filter the QUERY as well as the truth (#457), and that
+# needs bcftools — which the truvari env does not necessarily provide (the same
+# reason the per-type TRUTH subsets are pre-generated above). So split here, while
+# bioinf is still active, and let stage 5 read only pre-made files.
+conda_activate bioinf
+presplit_calls() {  # <caller> <comp.vcf.gz>
+    local caller="$1" comp="$2"
+    [[ -f "$comp" ]] || return 0
+    for svt in DEL DUP INV INS; do
+        local q="$OUTDIR/${caller}_calls_${svt}.vcf.gz"
+        bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$q" "$comp" 2>/dev/null || continue
+        bcftools index -f -t "$q" 2>/dev/null || true
+        local n; n=$(bcftools view -H "$q" 2>/dev/null | wc -l)
+        [[ "$n" -eq 0 ]] && rm -f "$q" "${q}.tbi"
+    done
+}
+presplit_calls manta "$MANTA_SV"
+[[ -n "${DELLY_SV:-}" ]] && presplit_calls delly "$DELLY_SV"
+
 # ── Stage 5: Score each caller with truvari (overall + per SV type) ──────
 echo "[5/5] Scoring SVs with truvari..."
 conda_activate "$TRUVARI_ENV"
@@ -385,19 +428,59 @@ PY
     fi
 }
 
-# Score one caller's VCF against the truth — overall + each per-type subset.
-# Outputs land under truvari_<caller>_<overall|TYPE>/, so Manta vs Delly is a
-# direct side-by-side (esp. for BND).
+# Score one caller's VCF against the truth — overall + each per-type subset (#457).
+#
+# Three things this gets right that the earlier version did not:
+#
+#  1. Per-type runs filter the QUERY as well as the truth. Passing the full caller
+#     VCF against a type-filtered truth counted every record of another type as a
+#     false positive, which produced arithmetically impossible output —
+#     manta_BND FP=39 against manta_overall FP=20. A subset cannot have more false
+#     positives than the whole.
+#  2. The aggregate scores only types truvari can actually match. BND (no SVLEN,
+#     END==POS) and CNV are unmatchable by truvari, so leaving them in capped the
+#     aggregate near 0.5 regardless of caller quality — and made a CORRECT fix look
+#     like a regression when #453 started emitting more BND records.
+#  3. BND is scored separately by breakpoint proximity, and CNV by the direction
+#     check in stage 4c. Both report junctions/events, not records.
 score_caller() {  # <caller> <comp.vcf.gz>
     local caller="$1" comp="$2"
     [[ -f "$comp" ]] || { echo "  ($caller: no calls to score)"; return 0; }
     echo "  === $caller ==="
-    run_truvari "$TRUTH_SV" "${caller}_overall" "$comp"
+
+    # Aggregate over the truvari-scoreable subset only.
+    if [[ -f "$TRUTH_SCOREABLE" ]]; then
+        run_truvari "$TRUTH_SCOREABLE" "${caller}_overall" "$comp"
+    else
+        echo "  ($caller: no truvari-scoreable truth types — aggregate skipped)"
+    fi
+
     for typed in "$OUTDIR"/truth_sv_*.vcf.gz; do
         [[ -f "$typed" ]] || continue
         local svt; svt=$(basename "$typed" .vcf.gz); svt=${svt#truth_sv_}
-        run_truvari "$typed" "${caller}_${svt}" "$comp"
+        case "$svt" in
+            # Scored separately below / in stage 4c — truvari cannot match either.
+            BND|CNV|scoreable) continue ;;
+        esac
+        # Type-filtered query, pre-split in stage 4d (bcftools may be absent here).
+        local q="$OUTDIR/${caller}_calls_${svt}.vcf.gz"
+        if [[ -f "$q" ]]; then
+            run_truvari "$typed" "${caller}_${svt}" "$q"
+        else
+            # No calls of this type at all: recall is 0 by definition, but say so
+            # rather than emitting a precision figure computed from nothing.
+            echo "  ${caller}_${svt} recall=0.000  (caller emitted no $svt records)"
+        fi
     done
+
+    # BND: proximity-scored, junction-level (truvari cannot match breakends).
+    if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
+        python3 "$REPO_ROOT/scripts/delta/bnd_proximity.py" \
+            --truth "$OUTDIR/truth_sv_BND.vcf.gz" \
+            --calls "$comp" \
+            --window "$BND_WINDOW" \
+            --label "$caller" || true
+    fi
 }
 
 score_caller manta "$MANTA_SV"
