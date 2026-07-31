@@ -17,6 +17,46 @@ Hand-written guidance below; the GitNexus block that follows is auto-generated
   found no inputs still printed PASS over an empty `summary.tsv` (job 19887446). Open
   the actual output (per-item rows, counts, sizes) before believing a success.
 
+### The recurring failure mode: harnesses that don't check their own coverage
+Every quiet failure found so far has the same shape — the harness reports a *metric*
+without asserting it actually **measured everything it planted**. Verified instances:
+
+| what it reported | what was true |
+|---|---|
+| `VERDICT: PASS`, bias/MAE in range (#450) | 160 of 567 planted sites silently excluded — the whole lowest-VAF cluster, i.e. the case the harness exists to test |
+| `BND recall=0.000` (#451) | truth was emitted unpaired/MATEID-less, so BND was unmatchable by construction; the reads were fine |
+| `nsom > 0` abort guard passed | the VAF values were the malformed string `AF=AF=0.3000`; the guard counted **records**, not content |
+
+**Rules when writing or reviewing a harness:**
+- Assert on **coverage of its own inputs**, not just on the metric: `n_scored` vs
+  `n_planted`, and report the shortfall per stratum. A metric over an unknown
+  denominator is not a result.
+- A zero or unexpectedly-small denominator is a **hard failure**, never a `WARNING`.
+  `cancer_pipeline.sbatch` only warned on an empty somatic truth, so it would have
+  scored every caller against nothing and printed results.
+- Guards must check **content**, not counts. Record counts pass while values are garbage.
+- If a step drops data deliberately (filters, LoD, min-depth), log how much it dropped.
+
+**This is not purely a bash problem.** The two deepest defects (#450, #451) were
+`bcftools` genotype semantics and Rust record emission — a Rust harness that likewise
+never asked "did I score all my planted sites?" would have failed just as silently. Bash
+contributed the *fragility* (see the footguns below), not the blind spots.
+
+### Bash footguns actually hit in this repo
+- `set -euo pipefail` + `zcat … | head` makes `zcat` take SIGPIPE (exit 141) and `set -e`
+  aborts a step that succeeded. Wrap in `set +o pipefail` … `set -o pipefail`.
+- **`$(cmd; echo $?)` does not capture a failing status** — the inherited `set -e` aborts
+  the subshell before `echo` runs, yielding an empty string. Use `cmd || rc=$?`.
+- **A process substitution's failure is invisible to `set -e`** — `while read … done <
+  <(cmd)` just runs zero iterations if `cmd` dies, so downstream logic silently sees "no
+  results". Assign to a variable first, or derive the data from something already captured.
+- Don't `case`/`if` on only the statuses you expect: handle `*)` explicitly, or an
+  unexpected rc gets treated as the happy path (`cancer_pipeline.sbatch` read every rc
+  except 10 as "already current").
+- Hardcoded offsets over token names (`substr($8,RSTART+9,…)`, `line[17..]`) break the
+  moment a token is renamed. Anchor on the token (`sub(/^EIDOLON_VAF=/,"",v)`) or use
+  `PREFIX.len()`.
+
 ## Delta / HPC (`scripts/delta/`)
 - Real-data validation runs on **NCSA Delta** (SLURM, account `bhrd-delta-cpu`). The
   cluster filesystem is **not reachable from this workstation** — the user runs jobs
