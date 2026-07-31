@@ -41,8 +41,25 @@ keeps accidentally settling for. Before calling anything done:
    or on a fixture rather than real data, state it. `scripts/delta/*.py` determine
    numbers the ACCESS report cites and are exercised by nothing automatic (#466).
 
-Applies to features as much as fixes: a new capability needs correctness evidence, not
-a demonstration that it emits something.
+**The bar is HIGHER for new features than for fixes**, because a fix has a
+known-bad baseline and a feature has none. With a fix you can revert it and watch the
+test fail — non-vacuity is free. With a feature, "it works" has no counterfactual, so
+the negative case has to be built deliberately:
+
+- **State the correctness criterion before implementing it**, and how it will be
+  falsified. If that cannot be written down, the feature is not ready to build.
+- **Include a known-answer fixture** — inputs whose correct output is computable
+  independently of the code under test. A 7-alt-in-100-reads BAM has an observed VAF of
+  exactly 0.070 whatever the implementation thinks.
+- **Include a case where it must NOT fire.** Most defects this cycle were things
+  matching or counting when they should not have, or vice versa.
+- **Verify the whole chain, not the unit.** #405's subclonal VAF passed its unit tests
+  and shipped; the harness validating it was itself excluding the sites it existed to
+  test, so the end-to-end claim was wrong for a year. BND junction reads were correct
+  the whole time and nobody had confirmed it until it was checked by hand.
+
+A feature demonstrated only by "it emitted something plausible" has not been validated,
+it has been exercised.
 
 ## Don't trust a green result — read the artifact
 - Harness "overall: PASS" / summary lines can be **false passes** — e.g. a run that
