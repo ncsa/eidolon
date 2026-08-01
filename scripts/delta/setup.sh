@@ -53,8 +53,38 @@ export CARGO_TARGET_DIR
 mkdir -p "$CARGO_TARGET_DIR"
 echo "[1/4] Building eidolon release binary (artifacts → \$SCRATCH)..."
 cd "$REPO_ROOT"
+# Say what is about to be built, and refuse to build a checkout that is behind its
+# remote. A partial or interrupted `git pull` leaves the tree on older code and setup
+# happily builds it: job 20682989 ran a 3.0.1 binary against a 3.1.0 checkout, spent
+# 25 core-hours, and produced a complete set of plausible numbers that tested none of
+# the fix it was submitted to verify. Nothing in the old output could have revealed
+# that, because setup never reported what it built.
+echo "      checkout: $(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}')"
+    if git fetch -q origin 2>/dev/null; then
+        behind="$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)"
+        if [[ "${behind:-0}" -gt 0 ]]; then
+            echo "      ERROR: checkout is ${behind} commit(s) behind ${upstream}." >&2
+            echo "      Pull before building, or the binary will not contain the code you" >&2
+            echo "      think it does. Set ALLOW_BEHIND=1 to build anyway." >&2
+            [[ "${ALLOW_BEHIND:-0}" == "1" ]] || exit 1
+        fi
+    else
+        echo "      WARNING: could not fetch ${upstream} — cannot confirm this checkout" >&2
+        echo "      is current. If a pull failed earlier, you may be building stale code." >&2
+    fi
+fi
 cargo build --release 2>&1 | tail -5
 echo "      Binary: $CARGO_TARGET_DIR/release/eidolon"
+# Report the version actually produced. This is the line whose absence cost a run.
+built_ver="$("$CARGO_TARGET_DIR/release/eidolon" --version 2>/dev/null || echo unknown)"
+repo_ver="$(awk -F\' '/^version = /{print $2; exit}' Cargo.toml 2>/dev/null || echo unknown)"
+echo "      Built:  ${built_ver}   (Cargo.toml says ${repo_ver})"
+if [[ "$built_ver" != *"$repo_ver"* ]]; then
+    echo "      ERROR: built binary reports '${built_ver}' but Cargo.toml says ${repo_ver}." >&2
+    exit 1
+fi
 
 # ── 2. NEAT 4 conda env ─────────────────────────────────────────────────
 setup_conda   # load the conda module + bootstrap `conda` (Delta: miniforge3-python)

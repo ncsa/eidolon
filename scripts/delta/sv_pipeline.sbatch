@@ -133,6 +133,22 @@ TRUTH_VCF="${PREFIX}_merged_truth.vcf.gz"
 # Refuse to score fresh caller output against a truth VCF written by a different
 # build of eidolon (see lib_report.sh::check_outdir_version).
 check_outdir_version "$EIDOLON_BIN" "$OUTDIR" || exit 1
+# Say WHICH build produced these numbers, in the log, every time. This pipeline never
+# rebuilds — it runs whatever is at $EIDOLON_BIN — and on a fresh OUTDIR there is no
+# stamp to compare against, so a stale binary runs silently and its results are
+# indistinguishable from a current one. Job 20682989 reproduced job 20675480's caller
+# numbers exactly and the log could not answer "was the fix even in this build?".
+echo "eidolon binary: $EIDOLON_BIN"
+echo "eidolon version: ${EIDOLON_VERSION:-unknown}"
+echo "repo HEAD:      $(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+# A binary older than the checkout is almost always a forgotten rebuild.
+_repo_ver="$(awk -F\' '/^version = /{print $2; exit}' "$REPO_ROOT/Cargo.toml" 2>/dev/null)"
+if [[ -n "$_repo_ver" && "${EIDOLON_VERSION:-}" != *"$_repo_ver"* ]]; then
+    echo "ERROR: binary reports '${EIDOLON_VERSION:-unknown}' but the checkout is $_repo_ver." >&2
+    echo "  The binary is stale — rebuild before running, or the results describe code" >&2
+    echo "  that is not the code you think you are testing. Set ALLOW_STALE_BIN=1 to override." >&2
+    [[ "${ALLOW_STALE_BIN:-0}" == "1" ]] || exit 1
+fi
 
 if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
     echo "[1/5] Simulation outputs already present — skipping."
