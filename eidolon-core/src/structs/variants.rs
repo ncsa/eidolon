@@ -766,7 +766,13 @@ fn sv_type_matches_svtype(sv_type: SvType, svtype_str: &str) -> bool {
     svtype_str.eq_ignore_ascii_case(expected)
 }
 
-fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
+/// Test-only re-export: lets the read generator's tests assert that the geometry an ALT
+/// declares is the geometry the reads are built from, without duplicating the parser.
+pub fn parse_bnd_alt_for_test(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
+    parse_bnd_alt(alt)
+}
+
+pub(crate) fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
     // VCF 4.2 breakend notation (Section 1.4.2)
     // 4 possible forms involving brackets:
     // 1. t[p[  2. t]p]  3. ]p]t  4. [p[t

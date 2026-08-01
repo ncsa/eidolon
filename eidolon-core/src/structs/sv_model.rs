@@ -629,6 +629,20 @@ impl SvModel {
                 None
             };
             sv_data.copy_number = copy_number;
+            // The chimeric read generator dispatches on these flags, NOT on the ALT
+            // string, and they are otherwise only ever set by the input-VCF parser. A de
+            // novo BND left them at their false/false defaults, which is case 4 (`]p]t`)
+            // — a DIRECT join — while the ALT above says `t]p]`, case 2, head-to-head
+            // with the mate piece reverse-complemented. The truth VCF therefore described
+            // a different rearrangement than the reads carried, and a direct intra-contig
+            // join is just a deletion or duplication: on Delta, Manta placed DEL/DUP
+            // candidates within 1-2bp of all 7 planted junctions and emitted no breakend
+            // at any of them, so BND recall read 0.000 for a caller that had found every
+            // one. Keep these in step with the ALT emitted above.
+            if sv_type == SvType::Bnd {
+                sv_data.bnd_join_after = true;
+                sv_data.bnd_mate_extends_right = false;
+            }
             sv_data.mate_contig = m_contig;
             sv_data.mate_pos = m_pos;
 
@@ -698,6 +712,10 @@ impl SvModel {
                 mate_sv.end = Some(mate_1based);
                 mate_sv.svlen = None;
                 mate_sv.copy_number = None;
+                // Same form as the anchor (`t]p]`), so the same geometry — a reciprocal
+                // `t]p]` <-> `t]p]` pair is the spec's own worked example.
+                mate_sv.bnd_join_after = true;
+                mate_sv.bnd_mate_extends_right = false;
                 mate_sv.mate_contig = Some(contig_name.to_string());
                 mate_sv.mate_pos = Some(anchor_1based);
                 let mate_info = format!(
@@ -1080,7 +1098,7 @@ fn genotype_string(genotype: &Genotype, ploidy: usize) -> String {
 mod tests {
     use super::*;
     use crate::structs::nucleotides::Nucleotide;
-    use crate::structs::variants::{AlternateType, SvData, VariantType};
+    use crate::structs::variants::{AlternateType, SvData, VariantType, parse_bnd_alt};
 
     #[test]
     fn default_sv_model_is_not_usable() {
@@ -1413,6 +1431,60 @@ mod tests {
     /// tool, and `sample_variants_emits_all_supported_types` passed anyway because
     /// it only asserts the BND *type appears*.
     #[test]
+    /// The chimeric read generator dispatches on `bnd_join_after` /
+    /// `bnd_mate_extends_right` — NOT on the ALT string. Those flags are assigned only
+    /// by the input-VCF parser (`variants.rs`), so a de novo BND leaves them at their
+    /// `SvData::new` defaults of false/false, which is case 4 (`]p]t`): a DIRECT join
+    /// with no reverse complement. Meanwhile the ALT written to the truth VCF is
+    /// `t]p]` — case 2, head-to-head, reverse-complemented.
+    ///
+    /// So the truth VCF describes a different rearrangement than the reads encode. On
+    /// Delta this showed up as Manta placing DEL/DUP candidates within 1-2bp of all 7
+    /// planted junctions while emitting no breakend there at all, and BND recall being
+    /// reported as 0.000 for a caller that had in fact found every junction.
+    #[test]
+    fn denovo_bnd_read_geometry_matches_the_alt_it_declares() {
+        let mut m = SvModel::default();
+        m.per_base_rate = 5e-3;
+        m.homozygous_frequency = 0.5;
+        m.type_probabilities.clear();
+        m.type_probabilities.insert(SvType::Bnd, 1.0);
+        m.length_log_normal.insert(SvType::Bnd, (7.0, 0.3));
+        let seq = acgt_sequence(50_000);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", 50_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+
+        let mut checked = 0;
+        for v in &out {
+            let Some(sv) = v.alternate.as_symbolic() else {
+                continue;
+            };
+            if sv.sv_type != SvType::Bnd {
+                continue;
+            }
+            // The same parser the input-VCF path uses, so the two cannot drift apart.
+            let (_mc, _mp, j_after, m_right) = parse_bnd_alt(&sv.raw_alt);
+            assert_eq!(
+                sv.bnd_join_after, j_after,
+                "ALT {} declares join_after={j_after}, but the read generator will use \
+                 bnd_join_after={} — the reads would encode a different junction than \
+                 the truth VCF describes",
+                sv.raw_alt, sv.bnd_join_after
+            );
+            assert_eq!(
+                sv.bnd_mate_extends_right, m_right,
+                "ALT {} declares mate_extends_right={m_right}, but the read generator \
+                 will use bnd_mate_extends_right={}",
+                sv.raw_alt, sv.bnd_mate_extends_right
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no de novo BND was produced — test proves nothing"
+        );
+    }
+
     fn denovo_bnd_emits_a_cross_linked_mate_pair() {
         let mut m = SvModel::default();
         m.per_base_rate = 5e-3;
