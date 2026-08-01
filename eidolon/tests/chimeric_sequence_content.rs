@@ -109,6 +109,19 @@ fn derived_haplotype(reference: &[u8], sv: &Sv) -> Vec<u8> {
             out.extend_from_slice(&reference[..*pos]);
             out.extend(revcomp(&reference[..*mate_pos]));
         }
+        // VCF 4.2 case 1, `t[p[`: REF[..=pos] + MATE[mate_pos..]. A DIRECT join —
+        // nothing reverse-complemented. This is what a deletion-like junction looks
+        // like, and until geometry sampling existed eidolon could not emit one.
+        Sv::BndCase1 { pos, mate_pos } => {
+            out.extend_from_slice(&reference[..*pos]);
+            out.extend_from_slice(&reference[*mate_pos - 1..]);
+        }
+        // VCF 4.2 case 4, `]p]t`: MATE[..=mate_pos] + REF[pos..]. Also direct, with the
+        // mate piece LEADING. The reciprocal of case 1.
+        Sv::BndCase4 { pos, mate_pos } => {
+            out.extend_from_slice(&reference[..*mate_pos]);
+            out.extend_from_slice(&reference[*pos - 1..]);
+        }
         // VCF 4.2 case 3, `[p[t`: revcomp(MATE[mate_pos..]) + REF[pos..]. Here it is the
         // FIRST piece that is reverse-complemented, which case 2 never exercises.
         Sv::BndCase3 { pos, mate_pos } => {
@@ -125,6 +138,8 @@ enum Sv {
     Dup { pos: usize, end: usize },
     BndCase2 { pos: usize, mate_pos: usize },
     BndCase3 { pos: usize, mate_pos: usize },
+    BndCase1 { pos: usize, mate_pos: usize },
+    BndCase4 { pos: usize, mate_pos: usize },
 }
 
 /// Contiguous match, or a match interrupted by ONE short indel.
@@ -576,5 +591,38 @@ fn inv_junction_labels_match_the_junction_the_read_spans() {
     assert!(
         j1 >= 3 && j2 >= 3,
         "expected reads spanning both labelled junctions; got j1={j1}, j2={j2}"
+    );
+}
+
+/// The two DIRECT forms, which geometry sampling (#458 item 2) newly makes reachable.
+///
+/// Until then eidolon emitted only `t]p]`, so cases 1 and 4 could not appear in output
+/// at all and nothing tested them. They matter because a direct join carries no
+/// inversion signature: Manta classifies these as DEL/DUP:TANDEM rather than putting
+/// them in its BND bucket, which is precisely the separation this change exists to
+/// restore.
+#[test]
+fn bnd_case1_direct_join_carries_no_reverse_complement() {
+    assert_derived(
+        "chim_bnd1",
+        "H1N1_HA\t500\t.\tG\tG[H1N1_HA:1500[\t60\tPASS\tSVTYPE=BND\tGT\t1/1",
+        Sv::BndCase1 {
+            pos: 500,
+            mate_pos: 1500,
+        },
+        500,
+    );
+}
+
+#[test]
+fn bnd_case4_direct_join_leads_with_the_mate_piece() {
+    assert_derived(
+        "chim_bnd4",
+        "H1N1_HA\t500\t.\tG\t]H1N1_HA:1500]G\t60\tPASS\tSVTYPE=BND\tGT\t1/1",
+        Sv::BndCase4 {
+            pos: 500,
+            mate_pos: 1500,
+        },
+        1500,
     );
 }
