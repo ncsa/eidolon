@@ -632,6 +632,96 @@ print(f'    reported {tp}/$base={tp/$base:.3f}  ->  over the full truth {tp}/$n_
     return 1
 }
 
+# ── BND geometry: does the truth describe all four adjacencies, reciprocally? ──
+# Before v3.1.0 every emitted junction was head-to-head (t]p]). A caller therefore only
+# ever saw inversion-like adjacencies, and "BND recall=1.000" was a measurement of one
+# quarter of the problem that read like the whole of it. Geometry is now sampled across
+# all four VCF 4.2 §5.4 forms, so this asserts two things the old harness never did:
+#
+#   1. COVERAGE OF ITS OWN INPUT — every ALT parses into one of the four forms, and the
+#      per-form counts are reported. A geometry distribution over an unknown denominator
+#      is not a result; if a form is missing, that must be visible rather than inferred
+#      from a recall number that moved.
+#   2. RECIPROCITY — each junction's two records form a spec-valid pair. This is the
+#      #451 defect stated as an assertion: the truth described a rearrangement the reads
+#      did not carry, and nothing checked the two sides agreed, so it looked like a
+#      caller failure for two months (v1.13.1 2026-06-02 -> v3.1.0 2026-08-01).
+#
+# Pairings are the spec's own worked examples: t[p[ <-> ]p]t (direct), t]p] <-> t]p]
+# (head-to-head), [p[t <-> [p[t (tail-to-tail).
+check_bnd_geometry() {  # <bnd_truth.vcf.gz>
+    local src="$1"
+    [[ -f "$src" ]] || { echo "  ERROR: BND geometry: no BND truth at $src" >&2; return 1; }
+    bcftools query -f '%CHROM\t%POS\t%ALT\n' "$src" 2>/dev/null \
+      | awk -F'\t' '
+          # Which of the four forms is this ALT? "" means unparsable, which is a defect
+          # and is counted separately rather than being silently dropped.
+          function form(a) {
+              if (a ~ /^[ACGTNacgtn]+\[/) return "t[p["   # case 1  DeletionLike
+              if (a ~ /^[ACGTNacgtn]+\]/) return "t]p]"   # case 2  HeadToHead
+              if (a ~ /^\[/)              return "[p[t"   # case 3  TailToTail
+              if (a ~ /^\]/)              return "]p]t"   # case 4  DuplicationLike
+              return ""
+          }
+          function mate(a,   b,n,p,i) {
+              b=a; gsub(/[][]/,"|",b); n=split(b,p,"|")
+              for (i=1;i<=n;i++) if (p[i] ~ /:/) return p[i]
+              return ""
+          }
+          # The spec pairing. Note it is NOT "same form": a direct junction is described
+          # by two DIFFERENT forms, which is exactly the case a naive check would miss.
+          function mates_ok(a,b) {
+              if (a=="t[p[") return b=="]p]t"
+              if (a=="]p]t") return b=="t[p["
+              if (a=="t]p]") return b=="t]p]"
+              if (a=="[p[t") return b=="[p[t"
+              return 0
+          }
+          { n++
+            f=form($3); m=mate($3)
+            if (f=="" || m=="") { bad++; badex=(badex==""?$3:badex); next }
+            cnt[f]++; parsed++
+            self=$1":"$2; g[self]=f; tgt[self]=m; ord[++k]=self }
+          END{
+            printf("  BND geometry: %d record(s), %d parsed into a form, %d unparsable\n",
+                   n+0, parsed+0, bad+0)
+            split("t[p[ t]p] [p[t ]p]t", forms, " ")
+            split("direct/deletion-like head-to-head tail-to-tail direct/duplication-like",
+                  names, " ")
+            for (i=1;i<=4;i++)
+                printf("    %-5s %-22s %d\n", forms[i], names[i], cnt[forms[i]]+0)
+            # A truth that is entirely one form is internally CONSISTENT, so every check
+            # below passes on it — that is exactly what pre-v3.1.0 output looked like.
+            # Flagged, not failed: fitted weights may legitimately be skewed, so a hard
+            # threshold here would be a flaky assertion about a random draw. The point is
+            # that a silent regression to one geometry must not be invisible.
+            nd=0; for (i=1;i<=4;i++) if (cnt[forms[i]]>0) nd++
+            if (nd==1 && parsed>=24)
+                printf("    NOTE: all %d junction record(s) share ONE geometry. That is the\n"\
+                       "      pre-v3.1.0 hardcoded behaviour; under uniform weights it is\n"\
+                       "      vanishingly unlikely at this count. Check bnd_geometry_weights\n"\
+                       "      in the model before reading any BND number below.\n",
+                       parsed+0)
+            # Reciprocity, checked per record against the record its ALT points at.
+            for (i=1;i<=k;i++) {
+                s=ord[i]; t=tgt[s]
+                if (!(t in g)) { unpaired++
+                    if (uex=="") uex=s" -> "t" (no record there)"
+                    continue }
+                if (!mates_ok(g[s], g[t])) { mismatch++
+                    if (mex=="") mex=s" "g[s]" <-> "t" "g[t] }
+            }
+            printf("    reciprocity: %d unpaired, %d mispaired\n", unpaired+0, mismatch+0)
+            if (bad)      printf("    first unparsable ALT: %s\n", badex)
+            if (unpaired) printf("    first unpaired:       %s\n", uex)
+            if (mismatch) printf("    first mispaired:      %s\n", mex)
+            # A record whose mate is absent or contradicts it describes a rearrangement
+            # the reads cannot carry. That is not a caller result to be interpreted, it
+            # is our artifact being wrong, so it is a hard failure.
+            exit (bad+unpaired+mismatch > 0) ? 1 : 0
+          }'
+}
+
 # ── BND junction spans: a comparable representation ──────────────────────
 # A BND pair at (A,B) and a caller's <DUP:TANDEM>/<DEL>/<INV> spanning A..B describe the
 # SAME event, but truvari matches variants as INTERVALS and these are not
@@ -912,6 +1002,16 @@ BND_SPAN_RC=0
 # from a displaced one at this scale — see the probe for why that is not tunable.
 BNDSPAN_VALID=1
 if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
+    # Runs BEFORE the spans are derived: if the junctions are not reciprocal, every
+    # number downstream describes our own broken artifact rather than any caller.
+    # `|| rc=$?` and not `$(cmd; echo $?)` — the latter loses the status under set -e.
+    BND_GEOM_RC=0
+    check_bnd_geometry "$OUTDIR/truth_sv_BND.vcf.gz" || BND_GEOM_RC=$?
+    if [[ "$BND_GEOM_RC" -ne 0 ]]; then
+        echo "ERROR: the BND truth is not internally consistent (see above). Scoring it" >&2
+        echo "  would measure our emission defect and report it as caller performance." >&2
+        CAL_FAIL=1
+    fi
     build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
         || BND_SPAN_RC=$?
     case "$BND_SPAN_RC" in
