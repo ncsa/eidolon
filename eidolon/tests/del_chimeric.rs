@@ -16,8 +16,11 @@
 //! at high coverage and pins:
 //!   1. The FASTQ contains `EIDOLON_chimeric_DEL_*` reads.
 //!   2. Their QNAME encodes the POS and END the test injected (so a
-//!      future refactor that drops the DEL tag or shifts coordinates
-//!      fails loudly).
+//!      future refactor that drops the DEL tag fails loudly). NOTE: this does
+//!      NOT pin the emitted geometry — the QNAME is formatted from the same
+//!      `location`/`end` INPUTS, so shifting either by ±1 leaves it unchanged.
+//!      `chimeric_sequence_content.rs` asserts the actual junction bases and is
+//!      what catches a coordinate shift.
 //!   3. The chimeric read count is roughly proportional to coverage —
 //!      catches a regression where the new branch silently emits zero.
 

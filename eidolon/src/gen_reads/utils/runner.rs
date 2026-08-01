@@ -3031,6 +3031,41 @@ mod tests {
         r
     }
 
+    /// #224: a chimeric fragment whose junction sits too close to either end produces a
+    /// read with an anchor too short for BWA to split-align — the regression that shipped
+    /// in v1.13.0 and was fixed by the `read_len / 4` floor. Nothing tested that floor,
+    /// so replacing it with `1` was silently safe.
+    #[test]
+    fn balanced_chimeric_offset_keeps_a_split_alignable_anchor_either_side() {
+        let mut rng = NeatRng::new_from_seed(&vec!["chimeric offset".to_string()]).unwrap();
+        let (read_len, frag_len) = (151usize, 400usize);
+        let floor = read_len / 4; // 37
+        for _ in 0..1000 {
+            let off = balanced_chimeric_offset(frag_len, read_len, &mut rng).unwrap();
+            assert!(
+                off >= floor,
+                "offset {off} leaves a {off}bp anchor before the junction, below the \
+                 read_len/4 floor of {floor} (#224)"
+            );
+            assert!(
+                frag_len - off >= floor,
+                "offset {off} leaves a {}bp anchor after the junction, below {floor} (#224)",
+                frag_len - off
+            );
+        }
+    }
+
+    /// Degenerate case: a fragment no longer than the read cannot honour the floor on both
+    /// sides. It must still return a usable offset rather than panic or return 0.
+    #[test]
+    fn balanced_chimeric_offset_survives_a_fragment_no_longer_than_the_read() {
+        let mut rng = NeatRng::new_from_seed(&vec!["degenerate".to_string()]).unwrap();
+        for _ in 0..100 {
+            let off = balanced_chimeric_offset(151, 151, &mut rng).unwrap();
+            assert!(off >= 1, "offset must be at least 1, got {off}");
+        }
+    }
+
     #[test]
     fn bnd_pieces_reverse_complement_exactly_the_spec_cases() {
         let reference = bnd_reference();
