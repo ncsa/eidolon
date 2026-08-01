@@ -87,7 +87,10 @@ pub fn validate_file(path: &Path, format: Option<Format>) -> Result<Vec<Finding>
 /// warnings are reported but do not fail, since by definition nothing downstream
 /// rejects them.
 pub fn run(paths: &[std::path::PathBuf], format: Option<Format>) -> Result<(), ValidateError> {
-    let mut any_error = false;
+    // Only the files that actually failed. Listing every path checked — including ones
+    // that passed — would misattribute the failure, which is the opposite of what this
+    // subcommand is for.
+    let mut failed: Vec<String> = Vec::new();
     for path in paths {
         let findings = validate_file(path, format)?;
         let errors = findings
@@ -111,17 +114,11 @@ pub fn run(paths: &[std::path::PathBuf], format: Option<Format>) -> Result<(), V
             path.display()
         );
         if errors > 0 {
-            any_error = true;
+            failed.push(path.display().to_string());
         }
     }
-    if any_error {
-        return Err(ValidateError::Invalid(
-            paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
+    if !failed.is_empty() {
+        return Err(ValidateError::Invalid(failed.join(", ")));
     }
     Ok(())
 }

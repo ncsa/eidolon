@@ -171,6 +171,11 @@ bcftools index -t "$SITES"
 nsom=$(bcftools view -H "$SITES" | wc -l)
 echo "somatic sites carrying EIDOLON_VAF: $nsom"
 [[ "$nsom" -gt 0 ]] || { echo "ABORT: 0 somatic EIDOLON_VAF sites — is this build >= #405?" >&2; exit 1; }
+# The record count above is necessary but not sufficient, and this is the exact site
+# where that bit: it passed while every value was the malformed string `AF=AF=0.3000`,
+# because counting records says nothing about their content. bcftools would not have
+# complained either — it silently converts a type-mismatched value to `.`.
+validate_artifacts "$EIDOLON_BIN" "somatic sites" "$SITES" || exit 1
 # Read-the-artifact guard: EIDOLON_VAF must span a spectrum, not pile at one value.
 echo "EIDOLON_VAF spread (should span deciles for a subclonal architecture):"
 bcftools query -f '%INFO/AF\n' "$SITES" \

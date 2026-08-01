@@ -172,6 +172,12 @@ else
     stamp_outdir_version "$OUTDIR"
 fi
 
+# Gate the truth BEFORE stage 3b inspects it or any caller is scored against it. The
+# truth VCF is the denominator of every number this pipeline reports, so a malformed one
+# does not produce an error — it produces a plausible wrong answer.
+validate_artifacts "$EIDOLON_BIN" "simulated truth" \
+    "$TRUTH_VCF" "${PREFIX}_normal.vcf.gz" "${PREFIX}_tumor.vcf.gz" || exit 1
+
 # ── Stage 2 & 3: Index reference, align ──────────────────────────────────
 NORMAL_BAM="$OUTDIR/normal.bam"
 TUMOR_BAM="$OUTDIR/tumor.bam"
@@ -204,6 +210,10 @@ echo "[2/5] Aligning normal reads..."
 index_and_align "$NORMAL_R1" "$NORMAL_BAM" "NORMAL"
 echo "[3/5] Aligning tumor (merged) reads..."
 index_and_align "${PREFIX}_merged_r1.fastq.gz" "$TUMOR_BAM" "TUMOR"
+
+# The aligned BAMs are what Manta, Delly and GATK read. `samtools quickcheck` would
+# catch a truncated one; nothing in this pipeline was running it.
+validate_artifacts "$EIDOLON_BIN" "aligned BAMs" "$NORMAL_BAM" "$TUMOR_BAM" || exit 1
 
 # ── Stage 3b: PRE-FLIGHT — inspect + extract the somatic SV truth ────────
 # eidolon's SVs are symbolic records (ALT like <DEL>/<DUP>/<INV>, INFO SVTYPE/
