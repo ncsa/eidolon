@@ -55,7 +55,8 @@ the negative case has to be built deliberately:
   matching or counting when they should not have, or vice versa.
 - **Verify the whole chain, not the unit.** #405's subclonal VAF passed its unit tests
   and shipped; the harness validating it was itself excluding the sites it existed to
-  test, so the end-to-end claim was wrong for a year. BND junction reads were correct
+  test, so the end-to-end claim was wrong from #405 landing (2026-07-24) until the
+  harness was audited a week later. BND junction reads were correct
   the whole time and nobody had confirmed it until it was checked by hand.
 
 A feature demonstrated only by "it emitted something plausible" has not been validated,
@@ -74,7 +75,8 @@ Every rule below was earned by a defect that shipped green:
 - **Test the path that can break, not the path that works.** `bnd_fastq.rs` "covered"
   BND read generation by driving the *input-VCF* path — where the parser sets the
   geometry flags correctly — while the *de novo* path shipped a truth VCF that
-  contradicted its own reads for a year. Ask which path the test actually exercises.
+  contradicted its own reads from v1.13.1 to v3.1.0. Ask which path the test
+  actually exercises.
 - **Assert content, not existence.** That same test asserted only that some read was
   *named* `EIDOLON_chimeric`. Names, counts, non-emptiness, and exit 0 are not content.
   If a wrong value would still pass, the test is decoration.

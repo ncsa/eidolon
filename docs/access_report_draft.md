@@ -138,7 +138,9 @@ purity/coverage point — both expanded in Phase 2.
 ### 3.5 Defects found and fixed through verification
 
 Benchmarking surfaced six real bugs invisible to unit tests; each was diagnosed,
-fixed, and re-verified end-to-end:
+fixed, and re-verified end-to-end. A second audit cycle in August 2026 surfaced eleven
+more, of a different kind — defects in the *measuring* layer rather than the simulator —
+and those are tabulated after the first six.
 
 | # | Defect | Effect when fixed |
 |---|---|---|
@@ -149,8 +151,34 @@ fixed, and re-verified end-to-end:
 | #290 | som.py indel normalization off by default (scoring) | cancer indel recall 0.60 → 0.90 |
 | #125 | Adapter path wrote a malformed FASTQ record (quality one char longer than the sequence) for zero-length inserts; bwa-mem2 halts at the first such record | short-insert adapter alignment 2,986 → 3.89M reads (silent truncation eliminated); SNP recall 0.0004 → 0.944 |
 
-All affect every paired-end run, not just cancer (the sixth affects any short-insert
-adapter run). The somatic-SNV journey (0.33 → 0.94) and cancer-indel journey
+**August 2026 — a second cycle, and a different class of defect.** The six above are
+simulator bugs found by benchmarking. The eleven below were found by auditing the
+*measuring* layer, and every one of them had been reporting a plausible number rather
+than failing:
+
+| # | Defect | What it was reporting instead |
+|---|---|---|
+| #451 | de novo BND truth described a rearrangement the reads did not carry (flags never set for the de novo path) | `BND recall = 0.000` for a caller that had found every junction to within 1–2 bp |
+| #450 | subclonal-VAF harness excluded the sites it exists to test (`bcftools call` discards a hom-ref alt and its read count) | `VERDICT: PASS` with clean bias/MAE over 407 of 567 planted sites |
+| #457 | per-type SV scoring filtered the truth but not the query | `manta_BND FP=43` against `manta_overall FP=24` — a subset with more false positives than the whole |
+| #457 | BND scored without `--bnddist`, on the inherited belief truvari could not match breakends | `0.000`, across every SV run to date |
+| #444 | `compare-vcfs` wrote VCFs whose own header did not declare their INFO tags | opaque `[E::bcf_hdr_read]` failures far downstream |
+| — | `build_bnd_spans` was **called 250 lines above its definition** — `command not found` (127) swallowed by `\|\|` | "no intra-contig junctions?" — impossible on a single-contig reference |
+| — | recall denominators never checked against the truth handed to the scorer | 4 of 152 per-type checks silently scored a subset (a DEL reported 0.800 where the full denominator gives 0.727) |
+| — | a stale binary ran with no version check and no log line | a full set of plausible numbers testing none of the fix it was submitted to verify |
+| — | POS meant "last unaffected base" for `<DEL>` and "first affected base" for `<DUP>`/`<CNV>`/`<INV>` | `END−POS == \|SVLEN\|` for DEL and `\|SVLEN\|−1` for the rest, in the same file |
+| — | `<INV>` and `<DUP>` junction geometry had **no tests at all** | four mutations, including inverting the junction dispatch, passed the entire suite |
+| #458 | only one of four breakend geometries was ever emitted | BND was not a separable category from INV — our junctions converted to `<INV>` and scored as false positives |
+
+The pattern is uniform and worth stating plainly: **each reported a metric without
+asserting it had measured what it was given.** A record count passed while every value
+was the malformed string `AF=AF=0.3000`; a recall was computed over a denominator nobody
+had checked; a scorer was blamed for a defect in its input. Several were caught only
+because a test was written to fail — reverting the fix and watching it break — rather
+than to pass.
+
+All six of the original defects affect every paired-end run, not just cancer (the sixth
+affects any short-insert adapter run). The somatic-SNV journey (0.33 → 0.94) and cancer-indel journey
 (0.20 → 0.90) trace the cumulative impact. Defect #125 is detailed in §3.11: it is
 the clearest case of verification-as-result — local `zcat`/`wc` read counts were
 correct (line counts are unaffected by a too-long quality string), so the bug was
@@ -465,20 +493,26 @@ Per-type recovery (Manta + truvari, 60×/0.8):
 | DEL | 17 | **0.882** (15/17) | — (incl. 376 / 645 kb) |
 | DUP | 14 | **0.929** (13/14) | — (incl. 1 Mb) |
 | INV | 4 | **1.000** (4/4) | — |
-| BND | 22 | signal present at read level; ~50% Manta-called | truvari can't benchmark breakends; Manta translocation recall |
+| BND | 22 | **superseded — see §3.7.1** | *the claim in this row was wrong* |
 | CNV | 7 | depth 1.83× + GATK caller 4/7 by direction | Manta does not call CNV |
 
 Overall figures across all 64 truth SVs (recall 0.500, precision 0.561) are bounded
-by BND (unscoreable by truvari) and CNV (uncallable by Manta) — tool constraints,
-not simulator defects.
+by BND and CNV. The CNV bound is a genuine tool constraint (Manta does not call copy
+number). **The BND bound was not**: it was a simulator defect compounded by two
+scoring errors, and the paragraphs below that attribute it to truvari are retracted.
+§3.7.1 gives the corrected account.
 
 **Confirmed by an independent second caller.** Delly (read-pair/split/depth-based,
 no assembly) recovers the same SVs at the *same* rates — **DEL 0.882, DUP 0.929,
 INV 1.000, identical to Manta** — with slightly higher precision (0.667 vs 0.561),
 and likewise scores 0/22 BND and 0/7 CNV. Two independent callers agreeing this
-closely is strong evidence eidolon's SV data is not tuned to one tool, and that the
-BND/CNV gaps are scorer/caller limitations (truvari cannot benchmark breakends;
-neither caller emits truvari-matchable CNV) rather than simulator defects.
+closely is strong evidence eidolon's SV data is not tuned to one tool.
+
+The inference we drew from the shared BND zero was wrong, and instructively so. Two
+callers agreeing told us the cause was common to both — we concluded that meant the
+*scorer*, when the other thing common to both is the *input*. It was the input. See
+§3.7.1. The CNV half of the claim stands: neither caller emits truvari-matchable
+copy-number calls.
 
 **Per-tissue models shift the spectrum correctly.** Swapping the pan-cancer model
 for tissue-specific COSMIC SV models reproduces each tissue's dominant SV type in
@@ -553,6 +587,67 @@ tandem-dup junctions as generic BND pairs rather than the canonical `DUP` that
 callers and truth sets expect (#313), and SV-scale insertions did not appear in any
 run (`INS: 0`) despite a non-zero model probability (#314). None is a defect in the
 validated read generation — all are realism / interoperability improvements.
+
+### 3.7.1 BND: measuring our own defect (v1.13.1 → v3.1.0)
+
+`BND recall = 0.000` stood in this report from the first SV validation until
+2026-08-01, attributed across successive drafts to truvari's inability to match
+breakends. The defect dates to v1.13.1 (2026-06-02). **All of those
+attributions were wrong**, and the sequence of wrong answers is itself the finding.
+
+**What was actually true.** eidolon's read generator dispatches on two flags that were
+only ever assigned by the input-VCF parser, so every *de novo* breakend left them at
+their defaults — VCF 4.2 case 4, a DIRECT join — while the ALT written to the truth VCF
+said `t]p]`, case 2, reverse-complemented. **The truth VCF described a rearrangement the
+reads did not carry**, from v1.13.1 (2026-06-02) until v3.1.0 (2026-08-01). And a direct intra-contig join is not a breakend at
+all: joining A-left to B-right *is* a deletion. eidolon had been planting DELs and DUPs
+and labelling them BND.
+
+Manta had been right the whole time. On Delta job 20675480 it placed DEL/DUP candidates
+within **1–2 bp of all seven** planted junctions and emitted no breakend at any of them —
+exactly what direct joins should produce. The reads were never at fault either: 7–15
+discordant pairs and 3–15 split reads at every one of the 14 breakends.
+
+**Three claims retracted:**
+
+1. *"truvari cannot benchmark breakends."* False since truvari v5.0.0, which added
+   `-B/--bnddist`; Delta runs v5.4.0. The harness simply never passed the flag. This was
+   inherited from an early draft and repeated without being checked against the tool's
+   changelog.
+2. *"Two callers agreeing on zero proves the scorer is at fault."* Two callers agreeing
+   localises the cause to something common to both — which is as easily the **input** as
+   the scorer. It was the input.
+3. *"BND signal is present at read level, so the simulator is fine."* The signal was
+   present, but it was the signal for a different event than the truth declared.
+
+**Corrected measurements (August 2026, jobs 20684366 / 20699004 / 20716772):**
+
+| metric | before | after | replication |
+|---|---|---|---|
+| `manta_BND` recall | 0.000 | **1.000** (14/14) | 2 runs |
+| `manta_INV` recall | 0.000 | **0.833** (5/6) | 2 runs |
+| `manta_overall` recall | 0.625 | **0.833** | 2 runs |
+
+`manta_INV` was itself a representation artifact: Manta stopped emitting `<INV>` around
+v1.5 and reports inversions as breakend pairs, shipping `convertInversion.py` to convert
+them back. The harness now runs it, and scores BND against the **raw** calls and INV
+against the **converted** ones — one file per question, because the converter consumes
+the breakends it converts.
+
+**A residual that is ours, quantified.** `manta_INV precision = 0.312` (FP = 11), of
+which **7 are our own junctions**: eidolon emitted only the head-to-head geometry, which
+*is* the inversion signature, so `convertInversion.py` converts our junctions into `<INV>`
+records that then score as false positives against a truth that never contained them.
+Confirmed by matching each FP's `END` against the truth's junction mates — 7 land on
+junctions, 4 on real inversions (Manta redundancy). Excluding our own artifact, precision
+is **5/9 ≈ 0.556**.
+
+**Status of this section.** BND geometry sampling has since been implemented (#458 item
+2), so junctions will no longer all be inversion-shaped. **The numbers above predate that
+change and will move.** They are reported now because they are the first genuine BND
+measurements this project has produced, not because they are final. A post-geometry
+campaign is required before §3.7 is submittable, and until then *"BND recall"* here means
+**head-to-head junction recall**, seven junctions, not breakend detection in general.
 
 ### 3.8 At-scale validation (chr1–3 subset, ~690 Mb)
 
@@ -764,6 +859,19 @@ from real data** (PyClone-VI / PCAWG cluster tables), or **replayed** from a rea
 VCF at its observed VAF. Every somatic truth record carries the intended CCF (`INFO/EIDOLON_CCF`)
 and the intended observed VAF (`INFO/EIDOLON_VAF`) as ground truth.
 
+> **Correction (2026-07-31).** The figures in this section were, from #405 landing
+> (2026-07-24) until #450 was fixed a week later, computed over **407 of 567 planted
+> sites** — an entire CCF cluster was silently
+> excluded, because the harness measured observed VAF through `bcftools call`, which
+> discards a hom-ref call together with its read count (#450). The exclusion was
+> VAF-dependent, so it flattered the result in the direction that mattered. Re-measured
+> on Delta job 20675479 with the genotype-calling step removed: **543 of 567 sites**,
+> three CCF clusters present where two were, `bias = −0.0072`, `MAE = 0.0291`. The
+> clusters land where `purity × dosage × CCF` predicts (0.40 / 0.16 / 0.04 at purity
+> 0.8), which the code cannot fake. A 4.2 % residual remains unscored, distributed
+> 7/9/8 across the three clusters — reported per stratum by the harness rather than
+> requiring two tables to be differenced by hand.
+
 **Real-data validation (Delta).** A round-trip the unit tests cannot reach: simulate,
 align the merged reads with bwa-mem2, and measure the observed VAF at each somatic site
 against the intended `EIDOLON_VAF`. Two complementary runs — a *controlled synthetic*
@@ -822,9 +930,12 @@ remaining defects of the kind already found.
 
 3. **Exercise the new cancer features deeply — SV validation DONE (§3.7).**
    Structural-variant realism was validated downstream with Manta + truvari: eidolon's
-   DEL/DUP/INV (to 1 Mb) recover at 0.88–1.00 recall, CNV confirmed by depth, BNDs
-   emitted and partly reassembled by Manta, somatic specificity confirmed — the
-   first end-to-end check of the SV machinery, with no simulator defect found.
+   DEL/DUP/INV (to 1 Mb) recover at 0.88–1.00 recall, CNV confirmed by depth,
+   somatic specificity confirmed — the first end-to-end check of the SV machinery.
+   The BND half of this claim, and the "no simulator defect found" that accompanied
+   it, are **retracted**: a de novo breakend defect had been misread as a scorer
+   limitation (§3.7.1). Corrected `manta_BND recall = 1.000`, pending a
+   post-geometry campaign.
    Remaining sub-items: exercise the **per-tissue cancer models** (BRCA / skin /
    lung) to confirm tissue-specific SV spectra downstream, and sweep the
    **purity-mixing** machinery across purity/coverage.
