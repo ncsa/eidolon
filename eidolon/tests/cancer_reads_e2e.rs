@@ -431,3 +431,81 @@ fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
         "EIDOLON_VAF should be the input 0.18"
     );
 }
+
+/// Purity must actually shape the MIX, not just the config echo.
+///
+/// The existing checks assert only that some `@N_` and some `@T_` read exists. Changing
+/// `per_pass_coverage` so the effective purity is ~0.97 instead of the configured value
+/// passed all three tests in this file — including the subclonal-VAF one, which reads the
+/// DECLARED purity out of `EIDOLON_VAF` rather than measuring anything from the merged
+/// reads. Only the isolated arithmetic unit test caught it.
+///
+/// Purity is deliberately asymmetric here. At `purity: 0.5` the expected mix is 1:1, so
+/// swapping the normal and tumor coverages is invisible — the case where the test must
+/// still fire.
+#[test]
+fn merged_fastq_read_counts_track_configured_purity() {
+    let (_dir, work) = fresh_workdir();
+    let yaml = work.join("purity.yml");
+    // total 30x at purity 0.75 -> normal round(7.5)=8, tumor round(22.5)=23.
+    let (norm_cov, tum_cov) = (8.0f64, 23.0f64);
+    let expected_normal_frac = norm_cov / (norm_cov + tum_cov);
+    std::fs::write(
+        &yaml,
+        format!(
+            "reference: {ref}\n\
+             output_dir: {out}\n\
+             output_prefix: purity\n\
+             total_coverage: 30\n\
+             purity: 0.75\n\
+             read_len: 70\n\
+             paired_ended: true\n\
+             fragment_mean: 250\n\
+             fragment_st_dev: 30\n\
+             normal_mutation_rate: 0.001\n\
+             tumor_mutation_rate: 0.001\n\
+             overwrite_output: true\n\
+             rng_seed: purity-mix\n",
+            ref = h1n1_reference().display(),
+            out = work.display(),
+        ),
+    )
+    .unwrap();
+
+    eidolon()
+        .args(["gen-cancer-reads", "-c"])
+        .arg(&yaml)
+        .assert()
+        .success();
+
+    let lines = read_gz_lines(&work.join("purity_merged_r1.fastq.gz"));
+    let headers: Vec<&String> = lines.iter().step_by(4).collect();
+    let n_normal = headers.iter().filter(|h| h.starts_with("@N_")).count();
+    let n_tumor = headers.iter().filter(|h| h.starts_with("@T_")).count();
+    let total = n_normal + n_tumor;
+    assert!(
+        total > 100,
+        "only {total} tagged reads — too few to measure a mix"
+    );
+    assert_eq!(
+        total,
+        headers.len(),
+        "{} read(s) carry neither an N_ nor a T_ tag",
+        headers.len() - total
+    );
+
+    let observed = n_normal as f64 / total as f64;
+    assert!(
+        (observed - expected_normal_frac).abs() <= 0.05,
+        "normal reads are {observed:.3} of the merged FASTQ ({n_normal} normal, \
+         {n_tumor} tumor) but purity 0.75 implies {expected_normal_frac:.3}. \
+         The configured purity is not reaching the mix."
+    );
+    // Direction, stated separately: at purity 0.75 the tumor pass must dominate. This is
+    // what a normal/tumor swap trips, and what a symmetric 0.5 purity could never catch.
+    assert!(
+        n_tumor > n_normal,
+        "purity 0.75 must yield more tumor reads than normal; got \
+         {n_tumor} tumor vs {n_normal} normal"
+    );
+}
