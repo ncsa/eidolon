@@ -87,7 +87,10 @@ fn gen_reads_with_symbolic_dup_emits_chimeric_junction_reads() {
         fastq_qnames.len()
     );
 
-    // QNAME shape pins POS=400 END=799.
+    // QNAME shape pins POS=400 END=799 — but ONLY the tag and the echoed inputs. The
+    // QNAME is formatted from the same `location`/`end` the test supplied, never from
+    // the emitted geometry, so shifting either by ±1 leaves this assertion satisfied.
+    // The junction bases are asserted in chimeric_sequence_content.rs.
     let qname_has_coords = dup_chimeric
         .iter()
         .any(|q| q.contains("EIDOLON_chimeric_DUP_H1N1_HA_400_799_"));
