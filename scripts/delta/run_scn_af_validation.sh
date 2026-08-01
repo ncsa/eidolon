@@ -11,7 +11,7 @@
 #   2. gen-reads with that VCF as input_vcf, mutation_rate=0 and sv_rate_scale=0 so ONLY the
 #      supplied sites are placed (nothing de novo confounds the per-site AF comparison), using
 #      the Phase-1 models so reads/coverage are realistic.
-#   3. Compare golden-VCF AF vs pool AF at shared sites with scn_af_compare.py.
+#   3. Compare golden-VCF AF vs pool AF at shared sites with `eidolon compare-af`.
 #
 # The feature is automatic: gen-reads honors a per-variant AF whenever the input VCF carries
 # INFO/AF (or FORMAT/AD). There is no CLI flag to enable it.
@@ -75,7 +75,7 @@ mkdir -p "$OUTDIR"
 # GT, so on a diploid-called pool it collapses every het to 0.5 and every hom to 1.0
 # (the exact bug that produced a piled-at-0.5 "truth" and r=0.61 in job 20270457). Instead
 # pass the AD-carrying VCF straight through with NO INFO/AF: both gen-reads (from_file) and
-# scn_af_compare.py then derive the fraction from FORMAT/AD, which is the real pool spectrum.
+# `eidolon compare-af` then derive the fraction from FORMAT/AD, which is the real pool spectrum.
 # stage_scn.sh emits AD (mpileup -a FORMAT/AD); VCFs staged before that fix lack it, so fall
 # back to re-deriving AD from the BAM at just the SNV sites (fast, -R restricted). POOL_AF is
 # BOTH the gen-reads input and the truth, so the comparison stays self-consistent either way.
@@ -96,7 +96,7 @@ elif [[ -s "$BAM" ]]; then
     # low-AF end of a pool spectrum — the part this harness exists to validate — was
     # being destroyed before the comparison saw it. Worse than the subclonal case,
     # which at least passed -C alleles. Measuring a fraction needs no genotype call;
-    # scn_af_compare.py reads the per-allele AD directly.
+    # `eidolon compare-af` reads the per-allele AD directly.
     bcftools mpileup -a FORMAT/AD -d "$MPILEUP_MAX_DEPTH" -f "$REF" -R "$SITES" \
         "$BAM" -Oz -o "$POOL_AF" 2>/dev/null
 else
@@ -152,7 +152,7 @@ echo
 echo "════════════════════════════════════════════════════════════════"
 echo "SCN Phase 2 AF reproduction — real pool vs simulated golden VCF"
 echo "════════════════════════════════════════════════════════════════"
-python3 "$REPO_ROOT/scripts/delta/scn_af_compare.py" \
+"$EIDOLON_BIN" compare-af \
     --truth "$POOL_AF" --sim "$GOLDEN" --min-depth "$MIN_DEPTH"
 echo "════════════════════════════════════════════════════════════════"
 echo "Inputs: pool AF=$POOL_AF  golden=$GOLDEN  (cov=$COV, min-depth=$MIN_DEPTH)"

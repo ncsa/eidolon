@@ -1,0 +1,2 @@
+  104 truth allele(s) had NO coverage on the observed side and are excluded (18.3% of the planted set).
+FAIL: 18.3% of planted truth alleles went unscored (limit 10.0%). The reported bias/MAE cover a subset of the planted set and must not be quoted. Attribute the shortfall per stratum above before believing any of it.

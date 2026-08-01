@@ -163,9 +163,12 @@ contributed the *fragility* (see the footguns below), not the blind spots.
   Python is acceptable only where an **external tool forces it** — truvari and
   SigProfiler are Python packages, so parsing their output in their own env is fine.
 - **Vet what exists** (all validation/prep only, none shipped):
-  `scripts/delta/{scn_af_compare,sbs96_compare}.py` are per-validation measurement
-  helpers — they determine numbers the ACCESS report cites and are **not covered by CI**
-  (#466). `tools/{build_pcawg_sv_vcf,normalize_pcawg_sv_model,graft_sv_model}.py` are
+  `scripts/delta/sbs96_compare.py` is a per-validation measurement helper. It parses
+  SigProfiler's output in SigProfiler's own env, which is the one justification for
+  Python here, and it is **not covered by CI** (#466). `scn_af_compare.py` is gone —
+  ported to `eidolon compare-af`, which needed no external tool and so should never have
+  been Python; the port is pinned by golden fixtures reproducing the Python's output byte
+  for byte plus known-answer tests. `tools/{build_pcawg_sv_vcf,normalize_pcawg_sv_model,graft_sv_model}.py` are
   offline corpus prep. `tools/inject_cancer_sv_model.py` is **dead** — deprecated in
   v1.14.0, no live caller, safe to delete.
 - Before writing a helper that works *around* a third-party tool, **check that tool's

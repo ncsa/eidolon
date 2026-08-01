@@ -5,6 +5,7 @@ extern crate serde;
 extern crate serde_json;
 extern crate simplelog;
 
+pub mod compare_af;
 pub mod compare_vcfs;
 pub mod filter_reads;
 pub mod gen_bam_models;
@@ -28,8 +29,9 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::{
-    compare_vcfs::errors::CompareVcfsError, filter_reads::errors::FilterReadsError,
-    gen_bam_models::errors::GenBamModelsError, gen_cancer_reads::errors::GenCancerReadsError,
+    compare_af::errors::CompareAfError, compare_vcfs::errors::CompareVcfsError,
+    filter_reads::errors::FilterReadsError, gen_bam_models::errors::GenBamModelsError,
+    gen_cancer_reads::errors::GenCancerReadsError,
     gen_frag_length_model::errors::GenFragLengthModelError,
     gen_gc_bias_model::errors::GenGcBiasModelError, gen_mut_model::errors::GenMutationModelError,
     gen_reads::errors::GenerateReadsError, gen_seq_error_model::errors::GenSeqErrorModelError,
@@ -61,9 +63,11 @@ pub enum NeatErrors {
     GenCancerReads(#[from] GenCancerReadsError),
     #[error("Validation failed: {0}")]
     Validate(#[from] ValidateError),
+    #[error("{0}")]
+    CompareAf(#[from] CompareAfError),
 }
 
-fn neat_commands() -> [Command; 10] {
+fn neat_commands() -> [Command; 11] {
     // These are the submodule commands. Any new commands added should go here.
     let configuration_arg = Arg::new("configuration_yaml")
         .long("configuration-yaml")
@@ -129,6 +133,45 @@ fn neat_commands() -> [Command; 10] {
                     .help("Override format detection when the extension is absent or wrong")
                     .action(ArgAction::Set)
                     .value_parser(["fastq", "vcf", "bam"]),
+            ),
+        // Flags rather than a config YAML: this is a measurement run ad hoc and from
+        // harness scripts, where writing a YAML per comparison is pure friction.
+        Command::new("compare-af")
+            .about("Per-allele AF correlation between a truth VCF and a simulated one")
+            .arg_required_else_help(true)
+            .arg(
+                Arg::new("truth")
+                    .long("truth")
+                    .help("Truth VCF — the intended per-allele fractions")
+                    .action(ArgAction::Set)
+                    .required(true)
+                    .value_parser(value_parser!(PathBuf)),
+            )
+            .arg(
+                Arg::new("sim")
+                    .long("sim")
+                    .help("Simulated/observed VCF to compare against the truth")
+                    .action(ArgAction::Set)
+                    .required(true)
+                    .value_parser(value_parser!(PathBuf)),
+            )
+            .arg(
+                Arg::new("min_depth")
+                    .long("min-depth")
+                    .help("Skip sites whose total AD is below this on either side (default 0)")
+                    .action(ArgAction::Set)
+                    .value_parser(value_parser!(f64)),
+            )
+            .arg(
+                Arg::new("max_uncovered_frac")
+                    .long("max-uncovered-frac")
+                    .help(
+                        "Fail if more than this fraction of planted truth alleles go \
+                         unscored (default 0.10). A metric over an unknown denominator \
+                         is not a result, so this is enforced rather than warned about.",
+                    )
+                    .action(ArgAction::Set)
+                    .value_parser(value_parser!(f64)),
             ),
     ]
 }
@@ -466,6 +509,27 @@ fn main() -> Result<(), NeatErrors> {
                 info!("Running eidolon validate on {} file(s)", files.len());
                 validate::run(&files, format)?;
                 info!("eidolon validate completed successfully");
+            }
+        }
+        Some(("compare-af", _)) => {
+            if let Some(("compare-af", cmd)) = subcommand {
+                let truth = cmd.get_one::<PathBuf>("truth").expect("required by clap");
+                let sim = cmd.get_one::<PathBuf>("sim").expect("required by clap");
+                let min_depth = *cmd.get_one::<f64>("min_depth").unwrap_or(&0.0);
+                let max_uncovered = *cmd.get_one::<f64>("max_uncovered_frac").unwrap_or(&0.10);
+                info!("Running eidolon compare-af");
+                // A Fatal is a MEASUREMENT verdict, not a crash: print it verbatim and
+                // exit non-zero, matching what the Python printed. Letting it propagate
+                // would wrap the message in the error enum's Debug formatting, which is
+                // noise in a log a human reads to decide whether a run is usable.
+                match compare_af::run(truth, sim, min_depth, max_uncovered) {
+                    Ok(()) => info!("eidolon compare-af completed successfully"),
+                    Err(CompareAfError::Fatal(msg)) => {
+                        eprintln!("{msg}");
+                        std::process::exit(1);
+                    }
+                    Err(other) => return Err(NeatErrors::CompareAf(other)),
+                }
             }
         }
         _ => unreachable!("Parser should ensure no other subcommand choice is made."),

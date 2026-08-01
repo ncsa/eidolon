@@ -19,7 +19,7 @@
 # WHY EIDOLON_VAF, NOT FORMAT/AF: FORMAT/AF in the truth is measured per-pass
 # (tumor-only) = dosage x CCF; the observed sample VAF after tumor/normal mixing is
 # purity x that = EIDOLON_VAF. We map EIDOLON_VAF -> INFO/AF on the truth side so the
-# existing scn_af_compare.py (truth INFO/AF vs sim FORMAT/AD) does the comparison.
+# `eidolon compare-af` (truth INFO/AF vs sim FORMAT/AD) does the comparison.
 #
 # PREREQS
 #   * eidolon built from develop (>= #405 merged) via setup.sh -> $EIDOLON_BIN
@@ -157,7 +157,7 @@ R2="$OUTDIR/subvaf_merged_r2.fastq.gz"
 for f in "$TRUTH" "$R1" "$R2"; do [[ -s "$f" ]] || { echo "missing output: $f" >&2; exit 1; }; done
 
 # ── Step 2: somatic sites, with EIDOLON_VAF surfaced as INFO/AF (the truth) ──────
-# scn_af_compare.py reads INFO/AF; EIDOLON_VAF is the intended OBSERVED VAF.
+# `eidolon compare-af` reads INFO/AF; EIDOLON_VAF is the intended OBSERVED VAF.
 SITES="$OUTDIR/somatic_sites.vcf.gz"
 {
   echo '##fileformat=VCFv4.2'
@@ -226,7 +226,7 @@ samtools index "$MERGED_BAM"
 # them, and 160 of 567 planted sites (the entire lowest CCF cluster) never reached
 # the comparison. Measuring an allele fraction needs no genotype call at all.
 #
-# scn_af_compare.py selects this allele's own AD element from the ALT list, so
+# `eidolon compare-af` selects this allele's own AD element from the ALT list, so
 # mpileup's `<*>` non-ref placeholder beside the real base is handled.
 SIM="$OUTDIR/observed.vcf.gz"
 echo "=== mpileup at the somatic sites (AD only, no genotype calling) ==="
@@ -250,13 +250,13 @@ echo "════════════════════════�
 echo "#405 subclonal VAF reproduction — intended EIDOLON_VAF vs observed merged VAF"
 echo "════════════════════════════════════════════════════════════════"
 CMP="$OUTDIR/compare.txt"
-# scn_af_compare.py exits non-zero when too much of the planted set went unscored.
+# `eidolon compare-af` exits non-zero when too much of the planted set went unscored.
 # Capture that instead of letting `set -e` + pipefail abort here, which would skip both
 # the verdict and archive_run — the artifacts are most worth keeping when it fails.
 # `$(cmd; echo $?)` cannot be used for this: the inherited `set -e` kills the subshell
 # before echo runs. `|| rc=$?` is the form that works.
 CMP_RC=0
-python3 "$REPO_ROOT/scripts/delta/scn_af_compare.py" \
+"$EIDOLON_BIN" compare-af \
     --truth "$SITES" --sim "$SIM" --min-depth "$MIN_DEPTH" | tee "$CMP" || CMP_RC=$?
 echo "════════════════════════════════════════════════════════════════"
 
@@ -281,7 +281,7 @@ verdict=FAIL
 # That is #450 exactly — it reported clean numbers and PASS while excluding the sites
 # it existed to test.
 if [[ "$CMP_RC" -ne 0 ]]; then
-  echo "  coverage gate FAILED (scn_af_compare.py rc=$CMP_RC) — see the per-decile" >&2
+  echo "  coverage gate FAILED (eidolon compare-af rc=$CMP_RC) — see the per-decile" >&2
   echo "  planted/scored table above. bias and MAE are not usable." >&2
 elif [[ -n "$bias" && -n "$mae" ]] \
    && awk -v b="$absbias" -v bm="$BIAS_MAX" 'BEGIN{exit !(b<=bm)}' \
