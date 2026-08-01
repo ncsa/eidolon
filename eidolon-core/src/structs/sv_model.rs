@@ -54,6 +54,142 @@ const MIN_OBS_FOR_LENGTH_FIT: usize = 2;
 const FALLBACK_CN_DISTRIBUTION: &[(u32, f64)] =
     &[(0, 0.15), (1, 0.35), (3, 0.30), (4, 0.15), (5, 0.05)];
 
+/// RNG sub-stream namespace for breakend-geometry draws.
+///
+/// A dedicated child stream so adding this draw does not perturb the main sampling
+/// sequence — without it every position, length and genotype downstream would shift and
+/// every pinned baseline would move for a reason unrelated to the change.
+const BND_GEOMETRY_STREAM: u64 = 7_000_000;
+
+/// Weighted draw over the four geometries. Falls back to head-to-head only if the
+/// weights are empty or unusable, which preserves the pre-#458 behaviour rather than
+/// producing something arbitrary.
+fn sample_bnd_geometry(weights: &HashMap<BndGeometry, f64>, rng: &mut NeatRng) -> BndGeometry {
+    let total: f64 = weights
+        .values()
+        .filter(|w| w.is_finite() && **w > 0.0)
+        .sum();
+    if total <= 0.0 {
+        return BndGeometry::HeadToHead;
+    }
+    let Ok(r) = rng.random() else {
+        return BndGeometry::HeadToHead;
+    };
+    let mut acc = 0.0;
+    // Iterated over the fixed ALL order, not the HashMap's, so a given seed produces the
+    // same geometry across runs regardless of hash ordering.
+    for g in BndGeometry::ALL {
+        let w = weights.get(&g).copied().unwrap_or(0.0);
+        if !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        acc += w / total;
+        if r < acc {
+            return g;
+        }
+    }
+    BndGeometry::HeadToHead
+}
+
+/// Fallback geometry weights for a model with no BND training data.
+///
+/// **Uniform, deliberately.** Real breakend-orientation spectra are not uniform, but
+/// inventing a plausible-looking split would be a claim about biology that nothing here
+/// supports — and this repo has been bitten by exactly that kind of unexamined inherited
+/// number. Uniform is an explicit non-claim: it says "no information", and any model fit
+/// from a corpus that contains breakends overrides it with the real distribution.
+pub fn default_bnd_geometry_weights() -> HashMap<BndGeometry, f64> {
+    BndGeometry::ALL.iter().map(|g| (*g, 0.25)).collect()
+}
+
+/// The four reciprocal breakend geometries of VCF 4.2 §5.4.
+///
+/// A junction is an adjacency between two loci, and the four orientations are what
+/// distinguish a deletion-like join from an inversion breakpoint. Callers discriminate
+/// them: Manta classifies direct adjacencies as DEL/DUP:TANDEM and only puts
+/// inversion-like orientations in its BND bucket.
+///
+/// eidolon emitted ONLY `HeadToHead` until this existed, which had consequences well
+/// beyond realism (#458 item 2). Head-to-head IS the inversion signature, so every
+/// planted "BND" was geometrically an inversion breakpoint: Manta bucketed them as BND
+/// for that reason, `convertInversion.py` converted them to `<INV>`, and they then
+/// scored as INV false positives against a truth that never contained them — 7 of 11 in
+/// Delta job 20699004. BND was not a separable category from INV at all.
+///
+/// The spec's own worked examples give each reciprocal pair:
+///   `t[p[` <-> `]p]t`   (direct)
+///   `t]p]` <-> `t]p]`   (head-to-head)
+///   `[p[t` <-> `[p[t`   (tail-to-tail)
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum BndGeometry {
+    /// `t[p[` — piece right of the mate joined after this base. Deletion-like.
+    DeletionLike,
+    /// `]p]t` — piece left of the mate joined before this base. Duplication-like.
+    DuplicationLike,
+    /// `t]p]` — reverse-complemented piece left of the mate, joined after. Inversion.
+    HeadToHead,
+    /// `[p[t` — reverse-complemented piece right of the mate, joined before. Inversion.
+    TailToTail,
+}
+
+impl BndGeometry {
+    pub const ALL: [BndGeometry; 4] = [
+        BndGeometry::DeletionLike,
+        BndGeometry::DuplicationLike,
+        BndGeometry::HeadToHead,
+        BndGeometry::TailToTail,
+    ];
+
+    /// `(bnd_join_after, bnd_mate_extends_right)` — the pair the chimeric read
+    /// generator dispatches on. These MUST agree with the ALT string this geometry
+    /// emits; a mismatch between them is the defect fixed in v3.1.0.
+    pub fn flags(self) -> (bool, bool) {
+        match self {
+            BndGeometry::DeletionLike => (true, true),
+            BndGeometry::DuplicationLike => (false, false),
+            BndGeometry::HeadToHead => (true, false),
+            BndGeometry::TailToTail => (false, true),
+        }
+    }
+
+    /// Classify from the flags `parse_bnd_alt` returns, so fitting and emission cannot
+    /// drift apart: both go through this one mapping.
+    pub fn from_flags(join_after: bool, mate_extends_right: bool) -> BndGeometry {
+        match (join_after, mate_extends_right) {
+            (true, true) => BndGeometry::DeletionLike,
+            (false, false) => BndGeometry::DuplicationLike,
+            (true, false) => BndGeometry::HeadToHead,
+            (false, true) => BndGeometry::TailToTail,
+        }
+    }
+
+    /// The geometry the MATE record of this junction must carry.
+    ///
+    /// Only the two inversion orientations are self-reciprocal. A direct junction pairs
+    /// `t[p[` with `]p]t`, so the mate's geometry differs from the anchor's — which is
+    /// why "anchor and mate share a geometry" is the wrong invariant to assert, true
+    /// only while head-to-head was the sole form emitted.
+    pub fn reciprocal(self) -> BndGeometry {
+        match self {
+            BndGeometry::DeletionLike => BndGeometry::DuplicationLike,
+            BndGeometry::DuplicationLike => BndGeometry::DeletionLike,
+            BndGeometry::HeadToHead => BndGeometry::HeadToHead,
+            BndGeometry::TailToTail => BndGeometry::TailToTail,
+        }
+    }
+
+    /// The ALT string for a breakend of this geometry at `base`, mating to
+    /// `contig:pos` (1-based). The reference base is embedded per VCF 4.2 §5.4.
+    pub fn alt_string(self, base: char, contig: &str, pos: usize) -> String {
+        match self {
+            BndGeometry::DeletionLike => format!("{base}[{contig}:{pos}["),
+            BndGeometry::DuplicationLike => format!("]{contig}:{pos}]{base}"),
+            BndGeometry::HeadToHead => format!("{base}]{contig}:{pos}]"),
+            BndGeometry::TailToTail => format!("[{contig}:{pos}[{base}"),
+        }
+    }
+}
+
 /// Learned statistical model for symbolic-SV generation.
 ///
 /// The five fields together specify everything a sampler needs: how
@@ -91,6 +227,21 @@ pub struct SvModel {
     /// (CN value → probability). Probabilities sum to ~1.0 if any
     /// CNVs in the training corpus carried `INFO/CN`; empty otherwise.
     pub cnv_copy_number_distribution: HashMap<u32, f64>,
+
+    /// Observed distribution over the four breakend geometries (§5.4), fitted from the
+    /// training corpus' own BND ALT strings.
+    ///
+    /// Model files predating this field must still load, and they fall back to
+    /// [`default_bnd_geometry_weights`] — NOT to an empty map.
+    ///
+    /// That distinction matters operationally. A bare `#[serde(default)]` would give an
+    /// empty `HashMap`, the sampler would fall back to head-to-head, and every existing
+    /// model — including the COSMIC pan-cancer model the Delta campaign runs — would
+    /// keep emitting the single orientation this change exists to remove, until someone
+    /// remembered to rebuild it. Defaulting to uniform means the fix takes effect on
+    /// models already on disk.
+    #[serde(default = "default_bnd_geometry_weights")]
+    pub bnd_geometry_weights: HashMap<BndGeometry, f64>,
 
     /// Probability that a generated SV is homozygous (vs heterozygous),
     /// estimated as the homozygous fraction across all fit-eligible
@@ -146,6 +297,10 @@ impl SvModel {
         // Per-type accumulators of (span, &Variant) so we can pull CN
         // and genotype back out without re-walking the source.
         let mut by_type: HashMap<SvType, Vec<(usize, &Variant)>> = HashMap::new();
+        // Breakend geometry counts, taken from the corpus' own ALT strings. Classified
+        // through the SAME parser the read generator's flags come from, so a fitted
+        // model and the emitter cannot disagree about what a given ALT means.
+        let mut geometry_counts: HashMap<BndGeometry, usize> = HashMap::new();
 
         for v in observations {
             let sv = match v.alternate.as_symbolic() {
@@ -155,6 +310,18 @@ impl SvModel {
                     continue;
                 }
             };
+            if sv.sv_type == SvType::Bnd {
+                let (_c, _p, join_after, mate_right) =
+                    crate::structs::variants::parse_bnd_alt(&sv.raw_alt);
+                // A single breakend with no parseable mate locus yields (false, false)
+                // from the parser, which would masquerade as DuplicationLike. Only count
+                // records whose ALT actually resolved to a mate.
+                if _c.is_some() && _p.is_some() {
+                    *geometry_counts
+                        .entry(BndGeometry::from_flags(join_after, mate_right))
+                        .or_insert(0) += 1;
+                }
+            }
             match sv.sv_type {
                 SvType::Del
                 | SvType::Dup
@@ -299,11 +466,30 @@ impl SvModel {
             homozygous_frequency
         );
 
+        // Fitted geometry weights, or the uniform non-claim if the corpus had no
+        // parseable breakends. Reported so a model built from a BND-free corpus does not
+        // silently look like one that measured a uniform spectrum.
+        let total_geom: usize = geometry_counts.values().sum();
+        let bnd_geometry_weights = if total_geom == 0 {
+            info!(
+                "SvModel: no parseable breakends in the corpus — BND geometry defaults \
+                 to uniform (an explicit non-claim, not a measurement)"
+            );
+            default_bnd_geometry_weights()
+        } else {
+            info!("SvModel: fitted BND geometry from {total_geom} breakend record(s)");
+            geometry_counts
+                .into_iter()
+                .map(|(g, n)| (g, n as f64 / total_geom as f64))
+                .collect()
+        };
+
         Some(SvModel {
             per_base_rate,
             type_probabilities,
             length_log_normal,
             cnv_copy_number_distribution,
+            bnd_geometry_weights,
             homozygous_frequency,
         })
     }
@@ -351,6 +537,9 @@ impl SvModel {
         max_length_fraction: f64,
         rng: &mut NeatRng,
     ) -> Vec<Variant> {
+        // Dedicated sub-stream for geometry draws, so adding them leaves every other
+        // sampling decision — position, length, genotype — bit-for-bit unchanged.
+        let mut geom_rng = rng.derive_child(BND_GEOMETRY_STREAM);
         if rate_scale <= 0.0 || !rate_scale.is_finite() {
             return Vec::new();
         }
@@ -572,6 +761,9 @@ impl SvModel {
                 continue;
             }
 
+            // Set inside the BND arm and consumed twice afterwards — once for the
+            // anchor's flags, once to give the mate the RECIPROCAL geometry.
+            let mut bnd_geometry: Option<BndGeometry> = None;
             let (raw_alt, m_contig, m_pos) = match sv_type {
                 SvType::Del => ("<DEL>".to_string(), None, None),
                 SvType::Dup => ("<DUP>".to_string(), None, None),
@@ -607,8 +799,14 @@ impl SvModel {
                     // (VCF 4.2 §5.4). A literal "N" contradicts the REF column,
                     // which carries the real base — see #451.
                     let anchor_char: char = anchor_base.into();
+                    // Geometry is SAMPLED now rather than hardcoded head-to-head.
+                    // Emitting one orientation made every planted BND geometrically an
+                    // inversion breakpoint, which is why BND was not separable from INV
+                    // in scoring at all (#458 item 2).
+                    let geom = sample_bnd_geometry(&self.bnd_geometry_weights, &mut geom_rng);
+                    bnd_geometry = Some(geom);
                     (
-                        format!("{anchor_char}]{contig_name}:{mp_candidate}]"),
+                        geom.alt_string(anchor_char, contig_name, mp_candidate),
                         Some(contig_name.to_string()),
                         Some(mp_candidate),
                     )
@@ -652,9 +850,10 @@ impl SvModel {
             // candidates within 1-2bp of all 7 planted junctions and emitted no breakend
             // at any of them, so BND recall read 0.000 for a caller that had found every
             // one. Keep these in step with the ALT emitted above.
-            if sv_type == SvType::Bnd {
-                sv_data.bnd_join_after = true;
-                sv_data.bnd_mate_extends_right = false;
+            if let Some(geom) = bnd_geometry {
+                let (ja, mer) = geom.flags();
+                sv_data.bnd_join_after = ja;
+                sv_data.bnd_mate_extends_right = mer;
             }
             sv_data.mate_contig = m_contig;
             sv_data.mate_pos = m_pos;
@@ -718,8 +917,12 @@ impl SvModel {
             // builds is unchanged; only the record representation is fixed.
             if let Some((id1, id2, anchor_1based, mate_1based, mate_base)) = bnd_pair {
                 let mate_char: char = mate_base.into();
+                // The mate carries the RECIPROCAL geometry, not the same one. Only the
+                // two inversion orientations are self-reciprocal; a direct junction
+                // pairs `t[p[` with `]p]t`, per the spec's own worked example.
+                let mate_geom = bnd_geometry.unwrap_or(BndGeometry::HeadToHead).reciprocal();
                 let mut mate_sv = SvData::new(
-                    format!("{mate_char}]{contig_name}:{anchor_1based}]"),
+                    mate_geom.alt_string(mate_char, contig_name, anchor_1based),
                     SvType::Bnd,
                 );
                 mate_sv.end = Some(mate_1based);
@@ -727,8 +930,9 @@ impl SvModel {
                 mate_sv.copy_number = None;
                 // Same form as the anchor (`t]p]`), so the same geometry — a reciprocal
                 // `t]p]` <-> `t]p]` pair is the spec's own worked example.
-                mate_sv.bnd_join_after = true;
-                mate_sv.bnd_mate_extends_right = false;
+                let (m_ja, m_mer) = mate_geom.flags();
+                mate_sv.bnd_join_after = m_ja;
+                mate_sv.bnd_mate_extends_right = m_mer;
                 mate_sv.mate_contig = Some(contig_name.to_string());
                 mate_sv.mate_pos = Some(anchor_1based);
                 let mate_info = format!(
@@ -2010,11 +2214,17 @@ mod tests {
 
             let (_, _, ja, mr) = parse_bnd_alt(&sv.raw_alt);
             let (_, _, ja_m, mr_m) = parse_bnd_alt(&mate_sv.raw_alt);
+            // The mate carries the RECIPROCAL geometry, which is only the SAME geometry
+            // for the two inversion orientations. This assertion used to demand equality
+            // and passed solely because head-to-head was the only form ever emitted;
+            // once geometries are sampled, a direct junction pairs `t[p[` with `]p]t`.
+            let anchor_geom = BndGeometry::from_flags(ja, mr);
+            let mate_geom = BndGeometry::from_flags(ja_m, mr_m);
             assert_eq!(
-                (ja, mr),
-                (ja_m, mr_m),
-                "junction described two ways: {} then {} — a reciprocal pair must share \
-                 one geometry (VCF 4.2 §5.4's worked example is `t]p]` <-> `t]p]`)",
+                mate_geom,
+                anchor_geom.reciprocal(),
+                "junction described two ways: {} ({anchor_geom:?}) then {} ({mate_geom:?}) \
+                 — the mate must carry the reciprocal geometry (VCF 4.2 §5.4)",
                 sv.raw_alt,
                 mate_sv.raw_alt
             );
@@ -2071,6 +2281,146 @@ mod tests {
                 "{sv_type:?}: nothing sampled — test proves nothing"
             );
         }
+    }
+
+    /// A BND-only model whose geometry weights put all mass on one orientation.
+    fn bnd_model_with_geometry(g: BndGeometry) -> SvModel {
+        let mut m = SvModel::default();
+        m.per_base_rate = 5e-3;
+        m.homozygous_frequency = 0.5;
+        m.type_probabilities.clear();
+        m.type_probabilities.insert(SvType::Bnd, 1.0);
+        m.length_log_normal.insert(SvType::Bnd, (0.0, 0.0));
+        m.bnd_geometry_weights.clear();
+        m.bnd_geometry_weights.insert(g, 1.0);
+        m
+    }
+
+    /// Every geometry the model weights toward must actually be emitted, with the ALT
+    /// and the read-generation flags agreeing. Before #458 item 2 the sampler emitted
+    /// `t]p]` unconditionally, so three of the four forms were unreachable.
+    #[test]
+    fn every_bnd_geometry_can_be_emitted_and_its_flags_match_its_alt() {
+        for geom in BndGeometry::ALL {
+            let m = bnd_model_with_geometry(geom);
+            let seq = acgt_sequence(100_000);
+            let mut rng = deterministic_rng();
+            let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+            let mut anchors = 0;
+            for v in &out {
+                let Some(sv) = v.alternate.as_symbolic() else {
+                    continue;
+                };
+                if sv.sv_type != SvType::Bnd {
+                    continue;
+                }
+                let (_c, _p, ja, mr) = parse_bnd_alt(&sv.raw_alt);
+                let emitted = BndGeometry::from_flags(ja, mr);
+                // Every record is either the requested geometry or its reciprocal
+                // (the mate) — nothing else may appear.
+                assert!(
+                    emitted == geom || emitted == geom.reciprocal(),
+                    "asked for {geom:?} but emitted {emitted:?} (ALT {})",
+                    sv.raw_alt
+                );
+                // The flags the read generator dispatches on must match the ALT.
+                assert_eq!(
+                    (sv.bnd_join_after, sv.bnd_mate_extends_right),
+                    emitted.flags(),
+                    "ALT {} declares {emitted:?} but the flags say otherwise",
+                    sv.raw_alt
+                );
+                if emitted == geom {
+                    anchors += 1;
+                }
+            }
+            assert!(
+                anchors > 0,
+                "{geom:?}: nothing emitted — test proves nothing"
+            );
+        }
+    }
+
+    /// A direct junction's two records carry DIFFERENT geometries. This is the case that
+    /// only exists now that more than one orientation is sampled, and it is what the old
+    /// "anchor and mate share a geometry" assertion would have got wrong.
+    #[test]
+    fn a_direct_junction_pairs_two_different_forms() {
+        let m = bnd_model_with_geometry(BndGeometry::DeletionLike);
+        let seq = acgt_sequence(100_000);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+        let mut seen_del = false;
+        let mut seen_dup = false;
+        for v in &out {
+            let Some(sv) = v.alternate.as_symbolic() else {
+                continue;
+            };
+            if sv.sv_type != SvType::Bnd {
+                continue;
+            }
+            let (_c, _p, ja, mr) = parse_bnd_alt(&sv.raw_alt);
+            match BndGeometry::from_flags(ja, mr) {
+                BndGeometry::DeletionLike => seen_del = true,
+                BndGeometry::DuplicationLike => seen_dup = true,
+                other => panic!("unexpected geometry {other:?} for a direct junction"),
+            }
+        }
+        assert!(
+            seen_del && seen_dup,
+            "a `t[p[` anchor must be paired with a `]p]t` mate; saw del={seen_del} dup={seen_dup}"
+        );
+    }
+
+    /// Geometry is fitted from the corpus' own ALT strings, not assumed.
+    #[test]
+    fn fit_learns_bnd_geometry_from_the_corpus() {
+        // Three head-to-head breakends and one deletion-like: 0.75 / 0.25.
+        let alts = ["A]chr1:500]", "A]chr1:600]", "A]chr1:700]", "A[chr1:800["];
+        let obs: Vec<Variant> = alts
+            .iter()
+            .enumerate()
+            .map(|(i, alt)| {
+                let mut sd = SvData::new(*alt, SvType::Bnd);
+                sd.end = Some(100 + i);
+                let (c, p, ja, mr) = parse_bnd_alt(alt);
+                sd.mate_contig = c;
+                sd.mate_pos = p;
+                sd.bnd_join_after = ja;
+                sd.bnd_mate_extends_right = mr;
+                Variant {
+                    variant_type: VariantType::BND,
+                    location: 100 + i,
+                    reference: vec![Nucleotide::A],
+                    alternate: AlternateType::Symbolic(sd),
+                    genotype_str: "0/1".to_string(),
+                    genotype: Genotype::Heterozygous,
+                    allele_fraction: None,
+                    id: None,
+                    quality_score: None,
+                    filter: None,
+                    info: None,
+                    format: vec!["GT".to_string()],
+                    sample: vec!["0/1".to_string()],
+                    provenance: Provenance::InputVcf,
+                }
+            })
+            .collect();
+        let m = SvModel::fit_from_observations(&obs, 100_000).expect("should fit");
+        let w = &m.bnd_geometry_weights;
+        assert!(
+            (w.get(&BndGeometry::HeadToHead).copied().unwrap_or(0.0) - 0.75).abs() < 1e-9,
+            "head-to-head should be 3/4, got {:?}",
+            w.get(&BndGeometry::HeadToHead)
+        );
+        assert!(
+            (w.get(&BndGeometry::DeletionLike).copied().unwrap_or(0.0) - 0.25).abs() < 1e-9,
+            "deletion-like should be 1/4, got {:?}",
+            w.get(&BndGeometry::DeletionLike)
+        );
+        // ...and the orientations the corpus never showed must carry no weight, rather
+        // than being smoothed in.
+        assert_eq!(w.get(&BndGeometry::TailToTail).copied().unwrap_or(0.0), 0.0);
     }
 
     #[test]

@@ -100,11 +100,18 @@ pub fn default_sv_model() -> SvModel {
     // refit this; for now the literature value is the best estimate.
     let homozygous_frequency = 0.20;
 
+    // Breakend geometry: uniform, and deliberately not a literature value. Unlike the
+    // homozygous fraction above there is no figure here I can cite and defend, and this
+    // repo has already been burned by an unexamined inherited number. Uniform states
+    // "no information"; a model fitted from a corpus containing breakends replaces it.
+    let bnd_geometry_weights = crate::structs::sv_model::default_bnd_geometry_weights();
+
     SvModel {
         per_base_rate,
         type_probabilities,
         length_log_normal,
         cnv_copy_number_distribution,
+        bnd_geometry_weights,
         homozygous_frequency,
     }
 }
