@@ -1,5 +1,59 @@
 7/31/2026
 =========
+## eidolon v3.1.0 — de novo breakends now carry the junction they describe
+
+**Breaking for anyone benchmarking against the BND truth**, though no emitted format
+changes. What changes is what a BND *is* in the output.
+
+### The truth VCF described a rearrangement the reads did not carry
+
+The chimeric read generator dispatches on `bnd_join_after` / `bnd_mate_extends_right`,
+not on the ALT string. Those flags are assigned only by the input-VCF parser, so a de
+novo BND left them at their `SvData::new` defaults of `false/false` — VCF 4.2 **case 4,
+`]p]t`, a direct join with no reverse complement** — while the ALT written to the truth
+was **`t]p]`, case 2, head-to-head with the mate piece reverse-complemented**.
+`sv_model.rs` never set them at all.
+
+A direct intra-contig join is not a breakend. Joining A-left to B-right *is* a deletion;
+the reverse *is* a duplication. eidolon has been planting DELs and DUPs and labelling
+them BNDs since v1.13.1 (#224) — the #451 fix only replaced the literal `N` with the real
+anchor base, leaving the bracket form untouched.
+
+This is the root cause of `BND recall=0.000`, which survived five explanations across a
+year. It was never a caller failure and never a scoring artifact. On Delta job 20675480
+Manta placed DEL/DUP candidates within **1–2 bp of all seven planted junctions**, emitted
+no INV and no breakend anywhere near them, and was marked as having found none of them:
+
+| planted junction | Manta candidate | worst endpoint error |
+|---|---|---|
+| 20592138-49516423 | DUP 20592137-49516423 | 1 bp |
+| 20610778-45788036 | DEL 20610777-45788034 | 2 bp |
+| 26790171-36133098 | DEL 26790171-36133097 | 1 bp |
+| 34999235-36134214 | DUP 34999234-36134214 | 1 bp |
+| 40696874-53467765 | DUP 40696872-53467764 | 2 bp |
+| 47038466-51969855 | DUP 47038465-51969855 | 1 bp |
+| 50310249-51236091 | DEL 50310249-51236090 | 1 bp |
+
+The reads were never at fault: 7–15 discordant pairs and 3–15 split reads at each of the
+14 breakends, which is what a het somatic junction should look like at 18×. The caller
+was right, the reads were right, and the truth was wrong.
+
+`sv_model.rs` now sets both flags to match the `t]p]` ALT it emits, on the anchor and the
+mate. A reciprocal `t]p]` ↔ `t]p]` pair is the spec's own worked example, so the ALT
+stays and the reads move to match it.
+
+### Why the tests did not catch it
+
+`bnd_fastq.rs` drives the **input** path — where the parser sets the flags correctly, so
+the one path that was never broken — and asserts only that some read is named
+`EIDOLON_chimeric`. An existence check on the working case. `get_bnd_pieces` had no tests
+at all, so nothing in the suite could distinguish a direct join from a head-to-head one.
+
+Now pinned at both ends: `denovo_bnd_read_geometry_matches_the_alt_it_declares` parses
+the emitted ALT with the same parser the input path uses and asserts the flags agree
+(verified to fail before the fix), and `bnd_pieces_reverse_complement_exactly_the_spec_
+cases` pins all four VCF 4.2 forms and which piece is reverse-complemented.
+
 ## eidolon v3.0.1 — measurement integrity
 
 **Fixes only; no feature work and no change to simulated output.** Every item here is a
