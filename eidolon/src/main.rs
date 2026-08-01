@@ -14,6 +14,7 @@ pub mod gen_gc_bias_model;
 pub mod gen_mut_model;
 pub mod gen_reads;
 pub mod gen_seq_error_model;
+pub mod validate;
 
 use eidolon_core::{self, file_tools::file_io::create_output_file};
 use std::env;
@@ -32,6 +33,7 @@ use crate::{
     gen_frag_length_model::errors::GenFragLengthModelError,
     gen_gc_bias_model::errors::GenGcBiasModelError, gen_mut_model::errors::GenMutationModelError,
     gen_reads::errors::GenerateReadsError, gen_seq_error_model::errors::GenSeqErrorModelError,
+    validate::errors::ValidateError,
 };
 /// This script parses arguments and checks them before submitting to the submodules, which currently
 /// include `gen-reads` and `filter-files`. As more are added, this can be expanded or refactored
@@ -57,9 +59,11 @@ pub enum NeatErrors {
     CompareVcfs(#[from] CompareVcfsError),
     #[error("Error while generating cancer read dataset {0}")]
     GenCancerReads(#[from] GenCancerReadsError),
+    #[error("Validation failed: {0}")]
+    Validate(#[from] ValidateError),
 }
 
-fn neat_commands() -> [Command; 9] {
+fn neat_commands() -> [Command; 10] {
     // These are the submodule commands. Any new commands added should go here.
     let configuration_arg = Arg::new("configuration_yaml")
         .long("configuration-yaml")
@@ -107,6 +111,25 @@ fn neat_commands() -> [Command; 9] {
             .about("Simulate a tumor/normal mixture (two gen-reads passes + merge)")
             .arg_required_else_help(true)
             .arg(&configuration_arg),
+        // Takes file paths directly rather than a config YAML: it is a diagnostic run
+        // ad hoc and from harness scripts, where writing a YAML per check is friction.
+        Command::new("validate")
+            .about("Check an emitted FASTQ/VCF against what its consumers accept")
+            .arg_required_else_help(true)
+            .arg(
+                Arg::new("files")
+                    .help("Artifacts to validate (.fq/.fastq/.vcf, optionally .gz)")
+                    .action(ArgAction::Append)
+                    .required(true)
+                    .value_parser(value_parser!(PathBuf)),
+            )
+            .arg(
+                Arg::new("format")
+                    .long("format")
+                    .help("Override format detection when the extension is absent or wrong")
+                    .action(ArgAction::Set)
+                    .value_parser(["fastq", "vcf"]),
+            ),
     ]
 }
 
@@ -426,6 +449,22 @@ fn main() -> Result<(), NeatErrors> {
                     Err(error) => return Err(NeatErrors::GenCancerReads(error)),
                     Ok(()) => info!("eidolon gen-cancer-reads completed successfully"),
                 }
+            }
+        }
+        Some(("validate", _)) => {
+            if let Some(("validate", cmd)) = subcommand {
+                let files: Vec<PathBuf> = cmd
+                    .get_many::<PathBuf>("files")
+                    .expect("clap marks files as required")
+                    .cloned()
+                    .collect();
+                let format = cmd.get_one::<String>("format").map(|f| match f.as_str() {
+                    "fastq" => validate::Format::Fastq,
+                    _ => validate::Format::Vcf,
+                });
+                info!("Running eidolon validate on {} file(s)", files.len());
+                validate::run(&files, format)?;
+                info!("eidolon validate completed successfully");
             }
         }
         _ => unreachable!("Parser should ensure no other subcommand choice is made."),
