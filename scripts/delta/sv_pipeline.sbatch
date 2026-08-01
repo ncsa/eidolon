@@ -259,12 +259,6 @@ done
 # END==POS, and CNV is a copy-ratio call — truvari matches neither, so including
 # them made every aggregate a guaranteed partial miss (#457). They are scored
 # separately: BND by breakpoint proximity, CNV by the stage-4c direction check.
-# Derive comparable junction spans from the BND pairs (see build_bnd_spans).
-if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
-    build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
-        || echo "  (BND span derivation produced nothing — no intra-contig junctions?)"
-fi
-
 # What would --sizemax silently discard? Truvari drops oversized records BEFORE
 # comparison, so an unreported ceiling turns real events into guaranteed misses.
 n_over=$(bcftools query -f '%INFO/SVLEN\n' "$TRUTH_SV" 2>/dev/null \
@@ -437,9 +431,66 @@ s = json.load(open(sys.argv[1])); name = sys.argv[2]
 print(f"  {name:<18} recall={(s.get('recall') or 0):.3f}  precision={(s.get('precision') or 0):.3f}  "
       f"f1={(s.get('f1') or 0):.3f}  TP={s.get('TP-base') or 0}  FN={s.get('FN') or 0}  FP={s.get('FP') or 0}")
 PY
+        check_denominator "$truth" "$out" "$label" || true
     else
         echo "  $label: truvari produced no summary.json (see $out)"
+        SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
     fi
+}
+
+# Coverage check: truvari's TP-base+FN is its POST-filter base count. If that is less than
+# the number of records in the truth we handed it, records were discarded before comparison
+# and the reported recall was computed over a SUBSET — a wrong denominator, silently.
+#
+# This checks the OUTCOME rather than enumerating causes, so it generalises past any one
+# filter. An audit of the archived runs found 4 such cases in 152 per-type checks (a DEL in
+# job_19758751 reported 0.800 where the full denominator gives 0.727; an INV in
+# job_20636298 reported 0.800 vs 0.667) and nothing in the output said so.
+#
+# It also ATTRIBUTES the loss: every base record truvari considered lands in tp-base.vcf.gz
+# or fn.vcf.gz, so truth-minus-those is exactly the discarded set, printed with SVTYPE/SVLEN
+# so the responsible filter is obvious. eidolon's own floor is MIN_SV_LENGTH_BP=50, equal to
+# truvari's --sizemin default, so a size-driven drop here means the LARGE end (--sizemax).
+check_denominator() {  # <truth.vcf.gz> <truvari_out_dir> <label>
+    local truth="$1" out="$2" label="$3"
+    local n_truth base
+    n_truth=$(bcftools view -H "$truth" 2>/dev/null | wc -l)
+    base=$(python3 -c "import json;d=json.load(open('$out/summary.json'));print((d.get('TP-base') or 0)+(d.get('FN') or 0))" 2>/dev/null || echo 0)
+    [[ "$n_truth" -eq "$base" ]] && return 0
+
+    echo "  ERROR: $label scored only $base of $n_truth truth record(s); $((n_truth - base)) discarded" >&2
+    echo "    before comparison, so the recall above used the WRONG DENOMINATOR." >&2
+    if [[ "$base" -gt 0 ]]; then
+        python3 -c "
+import json
+d = json.load(open('$out/summary.json')); tp = d.get('TP-base') or 0
+print(f'    reported {tp}/$base={tp/$base:.3f}  ->  over the full truth {tp}/$n_truth={tp/$n_truth:.3f}')" >&2
+    fi
+
+    # Attribute it: every base record truvari considered lands in tp-base or fn, so
+    # truth-minus-those is exactly what was discarded. awk-join (not join(1)) to avoid
+    # depending on key collation matching between two independently sorted streams.
+    local considered="$OUTDIR/.considered_$label" f found=0
+    : > "$considered"
+    for f in "$out/tp-base.vcf.gz" "$out/fn.vcf.gz"; do
+        if [[ -f "$f" ]]; then
+            bcftools query -f '%CHROM\t%POS\n' "$f" >> "$considered" 2>/dev/null && found=1
+        fi
+    done
+    if [[ "$found" -eq 1 ]]; then
+        echo "    discarded records (CHROM POS SVTYPE SVLEN); --sizemax=$TRUVARI_SIZEMAX:" >&2
+        bcftools query -f '%CHROM\t%POS\t%INFO/SVTYPE\t%INFO/SVLEN\n' "$truth" 2>/dev/null \
+          | awk -F'\t' -v seen="$considered" '
+              BEGIN { while ((getline line < seen) > 0) { split(line, k, "\t"); c[k[1] "~" k[2]] = 1 } }
+              !((($1 "~" $2) in c)) { n++; if (n <= 10) printf "      %s %s %s %s\n", $1, $2, $3, $4 }
+              END { if (n > 10) printf "      ... and %d more\n", n - 10 }' >&2
+    else
+        echo "    (no tp-base/fn VCF in $out — cannot attribute; inspect it directly)" >&2
+    fi
+    rm -f "$considered"
+
+    SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
+    return 1
 }
 
 # ── BND junction spans: a comparable representation ──────────────────────
@@ -455,11 +506,19 @@ PY
 # COMPARISON artifact, not an output format — END on a real BND must equal POS. Only
 # intra-contig junctions can become spans; inter-contig ones are counted and skipped.
 build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
+    # Exit status is three-way on purpose, because "no spans" has two very different
+    # meanings and the caller must not treat them alike:
+    #   0 = spans written
+    #   2 = nothing to write because every junction is inter-contig (legitimate)
+    #   1 = anything else (a defect; the previous version reported this as case 2)
     local src="$1" dst="$2"
-    [[ -f "$src" ]] || return 1
-    local body="$OUTDIR/.bnd_span_body"
+    [[ -f "$src" ]] || { echo "  ERROR: BND spans: no BND truth at $src" >&2; return 1; }
+    local body="$OUTDIR/.bnd_span_body" stats="$OUTDIR/.bnd_span_stats"
+    local hdr="$OUTDIR/.bnd_span_hdr" err="$OUTDIR/.bnd_span_err"
+    rm -f "$body" "$stats" "$hdr" "$err"
+
     bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' "$src" \
-      | awk -F'\t' 'BEGIN{OFS="\t"}
+      | awk -F'\t' -v stats="$stats" 'BEGIN{OFS="\t"}
           { alt=$4; gsub(/[][]/, "|", alt); n=split(alt, p, "|"); loc=""
             for (i=1;i<=n;i++) if (p[i] ~ /:/) { loc=p[i]; break }
             if (loc == "") { bad++; next }
@@ -471,18 +530,66 @@ build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
             seen[key]=1
             print $1, lo, ".", $3, "<BND_SPAN>", 37, "PASS", \
                   "SVTYPE=BND;END=" hi ";SVLEN=" (hi-lo), "GT", "0/1" }
-          END{ printf("  BND spans: %d junction(s) from %d record(s) "\
+          END{ print length(seen), dup+0, inter+0, bad+0 > stats
+               printf("  BND spans: %d junction(s) from %d record(s) "\
                       "(inter-contig skipped=%d, unparsable ALT=%d)\n",
                       length(seen), length(seen)+dup+inter+bad, inter+0, bad+0) > "/dev/stderr" }' \
       > "$body"
-    if [[ ! -s "$body" ]]; then rm -f "$body"; return 1; fi
-    { bcftools view -h "$src" | grep -vE '^#CHROM'
-      echo '##ALT=<ID=BND_SPAN,Description="Derived: intra-contig BND junction as a span (comparison only)">'
-      echo '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Junction span">'
+
+    local n_junc dup inter bad
+    if ! read -r n_junc dup inter bad < "$stats" 2>/dev/null; then
+        echo "  ERROR: BND spans: derivation produced no statistics — awk did not run." >&2
+        rm -f "$body" "$stats"; return 1
+    fi
+    rm -f "$stats"
+    if [[ "$n_junc" -eq 0 ]]; then
+        rm -f "$body"
+        if [[ "$bad" -eq 0 && "$inter" -gt 0 ]]; then
+            echo "  BND spans: none derived — all $inter junction record(s) are inter-contig," >&2
+            echo "    which cannot be expressed as a span. Expected on a multi-contig reference." >&2
+            return 2
+        fi
+        echo "  ERROR: BND spans: 0 junctions derived from a non-empty BND truth" >&2
+        echo "    (unparsable ALT=$bad, inter-contig=$inter). The ALT parser or the truth is wrong." >&2
+        return 1
+    fi
+
+    # Inherit the source header, then backfill ONLY what is missing. The body writes
+    # SVTYPE/END/SVLEN and a GT column; an undeclared END is parsed as Type=String and
+    # kills bcftools outright, which the old `2>/dev/null` hid while still returning 0.
+    bcftools view -h "$src" | grep -vE '^#CHROM' > "$hdr"
+    local decl id kind
+    for decl in '##ALT=<ID=BND_SPAN,Description="Derived: intra-contig BND junction as a span (comparison only)">' \
+                '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">' \
+                '##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant described in this record">' \
+                '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="Difference in length between REF and ALT alleles">' \
+                '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">'; do
+        id="${decl#*<ID=}"; id="${id%%,*}"
+        kind="${decl%%=*}"
+        grep -q "^${kind}=<ID=${id}," "$hdr" || echo "$decl" >> "$hdr"
+    done
+
+    local rc=0
+    { cat "$hdr"
       bcftools view -h "$src" | grep -E '^#CHROM'
-      cat "$body"; } | bcftools sort -O z -o "$dst" 2>/dev/null
+      cat "$body"; } | bcftools sort -O z -o "$dst" 2> "$err" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "  ERROR: BND spans: bcftools sort failed (rc=$rc):" >&2
+        sed 's/^/      /' "$err" >&2
+        rm -f "$body" "$hdr" "$err" "$dst"; return 1
+    fi
     bcftools index -f -t "$dst" 2>/dev/null || true
-    rm -f "$body"
+
+    # Coverage of its own input: the file must hold every junction awk counted.
+    local n_written; n_written=$(bcftools view -H "$dst" 2>/dev/null | wc -l)
+    if [[ "$n_written" -ne "$n_junc" ]]; then
+        echo "  ERROR: BND spans: derived $n_junc junction(s) but wrote $n_written record(s)." >&2
+        sed 's/^/      /' "$err" >&2
+        rm -f "$body" "$hdr" "$err"; return 1
+    fi
+    echo "  BND spans: $n_written junction span(s) -> $(basename "$dst")"
+    rm -f "$body" "$hdr" "$err"
+    return 0
 }
 
 # ── Rule 0: calibrate the scorer before believing it ────────────────────
@@ -501,7 +608,11 @@ selftest_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     local r=0
     [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
     if awk -v r="$r" 'BEGIN{exit !(r > 0.999)}'; then
-        echo "  selftest $label: PASS (truth vs truth recall=$r)"
+        # recall=1.000 is necessary but NOT sufficient: a filter that discards a record
+        # removes it from base AND comp alike, so the subset still matches itself
+        # perfectly. Only the denominator check sees that.
+        check_denominator "$truth" "$out" "selftest_$label" || return 1
+        echo "  selftest $label: PASS (truth vs truth recall=$r, all $(bcftools view -H "$truth" | wc -l) records scored)"
         return 0
     fi
     echo "ERROR: scorer selftest FAILED for $label — truth vs truth recall=$r, expected 1.000." >&2
@@ -557,7 +668,26 @@ score_caller() {  # <caller> <comp.vcf.gz>
     echo "  === $caller (cSample=$(comp_sample "$comp")) ==="
 
     if [[ -f "$TRUTH_SCOREABLE" ]]; then
-        run_truvari "$TRUTH_SCOREABLE" "${caller}_overall" "$comp"
+        # The aggregate truth excludes BND and CNV, so the query must exclude them too.
+        # Otherwise every BND/CNV call the caller made is a false positive against a
+        # truth that never contained one — job 20675480 reported manta_overall FP=24
+        # from a 24-record truth, with Manta's BND calls making up the bulk. `-e`
+        # (exclude) rather than `-i`, so a record with no SVTYPE at all is kept instead
+        # of silently dropped.
+        local qs="$OUTDIR/${caller}_calls_scoreable.vcf.gz"
+        if ! bcftools view -e 'INFO/SVTYPE="BND" || INFO/SVTYPE="CNV"' \
+                -O z -o "$qs" "$comp" 2>/dev/null; then
+            echo "  ERROR: $caller: could not build the aggregate query subset —" >&2
+            echo "    skipping the aggregate rather than scoring an unfiltered query." >&2
+            SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
+        else
+            bcftools index -f -t "$qs" 2>/dev/null || true
+            local n_all n_sub
+            n_all=$(bcftools view -H "$comp" 2>/dev/null | wc -l)
+            n_sub=$(bcftools view -H "$qs" 2>/dev/null | wc -l)
+            echo "  (aggregate query: $n_sub of $n_all $caller call(s); $((n_all - n_sub)) BND/CNV call(s) excluded, scored separately)"
+            run_truvari "$TRUTH_SCOREABLE" "${caller}_overall" "$qs"
+        fi
     else
         echo "  ($caller: no truvari-scoreable truth types — aggregate skipped)"
     fi
@@ -581,21 +711,66 @@ score_caller() {  # <caller> <comp.vcf.gz>
         fi
     done
 
-    # BND, representation 1: breakend-to-breakend.
+    # BND, representation 1: breakend-to-breakend. The query is the caller's BND
+    # records ONLY — comparing breakends to breakends. Passing the whole call set here
+    # made every non-BND call a false positive: job 20675480 reported manta_BND FP=43
+    # against manta_overall FP=24, and a subset cannot have more false positives than
+    # the whole. That was #457's defect surviving in the one run it never covered.
     if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
-        run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$comp" \
-            --bnddist "$BND_DIST"
+        local qb="$OUTDIR/${caller}_calls_BND.vcf.gz"
+        bcftools view -i 'INFO/SVTYPE="BND"' -O z -o "$qb" "$comp" 2>/dev/null || true
+        if [[ -f "$qb" ]] && [[ "$(bcftools view -H "$qb" 2>/dev/null | wc -l)" -gt 0 ]]; then
+            bcftools index -f -t "$qb" 2>/dev/null || true
+            run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
+                --bnddist "$BND_DIST"
+        else
+            rm -f "$qb" "${qb}.tbi"
+            echo "  ${caller}_BND recall=0.000  (caller emitted no BND records)"
+        fi
     fi
     # BND, representation 2: junction spans vs whatever type the caller used. -t
     # (--typeignore) is required: the caller legitimately calls a junction a DUP.
+    #
+    # The query is deliberately UNFILTERED here — the whole point is that the caller may
+    # have used any type for the junction, so it cannot be narrowed by type. That makes
+    # recall the measurement and FP/precision uninterpretable (every unrelated call is
+    # an unmatched comp record), so say so rather than let the number be quoted.
     if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
         run_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$comp" -t
+        echo "    ^ BNDspan: recall is the measurement; precision/FP/f1 are NOT — the query"
+        echo "      is intentionally unfiltered because the caller may use any SVTYPE here."
     fi
 }
 
 # ── Rule 0: calibrate every scorer before believing any of it ────────────
-echo "[5/5] Calibrating scorers (truth-vs-truth must be perfect; decoy must be zero)..."
+# Derive comparable junction spans from the BND pairs (see build_bnd_spans). This runs
+# HERE, not in stage 3b, because bash resolves function names at call time: the call used
+# to sit ~250 lines above the definition, so it was `command not found` (127) on every
+# run and the `||` branch reported it as "no intra-contig junctions". The BNDspan scoring
+# path — the one that recovers a caller which re-represents a junction — therefore never
+# executed. Handle every status explicitly; an unexpected rc must not read as success.
+# Hoisted above the span derivation: a failed derivation is a calibration failure, and
+# the flag must exist before anything can set it (set -u).
 CAL_FAIL=0
+# Counts per-type comparisons whose recall denominator did not cover the whole truth.
+# Evaluated after ALL scoring so every discrepancy is reported, not just the first.
+SCORE_COVERAGE_FAIL=0
+
+BND_SPAN_RC=0
+if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
+    build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
+        || BND_SPAN_RC=$?
+    case "$BND_SPAN_RC" in
+        0) ;;                                   # spans written
+        2) echo "  (BNDspan scoring skipped: no intra-contig junctions to span)" ;;
+        *) echo "ERROR: BND span derivation failed (rc=$BND_SPAN_RC) — BNDspan scoring" >&2
+           echo "  cannot run, so a caller that re-represents junctions will score 0" >&2
+           echo "  recall for reasons that are ours, not the caller's." >&2
+           CAL_FAIL=1 ;;
+    esac
+fi
+
+echo "[5/5] Calibrating scorers (truth-vs-truth must be perfect; decoy must be zero)..."
 if [[ -f "$TRUTH_SCOREABLE" ]]; then
     selftest_truvari "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
     decoy_truvari    "$TRUTH_SCOREABLE" scoreable
@@ -605,22 +780,43 @@ if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
 fi
 if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
+    # The selftest above compares spans to THEMSELVES, which matches trivially. It says
+    # nothing about the premise BNDspan actually rests on: that truvari -t matches a
+    # derived <BND_SPAN> to the <DUP:TANDEM> a caller emits for the same junction. If
+    # that does not hold, BNDspan recall measures our comparison, not the caller — the
+    # exact error this line of work began with. Known-answer, both directions.
+    "$REPO_ROOT/scripts/delta/probe_bndspan.sh" \
+        --spans "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
+        --reference "$REFERENCE" --work "$OUTDIR/.bndspan_probe" || CAL_FAIL=1
 fi
+# Skip scoring rather than exit: the calibration artifacts and the truth VCFs are worth
+# archiving precisely BECAUSE the scorer misbehaved, and the exit below runs after
+# archive_run. Scoring itself is pointless with a scorer that cannot score a known answer.
 if [[ "$CAL_FAIL" -ne 0 ]]; then
     echo "ERROR: at least one scorer cannot match the truth to itself — refusing to" >&2
     echo "  report caller results computed with a configuration that demonstrably" >&2
-    echo "  cannot score a perfect answer." >&2
-    exit 1
+    echo "  cannot score a perfect answer. Skipping caller scoring; see the selftest" >&2
+    echo "  output above and the archived truvari_selftest_* directories." >&2
+else
+    score_caller manta "$MANTA_SV"
+    [[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
 fi
 
-score_caller manta "$MANTA_SV"
-[[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
-
 # ── Summary ──────────────────────────────────────────────────────────────
+# Never print an unqualified "complete" over a run whose numbers are not usable — a
+# summary banner that reads as success regardless of outcome is how a bad run gets
+# believed. The detail follows in the deferred failure gate below.
+if [[ "$CAL_FAIL" -ne 0 ]]; then
+    RUN_STATUS="FAILED (scorer calibration) — no caller results"
+elif [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+    RUN_STATUS="FAILED ($SCORE_COVERAGE_FAIL comparison(s) scored a SUBSET of the truth)"
+else
+    RUN_STATUS="complete"
+fi
 cat <<EOF
 
 ════════════════════════════════════════════════════════════════
-SV validation pipeline complete — Job $SLURM_JOB_ID
+SV validation pipeline $RUN_STATUS — Job $SLURM_JOB_ID
 
 Inputs:
   Reference:    $REFERENCE
@@ -653,3 +849,23 @@ fi
 # Persist report artifacts off scratch + record provenance/resources.
 # (manta overall always exists; delly summaries remain under $OUTDIR/truvari_delly_*)
 archive_run sv "$OUTDIR" truvari_manta_overall/summary.json
+
+# ── Deferred failure gate ────────────────────────────────────────────────
+# Deliberately last. Every discrepancy is reported inline next to the comparison it
+# affects (so the scale is visible rather than just the first case), the artifacts are
+# archived (so a failure is diagnosable after the fact), and only then does the job
+# exit non-zero — because a run that published recalls over a subset of the truth, or
+# scored with an uncalibrated scorer, must not look successful to whoever reads the
+# SLURM exit status.
+if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+    echo "" >&2
+    [[ "$CAL_FAIL" -ne 0 ]] && \
+        echo "FAILED: scorer calibration (Rule 0) — no caller results were produced." >&2
+    if [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+        echo "FAILED: $SCORE_COVERAGE_FAIL comparison(s) did not score the whole truth set." >&2
+        echo "  Those recalls are over a subset and must not be reported as-is. Raise" >&2
+        echo "  TRUVARI_SIZEMAX (currently $TRUVARI_SIZEMAX) or relax the size filters," >&2
+        echo "  then re-score. Artifacts are archived." >&2
+    fi
+    exit 1
+fi
