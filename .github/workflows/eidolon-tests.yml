@@ -50,3 +50,26 @@ jobs:
         RUSTFLAGS: "-D warnings"
     - name: Run tests
       run: cargo test --verbose --workspace
+
+  # The Delta harness scripts determine numbers the ACCESS report cites and were
+  # covered by nothing automatic (#466). They are bash, so cargo test cannot reach
+  # them; this job runs their own suite and then proves that suite is non-vacuous by
+  # mutating the production code and requiring every mutation to be caught.
+  delta-harness:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install bcftools
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq bcftools
+    - name: Shell syntax check
+      run: |
+        for f in scripts/delta/*.sh scripts/delta/*.sbatch scripts/delta/tests/*.sh; do
+          [ -e "$f" ] || continue
+          bash -n "$f" || exit 1
+        done
+    - name: BND geometry harness tests
+      run: scripts/delta/tests/test_bnd_geometry.sh
+    - name: Prove the harness tests are non-vacuous
+      run: scripts/delta/tests/test_bnd_geometry.sh --mutate
