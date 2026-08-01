@@ -38,5 +38,15 @@ jobs:
           ubuntu-latest-cargo-
     - name: Build
       run: cargo build
+    # Deny rustc warnings across ALL targets, tests included. A stray duplicated
+    # `#[test]` attribute silently DISABLED `denovo_bnd_emits_a_cross_linked_mate_pair`
+    # — the #451 regression guard — while making another test run twice, which reads as
+    # a passing "2 passed". rustc said `duplicated attribute` and `function is never
+    # used` the whole time and nothing was listening. The tree is at zero rustc warnings,
+    # so this costs nothing to hold.
+    - name: Deny warnings (a disabled test is a silent warning)
+      run: cargo build --workspace --all-targets
+      env:
+        RUSTFLAGS: "-D warnings"
     - name: Run tests
       run: cargo test --verbose --workspace

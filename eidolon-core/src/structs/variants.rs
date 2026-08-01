@@ -1097,6 +1097,66 @@ mod tests {
         }
     }
 
+    /// The BND payload must actually REACH `SvData`. `parse_bnd_alt_extracts_mate_info`
+    /// tests the helper in isolation and
+    /// `parse_alternate_breakend_alt_classifies_as_bnd` throws the `AlternateType` away
+    /// (`let (vt, _, _)`) to assert only the type tag — so deleting the two flag
+    /// assignments, or shifting the mate coordinate, left the whole suite green while
+    /// every parsed breakend silently became a direct join.
+    ///
+    /// This is the input-VCF side of the defect that shipped on the de novo side: the
+    /// ALT said one rearrangement and the reads carried another.
+    #[test]
+    fn parsing_a_bnd_record_carries_geometry_and_mate_into_svdata() {
+        // ref, ALT, mate contig, mate pos, join_after, mate_extends_right, form
+        let cases = [
+            (
+                "G",
+                "G]17:198982]",
+                "17",
+                198982usize,
+                true,
+                false,
+                "case 2 t]p]",
+            ),
+            ("G", "G[17:198982[", "17", 198982, true, true, "case 1 t[p["),
+            (
+                "A",
+                "]13:123456]A",
+                "13",
+                123456,
+                false,
+                false,
+                "case 4 ]p]t",
+            ),
+            (
+                "A",
+                "[13:123456[A",
+                "13",
+                123456,
+                false,
+                true,
+                "case 3 [p[t",
+            ),
+        ];
+        for (ref_base, alt, contig, pos, join_after, mate_right, form) in cases {
+            let (_vt, alternate, _r) = parse_alt_payload(100, ".", ref_base, alt).expect(form);
+            let sv = alternate
+                .as_symbolic()
+                .unwrap_or_else(|| panic!("{form}: expected a symbolic BND"));
+            assert_eq!(
+                (
+                    sv.mate_contig.as_deref(),
+                    sv.mate_pos,
+                    sv.bnd_join_after,
+                    sv.bnd_mate_extends_right
+                ),
+                (Some(contig), Some(pos), join_after, mate_right),
+                "{form}: ALT {alt} did not reach SvData as the junction it declares"
+            );
+        }
+    }
+
     #[test]
     fn parse_alternate_unrecognized_nonliteral_alt_is_invalid_vcf() {
         // A non-IUPAC ALT that's neither symbolic nor breakend should still
