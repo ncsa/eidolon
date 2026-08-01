@@ -61,6 +61,40 @@ the negative case has to be built deliberately:
 A feature demonstrated only by "it emitted something plausible" has not been validated,
 it has been exercised.
 
+### Test adequacy (not test presence)
+
+**New code ships with tests that would catch it being wrong. There is no exemption for
+"small", "obvious", or "hard to test".** If it is hard to test, that is usually a signal
+the seam is in the wrong place — narrow the function's inputs until it is testable
+(`get_bnd_pieces` took a whole `ContigContext` but used only contig lengths; taking the
+reference map instead made it unit-testable with no behaviour change).
+
+Every rule below was earned by a defect that shipped green:
+
+- **Test the path that can break, not the path that works.** `bnd_fastq.rs` "covered"
+  BND read generation by driving the *input-VCF* path — where the parser sets the
+  geometry flags correctly — while the *de novo* path shipped a truth VCF that
+  contradicted its own reads for a year. Ask which path the test actually exercises.
+- **Assert content, not existence.** That same test asserted only that some read was
+  *named* `EIDOLON_chimeric`. Names, counts, non-emptiness, and exit 0 are not content.
+  If a wrong value would still pass, the test is decoration.
+- **A function that makes a decision needs a test of that decision.** `get_bnd_pieces`
+  chooses which piece of a junction is reverse-complemented — the entire semantics of a
+  breakend — and had zero tests.
+- **Invariants that span two components need their own test.** The defect was neither
+  side being wrong: `sv_model.rs` emitted a correct ALT and `runner.rs` honoured its
+  flags correctly. They simply disagreed, and nothing asserted they must agree. Where
+  two components must stay in step, assert it directly, and use the *same* helper both
+  sides use so they cannot drift.
+- **Prove non-vacuity by mutation.** Before believing a new test, break the code it
+  covers and watch it fail. If it still passes, it is not a test. This is cheap for a
+  fix (revert it) and must be done deliberately for a feature. It is how an `##ALT`
+  assertion was found that could never fail.
+
+When auditing, mutation is the method: change the production code to something plausibly
+wrong, run the tests, and record what happened. A coverage claim with no mutation
+experiment behind it is an opinion.
+
 ### Status vocabulary
 **Nothing is "done" until there is evidence it works as intended. Until then it is
 in progress.** This governs how work is reported, not just how it is tested:

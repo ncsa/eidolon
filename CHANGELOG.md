@@ -5,6 +5,8 @@
 **Breaking for anyone benchmarking against the BND truth**, though no emitted format
 changes. What changes is what a BND *is* in the output.
 
+Also carries everything staged as v3.0.1 below, which was never tagged separately.
+
 ### The truth VCF described a rearrangement the reads did not carry
 
 The chimeric read generator dispatches on `bnd_join_after` / `bnd_mate_extends_right`,
@@ -54,7 +56,13 @@ the emitted ALT with the same parser the input path uses and asserts the flags a
 (verified to fail before the fix), and `bnd_pieces_reverse_complement_exactly_the_spec_
 cases` pins all four VCF 4.2 forms and which piece is reverse-complemented.
 
-## eidolon v3.0.1 — measurement integrity
+## eidolon v3.0.1 — measurement integrity (never tagged; shipped inside v3.1.0)
+
+Staged as its own patch release and then folded in, because the result that would have
+justified tagging it — the #450 subclonal-VAF confirmation from Delta job 20675479 — ran
+*before* the last three measurement fixes merged. A tag cut afterwards would not have
+been the code that produced the number, so there was nothing to cite it for. The
+validation campaign runs on v3.1.0 instead, and everything below ships there.
 
 **Fixes only; no feature work and no change to simulated output.** Every item here is a
 defect in something that *measures* eidolon, not in eidolon's simulation. They are
