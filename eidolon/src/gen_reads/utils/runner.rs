@@ -1850,7 +1850,7 @@ fn generate_chimeric_pair(
     // L2 = frag_len - offset
 
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
-        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, ctx)?;
+        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, &ctx.reference)?;
 
     let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
 
@@ -2331,13 +2331,18 @@ fn get_inv_pieces(
     })
 }
 
+/// Split a BND into the two reference pieces a chimeric fragment is stitched from.
+///
+/// Takes the reference map rather than the whole `ContigContext` because contig lengths
+/// are all it needs — and because the geometry it selects is the thing most worth
+/// testing directly. The `bool` in each tuple is "reverse-complement this piece".
 fn get_bnd_pieces(
     contig: &str,
     pos: usize, // 0-based
     sv: &SvData,
     len1: usize,
     len2: usize,
-    ctx: &ContigContext,
+    reference: &HashMap<String, Vec<Nucleotide>>,
 ) -> Result<((String, usize, usize, bool), (String, usize, usize, bool)), GenerateReadsError> {
     let mate_contig = sv.mate_contig.as_ref().unwrap().clone();
     let mate_pos = sv.mate_pos.unwrap().saturating_sub(1);
@@ -2345,12 +2350,12 @@ fn get_bnd_pieces(
     // BNDs can legitimately point at a contig outside the reference (a real
     // VCF data quality issue). Surface that as an error rather than silently
     // producing zero-length sequences via `unwrap_or(0)`.
-    let c1_len = ctx.reference.get(contig).map(|s| s.len()).ok_or_else(|| {
+    let c1_len = reference.get(contig).map(|s| s.len()).ok_or_else(|| {
         GenerateReadsError::CliError(format!(
             "BND at {contig}:{pos} references its own contig {contig} but that contig is not in the reference"
         ))
     })?;
-    let c2_len = ctx.reference.get(&mate_contig).map(|s| s.len()).ok_or_else(|| {
+    let c2_len = reference.get(&mate_contig).map(|s| s.len()).ok_or_else(|| {
         GenerateReadsError::CliError(format!(
             "BND at {contig}:{pos} has mate on contig {mate_contig} but that contig is not in the reference"
         ))
@@ -3001,6 +3006,103 @@ mod tests {
     use eidolon_core::structs::bed_record::BedRecord;
     use eidolon_core::structs::sequence_block::{RegionType, SequenceMap};
     use eidolon_core::structs::variants::AlternateType;
+
+    /// The four VCF 4.2 §5.4 breakend forms, and specifically WHICH PIECE gets reverse-
+    /// complemented. This is the property nothing tested: `bnd_fastq.rs` drives the input
+    /// path (where the parser sets the flags) and only asserts that some read is named
+    /// "EIDOLON_chimeric", so a direct join and a head-to-head join were indistinguishable
+    /// to the whole suite.
+    ///
+    /// That gap let de novo BNDs ship a truth VCF saying `t]p]` (reverse-complemented)
+    /// while the reads were built as case 4 (a direct join) — which is simply a deletion
+    /// or duplication, and is what Manta correctly called them on Delta.
+    fn bnd_sv(join_after: bool, mate_extends_right: bool) -> SvData {
+        let mut sv = SvData::new("N]chr1:5001]", SvType::Bnd);
+        sv.mate_contig = Some("chr1".to_string());
+        sv.mate_pos = Some(5001); // 1-based, so 5000 0-based
+        sv.bnd_join_after = join_after;
+        sv.bnd_mate_extends_right = mate_extends_right;
+        sv
+    }
+
+    fn bnd_reference() -> HashMap<String, Vec<Nucleotide>> {
+        let mut r = HashMap::new();
+        r.insert("chr1".to_string(), vec![Nucleotide::A; 10_000]);
+        r
+    }
+
+    #[test]
+    fn bnd_pieces_reverse_complement_exactly_the_spec_cases() {
+        let reference = bnd_reference();
+        let (pos, len1, len2) = (1000usize, 100usize, 50usize);
+
+        // Case 1, t[p[ : REF[..=pos] + MATE[mate_pos..]. Direct, nothing reversed.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(true, true), len1, len2, &reference).unwrap();
+        assert_eq!((a.1, a.2, a.3), (901, 1001, false), "case 1 anchor piece");
+        assert_eq!(
+            (b.1, b.2, b.3),
+            (5000, 5050, false),
+            "case 1 mate piece must NOT be reversed"
+        );
+
+        // Case 2, t]p] : REF[..=pos] + revcomp(MATE[..=mate_pos]). This is the form de
+        // novo BNDs declare, so the mate piece MUST be reverse-complemented.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(true, false), len1, len2, &reference).unwrap();
+        assert_eq!((a.1, a.2, a.3), (901, 1001, false), "case 2 anchor piece");
+        assert_eq!(
+            (b.1, b.2, b.3),
+            (4951, 5001, true),
+            "case 2 mate piece MUST be reverse-complemented"
+        );
+
+        // Case 3, [p[t : revcomp(MATE[mate_pos..]) + REF[pos..]. Mate piece comes first.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(false, true), len1, len2, &reference).unwrap();
+        assert_eq!(
+            (a.1, a.2, a.3),
+            (5000, 5100, true),
+            "case 3 mate piece leads, reversed"
+        );
+        assert_eq!((b.1, b.2, b.3), (1000, 1050, false), "case 3 anchor piece");
+
+        // Case 4, ]p]t : MATE[..=mate_pos] + REF[pos..]. Direct, nothing reversed — the
+        // layout a de novo BND was silently getting from the false/false defaults.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(false, false), len1, len2, &reference).unwrap();
+        assert_eq!(
+            (a.1, a.2, a.3),
+            (4901, 5001, false),
+            "case 4 mate piece leads, NOT reversed"
+        );
+        assert_eq!((b.1, b.2, b.3), (1000, 1050, false), "case 4 anchor piece");
+    }
+
+    /// The regression proper: the geometry a de novo BND's ALT declares must be the
+    /// geometry its reads are built from. Distinct from the case table above, which pins
+    /// the generator; this pins the two ends AGREEING.
+    #[test]
+    fn denovo_bnd_alt_form_produces_a_reverse_complemented_junction() {
+        let reference = bnd_reference();
+        // `t]p]` is what sv_model.rs emits for every de novo BND.
+        let (_mc, _mp, join_after, mate_right) =
+            eidolon_core::structs::variants::parse_bnd_alt_for_test("N]chr1:5001]");
+        let (_a, b) = get_bnd_pieces(
+            "chr1",
+            1000,
+            &bnd_sv(join_after, mate_right),
+            100,
+            50,
+            &reference,
+        )
+        .unwrap();
+        assert!(
+            b.3,
+            "a `t]p]` breakend joins a REVERSE-COMPLEMENTED piece (VCF 4.2 §5.4); a \
+             direct join here is a deletion or duplication, not a breakend"
+        );
+    }
 
     #[test]
     fn test_split_contig_into_chunks_covers_contig_without_gaps_or_overlap() {
