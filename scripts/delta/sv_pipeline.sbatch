@@ -297,6 +297,11 @@ if [[ -f "$TRUTH_SCOREABLE" ]]; then
 fi
 
 # ── Stage 4: Manta somatic SV calling ────────────────────────────────────
+# Calibration/coverage flags. Declared here because stage 4a can set CAL_FAIL, which
+# is well before the scoring stage that consumes it (set -u).
+CAL_FAIL=0
+SCORE_COVERAGE_FAIL=0
+
 MANTA_DIR="$OUTDIR/manta"
 MANTA_SV="$MANTA_DIR/results/variants/somaticSV.vcf.gz"
 if [[ -f "$MANTA_SV" ]]; then
@@ -330,6 +335,95 @@ if [[ "$CAND_N" -eq 0 ]]; then
 elif [[ "$SOM_N" -eq 0 ]]; then
     echo "  NOTE: candidates exist but 0 somatic -> signal IS there; Manta's somatic"
     echo "        classifier dropped them (low support at this coverage/purity)."
+fi
+
+# ── Stage 4a: normalise Manta's inversion representation ─────────────────
+# Manta stopped emitting <INV> around v1.5 and reports inversions as BND PAIRS
+# instead, shipping libexec/convertInversion.py to convert them back. Delta runs
+# 1.6.0, so `manta_INV recall=0.000` is DOCUMENTED TOOL BEHAVIOUR, not a miss.
+# Measured in job 20684366: Manta placed 18 breakends within 500bp of 5 of the 6
+# truth inversions (4 per inversion = 2 junctions x 2 records, 2 for a 1588bp one)
+# while emitting zero INV records. Those 18 were then counted as manta_BND false
+# positives, so BOTH numbers were representation artifacts:
+#     manta_INV recall 0.000  -> 5/6 detected
+#     manta_BND precision 0.438 -> every breakend accounted for
+#
+# The caller side is normalised with the CALLER'S OWN converter rather than by
+# deriving a breakend representation of our truth. build_bnd_spans was correct code
+# built on a representation we chose, and its negative control killed it; Manta
+# ships the canonical mapping, so use it.
+#
+# Falsifiable expectation, checked below: eidolon's 7 junctions are LONE
+# head-to-head adjacencies with no tail-to-tail partner, so they must NOT convert
+# (14 BND records survive); the 18 properly-bracketed inversion breakends must.
+convert_manta_inversions() {  # <in.vcf.gz> <out.vcf.gz>
+    # rc 0 = converted, 2 = converter unavailable (older Manta), 1 = error.
+    local src="$1" dst="$2"
+    local samtools_bin; samtools_bin="$(command -v samtools || true)"
+    [[ -n "$samtools_bin" ]] || { echo "  ERROR: samtools not on PATH for convertInversion" >&2; return 1; }
+
+    conda_activate "$MANTA_ENV" || return 1
+    local conv; conv="$(dirname "$(command -v configManta.py 2>/dev/null || echo /nonexistent)")/../libexec/convertInversion.py"
+    if [[ ! -f "$conv" ]]; then
+        echo "  Manta inversion conversion: convertInversion.py not found — this Manta" >&2
+        echo "    predates the BND-pair inversion representation, so no conversion needed." >&2
+        conda_activate bioinf || true
+        return 2
+    fi
+
+    local plain="$OUTDIR/.manta_conv_in.vcf" out="$OUTDIR/.manta_conv_out.vcf" err="$OUTDIR/.manta_conv_err"
+    zcat "$src" > "$plain"
+    local rc=0
+    # usage: convertInversion.py <samtools path> <reference fasta> <vcf file>
+    python "$conv" "$samtools_bin" "$REFERENCE" "$plain" > "$out" 2> "$err" || rc=$?
+    conda_activate bioinf || true
+    if [[ "$rc" -ne 0 ]]; then
+        echo "  ERROR: convertInversion.py failed (rc=$rc):" >&2
+        sed 's/^/      /' "$err" >&2
+        rm -f "$plain" "$out" "$err"; return 1
+    fi
+
+    # Verify the conversion did what it claims, rather than trusting a zero exit.
+    local bnd_in bnd_out inv_out
+    # grep -c prints 0 and exits 1 on no match; `|| true` keeps that from aborting
+    # under `set -e` while still yielding the count.
+    bnd_in=$(grep -c 'SVTYPE=BND' "$plain" || true)
+    bnd_out=$(grep -c 'SVTYPE=BND' "$out" || true)
+    inv_out=$(grep -c 'SVTYPE=INV' "$out" || true)
+    if [[ "$inv_out" -eq 0 ]]; then
+        echo "  ERROR: convertInversion.py produced NO <INV> records from $bnd_in breakend(s)." >&2
+        echo "    Either no inversion-shaped BND pairs were present, or the conversion" >&2
+        echo "    silently no-opped. Not scoring against an unconverted file." >&2
+        rm -f "$plain" "$out" "$err"; return 1
+    fi
+    if [[ "$bnd_out" -ge "$bnd_in" ]]; then
+        echo "  ERROR: BND count did not drop ($bnd_in -> $bnd_out) yet $inv_out INV" >&2
+        echo "    record(s) appeared — the output is internally inconsistent." >&2
+        rm -f "$plain" "$out" "$err"; return 1
+    fi
+
+    bcftools sort -O z -o "$dst" "$out" 2>/dev/null || { rm -f "$plain" "$out" "$err"; return 1; }
+    bcftools index -f -t "$dst" 2>/dev/null || true
+    echo "  Manta inversion conversion: $bnd_in BND -> $bnd_out BND + $inv_out INV"
+    echo "    (Manta reports inversions as breakend pairs since ~v1.5; converted with"
+    echo "     its own libexec/convertInversion.py so INV truth is scored like-for-like)"
+    rm -f "$plain" "$out" "$err"
+    return 0
+}
+
+MANTA_SV_RAW="$MANTA_SV"
+if [[ -f "$MANTA_SV" ]]; then
+    MANTA_SV_CONV="$OUTDIR/manta_somaticSV_invconv.vcf.gz"
+    conv_rc=0
+    convert_manta_inversions "$MANTA_SV" "$MANTA_SV_CONV" || conv_rc=$?
+    case "$conv_rc" in
+        0) MANTA_SV="$MANTA_SV_CONV" ;;   # score against the normalised calls
+        2) ;;                              # no converter: nothing to normalise
+        *) echo "ERROR: Manta inversion conversion failed — scoring against the raw" >&2
+           echo "  calls would report manta_INV=0.000 for inversions Manta DID find," >&2
+           echo "  and count those breakends as manta_BND false positives." >&2
+           CAL_FAIL=1 ;;
+    esac
 fi
 
 # ── Stage 4b: Delly somatic SV calling (2nd caller vs Manta) ─────────────
@@ -767,13 +861,7 @@ score_caller() {  # <caller> <comp.vcf.gz>
 # run and the `||` branch reported it as "no intra-contig junctions". The BNDspan scoring
 # path — the one that recovers a caller which re-represents a junction — therefore never
 # executed. Handle every status explicitly; an unexpected rc must not read as success.
-# Hoisted above the span derivation: a failed derivation is a calibration failure, and
-# the flag must exist before anything can set it (set -u).
-CAL_FAIL=0
-# Counts per-type comparisons whose recall denominator did not cover the whole truth.
-# Evaluated after ALL scoring so every discrepancy is reported, not just the first.
-SCORE_COVERAGE_FAIL=0
-
+# Initialised near the top (before stage 4a, which can set it).
 BND_SPAN_RC=0
 # Set to 0 by probe_bndspan.sh when truvari cannot distinguish a correct junction call
 # from a displaced one at this scale — see the probe for why that is not tunable.
@@ -853,7 +941,9 @@ Inputs:
 
 Key outputs in $OUTDIR:
   SV truth:     truth_sv.vcf.gz            ($SV_TRUTH_N somatic SVs)
-  Manta calls:  manta/results/variants/somaticSV.vcf.gz
+  Manta calls:  manta/results/variants/somaticSV.vcf.gz   (raw: $MANTA_SV_RAW)
+  Manta scored: $MANTA_SV
+                (differs from raw when inversions were converted from BND pairs)
   Delly calls:  delly.somatic.vcf.gz       (RUN_DELLY=1)
   Scores:       truvari_<caller>_<overall|TYPE>/summary.json   (manta + delly)
 
