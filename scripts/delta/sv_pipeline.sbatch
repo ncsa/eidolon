@@ -437,9 +437,66 @@ s = json.load(open(sys.argv[1])); name = sys.argv[2]
 print(f"  {name:<18} recall={(s.get('recall') or 0):.3f}  precision={(s.get('precision') or 0):.3f}  "
       f"f1={(s.get('f1') or 0):.3f}  TP={s.get('TP-base') or 0}  FN={s.get('FN') or 0}  FP={s.get('FP') or 0}")
 PY
+        check_denominator "$truth" "$out" "$label" || true
     else
         echo "  $label: truvari produced no summary.json (see $out)"
+        SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
     fi
+}
+
+# Coverage check: truvari's TP-base+FN is its POST-filter base count. If that is less than
+# the number of records in the truth we handed it, records were discarded before comparison
+# and the reported recall was computed over a SUBSET — a wrong denominator, silently.
+#
+# This checks the OUTCOME rather than enumerating causes, so it generalises past any one
+# filter. An audit of the archived runs found 4 such cases in 152 per-type checks (a DEL in
+# job_19758751 reported 0.800 where the full denominator gives 0.727; an INV in
+# job_20636298 reported 0.800 vs 0.667) and nothing in the output said so.
+#
+# It also ATTRIBUTES the loss: every base record truvari considered lands in tp-base.vcf.gz
+# or fn.vcf.gz, so truth-minus-those is exactly the discarded set, printed with SVTYPE/SVLEN
+# so the responsible filter is obvious. eidolon's own floor is MIN_SV_LENGTH_BP=50, equal to
+# truvari's --sizemin default, so a size-driven drop here means the LARGE end (--sizemax).
+check_denominator() {  # <truth.vcf.gz> <truvari_out_dir> <label>
+    local truth="$1" out="$2" label="$3"
+    local n_truth base
+    n_truth=$(bcftools view -H "$truth" 2>/dev/null | wc -l)
+    base=$(python3 -c "import json;d=json.load(open('$out/summary.json'));print((d.get('TP-base') or 0)+(d.get('FN') or 0))" 2>/dev/null || echo 0)
+    [[ "$n_truth" -eq "$base" ]] && return 0
+
+    echo "  ERROR: $label scored only $base of $n_truth truth record(s); $((n_truth - base)) discarded" >&2
+    echo "    before comparison, so the recall above used the WRONG DENOMINATOR." >&2
+    if [[ "$base" -gt 0 ]]; then
+        python3 -c "
+import json
+d = json.load(open('$out/summary.json')); tp = d.get('TP-base') or 0
+print(f'    reported {tp}/$base={tp/$base:.3f}  ->  over the full truth {tp}/$n_truth={tp/$n_truth:.3f}')" >&2
+    fi
+
+    # Attribute it: every base record truvari considered lands in tp-base or fn, so
+    # truth-minus-those is exactly what was discarded. awk-join (not join(1)) to avoid
+    # depending on key collation matching between two independently sorted streams.
+    local considered="$OUTDIR/.considered_$label" f found=0
+    : > "$considered"
+    for f in "$out/tp-base.vcf.gz" "$out/fn.vcf.gz"; do
+        if [[ -f "$f" ]]; then
+            bcftools query -f '%CHROM\t%POS\n' "$f" >> "$considered" 2>/dev/null && found=1
+        fi
+    done
+    if [[ "$found" -eq 1 ]]; then
+        echo "    discarded records (CHROM POS SVTYPE SVLEN); --sizemax=$TRUVARI_SIZEMAX:" >&2
+        bcftools query -f '%CHROM\t%POS\t%INFO/SVTYPE\t%INFO/SVLEN\n' "$truth" 2>/dev/null \
+          | awk -F'\t' -v seen="$considered" '
+              BEGIN { while ((getline line < seen) > 0) { split(line, k, "\t"); c[k[1] "~" k[2]] = 1 } }
+              !((($1 "~" $2) in c)) { n++; if (n <= 10) printf "      %s %s %s %s\n", $1, $2, $3, $4 }
+              END { if (n > 10) printf "      ... and %d more\n", n - 10 }' >&2
+    else
+        echo "    (no tp-base/fn VCF in $out — cannot attribute; inspect it directly)" >&2
+    fi
+    rm -f "$considered"
+
+    SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
+    return 1
 }
 
 # ── BND junction spans: a comparable representation ──────────────────────
@@ -501,7 +558,11 @@ selftest_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     local r=0
     [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
     if awk -v r="$r" 'BEGIN{exit !(r > 0.999)}'; then
-        echo "  selftest $label: PASS (truth vs truth recall=$r)"
+        # recall=1.000 is necessary but NOT sufficient: a filter that discards a record
+        # removes it from base AND comp alike, so the subset still matches itself
+        # perfectly. Only the denominator check sees that.
+        check_denominator "$truth" "$out" "selftest_$label" || return 1
+        echo "  selftest $label: PASS (truth vs truth recall=$r, all $(bcftools view -H "$truth" | wc -l) records scored)"
         return 0
     fi
     echo "ERROR: scorer selftest FAILED for $label — truth vs truth recall=$r, expected 1.000." >&2
@@ -596,6 +657,9 @@ score_caller() {  # <caller> <comp.vcf.gz>
 # ── Rule 0: calibrate every scorer before believing any of it ────────────
 echo "[5/5] Calibrating scorers (truth-vs-truth must be perfect; decoy must be zero)..."
 CAL_FAIL=0
+# Counts per-type comparisons whose recall denominator did not cover the whole truth.
+# Evaluated after ALL scoring so every discrepancy is reported, not just the first.
+SCORE_COVERAGE_FAIL=0
 if [[ -f "$TRUTH_SCOREABLE" ]]; then
     selftest_truvari "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
     decoy_truvari    "$TRUTH_SCOREABLE" scoreable
@@ -606,21 +670,34 @@ fi
 if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
 fi
+# Skip scoring rather than exit: the calibration artifacts and the truth VCFs are worth
+# archiving precisely BECAUSE the scorer misbehaved, and the exit below runs after
+# archive_run. Scoring itself is pointless with a scorer that cannot score a known answer.
 if [[ "$CAL_FAIL" -ne 0 ]]; then
     echo "ERROR: at least one scorer cannot match the truth to itself — refusing to" >&2
     echo "  report caller results computed with a configuration that demonstrably" >&2
-    echo "  cannot score a perfect answer." >&2
-    exit 1
+    echo "  cannot score a perfect answer. Skipping caller scoring; see the selftest" >&2
+    echo "  output above and the archived truvari_selftest_* directories." >&2
+else
+    score_caller manta "$MANTA_SV"
+    [[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
 fi
 
-score_caller manta "$MANTA_SV"
-[[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
-
 # ── Summary ──────────────────────────────────────────────────────────────
+# Never print an unqualified "complete" over a run whose numbers are not usable — a
+# summary banner that reads as success regardless of outcome is how a bad run gets
+# believed. The detail follows in the deferred failure gate below.
+if [[ "$CAL_FAIL" -ne 0 ]]; then
+    RUN_STATUS="FAILED (scorer calibration) — no caller results"
+elif [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+    RUN_STATUS="FAILED ($SCORE_COVERAGE_FAIL comparison(s) scored a SUBSET of the truth)"
+else
+    RUN_STATUS="complete"
+fi
 cat <<EOF
 
 ════════════════════════════════════════════════════════════════
-SV validation pipeline complete — Job $SLURM_JOB_ID
+SV validation pipeline $RUN_STATUS — Job $SLURM_JOB_ID
 
 Inputs:
   Reference:    $REFERENCE
@@ -653,3 +730,23 @@ fi
 # Persist report artifacts off scratch + record provenance/resources.
 # (manta overall always exists; delly summaries remain under $OUTDIR/truvari_delly_*)
 archive_run sv "$OUTDIR" truvari_manta_overall/summary.json
+
+# ── Deferred failure gate ────────────────────────────────────────────────
+# Deliberately last. Every discrepancy is reported inline next to the comparison it
+# affects (so the scale is visible rather than just the first case), the artifacts are
+# archived (so a failure is diagnosable after the fact), and only then does the job
+# exit non-zero — because a run that published recalls over a subset of the truth, or
+# scored with an uncalibrated scorer, must not look successful to whoever reads the
+# SLURM exit status.
+if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+    echo "" >&2
+    [[ "$CAL_FAIL" -ne 0 ]] && \
+        echo "FAILED: scorer calibration (Rule 0) — no caller results were produced." >&2
+    if [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+        echo "FAILED: $SCORE_COVERAGE_FAIL comparison(s) did not score the whole truth set." >&2
+        echo "  Those recalls are over a subset and must not be reported as-is. Raise" >&2
+        echo "  TRUVARI_SIZEMAX (currently $TRUVARI_SIZEMAX) or relax the size filters," >&2
+        echo "  then re-score. Artifacts are archived." >&2
+    fi
+    exit 1
+fi

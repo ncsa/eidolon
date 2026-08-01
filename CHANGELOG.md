@@ -68,12 +68,16 @@ Three defects:
   `manta_BND FP=39` against `manta_overall FP=20`. A subset cannot have more false
   positives than the whole. Per-type precision/FP/f1 from this harness were meaningless;
   only per-type recall was ever sound.
-- **BND was unscoreable.** `truvari bench` matches by position *and size overlap*, and a
-  breakend has no `SVLEN` with `END == POS`, so truvari cannot match one however correct
-  the truth is. Adds `scripts/delta/bnd_proximity.py`, which scores junctions (not
-  records — a junction is one event described by two mate records, so record-counting
-  weighted BND 2× against DEL/DUP/INV) and is representation-agnostic, since callers
-  legitimately re-represent a junction as `<DUP:TANDEM>` at the correct coordinates.
+- **BND was scored with the wrong tool settings, not unscoreable.** truvari **can**
+  benchmark breakends — `-B/--bnddist` has existed since v5.0.0, and Delta runs v5.4.0.
+  The harness simply never passed it, and the resulting `recall=0.000` was misread as a
+  tool limitation. BND is now scored two ways, because callers represent a junction two
+  ways: breakend-to-breakend via `--bnddist`, and against a **derived junction span**
+  (one record per junction, `POS`=min, `END`=max) for callers that re-represent a
+  junction as `<DUP:TANDEM>`/`<DEL>`/`<INV>` — a span and a point record are not
+  interval-comparable, which no similarity threshold can bridge. Both are reported and
+  labelled. Spans are a comparison artifact only; `END` on an emitted BND still equals
+  `POS` per VCF 4.2 §5.4.
 - **The aggregate was dominated by unmatchable types.** BND + CNV were 23 of 47 truth
   records in one run, all guaranteed misses, capping the aggregate near 0.5 regardless of
   caller quality — and making v3.0.0's *correct* BND fix look like a regression
@@ -98,6 +102,17 @@ bar, enforced rather than moved; §3.9's own analysis used 6,225 SNVs). This was
   figure computed from nothing.
 - `eidolon/tests/vcf_validation.rs` gained whole-artifact validation of the
   `compare-vcfs` outputs.
+- **Recall denominators are now verified to cover the whole truth.** truvari's
+  `TP-base + FN` is a *post-filter* count; when a filter discarded truth records the
+  recall was computed over a subset and nothing said so. An audit of the archived runs
+  found 4 such cases in 152 per-type checks (a DEL reporting 0.800 where the full
+  denominator gives 0.727). Each comparison now checks that count against the truth it
+  was handed, prints the discarded records with `SVTYPE`/`SVLEN` (derived by differencing
+  the truth against truvari's own `tp-base`/`fn` output, so the attribution is exact) and
+  the corrected recall, and fails the job — after archiving, so a failure stays
+  diagnosable. This also closes a hole in the Rule 0 selftest: a filter drops a record
+  from base *and* comparison alike, so truth-vs-truth still scored a perfect 1.000 over
+  the surviving subset.
 
 Every fix in this release was reproduced and verified locally; no Delta time was spent
 diagnosing or confirming any of them.
