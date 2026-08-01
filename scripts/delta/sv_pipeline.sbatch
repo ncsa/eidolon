@@ -780,6 +780,14 @@ if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
 fi
 if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
+    # The selftest above compares spans to THEMSELVES, which matches trivially. It says
+    # nothing about the premise BNDspan actually rests on: that truvari -t matches a
+    # derived <BND_SPAN> to the <DUP:TANDEM> a caller emits for the same junction. If
+    # that does not hold, BNDspan recall measures our comparison, not the caller — the
+    # exact error this line of work began with. Known-answer, both directions.
+    "$REPO_ROOT/scripts/delta/probe_bndspan.sh" \
+        --spans "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
+        --reference "$REFERENCE" --work "$OUTDIR/.bndspan_probe" || CAL_FAIL=1
 fi
 # Skip scoring rather than exit: the calibration artifacts and the truth VCFs are worth
 # archiving precisely BECAUSE the scorer misbehaved, and the exit below runs after
