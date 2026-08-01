@@ -88,6 +88,14 @@ fn derived_haplotype(reference: &[u8], sv: &Sv) -> Vec<u8> {
             out.extend_from_slice(&reference[..*pos]);
             out.extend_from_slice(&reference[*end..]);
         }
+        // Tandem <DUP>: POS is the base BEFORE the event, so the duplicated bases
+        // are 1-based [POS+1, END] = 0-based [pos, end), and the derived haplotype
+        // carries that block twice. The novel junction is at offset `end`.
+        Sv::Dup { pos, end } => {
+            out.extend_from_slice(&reference[..*end]);
+            out.extend_from_slice(&reference[*pos..*end]);
+            out.extend_from_slice(&reference[*end..]);
+        }
         // VCF 4.2 case 2, `t]p]`: REF[..=pos] + revcomp(MATE[..=mate_pos]).
         Sv::BndCase2 { pos, mate_pos } => {
             out.extend_from_slice(&reference[..*pos]);
@@ -105,6 +113,7 @@ fn derived_haplotype(reference: &[u8], sv: &Sv) -> Vec<u8> {
 
 enum Sv {
     Del { pos: usize, end: usize },
+    Dup { pos: usize, end: usize },
     BndCase2 { pos: usize, mate_pos: usize },
     BndCase3 { pos: usize, mate_pos: usize },
 }
@@ -378,5 +387,32 @@ fn chimeric_mates_are_sequenced_from_opposite_strands() {
         r2_reversed * 10 >= pairs.len() * 8,
         "only {r2_reversed} of {} R2 reads reverse-complement-match the derived haplotype",
         pairs.len()
+    );
+}
+
+/// A tandem `<DUP>` must duplicate 1-based [POS+1, END], not [POS, END].
+///
+/// `get_dup_pieces` treated `location` as the FIRST AFFECTED base while
+/// `get_del_pieces` treated it as the last unaffected one, so an input <DUP> and an
+/// input <DEL> in the same file meant different things by POS and the duplicated
+/// block started one base early. Nothing tested it: `dup_chimeric.rs` asserts QNAMEs,
+/// and `get_dup_pieces` had no unit tests at all.
+#[test]
+fn dup_chimeric_reads_duplicate_the_vcf_conventional_block() {
+    assert_derived(
+        "chim_dup",
+        "H1N1_HA\t600\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;END=1400\tGT\t1/1",
+        Sv::Dup {
+            pos: 600,
+            end: 1400,
+        },
+        // The novel junction sits where the duplicated block is re-entered.
+        //
+        // The block is 800bp against a ~200bp fragment ON PURPOSE. At 200bp a fragment
+        // can span the WHOLE duplication, which needs a three-piece stitch (left +
+        // block + right) that get_dup_pieces cannot express — it returns two — and 4 of
+        // 30 reads then match no haplotype at all. That is a separate real defect
+        // (#474), and keeping it out of this test stops one bug from masking another.
+        1400,
     );
 }
