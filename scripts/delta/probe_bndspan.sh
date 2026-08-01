@@ -151,9 +151,21 @@ if [[ "$tp_near" -ne 1 ]]; then
     rc=1
 fi
 if [[ "$tp_far" -ne 0 ]]; then
-    echo "FAIL: truvari matched a <DUP> ${FAR_OFFSET}bp away from the junction. The" >&2
-    echo "  configuration is matching on position far more loosely than intended, so a" >&2
-    echo "  BNDspan 'match' does not mean the caller found this junction." >&2
+    span=$((P_END - P_POS))
+    ovl=$(awk -v s="$span" -v o="$FAR_OFFSET" 'BEGIN{printf "%.4f", (s-o)/s}')
+    echo "FAIL: truvari matched a <DUP> ${FAR_OFFSET}bp away from the junction, so a BNDspan" >&2
+    echo "  'match' does not mean the caller found this junction." >&2
+    echo "" >&2
+    echo "  This is not a tuning problem. truvari gates position by PADDED INTERVAL OVERLAP," >&2
+    echo "  not endpoint proximity: this span is ${span}bp, so a ${FAR_OFFSET}bp displacement still" >&2
+    echo "  leaves reciprocal overlap at $ovl. Overlap is scale-relative, so on a span this" >&2
+    echo "  large NO overlap threshold can detect a breakpoint error of this size, and" >&2
+    echo "  --refdist does not constrain endpoints once the intervals overlap at all." >&2
+    echo "" >&2
+    echo "  Collapsing a junction (two precise points) into a span (one huge interval)" >&2
+    echo "  discards the precision the measurement depends on. Junction recall needs" >&2
+    echo "  endpoint proximity — truvari --bnddist for a caller that emits breakends, or an" >&2
+    echo "  explicit two-breakpoint check for one that re-represents them." >&2
     rc=1
 fi
 [[ "$rc" -eq 0 ]] && echo "  BNDspan bridge: PASS (matches the same junction, rejects a distant one)"

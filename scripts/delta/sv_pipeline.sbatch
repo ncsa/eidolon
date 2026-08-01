@@ -735,10 +735,12 @@ score_caller() {  # <caller> <comp.vcf.gz>
     # have used any type for the junction, so it cannot be narrowed by type. That makes
     # recall the measurement and FP/precision uninterpretable (every unrelated call is
     # an unmatched comp record), so say so rather than let the number be quoted.
-    if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
+    if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" && "$BNDSPAN_VALID" -eq 1 ]]; then
         run_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$comp" -t
         echo "    ^ BNDspan: recall is the measurement; precision/FP/f1 are NOT — the query"
         echo "      is intentionally unfiltered because the caller may use any SVTYPE here."
+    elif [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
+        echo "  ${caller}_BNDspan: not scored (representation bridge failed calibration)"
     fi
 }
 
@@ -757,6 +759,9 @@ CAL_FAIL=0
 SCORE_COVERAGE_FAIL=0
 
 BND_SPAN_RC=0
+# Set to 0 by probe_bndspan.sh when truvari cannot distinguish a correct junction call
+# from a displaced one at this scale — see the probe for why that is not tunable.
+BNDSPAN_VALID=1
 if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
     build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
         || BND_SPAN_RC=$?
@@ -787,7 +792,14 @@ if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     # exact error this line of work began with. Known-answer, both directions.
     "$REPO_ROOT/scripts/delta/probe_bndspan.sh" \
         --spans "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
-        --reference "$REFERENCE" --work "$OUTDIR/.bndspan_probe" || CAL_FAIL=1
+        --reference "$REFERENCE" --work "$OUTDIR/.bndspan_probe" || BNDSPAN_VALID=0
+    # A failed bridge disables BNDspan ONLY. It says nothing about DEL/DUP/INV scoring,
+    # so failing the whole calibration here would throw away sound measurements.
+    if [[ "$BNDSPAN_VALID" -eq 0 ]]; then
+        echo "  BNDspan scoring DISABLED — the probe above shows this configuration cannot" >&2
+        echo "  tell a correct junction call from a displaced one, so any recall it produced" >&2
+        echo "  would not be a measurement. DEL/DUP/INV and BND-to-BND are unaffected." >&2
+    fi
 fi
 # Skip scoring rather than exit: the calibration artifacts and the truth VCFs are worth
 # archiving precisely BECAUSE the scorer misbehaved, and the exit below runs after
