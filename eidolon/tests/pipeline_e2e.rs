@@ -527,29 +527,19 @@ fn gen_reads_with_trained_sv_model_emits_de_novo_symbolic_svs() {
         let svlen = info_int(line, "SVLEN=")
             .unwrap_or_else(|| panic!("symbolic record has no parseable INFO/SVLEN: {line}"));
         assert!(end > pos, "INFO/END={end} is not after POS={pos}: {line}");
-        // The span END implies must equal |SVLEN|, using the convention `place_sv`
-        // documents: for <DEL> POS is the base BEFORE the event, so the affected range is
-        // [POS+1, END] and END-POS == |SVLEN|; for <DUP>/<CNV>/<INV> "POS is the first
-        // affected base", so the range is [POS, END] inclusive and END-POS+1 == |SVLEN|.
-        // Whether that second convention should match VCF's is issue #474; this asserts
-        // the record is self-consistent under whichever one applies, which is what a
-        // downstream consumer needs and what shifting every END by +1000 broke.
-        let svtype = line
-            .split('\t')
-            .nth(7)
-            .and_then(|i| i.split(';').find_map(|f| f.strip_prefix("SVTYPE=")))
-            .unwrap_or_else(|| panic!("symbolic record has no INFO/SVTYPE: {line}"));
-        let implied_span = if svtype == "DEL" {
-            end - pos
-        } else {
-            end - pos + 1
-        };
+        // VCF 4.2, one rule for every symbolic type: POS is the base BEFORE the
+        // event, so the affected bases are 1-based [POS+1, END] and
+        // END - POS == |SVLEN|. This used to need a per-type branch — DEL followed
+        // the convention while DUP/CNV/INV put POS on the first affected base, so
+        // the same file carried two meanings of POS. Collapsing this assertion to a
+        // single rule is the observable half of that fix.
         assert_eq!(
-            implied_span,
+            end - pos,
             svlen.abs(),
-            "{svtype} record: the span INFO/END implies ({implied_span}) disagrees with \
-             |SVLEN| ({}) — a consumer sizing this event off END sees a different \
-             variant than one sizing it off SVLEN: {line}",
+            "INFO/END - POS ({}) disagrees with |SVLEN| ({}) — a consumer sizing \
+             this event off END sees a different variant than one sizing it off \
+             SVLEN: {line}",
+            end - pos,
             svlen.abs()
         );
     }

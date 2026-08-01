@@ -2278,8 +2278,9 @@ fn get_dup_pieces(
     // pre-dup context — see fn doc for the implication).
     let e1 = end.min(c_len);
     let s1 = e1.saturating_sub(len1);
-    // Right piece: first len2 bases of the duplicated region.
-    let s2 = location;
+    // Right piece: first len2 bases of the duplicated region. POS is the base
+    // BEFORE the event (VCF 4.2), so the region begins at location+1.
+    let s2 = location + 1;
     let e2 = (s2 + len2).min(c_len);
     Ok((
         (contig.to_string(), s1, e1, false),
@@ -2305,21 +2306,22 @@ fn get_inv_pieces(
         ))
     })?;
     Ok(if junction == 1 {
-        // Junction 1: REF[..POS-1] | RC(REF[POS..END])
-        // Left piece ends at index location-1. Right piece starts at RC(index end-1).
-        let e1 = location;
+        // Junction 1: REF[..POS] | RC(REF[POS+1..END])
+        // POS is the base BEFORE the inverted block (VCF 4.2), so the block begins
+        // at location+1 and the left piece ends there.
+        let e1 = location + 1;
         let s1 = e1.saturating_sub(len1);
 
         let e2 = end.min(c_len);
-        let s2 = e2.saturating_sub(len2).max(location);
+        let s2 = e2.saturating_sub(len2).max(location + 1);
         (
             (contig.to_string(), s1, e1, false),
             (contig.to_string(), s2, e2, true),
         )
     } else {
-        // Junction 2: RC(REF[POS..END]) | REF[END+1..]
-        // Left piece ends at RC(index location). Right piece starts at index end.
-        let s1 = location;
+        // Junction 2: RC(REF[POS+1..END]) | REF[END+1..]
+        // Same convention as junction 1: the inverted block begins at location+1.
+        let s1 = location + 1;
         let e1 = (s1 + len1).min(end).min(c_len);
 
         let s2 = end.min(c_len);
@@ -2820,15 +2822,15 @@ fn build_coverage_multipliers(
 /// modulates coverage, given the variant's 0-based stored `location` (= VCF
 /// POS − 1) and the `span_bases` reported by [`SvData::span`].
 ///
-/// VCF convention for `<DEL>`: POS is the anchor base immediately *before*
-/// the deletion (still present in the reference), and the deleted bases run
-/// from POS+1 to END (1-based, inclusive). So a DEL modulates `[POS, END)`
-/// in 0-based half-open coords, which is `[location + 1, location + span)`.
+/// One convention for every symbolic type (VCF 4.2): POS is the anchor base
+/// immediately *before* the event and is not itself affected, so the affected
+/// bases run from POS+1 to END (1-based, inclusive) and the modulated range is
+/// `[location + 1, location + span)` in 0-based half-open coords.
 ///
-/// `<DUP>`, `<CNV>`, `<INV>`: POS is conventionally *inside* the affected
-/// region (the duplicated / inverted block starts at POS itself). Those
-/// modulate `[POS − 1, END)` in 0-based half-open coords, i.e.
-/// `[location, location + span)`.
+/// This used to differ by type — DUP/CNV/INV modulated `[location, location + span)`
+/// on the basis that "POS is conventionally *inside* the affected region". That is
+/// not the VCF convention, and it meant an input `<DUP>` was modulated one base
+/// early while a `<DEL>` in the same file was not.
 fn sv_modulation_range(
     location_0based: usize,
     sv_type: SvType,
@@ -2838,8 +2840,12 @@ fn sv_modulation_range(
     let raw_end = location_0based.saturating_add(span_bases);
     let end = raw_end.min(block_end);
     let start = match sv_type {
-        SvType::Del => location_0based.saturating_add(1).min(block_end),
-        _ => location_0based.min(block_end),
+        // Point events never modulate coverage today (their multiplier is 1.0, so
+        // build_coverage_multipliers skips them before reaching here), but they have
+        // no POS+1..END range, so don't let a future multiplier change silently shift
+        // them by one.
+        SvType::Ins | SvType::Bnd => location_0based.min(block_end),
+        _ => location_0based.saturating_add(1).min(block_end),
     };
     (start, end)
 }
@@ -3451,19 +3457,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sv_modulation_range_dup_cnv_inv_include_anchor() {
-        // For DUP / CNV / INV, POS is conventionally inside the affected
-        // region — range starts at the anchor.
-        assert_eq!(sv_modulation_range(100, SvType::Dup, 100, 1000), (100, 200));
-        assert_eq!(sv_modulation_range(100, SvType::Cnv, 100, 1000), (100, 200));
-        assert_eq!(sv_modulation_range(100, SvType::Inv, 100, 1000), (100, 200));
+    fn test_sv_modulation_range_excludes_the_anchor_for_every_type() {
+        // location=100 -> POS=101 (1-based); span=100 -> END = 101+100-1 = 200.
+        // VCF 4.2: the anchor at POS is NOT affected, so the affected bases are
+        // 1-based 102..200, i.e. 0-based [101, 200) — identical to DEL.
+        //
+        // These used to be (100, 200): DUP/CNV/INV modulated one base early, so an
+        // input <DUP> and an input <DEL> in the same file used different conventions.
+        assert_eq!(sv_modulation_range(100, SvType::Dup, 100, 1000), (101, 200));
+        assert_eq!(sv_modulation_range(100, SvType::Cnv, 100, 1000), (101, 200));
+        assert_eq!(sv_modulation_range(100, SvType::Inv, 100, 1000), (101, 200));
+        // Same input, same answer as DEL — that equality is the property that was
+        // missing, not an incidental detail.
+        assert_eq!(
+            sv_modulation_range(100, SvType::Dup, 100, 1000),
+            sv_modulation_range(100, SvType::Del, 100, 1000)
+        );
     }
 
     #[test]
     fn test_sv_modulation_range_clipped_to_block_end() {
         // SV running past block_end gets clipped on both ends.
         assert_eq!(sv_modulation_range(95, SvType::Del, 100, 110), (96, 110));
-        assert_eq!(sv_modulation_range(95, SvType::Dup, 100, 110), (95, 110));
+        // Was (95, 110): DUP now excludes its anchor like every other type.
+        assert_eq!(sv_modulation_range(95, SvType::Dup, 100, 110), (96, 110));
         // Start clipped above block_end → empty range.
         let (s, e) = sv_modulation_range(150, SvType::Del, 50, 100);
         assert!(s >= e);
@@ -3567,9 +3584,11 @@ mod tests {
             Genotype::Heterozygous,
             None,
         )];
-        // span = 149 - 51 + 1 = 99; range = [50, 50 + 99) = [50, 149).
+        // POS = 51 (1-based); span = 149 - 51 + 1 = 99. The anchor at POS is not
+        // duplicated, so the affected range is [51, 50 + 99) = [51, 149).
+        // Was [50, 149) — one base early.
         let segs = build_coverage_multipliers(&svs, 2, 300);
-        assert_eq!(segs, vec![(0, 50, 1.0), (50, 149, 1.5), (149, 300, 1.0)]);
+        assert_eq!(segs, vec![(0, 51, 1.0), (51, 149, 1.5), (149, 300, 1.0)]);
     }
 
     #[test]
@@ -3582,9 +3601,10 @@ mod tests {
             Genotype::Homozygous,
             Some(4),
         )];
-        // span = 99 - 1 + 1 = 99; range = [0, 99).
+        // POS = 1 (1-based); span = 99 - 1 + 1 = 99. Anchor excluded, so the
+        // affected range is [1, 0 + 99) = [1, 99). Was [0, 99).
         let segs = build_coverage_multipliers(&svs, 2, 200);
-        assert_eq!(segs, vec![(0, 99, 2.0), (99, 200, 1.0)]);
+        assert_eq!(segs, vec![(0, 1, 1.0), (1, 99, 2.0), (99, 200, 1.0)]);
     }
 
     #[test]

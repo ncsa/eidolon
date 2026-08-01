@@ -900,11 +900,14 @@ fn weighted_pick_with<'a, T>(
 /// anchor_0based, sv_end_1based)` or `None` if the contig is too small
 /// for the chosen length.
 ///
-/// For `<DEL>`, the anchor (1-based POS) is the base immediately before
-/// the deletion and is NOT itself deleted — the affected range is
-/// `[POS+1, END]` 1-based inclusive, i.e. `[anchor_0based + 1,
-/// anchor_0based + 1 + length)` 0-based half-open. For `<DUP>` / `<CNV>`
-/// POS is the first affected base.
+/// INVARIANT, for every symbolic SPAN type: `anchor_0based` is the base
+/// immediately BEFORE the event and is NOT itself affected. The affected range
+/// is always `[anchor_0based + 1, anchor_0based + 1 + length)` 0-based
+/// half-open, i.e. 1-based `[POS+1, END]`, so `END - POS == |SVLEN|` holds
+/// uniformly (VCF 4.2 symbolic-allele convention).
+///
+/// `<INS>` and `<BND>` are point events, not spans: nothing in the reference is
+/// consumed, POS marks the position, and END == POS.
 fn place_sv(
     sv_type: SvType,
     length: usize,
@@ -925,28 +928,48 @@ fn place_sv(
         return None;
     }
     let anchor = rng.range_i64(0, max_anchor_inclusive as i64).ok()?.max(0) as usize;
-    let (start, end, sv_end_1based) = match sv_type {
+    let (start, end, vcf_anchor_0based, sv_end_1based) = match sv_type {
         SvType::Del => {
             let s = anchor + 1;
             let e = s + length;
             // 1-based END for SvData: span includes the anchor + deleted
             // bases, so END_1based = anchor_1based + length = anchor + 1 + length.
-            (s, e, anchor + 1 + length)
+            (s, e, anchor, anchor + 1 + length)
         }
         SvType::Ins => {
-            // Insertions are point events in the reference.
+            // Insertions are point events in the reference: POS carries the base
+            // before the inserted sequence and END == POS.
             let s = anchor;
             let e = s + 1;
-            (s, e, anchor + 1)
+            (s, e, anchor, anchor + 1)
+        }
+        SvType::Bnd => {
+            // A breakend is a point and POS IS the breakend base — the
+            // anchor-before convention does not apply, and END is forced to POS
+            // by the caller (VCF 4.2 5.4).
+            let s = anchor;
+            let e = s + 1;
+            (s, e, anchor, anchor + 1)
         }
         _ => {
+            // DUP/CNV/INV. `anchor` is the FIRST AFFECTED base, but VCF 4.2 puts
+            // POS on the base BEFORE a symbolic event, so the record's anchor is
+            // `anchor - 1` while the affected range stays [anchor, anchor+length).
+            // Emitting `anchor` directly is what made POS mean "last unaffected"
+            // for DEL and "first affected" for everything else, so END-POS equalled
+            // |SVLEN| for DEL and |SVLEN|-1 for the rest in the same file. It also
+            // put the first duplicated base in REF, where the preceding base belongs.
+            // There is no base before position 0.
+            if anchor == 0 {
+                return None;
+            }
             let s = anchor;
             let e = s + length;
-            // 1-based END = POS_1based + length - 1 = (anchor + 1) + length - 1 = anchor + length.
-            (s, e, anchor + length)
+            // 1-based END = last affected base = anchor + length.
+            (s, e, anchor - 1, anchor + length)
         }
     };
-    Some((start, end, anchor, sv_end_1based))
+    Some((start, end, vcf_anchor_0based, sv_end_1based))
 }
 
 /// Compute the 0-based half-open affected range of an existing symbolic
@@ -963,8 +986,13 @@ fn affected_range_for_existing(v: &Variant, block_end: usize) -> Option<(usize, 
     }
     let raw_end = v.location.saturating_add(span).min(block_end);
     let start = match sv.sv_type {
-        SvType::Del => v.location.saturating_add(1).min(block_end),
-        _ => v.location.min(block_end),
+        // Point events consume no reference bases, so the anchor itself marks the
+        // position for overlap purposes — there is no POS+1..END to speak of.
+        SvType::Ins | SvType::Bnd => v.location.min(block_end),
+        // Span events: POS is the base BEFORE the event (VCF 4.2), so the affected
+        // range starts at POS+1. This used to be DEL-only, which is what let a DUP
+        // and a DEL in the same file mean different things by POS.
+        _ => v.location.saturating_add(1).min(block_end),
     };
     if start >= raw_end {
         return None;
@@ -2000,6 +2028,49 @@ mod tests {
             pairs += 1;
         }
         assert!(pairs > 0, "no pair checked — test proves nothing");
+    }
+
+    /// VCF 4.2 puts POS on the base BEFORE a symbolic event, so `END - POS` must
+    /// equal `|SVLEN|` for every span type — one rule, not one per type.
+    ///
+    /// `place_sv` used to return the FIRST AFFECTED base as the anchor for
+    /// DUP/CNV/INV while returning the preceding base for DEL, so a single output
+    /// file carried two meanings of POS: `END-POS == |SVLEN|` for DEL and
+    /// `|SVLEN|-1` for the rest. It also put the first duplicated base in REF where
+    /// the preceding base belongs.
+    #[test]
+    fn denovo_symbolic_svs_put_pos_on_the_base_before_the_event() {
+        for sv_type in [SvType::Del, SvType::Dup, SvType::Cnv, SvType::Inv] {
+            let m = model_with_single_type(sv_type, 5e-3);
+            let seq = acgt_sequence(100_000);
+            let mut rng = deterministic_rng();
+            let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+            let mut checked = 0;
+            for v in &out {
+                let Some(sv) = v.alternate.as_symbolic() else {
+                    continue;
+                };
+                if sv.sv_type != sv_type {
+                    continue;
+                }
+                let pos = (v.location + 1) as i64; // 1-based POS
+                let end = sv.end.expect("symbolic SV must carry END") as i64;
+                let svlen = sv.svlen.expect("span SV must carry SVLEN");
+                assert_eq!(
+                    end - pos,
+                    svlen.abs(),
+                    "{sv_type:?} at POS {pos}: END-POS ({}) != |SVLEN| ({}) — POS is \
+                     not on the base before the event",
+                    end - pos,
+                    svlen.abs()
+                );
+                checked += 1;
+            }
+            assert!(
+                checked > 0,
+                "{sv_type:?}: nothing sampled — test proves nothing"
+            );
+        }
     }
 
     #[test]
