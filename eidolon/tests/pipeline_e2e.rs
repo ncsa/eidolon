@@ -392,9 +392,28 @@ fn gen_reads_treats_n_tract_as_gap_no_variants_inside() {
                 .unwrap_or(false)
         })
         .collect();
+    // POSITIVE CONTROL FIRST. Without it, "zero variants anywhere" satisfies this test:
+    // making non_n_regions return an empty vec whenever the sequence contains any N —
+    // the natural over-broad form of the fix this guards — passed the whole
+    // pipeline_e2e suite. A denominator is required before an exclusion means anything.
+    let variants_in_flanks = vcf_lines
+        .iter()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split('\t').nth(1).and_then(|p| p.parse::<usize>().ok()))
+        .filter(|p| (1..=240).contains(p) || (481..=720).contains(p))
+        .count();
+    assert!(
+        variants_in_flanks >= 10,
+        "only {variants_in_flanks} variant(s) placed in the non-N flanks [1,240] and \
+         [481,720] — too few for the N-tract exclusion below to mean anything. Either \
+         mutation placement is broken or the gap exclusion is over-broad."
+    );
+
     assert!(
         variants_in_gap.is_empty(),
-        "variants were placed inside the N tract [241, 480]; N regions must be excluded: {variants_in_gap:?}"
+        "variants were placed inside the N tract [241, 480] ({} in the flanks, so \
+         placement is working); N regions must be excluded: {variants_in_gap:?}",
+        variants_in_flanks
     );
 }
 
