@@ -150,6 +150,45 @@ fn write_sv_vcf(path: &std::path::Path, record: &str) {
     writeln!(f, "{record}").unwrap();
 }
 
+/// Every chimeric read paired by QNAME, as `(r1, r2)`.
+fn chimeric_pairs(tag: &str, record: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (_dir, work) = fresh_workdir();
+    let input_vcf = work.join(format!("input_{tag}.vcf"));
+    write_sv_vcf(&input_vcf, record);
+    let mut config = GenReadsConfig::new(h1n1_reference(), work.clone(), tag);
+    config.read_len = 50;
+    config.coverage = 30;
+    config.paired_ended = true;
+    config.produce_fastq = true;
+    config.input_vcf = Some(input_vcf);
+    config.mutation_rate = Some(0.0);
+    let yaml = config.write_yaml();
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(yaml.path())
+        .assert()
+        .success();
+
+    let grab = |suffix: &str| -> HashMap<String, Vec<u8>> {
+        let lines = read_gzip_fastq_lines(&work.join(format!("{tag}_{suffix}.fastq.gz")));
+        let mut m = HashMap::new();
+        for i in (0..lines.len()).step_by(4) {
+            if lines[i].starts_with('@') && lines[i].contains("EIDOLON_chimeric") {
+                let qname = lines[i].split('/').next().unwrap().to_string();
+                m.insert(qname, lines[i + 1].as_bytes().to_vec());
+            }
+        }
+        m
+    };
+    let (r1, r2) = (grab("r1"), grab("r2"));
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = r1
+        .iter()
+        .filter_map(|(q, a)| r2.get(q).map(|b| (a.clone(), b.clone())))
+        .collect();
+    out.sort();
+    out
+}
+
 /// Run gen-reads over one homozygous SV and return every chimeric read's sequence.
 fn chimeric_reads(tag: &str, record: &str) -> Vec<Vec<u8>> {
     let (_dir, work) = fresh_workdir();
@@ -288,5 +327,56 @@ fn bnd_case3_chimeric_reads_reverse_complement_the_leading_piece() {
         },
         // revcomp(REF[1499..]) is 1701-1499 = 202 bases, so the junction sits at 202.
         202,
+    );
+}
+
+/// R1 and R2 must be sequenced from OPPOSITE strands of the same fragment (FR). Removing
+/// `reverse_complement` from the four `generate_*_pair` sites passed every existing test,
+/// including `fastq_validation.rs::paired_ended_fastq_pair_invariants` — both mates would
+/// be same-strand, so there would be no proper pairs and no discordant-pair signal for a
+/// caller to find, which is half of what an SV simulator exists to produce.
+///
+/// The discriminating assertion is the negative one: R2 must NOT match the derived
+/// haplotype in the forward orientation. Observed on healthy output: 0/30 forward,
+/// 27/30 reverse-complement.
+#[test]
+fn chimeric_mates_are_sequenced_from_opposite_strands() {
+    let reference = &load_reference()[CONTIG];
+    let derived = derived_haplotype(reference, &Sv::Del { pos: 500, end: 800 });
+    let pairs = chimeric_pairs(
+        "chim_pair",
+        "H1N1_HA\t500\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=800\tGT\t1/1",
+    );
+    assert!(
+        pairs.len() >= 10,
+        "only {} chimeric pair(s) — too few to conclude anything",
+        pairs.len()
+    );
+
+    let (mut r2_forward, mut r2_reversed) = (0usize, 0usize);
+    for (r1, r2) in &pairs {
+        assert!(
+            best_contiguous(r1, &derived).1 >= MIN_IDENTITY,
+            "R1 is not a slice of the derived haplotype: {}",
+            String::from_utf8_lossy(r1)
+        );
+        if best_contiguous(r2, &derived).1 >= MIN_IDENTITY {
+            r2_forward += 1;
+        }
+        if best_contiguous(&revcomp(r2), &derived).1 >= MIN_IDENTITY {
+            r2_reversed += 1;
+        }
+    }
+    assert_eq!(
+        r2_forward,
+        0,
+        "{r2_forward} of {} R2 reads match the derived haplotype FORWARD — the mates are \
+         same-strand, so the pairs are not FR and carry no discordant-pair signal",
+        pairs.len()
+    );
+    assert!(
+        r2_reversed * 10 >= pairs.len() * 8,
+        "only {r2_reversed} of {} R2 reads reverse-complement-match the derived haplotype",
+        pairs.len()
     );
 }
