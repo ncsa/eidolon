@@ -1,3 +1,107 @@
+7/31/2026
+=========
+## eidolon v3.0.1 — measurement integrity
+
+**Fixes only; no feature work and no change to simulated output.** Every item here is a
+defect in something that *measures* eidolon, not in eidolon's simulation. They are
+grouped into one patch release deliberately, so the Delta validation campaign that
+follows attaches to a tagged version whose only difference from v3.0.0 is that the
+measurements are now correct.
+
+The common shape, and the reason these went unnoticed: each reported a plausible number
+rather than failing. A harness that says `VERDICT: PASS` over a subset it silently
+excluded, or `recall=0.000` for a comparison it could never make, is harder to catch
+than a crash.
+
+### `compare-vcfs` emitted VCFs with undeclared INFO tags (#444)
+
+`FN_with_reasons.vcf` and `FP.vcf` pass each record's INFO column through verbatim but
+wrote a fixed minimal header, so the artifacts carried tags their own header never
+declared. bcftools tolerates that streaming VCF→VCF but hard-fails on BCF translation —
+which `bcftools concat | sort` does internally — so it surfaced far downstream as an
+opaque failure.
+
+A fixed declaration set cannot work, because the two artifacts have different
+provenance: FN records come from the **golden** VCF, FP records from the **called** VCF,
+whose INFO is whatever the caller emitted (Mutect2 `TLOD`/`MBQ`, Strelka `SomaticEVS`).
+Each artifact now inherits `##INFO`/`##FILTER`/`##FORMAT`/`##ALT`/`##contig` from its own
+source, backfills an ID-only `##contig` for any record contig the source itself failed to
+declare, and adds `GT` only when absent.
+
+### Observed VAF was measured through a genotype call, destroying the low-VAF sites (#450)
+
+The subclonal-VAF harness excluded the sites it exists to validate — 160 of 567 planted
+sites, including an entire CCF cluster. Because the exclusion is VAF-dependent, the
+reported bias was optimistic in the direction that flattered the result.
+
+`bcftools mpileup | bcftools call -m -C alleles` was the cause. `-C alleles` constrains
+which alleles are considered, but `call -m` still makes a diploid ML **genotype** call,
+and a hom-ref call discards the uncalled allele together with its read count. On a
+synthetic 200× BAM carrying the three CCF clusters, `call -m` destroyed **two of three**:
+
+| site | intended | `mpileup \| call -m` | `mpileup` alone |
+|---|---|---|---|
+| 331 | 0.350 | `ALT=T` `AD=130,70` | `AD=130,70,0` → 0.350 |
+| 631 | 0.175 | `ALT=.` `AD=165` | `AD=165,35,0` → 0.175 |
+| 931 | 0.070 | `ALT=.` `AD=186` | `AD=186,14,0` → 0.070 |
+
+Coverage cannot rescue it — identical at 100×/300×/600× — because the decision is driven
+by the allele *fraction* against a diploid model, and no diploid genotype predicts 7%.
+
+Both harnesses now read `FORMAT/AD` straight from mpileup. This also fixes
+`run_scn_af_validation.sh` (#398's pool-AF validation), which shared the defect and was
+worse: with no `-C alleles` at all, sites the caller declined to call vanished entirely —
+the low end of the very spectrum it validates. `scn_af_compare.py` gained multi-allelic
+expansion (so the truth's ALT matches against mpileup's `T,<*>` list and selects that
+allele's own AD element), arity-checked per-allele fields (it had been taking `[0]`,
+reporting the *first* allele's fraction for every allele of a multi-allelic record), and
+zero-fill: a truth ALT the observed side never listed at a covered position now scores
+**0.0 observed** rather than being dropped, since otherwise the VAF-dependent exclusion
+just moves to a lower threshold.
+
+### SV scoring reported numbers that were not measurements (#457)
+
+Three defects:
+
+- **Per-type runs filtered the truth but not the query**, so every record of another type
+  counted as a false positive — producing arithmetically impossible output, with
+  `manta_BND FP=39` against `manta_overall FP=20`. A subset cannot have more false
+  positives than the whole. Per-type precision/FP/f1 from this harness were meaningless;
+  only per-type recall was ever sound.
+- **BND was unscoreable.** `truvari bench` matches by position *and size overlap*, and a
+  breakend has no `SVLEN` with `END == POS`, so truvari cannot match one however correct
+  the truth is. Adds `scripts/delta/bnd_proximity.py`, which scores junctions (not
+  records — a junction is one event described by two mate records, so record-counting
+  weighted BND 2× against DEL/DUP/INV) and is representation-agnostic, since callers
+  legitimately re-represent a junction as `<DUP:TANDEM>` at the correct coordinates.
+- **The aggregate was dominated by unmatchable types.** BND + CNV were 23 of 47 truth
+  records in one run, all guaranteed misses, capping the aggregate near 0.5 regardless of
+  caller quality — and making v3.0.0's *correct* BND fix look like a regression
+  (0.667 → 0.413). The aggregate now covers only the truvari-scoreable subset and states
+  what it excluded and where each type is scored instead.
+
+### Harnesses now fail instead of reporting an unusable measurement
+
+`signature_check.sh` warned `few SNVs — fit will be noisy` below 50 and fitted anyway.
+SBS-96 has 96 trinucleotide contexts; a spectrum from fewer mutations than contexts
+cannot populate them, and SigProfiler still returns an assignment that was reported as
+though it measured something. Now fatal below `MIN_SNVS` (default 50 — the historical
+bar, enforced rather than moved; §3.9's own analysis used 6,225 SNVs). This was the last
+`WARNING`-on-an-unusable-measurement site from the harness audit.
+
+### Also
+
+- `mpileup -d` is now explicit (`MPILEUP_MAX_DEPTH`, default 2000). Its default of 250
+  would silently downsample a 200×+ run.
+- New read-the-artifact guards: abort when no site carries `FORMAT/AD`, and when a
+  per-type query subset is empty report `recall=0.000` rather than emitting a precision
+  figure computed from nothing.
+- `eidolon/tests/vcf_validation.rs` gained whole-artifact validation of the
+  `compare-vcfs` outputs.
+
+Every fix in this release was reproduced and verified locally; no Delta time was spent
+diagnosing or confirming any of them.
+
 7/28/2026
 =========
 ## eidolon v3.0.0 — subclonal heterogeneity (#405); output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*; adopting SemVer
