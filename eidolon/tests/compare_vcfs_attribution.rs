@@ -464,9 +464,32 @@ fn txt_report_renders_attribution_and_warnings() {
         .assert()
         .success();
     let txt = std::fs::read_to_string(out.join("comparison_summary.txt")).unwrap();
+    // `contains("FN attribution")` cannot fail: report.rs pushes that header
+    // UNCONDITIONALLY, outside any branch, so it is present for every run including one
+    // with no false negatives at all. Making attribute_fn return Reason::Unknown for
+    // everything — every FN mis-attributed — passed it. Assert the rendered ROW instead.
     assert!(
         txt.contains("FN attribution"),
         "TXT missing FN attribution section:\n{txt}"
+    );
+    let attribution_line = txt
+        .lines()
+        .skip_while(|l| !l.contains("FN attribution"))
+        .find(|l| l.contains("outside_mutation_bed"))
+        .unwrap_or_else(|| {
+            panic!("FN attribution section has no outside_mutation_bed row:\n{txt}")
+        });
+    // The single golden variant is at chr1:500 and the BED names a contig that does not
+    // exist, so exactly one FN must be attributed there — the count, not just the label.
+    let count: usize = attribution_line
+        .split_whitespace()
+        .last()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no count on attribution row {attribution_line:?}"));
+    assert_eq!(
+        count, 1,
+        "expected exactly 1 FN attributed to outside_mutation_bed, got {count} \
+         (row: {attribution_line:?})"
     );
     assert!(
         txt.contains("Warnings"),
