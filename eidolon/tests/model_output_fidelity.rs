@@ -73,6 +73,56 @@ fn mean_fastq_quality(path: &Path) -> f64 {
     sum as f64 / n as f64
 }
 
+/// A training FASTQ whose quality DECAYS along the read: `start_phred` at cycle 0 falling
+/// linearly to `end_phred` at the last cycle. The uniform fixture cannot distinguish a
+/// model that reproduces a positional profile from one that returns a constant, because
+/// with one quality option every implementation looks identical.
+fn write_gradient_quality_fastq_gz(
+    path: &Path,
+    n_reads: usize,
+    read_len: usize,
+    start_phred: u8,
+    end_phred: u8,
+) {
+    let seq: String = "ACGT".chars().cycle().take(read_len).collect();
+    let qual: String = (0..read_len)
+        .map(|i| {
+            let frac = i as f64 / (read_len - 1) as f64;
+            let q = start_phred as f64 + (end_phred as f64 - start_phred as f64) * frac;
+            char::from(q.round() as u8 + 33)
+        })
+        .collect();
+    let f = fs::File::create(path).unwrap();
+    let mut enc = GzEncoder::new(f, Compression::default());
+    for i in 0..n_reads {
+        writeln!(enc, "@read{i}\n{seq}\n+\n{qual}").unwrap();
+    }
+    enc.finish().unwrap();
+}
+
+/// Mean Phred quality at each cycle across all reads of a single-end FASTQ.gz.
+fn per_cycle_mean_quality(path: &Path, read_len: usize) -> Vec<f64> {
+    let mut raw = String::new();
+    GzDecoder::new(fs::File::open(path).unwrap())
+        .read_to_string(&mut raw)
+        .unwrap();
+    let mut sum = vec![0u64; read_len];
+    let mut n = vec![0u64; read_len];
+    for (i, line) in raw.lines().enumerate() {
+        if i % 4 == 3 {
+            for (cycle, b) in line.bytes().enumerate().take(read_len) {
+                sum[cycle] += (b - 33) as u64;
+                n[cycle] += 1;
+            }
+        }
+    }
+    assert!(n[0] > 0, "no quality lines in {}", path.display());
+    sum.iter()
+        .zip(&n)
+        .map(|(s, c)| if *c == 0 { 0.0 } else { *s as f64 / *c as f64 })
+        .collect()
+}
+
 /// Build a sequencing-error model from a FASTQ whose bases are ALL Phred 35, then
 /// simulate with that model file and confirm the output read qualities are ~35 —
 /// i.e. the trained quality profile reaches the reads, not a built-in default.
@@ -505,5 +555,90 @@ fn built_gc_bias_model_depletes_disfavored_gc_in_output() {
         high_reads * 5 < low_reads,
         "high-GC reads ({high_reads}) not depleted vs low-GC ({low_reads}) — the built \
          gc_bias_model's weights are NOT shaping which regions gen-reads sequences"
+    );
+}
+
+/// The trained quality profile must reproduce its POSITIONAL SHAPE, not merely its mean.
+///
+/// `built_seq_error_model_drives_output_quality` trains on a uniform Phred-35 fixture, so
+/// the model carries a single quality option and any implementation returning a constant
+/// satisfies it. Two mutations confirmed that: replacing the per-position transition
+/// matrix with row 0 (quality stops decaying along the read), and returning
+/// `quality_score_options[0]` for every base. Both passed the whole workspace — nothing
+/// checked that quality varies with cycle at all.
+///
+/// Real Illumina quality decays along the read, and callers weight bases by it, so a
+/// simulator that emits flat quality is not modelling the thing it claims to.
+#[test]
+fn built_seq_error_model_reproduces_the_positional_quality_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let read_len = 100;
+    let (start_q, end_q) = (40u8, 20u8);
+
+    let fq = tmp.path().join("train_gradient.fastq.gz");
+    write_gradient_quality_fastq_gz(&fq, 500, read_len, start_q, end_q);
+
+    let model = tmp.path().join("seq_error_gradient.json.gz");
+    let build_cfg = write_yaml(
+        tmp.path(),
+        "seqerr_grad_build",
+        &format!(
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\n",
+            fq.display(),
+            model.display()
+        ),
+    );
+    eidolon()
+        .args(["gen-seq-error-model", "-c"])
+        .arg(&build_cfg)
+        .assert()
+        .success();
+
+    let sim_cfg = write_yaml(
+        tmp.path(),
+        "seqerr_grad_sim",
+        &format!(
+            "reference: {ref}\nread_len: {rl}\ncoverage: 20\npaired_ended: false\n\
+             sequence_error_model: {model}\nproduce_fastq: true\nproduce_bam: false\n\
+             produce_vcf: false\noverwrite_output: true\noutput_dir: {out}\n\
+             output_filename: grad\nrng_seed: seqerr gradient\nnum_threads: 1\n",
+            ref = h1n1_reference().display(),
+            rl = read_len,
+            model = model.display(),
+            out = tmp.path().display(),
+        ),
+    );
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(&sim_cfg)
+        .assert()
+        .success();
+
+    let profile = per_cycle_mean_quality(&tmp.path().join("grad_r1.fastq.gz"), read_len);
+    let head: f64 = profile[..10].iter().sum::<f64>() / 10.0;
+    let tail: f64 = profile[read_len - 10..].iter().sum::<f64>() / 10.0;
+    eprintln!("[fidelity] trained {start_q} -> {end_q}; simulated head {head:.1}, tail {tail:.1}");
+
+    // The decay itself. A constant-quality implementation lands head == tail and fails
+    // here whatever value it picks, which is the point: the mean alone cannot tell them
+    // apart, only the shape can.
+    let trained_drop = (start_q - end_q) as f64;
+    assert!(
+        head - tail >= trained_drop * 0.5,
+        "quality falls only {:.1} Phred from cycle 0 to cycle {} but the training data \
+         falls {trained_drop:.0} — the positional profile is not reaching the reads \
+         (head {head:.1}, tail {tail:.1})",
+        head - tail,
+        read_len - 1
+    );
+    // ...and each end tracks the trained value, so "decays" cannot be satisfied by an
+    // arbitrary downward ramp unrelated to the model.
+    assert!(
+        (head - start_q as f64).abs() <= 5.0,
+        "cycle-0 quality {head:.1} does not track the trained {start_q}"
+    );
+    assert!(
+        (tail - end_q as f64).abs() <= 5.0,
+        "final-cycle quality {tail:.1} does not track the trained {end_q}"
     );
 }
