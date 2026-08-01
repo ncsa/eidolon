@@ -1,0 +1,54 @@
+# Ground truth for `eidolon validate`, OBSERVED not assumed.
+#
+# Captured by running each corpus file through the real tools. Versions tested:
+#   samtools 1.18, 1.19.2          (agreed exactly)
+#   bcftools 1.17, 1.19, 1.22      (agreed exactly; 1.22 is the Delta target)
+# Delta runs samtools 1.22, which could not be tested locally — the differential
+# test asserts ACCEPT/REJECT agreement rather than message equality, because
+# messages drift across versions while verdicts have proven stable.
+#
+# verdict: accept | warn | reject
+# The operation matters: `bcftools view` accepts unsorted input, `tabix` rejects it;
+# `bcftools view` accepts REF=Z, `bcftools norm -f` rejects it. A citation naming only
+# the tool would be wrong. My first pass recorded REF=Z as "no tool catches this",
+# which was false — I had not tried norm.
+#
+# file	operation	verdict	message
+fastq/good.fq	samtools import -0	accept	
+fastq/qual_short.fq	samtools import -0	reject	samtools import: truncated file. Aborting
+fastq/no_plus.fq	samtools import -0	reject	samtools import: truncated file. Aborting
+fastq/truncated.fq	samtools import -0	reject	samtools import: truncated file. Aborting
+fastq/no_at.fq	samtools import -0	reject	samtools import: truncated file. Aborting
+fastq/bad_base.fq	samtools import -0	reject	samtools import: truncated file. Aborting
+fastq/crlf.fq	samtools import -0	accept	tolerated
+fastq/bad_qualbyte.fq	samtools import -0	accept	tolerated (0x01 quality byte)
+vcf/good.vcf	bcftools view	accept	
+vcf/few_columns.vcf	bcftools view	reject	[E::bcf_write] Broken VCF record, the number of columns at chr1:100 does not match
+vcf/undeclared_info.vcf	bcftools view	warn	[W::vcf_parse_info] INFO 'XX' is not defined in the header, assuming Type=String
+vcf/undeclared_info.vcf	bcftools concat	reject	[E::bcf_translate] Unchecked error (2 Tag not defined in header) at chr1:100, exiting
+vcf/undeclared_info.vcf	bcftools view -i INFO/XX	reject	[filter.c:3224 filters_init1] Error: the tag "XX" is not defined in the VCF header
+vcf/no_contig.vcf	bcftools view	warn	[W::vcf_parse] Contig 'chr9' is not defined in the header
+vcf/unsorted.vcf	bcftools view	accept	tolerated
+vcf/unsorted.vcf	tabix -p vcf	reject	[E::hts_idx_push] Unsorted positions on sequence #1: 200 followed by 100
+vcf/bad_ref.vcf	bcftools view	accept	tolerated
+vcf/bad_ref.vcf	bcftools norm -f REF	reject	Non-ACGTN reference allele at chr1:100 .. REF_SEQ:'A' vs VCF:'Z'
+vcf/malformed_val.vcf	bcftools view	accept	SILENT DATA LOSS: value becomes DP=. on every path incl. BCF round-trip
+vcf/malformed_val.vcf	bcftools view -O b	accept	SILENT DATA LOSS: type mismatch discarded, no warning
+#
+# BAM, observed on samtools 1.22.1 (the version Delta runs), by EXIT STATUS.
+# Three operations disagree with each other here more than anywhere else:
+# quickcheck rejects a missing EOF that view accepts, and index rejects unsorted
+# records that both of the others accept.
+bam/good.bam	samtools quickcheck	accept	
+bam/no_eof.bam	samtools quickcheck	reject	<file> was missing EOF block when one should be present.
+bam/no_eof.bam	samtools view	accept	only warns: [W::bam_hdr_read] EOF marker is absent
+bam/truncated.bam	samtools quickcheck	reject	<file> caused an error whilst reading its header.
+bam/bad_magic.bam	samtools view	reject	[E::hts_hopen] Failed to open file
+bam/unsorted.bam	samtools index	reject	[E::hts_idx_push] Unsorted positions on sequence #1: 200 followed by 100
+bam/unsorted.bam	samtools view	accept	tolerated
+bam/pos_past_end.bam	samtools quickcheck	accept	NO TOOL CATCHES THIS: quickcheck, view and index all accept a read aligned past the contig end
+# Hand-patched: samtools REFUSES to write a BAM with a CIGAR/SEQ mismatch, so this was
+# made by rewriting the CIGAR op in good.bam from 10M to 5M (one uint32, no size change).
+# eidolon writes BAM directly via noodles and is not bound by that refusal, which is
+# exactly why the check has to exist.
+bam/cigar_len.bam	samtools view	reject	[E::bam_read1] CIGAR and query sequence lengths differ for r1
