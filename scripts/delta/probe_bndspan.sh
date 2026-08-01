@@ -17,8 +17,12 @@
 #   * a synthetic caller record at the span's own coordinates MUST match
 #   * the same record shifted far away MUST NOT
 #
-# Standalone use against an existing run directory (seconds, no simulation):
+# Standalone use against an existing run directory (seconds, no simulation). Either
+# point it at derived spans, or at the BND truth and let it derive them with the real
+# build_bnd_spans extracted from sv_pipeline.sbatch — which also checks that the ALT
+# parser works on actual eidolon output rather than on a fixture:
 #   scripts/delta/probe_bndspan.sh --spans "$OUTDIR/truth_sv_BNDspan.vcf.gz"
+#   scripts/delta/probe_bndspan.sh --bnd   "$OUTDIR/truth_sv_BND.vcf.gz"
 #
 # Exit 0 = the bridge works as assumed. Exit 1 = it does not, and any BNDspan number
 # produced with this configuration is meaningless.
@@ -26,6 +30,7 @@
 set -euo pipefail
 
 SPANS=""
+BND_TRUTH=""
 REFERENCE="${REFERENCE:-}"
 # Offset applied to the "must match" case. Real callers do not hit a breakpoint exactly;
 # job 20636298 had Manta 1 bp off. Non-zero on purpose — an exact-coordinate-only match
@@ -38,6 +43,7 @@ WORK="${WORK:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --spans)     SPANS="$2"; shift 2 ;;
+        --bnd)       BND_TRUTH="$2"; shift 2 ;;
         --reference) REFERENCE="$2"; shift 2 ;;
         --work)      WORK="$2"; shift 2 ;;
         -h|--help)   sed -n '2,30p' "$0"; exit 0 ;;
@@ -45,14 +51,39 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$SPANS" ]] || { echo "ERROR: --spans <truth_sv_BNDspan.vcf.gz> is required" >&2; exit 2; }
-[[ -f "$SPANS" ]] || { echo "ERROR: no such spans VCF: $SPANS" >&2; exit 2; }
+if [[ -z "$SPANS" && -z "$BND_TRUTH" ]]; then
+    echo "ERROR: one of --spans <truth_sv_BNDspan.vcf.gz> or --bnd <truth_sv_BND.vcf.gz>" >&2
+    exit 2
+fi
 
 if [[ -z "$WORK" ]]; then
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT
 fi
 mkdir -p "$WORK"
+
+# Derive the spans here when given the BND truth, using the REAL function rather than a
+# reimplementation — so this also exercises the ALT parser against actual eidolon output.
+if [[ -z "$SPANS" ]]; then
+    [[ -f "$BND_TRUTH" ]] || { echo "ERROR: no such BND truth: $BND_TRUTH" >&2; exit 2; }
+    SBATCH="$(cd "$(dirname "$0")" && pwd)/sv_pipeline.sbatch"
+    [[ -f "$SBATCH" ]] || { echo "ERROR: cannot find $SBATCH to extract build_bnd_spans" >&2; exit 2; }
+    OUTDIR="$WORK"          # build_bnd_spans writes its temporaries under $OUTDIR
+    eval "$(awk '/^build_bnd_spans\(\) \{/,/^\}$/' "$SBATCH")"
+    SPANS="$WORK/derived_BNDspan.vcf.gz"
+    span_rc=0
+    build_bnd_spans "$BND_TRUTH" "$SPANS" || span_rc=$?
+    case "$span_rc" in
+        0) ;;
+        2) echo "No intra-contig junctions to span — the bridge is untestable here, and" >&2
+           echo "  BNDspan scoring would legitimately not run." >&2
+           exit 0 ;;
+        *) echo "ERROR: span derivation failed (rc=$span_rc) — cannot probe the bridge." >&2
+           exit 1 ;;
+    esac
+fi
+
+[[ -f "$SPANS" ]] || { echo "ERROR: no such spans VCF: $SPANS" >&2; exit 2; }
 
 n_spans=$(bcftools view -H "$SPANS" 2>/dev/null | wc -l)
 if [[ "$n_spans" -eq 0 ]]; then
