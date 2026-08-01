@@ -429,22 +429,26 @@ if [[ -f "$MANTA_SV" ]]; then
     case "$conv_rc" in
         0)  MANTA_SV="$MANTA_SV_CONV"     # score against the normalised calls
             # A residual the raw/converted split CANNOT remove, stated here so the INV
-            # precision figure is not misread. eidolon emits every BND junction as
-            # head-to-head (`t]p]` <-> `t]p]`), which IS the inversion signature, so
-            # convertInversion.py converts the caller's breakend pairs for OUR junctions
-            # into <INV> records too. Those then score as INV false positives against a
-            # truth that never contained them.
+            # precision figure is not misread. An INVERSION-ORIENTED junction (t]p] or
+            # [p[t) has the same shape as an inversion, so convertInversion.py turns the
+            # caller's breakend pair for OUR junction into an <INV> record, which then
+            # scores as an INV false positive against a truth that never contained it.
             #
-            # In job 20699004 that was 7 of the 11 INV FPs. It is a simulator limitation
-            # (#458 item 2: only one geometry is ever sampled), not a caller error and
-            # not something scoring can undo — until eidolon emits direct and
-            # tail-to-tail junctions, a BND junction and an inversion are the same shape.
-            n_bnd_truth=$(bcftools view -H "$OUTDIR/truth_sv_BND.vcf.gz" 2>/dev/null | wc -l)
-            if [[ "${n_bnd_truth:-0}" -gt 0 ]]; then
-                echo "    NOTE: the truth's $((n_bnd_truth / 2)) BND junction(s) are head-to-head, which is"
-                echo "      the inversion signature — a caller's breakends for them convert to <INV>"
-                echo "      too and count as INV false positives. Expect INV precision to be"
-                echo "      depressed by up to that many; it is #458 item 2, not a caller result."
+            # This used to assert that ALL our junctions were head-to-head and print
+            # n_records/2 as the count. That was hardcoded from when geometry was
+            # hardcoded, and v3.1.0 falsified it: job 20719077 measured 226 direct /
+            # 128 head-to-head / 112 tail-to-tail across 466 junctions. The number is
+            # now MEASURED, because a printed claim nobody checks is how the harness
+            # ends up lying in exactly the way it exists to prevent.
+            n_inv_or=$(bcftools query -f '%ALT\n' "$OUTDIR/truth_sv_BND.vcf.gz" 2>/dev/null \
+                | grep -cE '^([ACGTNacgtn]+\]|\[)' || true)
+            if [[ "${n_inv_or:-0}" -gt 0 ]]; then
+                echo "    NOTE: $((n_inv_or / 2)) of the truth's junction(s) are inversion-oriented"
+                echo "      (t]p] or [p[t) — a caller's breakends for those convert to <INV> and"
+                echo "      count as INV false positives. Expect INV precision to be depressed by"
+                echo "      up to that many; it is our representation, not a caller result."
+                echo "      Direct junctions (t[p[ / ]p]t) do NOT convert; they are called"
+                echo "      <DEL>/<DUP:TANDEM>, which is the BND-recall ceiling noted in stage 5."
             fi
             ;;
         2) ;;                              # no converter: nothing to normalise
@@ -630,6 +634,152 @@ print(f'    reported {tp}/$base={tp/$base:.3f}  ->  over the full truth {tp}/$n_
 
     SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
     return 1
+}
+
+# ── BND geometry: does the truth describe all four adjacencies, reciprocally? ──
+# Before v3.1.0 every emitted junction was head-to-head (t]p]). A caller therefore only
+# ever saw inversion-like adjacencies, and "BND recall=1.000" was a measurement of one
+# quarter of the problem that read like the whole of it. Geometry is now sampled across
+# all four VCF 4.2 §5.4 forms, so this asserts two things the old harness never did:
+#
+#   1. COVERAGE OF ITS OWN INPUT — every ALT parses into one of the four forms, and the
+#      per-form counts are reported. A geometry distribution over an unknown denominator
+#      is not a result; if a form is missing, that must be visible rather than inferred
+#      from a recall number that moved.
+#   2. RECIPROCITY — each junction's two records form a spec-valid pair. This is the
+#      #451 defect stated as an assertion: the truth described a rearrangement the reads
+#      did not carry, and nothing checked the two sides agreed, so it looked like a
+#      caller failure for two months (v1.13.1 2026-06-02 -> v3.1.0 2026-08-01).
+#
+# Pairings are the spec's own worked examples: t[p[ <-> ]p]t (direct), t]p] <-> t]p]
+# (head-to-head), [p[t <-> [p[t (tail-to-tail).
+check_bnd_geometry() {  # <bnd_truth.vcf.gz>
+    local src="$1"
+    [[ -f "$src" ]] || { echo "  ERROR: BND geometry: no BND truth at $src" >&2; return 1; }
+    bcftools query -f '%CHROM\t%POS\t%ALT\n' "$src" 2>/dev/null \
+      | awk -F'\t' '
+          # Which of the four forms is this ALT? "" means unparsable, which is a defect
+          # and is counted separately rather than being silently dropped.
+          function form(a) {
+              if (a ~ /^[ACGTNacgtn]+\[/) return "t[p["   # case 1  DeletionLike
+              if (a ~ /^[ACGTNacgtn]+\]/) return "t]p]"   # case 2  HeadToHead
+              if (a ~ /^\[/)              return "[p[t"   # case 3  TailToTail
+              if (a ~ /^\]/)              return "]p]t"   # case 4  DuplicationLike
+              return ""
+          }
+          function mate(a,   b,n,p,i) {
+              b=a; gsub(/[][]/,"|",b); n=split(b,p,"|")
+              for (i=1;i<=n;i++) if (p[i] ~ /:/) return p[i]
+              return ""
+          }
+          # The spec pairing. Note it is NOT "same form": a direct junction is described
+          # by two DIFFERENT forms, which is exactly the case a naive check would miss.
+          function mates_ok(a,b) {
+              if (a=="t[p[") return b=="]p]t"
+              if (a=="]p]t") return b=="t[p["
+              if (a=="t]p]") return b=="t]p]"
+              if (a=="[p[t") return b=="[p[t"
+              return 0
+          }
+          { n++
+            f=form($3); m=mate($3)
+            if (f=="" || m=="") { bad++; badex=(badex==""?$3:badex); next }
+            cnt[f]++; parsed++
+            self=$1":"$2; g[self]=f; tgt[self]=m; ord[++k]=self }
+          END{
+            printf("  BND geometry: %d record(s), %d parsed into a form, %d unparsable\n",
+                   n+0, parsed+0, bad+0)
+            split("t[p[ t]p] [p[t ]p]t", forms, " ")
+            split("direct/deletion-like head-to-head tail-to-tail direct/duplication-like",
+                  names, " ")
+            for (i=1;i<=4;i++)
+                printf("    %-5s %-22s %d\n", forms[i], names[i], cnt[forms[i]]+0)
+            # A truth that is entirely one form is internally CONSISTENT, so every check
+            # below passes on it — that is exactly what pre-v3.1.0 output looked like.
+            # Flagged, not failed: fitted weights may legitimately be skewed, so a hard
+            # threshold here would be a flaky assertion about a random draw. The point is
+            # that a silent regression to one geometry must not be invisible.
+            nd=0; for (i=1;i<=4;i++) if (cnt[forms[i]]>0) nd++
+            if (nd==1 && parsed>=24)
+                printf("    NOTE: all %d junction record(s) share ONE geometry. That is the\n"\
+                       "      pre-v3.1.0 hardcoded behaviour; under uniform weights it is\n"\
+                       "      vanishingly unlikely at this count. Check bnd_geometry_weights\n"\
+                       "      in the model before reading any BND number below.\n",
+                       parsed+0)
+            # Reciprocity, checked per record against the record its ALT points at.
+            for (i=1;i<=k;i++) {
+                s=ord[i]; t=tgt[s]
+                if (!(t in g)) { unpaired++
+                    if (uex=="") uex=s" -> "t" (no record there)"
+                    continue }
+                if (!mates_ok(g[s], g[t])) { mismatch++
+                    if (mex=="") mex=s" "g[s]" <-> "t" "g[t] }
+            }
+            printf("    reciprocity: %d unpaired, %d mispaired\n", unpaired+0, mismatch+0)
+            if (bad)      printf("    first unparsable ALT: %s\n", badex)
+            if (unpaired) printf("    first unpaired:       %s\n", uex)
+            if (mismatch) printf("    first mispaired:      %s\n", mex)
+            # A record whose mate is absent or contradicts it describes a rearrangement
+            # the reads cannot carry. That is not a caller result to be interpreted, it
+            # is our artifact being wrong, so it is a hard failure.
+            exit (bad+unpaired+mismatch > 0) ? 1 : 0
+          }'
+}
+
+# ── Split the BND truth by geometry, because only half of it is BND-scoreable ──
+# Callers bucket only INVERSION-ORIENTED adjacencies (t]p], [p[t) as BND. A direct
+# adjacency inside one contig IS a deletion or a tandem duplication, and Manta calls it
+# <DEL>/<DUP:TANDEM>. Our truth types every junction BND regardless of geometry, so
+# scoring all of it against a caller's BND records asks truvari to match records that
+# cannot match by construction.
+#
+# MEASURED, not assumed — job 20719077, 466 junctions, geometry ~uniform:
+#   tp-base:  t[p[ 0    t]p] 188  [p[t 166  ]p]t 0     -> direct=0    inv-oriented=354
+#   fn:       t[p[ 226  t]p] 68   [p[t 58   ]p]t 226   -> direct=452  inv-oriented=126
+# Every single direct-form record was a false negative and none appeared in tp-base.
+# So manta_BND recall=0.380 (354/932) was a statement about OUR SVTYPE choice; the
+# caller number is 354/480 = 0.738, and the two geometries inside that agree closely
+# (head-to-head 0.734, tail-to-tail 0.741), so there is no bias within the class.
+#
+# Reporting the aggregate alone repeats the INV precision-floor mistake one layer down:
+# a number floored by our own representation, printed as if it described the caller.
+split_bnd_by_geometry() {  # <bnd_truth.vcf.gz> <inv_out.vcf.gz> <direct_out.vcf.gz>
+    local src="$1" inv="$2" dir="$3"
+    [[ -f "$src" ]] || { echo "  ERROR: BND split: no BND truth at $src" >&2; return 1; }
+    local hdr="$OUTDIR/.bnd_split_hdr" tmp="$OUTDIR/.bnd_split_tmp.vcf"
+    bcftools view -h "$src" > "$hdr" || return 1
+
+    local kind out n_inv=0 n_dir=0
+    for kind in inv direct; do
+        [[ "$kind" == inv ]] && out="$inv" || out="$dir"
+        { cat "$hdr"
+          bcftools view -H "$src" | awk -F'\t' -v k="$kind" '
+              { a=$5
+                # direct: t[p[ (base then open-bracket) or ]p]t (leading close-bracket)
+                d = (a ~ /^[ACGTNacgtn]+\[/ || a ~ /^\]/)
+                # inversion-oriented: t]p] (base then close) or [p[t (leading open)
+                i = (a ~ /^[ACGTNacgtn]+\]/ || a ~ /^\[/)
+                if ((k=="direct" && d) || (k=="inv" && i)) print }'
+        } > "$tmp"
+        bcftools view -O z -o "$out" "$tmp" || { rm -f "$tmp" "$hdr"; return 1; }
+        bcftools index -f -t "$out" || { rm -f "$tmp" "$hdr"; return 1; }
+    done
+    n_inv=$(bcftools view -H "$inv" | wc -l)
+    n_dir=$(bcftools view -H "$dir" | wc -l)
+    rm -f "$tmp" "$hdr"
+
+    local n_src
+    n_src=$(bcftools view -H "$src" | wc -l)
+    printf "  BND truth split by geometry: %d inversion-oriented, %d direct (of %d)\n" \
+        "$n_inv" "$n_dir" "$n_src"
+    # Coverage of the split's own input. A record that lands in neither bucket would
+    # silently shrink the denominator of whatever is scored next.
+    if [[ $((n_inv + n_dir)) -ne "$n_src" ]]; then
+        echo "  ERROR: BND split lost $((n_src - n_inv - n_dir)) record(s) — every record" >&2
+        echo "    must be exactly one of direct or inversion-oriented." >&2
+        return 1
+    fi
+    return 0
 }
 
 # ── BND junction spans: a comparable representation ──────────────────────
@@ -878,6 +1028,27 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
             bcftools index -f -t "$qb" 2>/dev/null || true
             run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
                 --bnddist "$BND_DIST"
+            # The aggregate above has a CEILING SET BY US, not by the caller: direct
+            # junctions are correctly called <DEL>/<DUP:TANDEM>, so they can never match
+            # a BND record. Job 20719077: every one of the 452 direct-form records was a
+            # FN and none appeared in tp-base, making the 0.380 aggregate a statement
+            # about our SVTYPE choice. BNDinv restricts the truth to the junctions a
+            # caller can actually represent as breakends, which is the caller number.
+            if [[ -f "$OUTDIR/truth_sv_BNDinv.vcf.gz" ]]; then
+                local n_inv n_dir
+                n_inv=$(bcftools view -H "$OUTDIR/truth_sv_BNDinv.vcf.gz" | wc -l)
+                n_dir=$(bcftools view -H "$OUTDIR/truth_sv_BNDdirect.vcf.gz" 2>/dev/null | wc -l)
+                if [[ "$n_inv" -gt 0 ]]; then
+                    run_truvari "$OUTDIR/truth_sv_BNDinv.vcf.gz" "${caller}_BNDinv" "$qb" \
+                        --bnddist "$BND_DIST"
+                    echo "    ^ BNDinv is the interpretable BND number: truth restricted to the"
+                    echo "      $n_inv inversion-oriented record(s) a caller CAN emit as breakends."
+                    echo "      The ${caller}_BND figure above additionally counts $n_dir direct-form"
+                    echo "      record(s) that are called <DEL>/<DUP:TANDEM> and cannot match by"
+                    echo "      construction — a ceiling of $n_inv/$((n_inv + n_dir)), set by our"
+                    echo "      representation. Quote BNDinv when describing the caller."
+                fi
+            fi
         else
             rm -f "$qb" "${qb}.tbi"
             echo "  ${caller}_BND recall=0.000  (caller emitted no BND records)"
@@ -912,6 +1083,20 @@ BND_SPAN_RC=0
 # from a displaced one at this scale — see the probe for why that is not tunable.
 BNDSPAN_VALID=1
 if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
+    # Runs BEFORE the spans are derived: if the junctions are not reciprocal, every
+    # number downstream describes our own broken artifact rather than any caller.
+    # `|| rc=$?` and not `$(cmd; echo $?)` — the latter loses the status under set -e.
+    BND_GEOM_RC=0
+    check_bnd_geometry "$OUTDIR/truth_sv_BND.vcf.gz" || BND_GEOM_RC=$?
+    if [[ "$BND_GEOM_RC" -ne 0 ]]; then
+        echo "ERROR: the BND truth is not internally consistent (see above). Scoring it" >&2
+        echo "  would measure our emission defect and report it as caller performance." >&2
+        CAL_FAIL=1
+    fi
+    # Split the truth by geometry so BND recall can be reported against the junctions a
+    # caller can actually emit as breakends, separately from the direct ones it cannot.
+    split_bnd_by_geometry "$OUTDIR/truth_sv_BND.vcf.gz" \
+        "$OUTDIR/truth_sv_BNDinv.vcf.gz" "$OUTDIR/truth_sv_BNDdirect.vcf.gz" || CAL_FAIL=1
     build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
         || BND_SPAN_RC=$?
     case "$BND_SPAN_RC" in
