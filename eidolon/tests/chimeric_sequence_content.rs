@@ -88,6 +88,14 @@ fn derived_haplotype(reference: &[u8], sv: &Sv) -> Vec<u8> {
             out.extend_from_slice(&reference[..*pos]);
             out.extend_from_slice(&reference[*end..]);
         }
+        // <INV>: POS is the base BEFORE the event, so the inverted block is 1-based
+        // [POS+1, END] = 0-based [pos, end), carried reverse-complemented. TWO novel
+        // junctions, at offsets `pos` and `end`.
+        Sv::Inv { pos, end } => {
+            out.extend_from_slice(&reference[..*pos]);
+            out.extend(revcomp(&reference[*pos..*end]));
+            out.extend_from_slice(&reference[*end..]);
+        }
         // Tandem <DUP>: POS is the base BEFORE the event, so the duplicated bases
         // are 1-based [POS+1, END] = 0-based [pos, end), and the derived haplotype
         // carries that block twice. The novel junction is at offset `end`.
@@ -113,9 +121,41 @@ fn derived_haplotype(reference: &[u8], sv: &Sv) -> Vec<u8> {
 
 enum Sv {
     Del { pos: usize, end: usize },
+    Inv { pos: usize, end: usize },
     Dup { pos: usize, end: usize },
     BndCase2 { pos: usize, mate_pos: usize },
     BndCase3 { pos: usize, mate_pos: usize },
+}
+
+/// Contiguous match, or a match interrupted by ONE short indel.
+///
+/// The default sequencing-error model emits indels, and a purely positional
+/// comparison frameshifts on them: 7 of 80 INV chimeric reads scored below 0.90 for
+/// that reason alone, and all 7 were explained by a single 1-2bp indel against the
+/// SAME derived haplotype. Tolerating one small gap keeps these tests measuring
+/// GEOMETRY rather than the error model — without it, a correct implementation
+/// looks ~9% broken and the noise floor hides real regressions.
+fn matches_with_one_small_indel(read: &[u8], hay: &[u8]) -> bool {
+    let find = |needle: &[u8]| -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return None;
+        }
+        hay.windows(needle.len()).position(|w| w == needle)
+    };
+    for k in 8..read.len().saturating_sub(7) {
+        let Some(p) = find(&read[..k]) else { continue };
+        let rest = &read[k..];
+        for g in -3i64..=3 {
+            let q = (p + k) as i64 + g;
+            if q < 0 || q as usize + rest.len() > hay.len() {
+                continue;
+            }
+            if identity(rest, &hay[q as usize..q as usize + rest.len()]) >= 0.95 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Best contiguous match of `read` anywhere in `hay`, returning `(offset, identity)`.
@@ -198,6 +238,34 @@ fn chimeric_pairs(tag: &str, record: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// Chimeric reads with their QNAMEs, for assertions about which junction a read came from.
+fn chimeric_reads_with_names(tag: &str, record: &str) -> Vec<(String, Vec<u8>)> {
+    let (_dir, work) = fresh_workdir();
+    let input_vcf = work.join(format!("input_{tag}.vcf"));
+    write_sv_vcf(&input_vcf, record);
+    let mut config = GenReadsConfig::new(h1n1_reference(), work.clone(), tag);
+    config.read_len = 50;
+    config.coverage = 30;
+    config.paired_ended = true;
+    config.produce_fastq = true;
+    config.input_vcf = Some(input_vcf);
+    config.mutation_rate = Some(0.0);
+    let yaml = config.write_yaml();
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(yaml.path())
+        .assert()
+        .success();
+    let lines = read_gzip_fastq_lines(&work.join(format!("{tag}_r1.fastq.gz")));
+    let mut out = Vec::new();
+    for i in (0..lines.len()).step_by(4) {
+        if lines[i].starts_with('@') && lines[i].contains("EIDOLON_chimeric") {
+            out.push((lines[i].clone(), lines[i + 1].as_bytes().to_vec()));
+        }
+    }
+    out
+}
+
 /// Run gen-reads over one homozygous SV and return every chimeric read's sequence.
 fn chimeric_reads(tag: &str, record: &str) -> Vec<Vec<u8>> {
     let (_dir, work) = fresh_workdir();
@@ -247,16 +315,26 @@ fn assert_derived(tag: &str, record: &str, sv: Sv, junction: usize) {
     );
 
     let (mut scored, mut spanning) = (0usize, 0usize);
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut exact_spanning = 0usize;
     for read in &reads {
         let (off, id) = best_contiguous(read, &derived);
-        assert!(
-            id >= MIN_IDENTITY,
-            "{tag}: chimeric read is not a slice of the derived haplotype \
-             (best identity {id:.2} at {off}). The reads do not encode the \
-             rearrangement the VCF declares.\n  read: {}",
-            String::from_utf8_lossy(read)
-        );
-        scored += 1;
+        if id >= MIN_IDENTITY || matches_with_one_small_indel(read, &derived) {
+            scored += 1;
+        } else {
+            // Not a geometry failure on its own: the sequencing-error model is active,
+            // and a read carrying BOTH a substitution and an indel cannot be anchored
+            // by an exact-prefix search. Measured on INV, 4 of 5 such reads were a
+            // single indel and the fifth was a substitution plus a 1bp deletion — all
+            // against this same haplotype. Collected and bounded below rather than
+            // failed individually; a real geometry error puts EVERY read at ~0.62, far
+            // under the bound.
+            unmatched.push(format!(
+                "identity {id:.2} at {off}: {}",
+                String::from_utf8_lossy(read)
+            ));
+            continue;
+        }
 
         // The negative control only means anything for reads that straddle the
         // breakpoint SUBSTANTIALLY. A read clipping the junction by 3 bases is still
@@ -266,13 +344,20 @@ fn assert_derived(tag: &str, record: &str, sv: Sv, junction: usize) {
         let anchor = read.len() / 4;
         if off + anchor <= junction && off + read.len() >= junction + anchor {
             spanning += 1;
+            // Indel tolerance is needed for sequencing errors, but it also absorbs a
+            // 1bp geometry shift — reverting a junction offset by one passed this file
+            // until this check existed. An error-free read spanning the junction must
+            // match EXACTLY, and a shifted junction frameshifts every such read.
+            if id >= 0.98 {
+                exact_spanning += 1;
+            }
             // THE assertion this file exists for: a read genuinely spanning the
             // junction cannot also be ordinary contiguous reference. Dropping a
             // reverse complement, inverting a junction dispatch, or collapsing a
             // junction back onto reference all surface here.
             let (roff, rid) = best_contiguous(read, reference);
             assert!(
-                rid < MIN_IDENTITY,
+                rid < MIN_IDENTITY && !matches_with_one_small_indel(read, reference),
                 "{tag}: a read spanning the breakpoint by >={anchor}bp either side also \
                  matches the UNBROKEN reference at {roff} (identity {rid:.2}) — it \
                  carries no junction signal.\n  read: {}",
@@ -280,11 +365,23 @@ fn assert_derived(tag: &str, record: &str, sv: Sv, junction: usize) {
             );
         }
     }
-    assert_eq!(
-        scored,
+    // Coverage of the harness's own input, reported rather than assumed. A geometry
+    // defect fails essentially every read, so this bound is not a fudge factor: the
+    // mutations this file guards against land at ~0.62 identity across the board.
+    let matched_pct = 100 * scored / reads.len();
+    assert!(
+        matched_pct >= 90,
+        "{tag}: only {scored} of {} chimeric reads match the derived haplotype \
+         ({matched_pct}%). Sequencing-error noise accounts for a few percent; this is \
+         a geometry failure.\n  unmatched:\n    {}",
         reads.len(),
-        "{tag}: scored {scored} of {} chimeric reads",
-        reads.len()
+        unmatched.join("\n    ")
+    );
+    assert!(
+        exact_spanning >= 3,
+        "{tag}: only {exact_spanning} read(s) match the junction EXACTLY (of {spanning} \
+         spanning it). Error-free reads crossing a correctly-built junction match at \
+         1.00; a junction shifted by even one base leaves none of them exact."
     );
     assert!(
         spanning >= 3,
@@ -414,5 +511,70 @@ fn dup_chimeric_reads_duplicate_the_vcf_conventional_block() {
         // 30 reads then match no haplotype at all. That is a separate real defect
         // (#474), and keeping it out of this test stops one bug from masking another.
         1400,
+    );
+}
+
+/// `<INV>` inverts 1-based [POS+1, END] and must reverse-complement it.
+///
+/// `get_inv_pieces` had NO tests: four separate mutations passed the whole suite,
+/// including inverting the junction dispatch (`junction == 1` -> `== 2`) and turning
+/// off either reverse-complement flag. With the revcomp off, the "inversion" junction
+/// carries no inversion signal at all, and `inv_fastq.rs` stayed green because it only
+/// greps QNAMEs for `_1_0`.
+#[test]
+fn inv_chimeric_reads_reverse_complement_the_inverted_block() {
+    assert_derived(
+        "chim_inv",
+        "H1N1_HA\t600\t.\tG\t<INV>\t60\tPASS\tSVTYPE=INV;END=1400\tGT\t1/1",
+        Sv::Inv {
+            pos: 600,
+            end: 1400,
+        },
+        600,
+    );
+}
+
+/// The junction a read is LABELLED with must be the junction it actually spans.
+///
+/// `assert_derived` only asks whether a read is a slice of the derived haplotype, and
+/// both INV junctions produce valid slices — so swapping the junction dispatch
+/// (`junction == 1` -> `== 2`) passes it. `inv_fastq.rs` greps QNAMEs for `_1_0`/`_2_0`
+/// without checking where those reads came from, so nothing caught it anywhere.
+#[test]
+fn inv_junction_labels_match_the_junction_the_read_spans() {
+    let reference = &load_reference()[CONTIG];
+    let (pos, end) = (600usize, 1400usize);
+    let derived = derived_haplotype(reference, &Sv::Inv { pos, end });
+    let reads = chimeric_reads_with_names(
+        "chim_inv_lbl",
+        "H1N1_HA\t600\t.\tG\t<INV>\t60\tPASS\tSVTYPE=INV;END=1400\tGT\t1/1",
+    );
+    let (mut j1, mut j2) = (0usize, 0usize);
+    for (name, read) in &reads {
+        let (off, id) = best_contiguous(read, &derived);
+        if id < 0.98 {
+            continue; // sequencing-error noise; geometry is asserted elsewhere
+        }
+        let anchor = read.len() / 4;
+        let spans = |j: usize| off + anchor <= j && off + read.len() >= j + anchor;
+        if name.contains("_1_0") && spans(pos) {
+            j1 += 1;
+        }
+        if name.contains("_2_0") && spans(end) {
+            j2 += 1;
+        }
+        // A read labelled for one junction must never be found spanning the other.
+        assert!(
+            !(name.contains("_1_0") && spans(end)),
+            "read labelled junction 1 spans junction 2 at {end}: {name}"
+        );
+        assert!(
+            !(name.contains("_2_0") && spans(pos)),
+            "read labelled junction 2 spans junction 1 at {pos}: {name}"
+        );
+    }
+    assert!(
+        j1 >= 3 && j2 >= 3,
+        "expected reads spanning both labelled junctions; got j1={j1}, j2={j2}"
     );
 }
