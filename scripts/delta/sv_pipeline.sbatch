@@ -427,7 +427,26 @@ if [[ -f "$MANTA_SV" ]]; then
     conv_rc=0
     convert_manta_inversions "$MANTA_SV" "$MANTA_SV_CONV" || conv_rc=$?
     case "$conv_rc" in
-        0) MANTA_SV="$MANTA_SV_CONV" ;;   # score against the normalised calls
+        0)  MANTA_SV="$MANTA_SV_CONV"     # score against the normalised calls
+            # A residual the raw/converted split CANNOT remove, stated here so the INV
+            # precision figure is not misread. eidolon emits every BND junction as
+            # head-to-head (`t]p]` <-> `t]p]`), which IS the inversion signature, so
+            # convertInversion.py converts the caller's breakend pairs for OUR junctions
+            # into <INV> records too. Those then score as INV false positives against a
+            # truth that never contained them.
+            #
+            # In job 20699004 that was 7 of the 11 INV FPs. It is a simulator limitation
+            # (#458 item 2: only one geometry is ever sampled), not a caller error and
+            # not something scoring can undo — until eidolon emits direct and
+            # tail-to-tail junctions, a BND junction and an inversion are the same shape.
+            n_bnd_truth=$(bcftools view -H "$OUTDIR/truth_sv_BND.vcf.gz" 2>/dev/null | wc -l)
+            if [[ "${n_bnd_truth:-0}" -gt 0 ]]; then
+                echo "    NOTE: the truth's $((n_bnd_truth / 2)) BND junction(s) are head-to-head, which is"
+                echo "      the inversion signature — a caller's breakends for them convert to <INV>"
+                echo "      too and count as INV false positives. Expect INV precision to be"
+                echo "      depressed by up to that many; it is #458 item 2, not a caller result."
+            fi
+            ;;
         2) ;;                              # no converter: nothing to normalise
         *) echo "ERROR: Manta inversion conversion failed — scoring against the raw" >&2
            echo "  calls would report manta_INV=0.000 for inversions Manta DID find," >&2
@@ -782,8 +801,23 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
 #     direction check instead. The aggregate covers types truvari can match, and the log
 #     states what was excluded and where it went.
 #  4. Every scorer is calibrated first (selftest + decoy). See selftest_truvari.
-score_caller() {  # <caller> <comp.vcf.gz>
-    local caller="$1" comp="$2"
+# <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
+#
+# `comp` is what most comparisons score against — for Manta that is the
+# inversion-normalised file, so <INV> truth is scored like-for-like. `raw_comp` is the
+# PRE-conversion call set and exists for one reason: convertInversion.py consumes the
+# breakend records it converts, so scoring BND against the converted file compares the
+# BND truth against a file with no breakends in it.
+#
+# Job 20699004 did exactly that. The conversion reported "32 BND -> 0 BND + 16 INV" and
+# manta_BND then read recall=0.000 "(caller emitted no BND records)" — down from 1.000
+# the run before. That was a harness artifact, not a caller result.
+#
+# So: BND scores against RAW, everything else against CONVERTED. The two are answers to
+# different questions and are NOT additive — the same underlying call can appear as a
+# breakend pair in raw and as one <INV> in converted.
+score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
+    local caller="$1" comp="$2" raw_comp="${3:-$2}"
     [[ -f "$comp" ]] || { echo "  ($caller: no calls to score)"; return 0; }
     echo "  === $caller (cSample=$(comp_sample "$comp")) ==="
 
@@ -838,7 +872,8 @@ score_caller() {  # <caller> <comp.vcf.gz>
     # the whole. That was #457's defect surviving in the one run it never covered.
     if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
         local qb="$OUTDIR/${caller}_calls_BND.vcf.gz"
-        bcftools view -i 'INFO/SVTYPE="BND"' -O z -o "$qb" "$comp" 2>/dev/null || true
+        # From the RAW calls: the converted file has had its breakends consumed.
+        bcftools view -i 'INFO/SVTYPE="BND"' -O z -o "$qb" "$raw_comp" 2>/dev/null || true
         if [[ -f "$qb" ]] && [[ "$(bcftools view -H "$qb" 2>/dev/null | wc -l)" -gt 0 ]]; then
             bcftools index -f -t "$qb" 2>/dev/null || true
             run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
@@ -856,7 +891,7 @@ score_caller() {  # <caller> <comp.vcf.gz>
     # recall the measurement and FP/precision uninterpretable (every unrelated call is
     # an unmatched comp record), so say so rather than let the number be quoted.
     if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" && "$BNDSPAN_VALID" -eq 1 ]]; then
-        run_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$comp" -t
+        run_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$raw_comp" -t
         echo "    ^ BNDspan: recall is the measurement; precision/FP/f1 are NOT — the query"
         echo "      is intentionally unfiltered because the caller may use any SVTYPE here."
     elif [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
@@ -924,7 +959,8 @@ if [[ "$CAL_FAIL" -ne 0 ]]; then
     echo "  cannot score a perfect answer. Skipping caller scoring; see the selftest" >&2
     echo "  output above and the archived truvari_selftest_* directories." >&2
 else
-    score_caller manta "$MANTA_SV"
+    score_caller manta "$MANTA_SV" "$MANTA_SV_RAW"
+    # Delly emits no BND at all and is not converted, so raw and scored are the same file.
     [[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
 fi
 
@@ -953,7 +989,10 @@ Key outputs in $OUTDIR:
   SV truth:     truth_sv.vcf.gz            ($SV_TRUTH_N somatic SVs)
   Manta calls:  manta/results/variants/somaticSV.vcf.gz   (raw: $MANTA_SV_RAW)
   Manta scored: $MANTA_SV
-                (differs from raw when inversions were converted from BND pairs)
+                Aggregate/DEL/DUP/INV are scored against this (inversion-normalised)
+                file; BND and BNDspan are scored against the RAW calls above, because
+                convertInversion.py consumes the breakend records it converts. The two
+                are separate questions and their TP counts are not additive.
   Delly calls:  delly.somatic.vcf.gz       (RUN_DELLY=1)
   Scores:       truvari_<caller>_<overall|TYPE>/summary.json   (manta + delly)
 
