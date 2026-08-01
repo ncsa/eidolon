@@ -193,7 +193,24 @@ fn validate_matches_live_tools() {
     let mut mismatches = Vec::new();
     for (file, expected) in recorded_verdicts() {
         let path = root.join(&file);
-        let live = if file.starts_with("fastq/") {
+        let live = if file.starts_with("bam/") {
+            // BAM needs all three operations: they disagree with each other, and a
+            // file is only usable if every one of them accepts it.
+            let ok = ["quickcheck", "view", "index"].iter().all(|op| {
+                let mut c = Command::new("samtools");
+                c.arg(op);
+                if *op == "view" {
+                    c.args(["-o", "/dev/null"]);
+                }
+                let _ = std::fs::remove_file(path.with_extension("bam.bai"));
+                c.arg(&path)
+                    .output()
+                    .expect("samtools not on PATH — this test needs it")
+                    .status
+                    .success()
+            });
+            if ok { "accept" } else { "reject" }
+        } else if file.starts_with("fastq/") {
             let out = Command::new("samtools")
                 .args(["import", "-0"])
                 .arg(&path)

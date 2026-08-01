@@ -24,6 +24,7 @@ use utils::finding::{Finding, Severity};
 pub enum Format {
     Fastq,
     Vcf,
+    Bam,
 }
 
 /// Infer the format from the extension, ignoring a trailing `.gz`.
@@ -34,6 +35,8 @@ pub fn format_from_path(path: &Path) -> Option<Format> {
         Some(Format::Fastq)
     } else if name.ends_with(".vcf") {
         Some(Format::Vcf)
+    } else if name.ends_with(".bam") {
+        Some(Format::Bam)
     } else {
         None
     }
@@ -66,10 +69,17 @@ pub fn validate_file(path: &Path, format: Option<Format>) -> Result<Vec<Finding>
     let format = format
         .or_else(|| format_from_path(path))
         .ok_or_else(|| ValidateError::UnknownFormat(path.display().to_string()))?;
+    // BAM is binary and is read from the path directly rather than decompressed to a
+    // String — a truncated BGZF stream must be detectable, and lossy UTF-8 conversion
+    // would destroy exactly the evidence that check needs.
+    if format == Format::Bam {
+        return Ok(utils::bam::validate_bam(path));
+    }
     let text = read_maybe_gzip(path)?;
     Ok(match format {
         Format::Fastq => utils::fastq::validate_fastq(&text),
         Format::Vcf => utils::vcf::validate_vcf(&text),
+        Format::Bam => unreachable!("handled above"),
     })
 }
 

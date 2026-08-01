@@ -155,5 +155,41 @@ pub const BCFTOOLS_NORM_BAD_REF: Citation = Citation {
 pub const NOTHING_REJECTS_SILENT_LOSS: &str = "No tool rejects this. bcftools silently converts the value to `.` on every path \
      tested (view, view -O b, query), so it is lost WITHOUT a warning.";
 
+pub const SAMTOOLS_QUICKCHECK_EOF: Citation = Citation {
+    operation: "samtools quickcheck",
+    message: "<file> was missing EOF block when one should be present.",
+};
+
+pub const SAMTOOLS_VIEW_UNREADABLE: Citation = Citation {
+    operation: "samtools view",
+    message: "[E::hts_hopen] Failed to open file / truncated stream",
+};
+
+/// Observed on the SAM path; samtools refuses to WRITE such a BAM, so the BAM-path
+/// wording could not be captured. eidolon writes BAM directly via noodles and is not
+/// bound by that refusal, which is why the check exists at all.
+pub const SAMTOOLS_VIEW_QUAL_LEN: Citation = Citation {
+    operation: "samtools view",
+    message: "[E::sam_parse1] SEQ and QUAL are of different length",
+};
+
+/// The SAM and BAM readers word this differently; the BAM one is quoted because this
+/// citation is only used for BAM. Verified on 1.22.1 against a hand-patched record.
+pub const SAMTOOLS_VIEW_CIGAR_LEN: Citation = Citation {
+    operation: "samtools view",
+    message: "[E::bam_read1] CIGAR and query sequence lengths differ for <read>",
+};
+
+pub const SAMTOOLS_INDEX_UNSORTED: Citation = Citation {
+    operation: "samtools index",
+    message: "[E::hts_idx_push] Unsorted positions on sequence #N",
+};
+
+/// A read aligned past the end of its own contig. quickcheck, view AND index all
+/// accept it — verified on 1.22.1 — so nothing downstream will ever surface it.
+pub const NOTHING_REJECTS_BAM_POS: &str = "No tool rejects this: samtools quickcheck, view and index all accept it. The \
+     record aligns past the end of the reference, so any consumer computing a span \
+     from it reads off the end of the contig.";
+
 pub const NOTHING_REJECTS_TOLERATED: &str =
     "No tool tested rejects this; it is a spec deviation only.";

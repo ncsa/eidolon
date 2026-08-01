@@ -34,3 +34,21 @@ vcf/bad_ref.vcf	bcftools view	accept	tolerated
 vcf/bad_ref.vcf	bcftools norm -f REF	reject	Non-ACGTN reference allele at chr1:100 .. REF_SEQ:'A' vs VCF:'Z'
 vcf/malformed_val.vcf	bcftools view	accept	SILENT DATA LOSS: value becomes DP=. on every path incl. BCF round-trip
 vcf/malformed_val.vcf	bcftools view -O b	accept	SILENT DATA LOSS: type mismatch discarded, no warning
+#
+# BAM, observed on samtools 1.22.1 (the version Delta runs), by EXIT STATUS.
+# Three operations disagree with each other here more than anywhere else:
+# quickcheck rejects a missing EOF that view accepts, and index rejects unsorted
+# records that both of the others accept.
+bam/good.bam	samtools quickcheck	accept	
+bam/no_eof.bam	samtools quickcheck	reject	<file> was missing EOF block when one should be present.
+bam/no_eof.bam	samtools view	accept	only warns: [W::bam_hdr_read] EOF marker is absent
+bam/truncated.bam	samtools quickcheck	reject	<file> caused an error whilst reading its header.
+bam/bad_magic.bam	samtools view	reject	[E::hts_hopen] Failed to open file
+bam/unsorted.bam	samtools index	reject	[E::hts_idx_push] Unsorted positions on sequence #1: 200 followed by 100
+bam/unsorted.bam	samtools view	accept	tolerated
+bam/pos_past_end.bam	samtools quickcheck	accept	NO TOOL CATCHES THIS: quickcheck, view and index all accept a read aligned past the contig end
+# Hand-patched: samtools REFUSES to write a BAM with a CIGAR/SEQ mismatch, so this was
+# made by rewriting the CIGAR op in good.bam from 10M to 5M (one uint32, no size change).
+# eidolon writes BAM directly via noodles and is not bound by that refusal, which is
+# exactly why the check has to exist.
+bam/cigar_len.bam	samtools view	reject	[E::bam_read1] CIGAR and query sequence lengths differ for r1

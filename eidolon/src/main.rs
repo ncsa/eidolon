@@ -118,7 +118,7 @@ fn neat_commands() -> [Command; 10] {
             .arg_required_else_help(true)
             .arg(
                 Arg::new("files")
-                    .help("Artifacts to validate (.fq/.fastq/.vcf, optionally .gz)")
+                    .help("Artifacts to validate (.fq/.fastq/.vcf/.bam, optionally .gz)")
                     .action(ArgAction::Append)
                     .required(true)
                     .value_parser(value_parser!(PathBuf)),
@@ -128,7 +128,7 @@ fn neat_commands() -> [Command; 10] {
                     .long("format")
                     .help("Override format detection when the extension is absent or wrong")
                     .action(ArgAction::Set)
-                    .value_parser(["fastq", "vcf"]),
+                    .value_parser(["fastq", "vcf", "bam"]),
             ),
     ]
 }
@@ -460,6 +460,7 @@ fn main() -> Result<(), NeatErrors> {
                     .collect();
                 let format = cmd.get_one::<String>("format").map(|f| match f.as_str() {
                     "fastq" => validate::Format::Fastq,
+                    "bam" => validate::Format::Bam,
                     _ => validate::Format::Vcf,
                 });
                 info!("Running eidolon validate on {} file(s)", files.len());

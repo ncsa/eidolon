@@ -10,7 +10,7 @@ pub enum ValidateError {
     },
     #[error(
         "cannot determine the format of {0} from its extension — pass --format fastq|vcf \
-         (recognised: .fq/.fastq/.vcf, optionally .gz)"
+         (recognised: .fq/.fastq/.vcf/.bam, optionally .gz)"
     )]
     UnknownFormat(String),
     #[error("{0} failed validation")]
