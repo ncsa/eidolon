@@ -510,6 +510,49 @@ fn gen_reads_with_trained_sv_model_emits_de_novo_symbolic_svs() {
         !symbolic_records.is_empty(),
         "expected at least one de novo symbolic SV in output; got VCF lines: {vcf_lines:#?}"
     );
+    // Presence is not enough: `contains("END=")` is satisfied by ANY value, and shifting
+    // every emitted END by +1000 passed the entire workspace. END is what downstream
+    // consumers size the event from (depth modulation, compare-vcfs, truvari), so assert
+    // it is INTERNALLY CONSISTENT with the record's own SVLEN and POS.
+    let info_int = |line: &str, key: &str| -> Option<i64> {
+        line.split('\t')
+            .nth(7)?
+            .split(';')
+            .find_map(|f| f.strip_prefix(key).and_then(|v| v.parse::<i64>().ok()))
+    };
+    for line in &symbolic_records {
+        let pos: i64 = line.split('\t').nth(1).unwrap().parse().unwrap();
+        let end = info_int(line, "END=")
+            .unwrap_or_else(|| panic!("symbolic record has no parseable INFO/END: {line}"));
+        let svlen = info_int(line, "SVLEN=")
+            .unwrap_or_else(|| panic!("symbolic record has no parseable INFO/SVLEN: {line}"));
+        assert!(end > pos, "INFO/END={end} is not after POS={pos}: {line}");
+        // The span END implies must equal |SVLEN|, using the convention `place_sv`
+        // documents: for <DEL> POS is the base BEFORE the event, so the affected range is
+        // [POS+1, END] and END-POS == |SVLEN|; for <DUP>/<CNV>/<INV> "POS is the first
+        // affected base", so the range is [POS, END] inclusive and END-POS+1 == |SVLEN|.
+        // Whether that second convention should match VCF's is issue #474; this asserts
+        // the record is self-consistent under whichever one applies, which is what a
+        // downstream consumer needs and what shifting every END by +1000 broke.
+        let svtype = line
+            .split('\t')
+            .nth(7)
+            .and_then(|i| i.split(';').find_map(|f| f.strip_prefix("SVTYPE=")))
+            .unwrap_or_else(|| panic!("symbolic record has no INFO/SVTYPE: {line}"));
+        let implied_span = if svtype == "DEL" {
+            end - pos
+        } else {
+            end - pos + 1
+        };
+        assert_eq!(
+            implied_span,
+            svlen.abs(),
+            "{svtype} record: the span INFO/END implies ({implied_span}) disagrees with \
+             |SVLEN| ({}) — a consumer sizing this event off END sees a different \
+             variant than one sizing it off SVLEN: {line}",
+            svlen.abs()
+        );
+    }
     for line in &symbolic_records {
         assert!(
             line.contains("SVTYPE="),
