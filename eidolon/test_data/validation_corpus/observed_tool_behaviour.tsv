@@ -8,8 +8,10 @@
 # messages drift across versions while verdicts have proven stable.
 #
 # verdict: accept | warn | reject
-# The operation matters: `bcftools view` accepts unsorted input, `tabix` rejects it.
-# A citation naming only the tool would be wrong.
+# The operation matters: `bcftools view` accepts unsorted input, `tabix` rejects it;
+# `bcftools view` accepts REF=Z, `bcftools norm -f` rejects it. A citation naming only
+# the tool would be wrong. My first pass recorded REF=Z as "no tool catches this",
+# which was false — I had not tried norm.
 #
 # file	operation	verdict	message
 fastq/good.fq	samtools import -0	accept	
@@ -28,5 +30,7 @@ vcf/undeclared_info.vcf	bcftools view -i INFO/XX	reject	[filter.c:3224 filters_i
 vcf/no_contig.vcf	bcftools view	warn	[W::vcf_parse] Contig 'chr9' is not defined in the header
 vcf/unsorted.vcf	bcftools view	accept	tolerated
 vcf/unsorted.vcf	tabix -p vcf	reject	[E::hts_idx_push] Unsorted positions on sequence #1: 200 followed by 100
-vcf/bad_ref.vcf	bcftools view	accept	NO TOOL CATCHES THIS
-vcf/malformed_val.vcf	bcftools view	accept	NO TOOL CATCHES THIS
+vcf/bad_ref.vcf	bcftools view	accept	tolerated
+vcf/bad_ref.vcf	bcftools norm -f REF	reject	Non-ACGTN reference allele at chr1:100 .. REF_SEQ:'A' vs VCF:'Z'
+vcf/malformed_val.vcf	bcftools view	accept	SILENT DATA LOSS: value becomes DP=. on every path incl. BCF round-trip
+vcf/malformed_val.vcf	bcftools view -O b	accept	SILENT DATA LOSS: type mismatch discarded, no warning
