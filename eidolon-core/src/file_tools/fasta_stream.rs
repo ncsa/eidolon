@@ -491,6 +491,58 @@ mod tests {
         }
     }
 
+    /// Every IUPAC code must resolve to EXACTLY its own constituents.
+    ///
+    /// `test_resolve_iupac_all_codes_yield_only_acgtn` asserts membership in
+    /// {A,C,G,T,N}, which ANY wrong mapping satisfies — resolving Y (pyrimidine, C/T)
+    /// to purines passed it and every other test in the workspace. Only R and H had
+    /// distribution tests, leaving Y, M, K, S, W, B, V and D unconstrained.
+    #[test]
+    fn resolve_iupac_yields_exactly_each_code_constituents() {
+        // IUPAC nucleotide codes, per the IUBMB/IUPAC-IUB definition.
+        let codes: [(char, &[Nucleotide]); 10] = [
+            ('R', &[Nucleotide::A, Nucleotide::G]), // puRine
+            ('Y', &[Nucleotide::C, Nucleotide::T]), // pYrimidine
+            ('M', &[Nucleotide::A, Nucleotide::C]), // aMino
+            ('K', &[Nucleotide::G, Nucleotide::T]), // Keto
+            ('S', &[Nucleotide::C, Nucleotide::G]), // Strong (3 H-bonds)
+            ('W', &[Nucleotide::A, Nucleotide::T]), // Weak (2 H-bonds)
+            ('B', &[Nucleotide::C, Nucleotide::G, Nucleotide::T]), // not A
+            ('D', &[Nucleotide::A, Nucleotide::G, Nucleotide::T]), // not C
+            ('H', &[Nucleotide::A, Nucleotide::C, Nucleotide::T]), // not G
+            ('V', &[Nucleotide::A, Nucleotide::C, Nucleotide::G]), // not T
+        ];
+        let mut rng = NeatRng::new_from_seed(&vec!["iupac constituents".to_string()]).unwrap();
+        for (code, expected) in codes {
+            let input: String = std::iter::repeat(code).take(600).collect();
+            let (seq, count) = resolve_iupac_bases(&input, &mut rng).unwrap();
+            assert_eq!(count, 600, "{code}: wrong ambiguity count");
+
+            let mut seen: Vec<Nucleotide> = Vec::new();
+            for n in &seq {
+                if !seen.contains(n) {
+                    seen.push(*n);
+                }
+            }
+            // Nothing outside the code's constituents...
+            for n in &seen {
+                assert!(
+                    expected.contains(n),
+                    "{code} resolved to {n:?}, which is not one of its constituents \
+                     {expected:?}"
+                );
+            }
+            // ...and every constituent actually appears, so a mapping that collapses a
+            // code onto a strict subset (e.g. always picking the first base) fails too.
+            for n in expected {
+                assert!(
+                    seen.contains(n),
+                    "{code} never resolved to {n:?} in 600 draws; observed only {seen:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_resolve_iupac_preserves_acgtn_unchanged() {
         let mut rng = NeatRng::new_from_seed(&vec!["iupac_test".to_string()]).unwrap();
