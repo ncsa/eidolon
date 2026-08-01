@@ -20,6 +20,7 @@ Usage:
       --truth pool.af.vcf.gz --sim af_run.vcf.gz [--min-depth 20]
 """
 import argparse
+import collections
 import gzip
 import math
 import sys
@@ -194,6 +195,10 @@ def main():
     ap.add_argument("--sim", required=True, help="VCF B — simulated golden VCF")
     ap.add_argument("--min-depth", type=float, default=0.0,
                     help="skip sites whose total AD is below this on either side (default 0)")
+    ap.add_argument("--max-uncovered-frac", type=float, default=0.10,
+                    help="fail if more than this fraction of planted truth alleles go "
+                         "unscored (default 0.10). A metric over an unknown denominator "
+                         "is not a result, so this is enforced rather than warned about.")
     args = ap.parse_args()
 
     a, _a_sites = load_af(args.truth)
@@ -237,9 +242,8 @@ def main():
         print(f"  {zero_filled} truth allele(s) had coverage but zero observed reads "
               "-> scored as observed AF 0.0 (not dropped)")
     if only_a:
-        print(f"  WARNING: {only_a} truth allele(s) had NO coverage on the observed "
-              "side and are excluded — if this is a large fraction, the comparison "
-              "does not cover the full planted set.", file=sys.stderr)
+        print(f"  {only_a} truth allele(s) had NO coverage on the observed side and are "
+              f"excluded ({only_a / len(a):.1%} of the planted set).", file=sys.stderr)
     if args.min_depth > 0:
         print(f"min-depth {args.min_depth:g}: {gated} shared sites gated, {len(xs)} compared")
     if len(xs) < 2:
@@ -252,12 +256,35 @@ def main():
     print(f"MAE={mae:.4f}  RMSE={rmse:.4f}  mean(sim-truth)={sum(diffs)/len(diffs):+.4f}")
     print("  target: r>=0.95 and per-bin MAE within AF-estimation noise at that coverage")
 
-    print("per-AF-decile MAE (truth bin):")
-    for lo in [i / 10 for i in range(10)]:
-        hi = lo + 0.1
-        bd = [abs(y - x) for x, y in zip(xs, ys) if (lo <= x < hi or (hi >= 1.0 and x == 1.0))]
-        if bd:
-            print(f"  [{lo:.1f},{hi:.1f})  n={len(bd):6d}  MAE={sum(bd)/len(bd):.4f}")
+    def _bin(af):
+        return min(int(af * 10), 9)
+
+    planted = collections.Counter(_bin(af) for af, _dp in a.values())
+
+    print("per-AF-decile coverage and MAE (truth bin):")
+    print(f"  {'bin':<12} {'planted':>8} {'scored':>8} {'unscored':>9}   MAE")
+    shortfall = 0
+    for i in range(10):
+        if not planted.get(i):
+            continue
+        lo, hi = i / 10, i / 10 + 0.1
+        bd = [abs(y - x) for x, y in zip(xs, ys) if _bin(x) == i]
+        n_p, n_s = planted[i], len(bd)
+        shortfall += n_p - n_s
+        mae_s = f"{sum(bd) / len(bd):.4f}" if bd else "n/a — NOTHING SCORED"
+        flag = "" if n_p == n_s else "  <-- incomplete"
+        print(f"  [{lo:.1f},{hi:.1f})   {n_p:>8} {n_s:>8} {n_p - n_s:>9}   {mae_s}{flag}")
+    print(f"  total planted={sum(planted.values())}  scored={len(xs)}  "
+          f"unscored={shortfall} ({shortfall / sum(planted.values()):.1%})")
+
+    # Enforced, not advised: a bias/MAE computed over a subset that silently omits the
+    # lowest-VAF stratum is exactly the #450 failure, and it read as a clean PASS.
+    uncovered = (len(a) - len(xs)) / len(a)
+    if uncovered > args.max_uncovered_frac:
+        sys.exit(f"FAIL: {uncovered:.1%} of planted truth alleles went unscored "
+                 f"(limit {args.max_uncovered_frac:.1%}). The reported bias/MAE cover a "
+                 f"subset of the planted set and must not be quoted. Attribute the "
+                 f"shortfall per stratum above before believing any of it.")
 
 
 if __name__ == "__main__":

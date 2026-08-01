@@ -84,6 +84,22 @@ Three defects:
   (0.667 → 0.413). The aggregate now covers only the truvari-scoreable subset and states
   what it excluded and where each type is scored instead.
 
+#### Coverage of the planted set is now enforced, not warned about
+
+Fixing the cause is not enough, because the harness had no way to *notice* the problem:
+it reported bias and MAE over whatever survived and said `VERDICT: PASS`. A subset that
+drops the lowest-VAF stratum produces numbers that look **better** than an honest
+full-coverage run — on a reproduction of #450, bias `+0.0011` / MAE `0.0227` against
+`+0.0008` / `0.0240` for the complete set — so the metrics can never be the only gate.
+
+`scn_af_compare.py` now prints planted / scored / unscored per AF decile and exits
+non-zero above `--max-uncovered-frac` (default 10%). Every planted bin is printed even
+when nothing in it was scored: previously an excluded stratum simply *vanished from the
+table*, and a missing row is far harder to notice than a row reading
+`0 of 104 — NOTHING SCORED`. `run_subclonal_vaf_validation.sh` folds that status into
+its verdict ahead of bias/MAE, and captures it with `|| rc=$?` so the failure does not
+abort the run before `archive_run`.
+
 ### Harnesses now fail instead of reporting an unusable measurement
 
 `signature_check.sh` warned `few SNVs — fit will be noisy` below 50 and fitted anyway.

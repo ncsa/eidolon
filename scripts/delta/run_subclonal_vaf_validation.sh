@@ -245,8 +245,14 @@ echo "════════════════════════�
 echo "#405 subclonal VAF reproduction — intended EIDOLON_VAF vs observed merged VAF"
 echo "════════════════════════════════════════════════════════════════"
 CMP="$OUTDIR/compare.txt"
+# scn_af_compare.py exits non-zero when too much of the planted set went unscored.
+# Capture that instead of letting `set -e` + pipefail abort here, which would skip both
+# the verdict and archive_run — the artifacts are most worth keeping when it fails.
+# `$(cmd; echo $?)` cannot be used for this: the inherited `set -e` kills the subshell
+# before echo runs. `|| rc=$?` is the form that works.
+CMP_RC=0
 python3 "$REPO_ROOT/scripts/delta/scn_af_compare.py" \
-    --truth "$SITES" --sim "$SIM" --min-depth "$MIN_DEPTH" | tee "$CMP"
+    --truth "$SITES" --sim "$SIM" --min-depth "$MIN_DEPTH" | tee "$CMP" || CMP_RC=$?
 echo "════════════════════════════════════════════════════════════════"
 
 # ── PASS/FAIL gate (don't trust a green run — parse the actual numbers) ───────
@@ -265,7 +271,14 @@ if [[ -n "$r" ]] && awk -v r="$r" -v rm="$R_MIN" 'BEGIN{exit !(r<rm)}'; then
   echo "        this depth; raise COV and/or widen SUBCLONES for a Pearson-meaningful run." >&2
 fi
 verdict=FAIL
-if [[ -n "$bias" && -n "$mae" ]] \
+# Coverage first: bias and MAE computed over a subset that dropped a whole VAF stratum
+# look BETTER than an honest full-coverage run, so they can never be the only gate.
+# That is #450 exactly — it reported clean numbers and PASS while excluding the sites
+# it existed to test.
+if [[ "$CMP_RC" -ne 0 ]]; then
+  echo "  coverage gate FAILED (scn_af_compare.py rc=$CMP_RC) — see the per-decile" >&2
+  echo "  planted/scored table above. bias and MAE are not usable." >&2
+elif [[ -n "$bias" && -n "$mae" ]] \
    && awk -v b="$absbias" -v bm="$BIAS_MAX" 'BEGIN{exit !(b<=bm)}' \
    && awk -v m="$mae" -v mm="$MAE_MAX" 'BEGIN{exit !(m<=mm)}'; then
   verdict=PASS
