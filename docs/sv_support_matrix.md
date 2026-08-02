@@ -24,7 +24,7 @@ a variant that silently fails to appear is a broken tool.
 | `<DEL>` symbolic | preserved | depth ratio **0.46** (het → expect 0.50) | ✅ |
 | `<DUP>` symbolic | preserved | depth ratio **1.59** (het → expect 1.50) | ✅ |
 | `<CNV>` symbolic, `CN=4` | preserved | depth ratio **1.67** | ⚠ semantics unconfirmed — see below |
-| `<INV>` symbolic | preserved | depth ratio **0.63** (balanced → expect ~1.00) | ⚠ **unexplained depth loss** |
+| `<INV>` symbolic | preserved | deep interior **1.00**; junction-proximal **0.74–0.82** | ✅ (see note) |
 | `<INS>` symbolic | preserved | not measured | ❓ untested |
 | BND, inter-chromosomal | both records preserved | 30 chimeric reads | ✅ |
 | BND, intra-chromosomal | both records preserved | 30 chimeric reads | ✅ |
@@ -48,14 +48,42 @@ contain.**
 cannot express. Known and open; `chimeric_sequence_content.rs` is deliberately
 parameterised to avoid it.
 
-### The unexplained cell
+### `<INV>` — investigated, and the *test* was wrong, not the code
 
-**`<INV>` depth 0.63.** A balanced inversion preserves copy number, so a heterozygous one
-should leave depth unchanged (~1.00), not drop it by a third. 0.63 sits between "no
-effect" (1.00) and "the inverted allele contributes nothing" (0.50), which suggests
-partial loss rather than a clean bug. Not yet diagnosed, and **not** yet filed as a
-defect — the measurement is one cell on one fixture, and the control span
-(`H1N1_NA:900-1100`) has not been varied. Investigate before drawing a conclusion.
+The first measurement of this cell read **0.63**, which looked like a balanced inversion
+losing a third of its coverage. It was flagged rather than filed, and that was the right
+call: diagnosis showed the fixture was at fault.
+
+Against a no-variant control run of the identical config:
+
+```
+300bp inversion, 250bp fragments (H1N1_NA:300-600)
+  inside inversion      0.62
+  flank left            0.81
+  flank right           0.76
+  far away              1.00     <- coverage is fine elsewhere, so the loss is real
+
+1200bp inversion, 250bp fragments (H1N1_PB2:500-1700)
+  deep interior         1.00     <- NO loss
+  near left junction    0.82
+  near right junction   0.74
+  outside               0.99
+```
+
+**The inverted sequence is covered at full depth.** The depletion is junction-proximal,
+extending roughly one fragment length around each breakpoint. A 300 bp inversion is
+*smaller than a 250 bp fragment*, so nearly every fragment overlapping it touches a
+junction and the entire event sits inside the dip zone — which is what produced 0.63.
+
+The remaining junction dip (0.74–0.82 over ~180 bp) is consistent with the mechanism: a
+fragment spanning a junction becomes a chimeric read placed at one locus, so its coverage
+contribution to the other side is not counted. Real aligners soft-clip and place such
+reads at one side too, so some dip is expected. **How much dip is realistic has not been
+compared against real data** — that is unquantified, not verified.
+
+Practical consequence for anyone writing SV tests: **an inversion shorter than the
+fragment length is not a clean fixture.** Its coverage behaviour is dominated by junction
+effects, not by the inversion.
 
 **`<CNV>` CN=4 → 1.67.** Whether that is right depends on whether `CN` means the copy
 number *of the affected allele* (het → (4+1)/2 = 2.50×) or *total* (→ 2.00×). Neither
