@@ -28,7 +28,9 @@ keeps accidentally settling for. Before calling anything done:
    code that should not have existed: it was built on an inherited claim that "truvari
    cannot benchmark breakends", true of truvari v4 and explicitly reversed in v5.0.0.
    Check a third-party tool's actual version and capabilities before writing anything
-   that works around its supposed limits.
+   that works around its supposed limits. (Retracted in the report 2026-08-01; a stale
+   copy of the same belief survived in §3.6 until 2026-08-02, so grep for a claim before
+   assuming one correction fixed every instance.)
 4. **Check coverage of the inputs, not just the metric.** Report `n_scored` vs
    `n_planted` per stratum. A metric over an unknown denominator is not a result — #450
    reported a clean bias while silently excluding the sites it existed to test.
@@ -38,8 +40,11 @@ keeps accidentally settling for. Before calling anything done:
    truvari was fine — Manta had not called those junctions. Each wrong answer was
    plausible enough to stop at.
 6. **Say what was NOT verified.** If something was checked by hand rather than by CI,
-   or on a fixture rather than real data, state it. `scripts/delta/*.py` determine
-   numbers the ACCESS report cites and are exercised by nothing automatic (#466).
+   or on a fixture rather than real data, state it. Partial progress: `scripts/delta/tests/`
+   now covers two `sv_pipeline.sbatch` functions in CI (mutation-proven), but **12 of its
+   14 functions remain uncovered**, including `score_caller` and `check_denominator`,
+   which produce every recall figure in ACCESS §3.5–3.7. `sbs96_compare.py` is still
+   untested (#466).
 
 **The bar is HIGHER for new features than for fixes**, because a fix has a
 known-bad baseline and a feature has none. With a fix you can revert it and watch the
@@ -196,9 +201,15 @@ contributed the *fragility* (see the footguns below), not the blind spots.
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.
-- **Shell footgun:** `set -euo pipefail` + `zcat … | head` makes `zcat` take SIGPIPE
-  (exit 141) when `head` closes the pipe early, and `set -e` then aborts a step that
-  actually succeeded. Wrap head-truncated pipelines in `set +o pipefail` … `set -o pipefail`.
+- Shell footguns that bite here are listed once under "Bash footguns actually hit in
+  this repo" above — the `zcat … | head` SIGPIPE trap in particular.
+
+## Where the evidence lives (so this file can stay a rulebook)
+- `docs/claude_engineering_audit.md` — defect taxonomy, timeline, and the case studies
+  behind the rules above. **Add new war stories there, not here.**
+- `docs/sv_support_matrix.md` + `eidolon/tests/sv_support_matrix.rs` — what eidolon can
+  reproduce from `input_vcf` vs generate de novo, measured, with the broken cells pinned.
+- `docs/pcawg_sv_measurement.md` — the PCAWG corpus measurements the SV model rests on.
 
 ## Testing (Rust)
 - `cargo test` builds a **fresh** binary (`assert_cmd::cargo_bin`) — no staleness worry.
