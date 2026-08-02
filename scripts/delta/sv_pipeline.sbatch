@@ -272,7 +272,19 @@ fi
 # Pre-generate per-type truth subsets NOW, while bcftools (bioinf) is active, so
 # the truvari scoring stage needs only truvari on its PATH (no bcftools in that
 # env). Empty types are removed so the scoring loop skips them.
-for svt in DEL DUP INV INS BND CNV; do
+# The canonical SVTYPE list, declared ONCE. The scoring loop iterates this same array
+# rather than globbing truth_sv_*.vcf.gz, so a derived artifact can never be mistaken
+# for an SVTYPE — see SV_TYPES_SCORED_IN_LOOP below.
+SV_TYPES=(DEL DUP INV INS BND CNV)
+# Types the generic scoring loop handles. BND is scored by breakpoint proximity and CNV
+# by the stage-4c direction check, so both are excluded here and handled explicitly.
+# Derived from SV_TYPES so a newly added type is scored rather than silently dropped.
+SV_TYPES_SCORED_IN_LOOP=()
+for svt in "${SV_TYPES[@]}"; do
+    case "$svt" in BND|CNV) continue ;; esac
+    SV_TYPES_SCORED_IN_LOOP+=("$svt")
+done
+for svt in "${SV_TYPES[@]}"; do
     typed="$OUTDIR/truth_sv_${svt}.vcf.gz"
     bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$typed" "$TRUTH_SV" 2>/dev/null || continue
     bcftools index -f -t "$typed" 2>/dev/null || true
@@ -996,12 +1008,22 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
         echo "  ($caller: no truvari-scoreable truth types — aggregate skipped)"
     fi
 
-    for typed in "$OUTDIR"/truth_sv_*.vcf.gz; do
+    # Iterate the CANONICAL type list, never a glob of whatever files happen to exist.
+    #
+    # This used to be `for typed in "$OUTDIR"/truth_sv_*.vcf.gz` with a hand-maintained
+    # exclusion list, which meant any newly derived truth artifact was silently promoted
+    # to an SVTYPE. Adding truth_sv_BNDinv.vcf.gz did exactly that in job 20745149:
+    #     manta_BNDinv recall=0.000  (caller emitted no BNDinv records)
+    #     manta_BNDinv       recall=0.738 ... TP=354  FN=126
+    # Two contradictory lines for one label, and for Delly only the false one appeared.
+    # The bug was not the missing exclusion, it was that the loop's input was the
+    # directory contents; adding to an exclusion list would leave the next artifact to
+    # find the same trap. SV_TYPES_SCORED_IN_LOOP is derived from SV_TYPES so a new type
+    # is picked up automatically while a new derived FILE cannot inject a fake one.
+    local svt
+    for svt in "${SV_TYPES_SCORED_IN_LOOP[@]}"; do
+        local typed="$OUTDIR/truth_sv_${svt}.vcf.gz"
         [[ -f "$typed" ]] || continue
-        local svt; svt=$(basename "$typed" .vcf.gz); svt=${svt#truth_sv_}
-        case "$svt" in
-            BND|BNDspan|CNV|scoreable) continue ;;   # handled separately below / 4c
-        esac
         local q="$OUTDIR/${caller}_calls_${svt}.vcf.gz"
         bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$q" "$comp" 2>/dev/null || true
         if [[ -f "$q" ]] && [[ "$(bcftools view -H "$q" 2>/dev/null | wc -l)" -gt 0 ]]; then
