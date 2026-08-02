@@ -330,6 +330,25 @@ The log-normal *form* was chosen, not tested. What actually bounds emitted sizes
 biology. **A data-derived-looking parameter whose real behaviour is governed by an
 invented constant.**
 
+> **⚠️ Correction (2026-08-02), from measuring the corpus** —
+> `docs/pcawg_sv_measurement.md` M4. This section originally called the fitted tails
+> "biologically implausible." Half of that was my assumption, not the data's:
+>
+> | | empirical p99 | fitted p99 | empirical max |
+> |---|---|---|---|
+> | DEL | 85.0 Mb | 276.2 Mb (3.2×) | 236.4 Mb |
+> | INV | 116.2 Mb | 2,786 Mb (24×) | 237.6 Mb |
+>
+> The fitted *tail* is genuinely wrong — 3–24× too heavy at p99. But **multi-megabase
+> somatic SVs are real**, reaching whole-chromosome scale in PCAWG. So the practical
+> concern inverts: the 0.25 cap (~62 Mb on chr1) is not protecting against an
+> unrealistic tail, it is **truncating events that genuinely occur**.
+>
+> Worth noting as a data point about this document's own method: the claim was flagged as
+> an *unvalidated assumption*, which was correct, and then I supplied a guess about which
+> direction it was wrong in. The guess was half wrong. The taxonomy entry stands; the
+> editorializing inside it did not survive contact with the data.
+
 ---
 
 ## 6. Case study: BND

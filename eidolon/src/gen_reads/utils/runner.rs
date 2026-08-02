@@ -48,6 +48,10 @@ use crate::{
 use eidolon_core::models::gc_bias_model::GcBiasModel;
 use flate2::{Compression, write::GzEncoder};
 
+/// Dedicated RNG sub-stream for the genome-wide translocation pass, so adding it leaves
+/// every per-contig sampling decision bit-for-bit unchanged.
+const TRANSLOCATION_STREAM: u64 = 9_100_000;
+
 struct ContigContext<'a> {
     config: &'a RunConfiguration,
     target_bed: &'a Option<HashMap<String, Vec<BedRecord>>>,
@@ -253,6 +257,40 @@ pub fn run_neat(
         None
     };
 
+    // Phase 0: place inter-chromosomal translocations across the WHOLE genome.
+    //
+    // A breakend's two ends live on different contigs and each generates reads from its
+    // own contig, so both records must exist before either contig is processed. The
+    // per-contig sampler cannot do this and used to hardcode the mate to the anchor's own
+    // contig, which made every "translocation" same-contig (466 of 466, job 20719077).
+    // BND's share of the per-base rate is subtracted from the per-contig budget inside
+    // `sample_variants`, so total SV yield is unchanged — it is split, not duplicated.
+    let translocations: HashMap<String, Vec<Variant>> = if config.sv_rate_scale > 0.0
+        && let Some(sv_model) = mutation_model.sv_model.as_ref()
+        && sv_model.is_usable()
+    {
+        let mut tra_rng = rng.derive_child(TRANSLOCATION_STREAM);
+        let t = sv_model.sample_translocations(
+            &contig_order_in_file,
+            reference.as_ref(),
+            config.ploidy,
+            config.sv_rate_scale,
+            &mut tra_rng,
+        );
+        let n: usize = t.values().map(|v| v.len()).sum();
+        if n > 0 {
+            info!(
+                "Placed {} inter-chromosomal translocation(s) ({} breakend records) across {} contig(s)",
+                n / 2,
+                n,
+                t.len()
+            );
+        }
+        t
+    } else {
+        HashMap::new()
+    };
+
     // Phase 1: Generate MutatedMaps for all contigs
     info!("Generating mutations for all contigs");
     let mut all_mutated_maps = HashMap::new();
@@ -272,6 +310,7 @@ pub fn run_neat(
             &target_bed,
             &mutation_regions,
             &input_variants,
+            translocations.get(name),
             &mutation_model,
             default_run_mutation_rate,
             m_rng,
@@ -992,6 +1031,10 @@ fn generate_mutated_map(
     target_bed: &Option<HashMap<String, Vec<BedRecord>>>,
     mutation_regions: &Option<HashMap<String, Vec<BedRecord>>>,
     input_variants: &Option<HashMap<String, Vec<Variant>>>,
+    // Breakend records already placed for this contig by the genome-wide translocation
+    // pass. Seeded into `sv_variants` before de novo sampling so overlap rejection sees
+    // them, exactly like input-VCF SVs.
+    preplaced_svs: Option<&Vec<Variant>>,
     mutation_model: &MutationModel,
     default_run_mutation_rate: f64,
     mut rng: NeatRng,
@@ -1050,6 +1093,11 @@ fn generate_mutated_map(
 
     let mut block_variants: Vec<Variant> = Vec::new();
     let mut sv_variants: Vec<Variant> = Vec::new();
+    // Genome-wide translocations land here first: they are already placed, and seeding
+    // them before de novo sampling makes overlap rejection treat them as occupied.
+    if let Some(pre) = preplaced_svs {
+        sv_variants.extend(pre.iter().cloned());
+    }
     if let Some(iv) = input_variants
         && let Some(vs) = iv.get(contig_name)
     {
