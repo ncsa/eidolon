@@ -21,9 +21,9 @@ a variant that silently fails to appear is a broken tool.
 
 | variant | truth VCF | read-level evidence | status |
 |---|---|---|---|
-| `<DEL>` symbolic | preserved | depth ratio **0.46** (het → expect 0.50) | ✅ |
-| `<DUP>` symbolic | preserved | depth ratio **1.59** (het → expect 1.50) | ✅ |
-| `<CNV>` symbolic, `CN=4` | preserved | depth ratio **1.67** | ⚠ semantics unconfirmed — see below |
+| `<DEL>` symbolic | preserved | het **0.54** vs 0.50 expected; hom **0.00** exact | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
+| `<DUP>` symbolic | preserved | het **1.61** vs 1.50; hom **2.17** vs 2.00 | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
+| `<CNV>` symbolic | preserved | CN 0/2 exact; CN 1,3,4,6 all **~8% high** | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) |
 | `<INV>` symbolic | preserved | deep interior **1.00**; junction-proximal **0.74–0.82** | ✅ (see note) |
 | `<INS>` symbolic | preserved | not measured | ❓ untested |
 | BND, inter-chromosomal | both records preserved | 30 chimeric reads | ✅ |
@@ -85,9 +85,36 @@ Practical consequence for anyone writing SV tests: **an inversion shorter than t
 fragment length is not a clean fixture.** Its coverage behaviour is dominated by junction
 effects, not by the inversion.
 
-**`<CNV>` CN=4 → 1.67.** Whether that is right depends on whether `CN` means the copy
-number *of the affected allele* (het → (4+1)/2 = 2.50×) or *total* (→ 2.00×). Neither
-matches 1.67. The semantics need to be pinned down before the cell can be scored.
+### `<CNV>` — semantics confirmed, but a systematic ~8% bias found ([#499](https://github.com/ncsa/eidolon/issues/499))
+
+The first reading of this cell (1.67 for `CN=4`) matched no sensible interpretation. It
+was measured against an in-run control span on a 300 bp event — the same flawed method
+that produced the bogus `<INV>` result. Re-measured properly (1200 bp event, deep
+interior only, against a separate no-variant run):
+
+```
+CN   multiplier  expected  observed  obs/exp
+ 0      0.00       0.00      0.00     exact
+ 1      0.50       0.50      0.54     1.08
+ 2      1.00       1.00      1.00     exact
+ 3      1.50       1.50      1.61     1.07
+ 4      2.00       2.00      2.17     1.09
+ 6      3.00       3.00      3.28     1.09
+```
+
+**Semantics answered:** `CN` is the **total** copy number, multiplier `CN/ploidy`, and
+genotype is ignored when `CN` is present. That is consistent and defensible.
+
+**But the delivery is ~8% high** whenever the multiplier is neither 0 nor 1 — and it is
+not CNV-specific. The same bias appears in DEL and DUP, both genotypes:
+
+```
+DEL het  0.54 vs 0.50   (1.079)      DUP het  1.61 vs 1.50   (1.073)
+DEL hom  0.00 vs 0.00   exact        DUP hom  2.17 vs 2.00   (1.084)
+```
+
+`coverage_multiplier_for` returns the correct values; the gap is between the requested
+multiplier and the depth actually delivered. Mechanism not diagnosed — see #499.
 
 ---
 
