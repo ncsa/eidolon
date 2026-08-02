@@ -42,6 +42,24 @@ pub fn default_sv_model() -> SvModel {
 
     // Type breakdown: fitted from the full gnomAD-SV v4.1 run.
     // Deletions dominate; BNDs are included at ~19%.
+    //
+    // ⚠ UNVERIFIED PREMISE (2026-08-02). This 0.1943 is a HEURISTIC, not a gnomAD
+    // measurement: `tools/validate_with_gnomad.sh:11` drops INV/CPX/CTX/BND before
+    // fitting, so no BND ever reached this number. Two consequences worth checking
+    // before it is trusted:
+    //
+    //   1. gnomAD-SV lists CTX (translocation) SEPARATELY from BND, so in that
+    //      taxonomy "BND" means an unresolved junction — many of them
+    //      intra-chromosomal — and NOT a translocation. eidolon now emits every BND
+    //      as an inter-chromosomal translocation, a convention taken from PCAWG,
+    //      where `svclass == "TRA"` is 100% inter-chromosomal
+    //      (docs/pcawg_sv_measurement.md M1). That measurement is about the CANCER
+    //      corpus and does not license the same reading of this germline share.
+    //   2. If the germline BND rate is wanted, it should be re-derived from gnomAD
+    //      CTX counts rather than left at a literature guess.
+    //
+    // Flagged rather than silently corrected: guessing a replacement number here
+    // would repeat the exact defect (see docs/claude_engineering_audit.md §5.1).
     // Inversions and Insertions are added here at nominal rates (heuristic) since they
     // were filtered in the original validation fit.
     let mut type_probabilities: HashMap<SvType, f64> = HashMap::new();
