@@ -494,7 +494,6 @@ mod tests {
     /// the FASTQ side pinned `'S'` and the BAM side silently turned it into `M`, and no
     /// test spanned the two.
     fn read_bam_cigars(path: &PathBuf) -> Vec<String> {
-        use noodles::sam::alignment::record::Cigar as _;
         let file = std::fs::File::open(path).unwrap();
         let mut reader = bam::io::Reader::new(file);
         reader.read_header().unwrap();
