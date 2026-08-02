@@ -34,6 +34,13 @@ problem and no amount of care removes it — treat the *evidence* as the product
   re-deriving numbers rather than from being challenged, which is weak evidence the
   method works — but they were also *found* only because someone asked for an audit.
 
+A fourth bias runs the **opposite** way and is worth stating up front so the document is
+not read as uniformly self-critical: **an evidence standard built on commits and
+`file:line` links can only see code that exists.** Work correctly *avoided* — a wrong
+design talked out of before it was built — leaves no artifact and cannot appear in any
+metric here. §7.1 documents one such case that the human happened to remember; there is
+no way to know how many others there were.
+
 ---
 
 ## 1. Summary
@@ -387,6 +394,57 @@ the events should exist in that form. Retracted in
 bug; log volume; #450's silent denominator exclusion; #451's de novo flag defect; the
 `bnd_proximity.py` redundancy; the BNDspan negative-control failure; the adapter CIGAR
 defect (during this audit).
+
+### 7.1 The contribution class this audit cannot see
+
+One episode, attested by the human author and recorded here in his words:
+
+> *"I was on the verge of a custom alignment function when Claude suggested a much
+> simpler path that I had overlooked."*
+
+The context is CIGAR generation. The apparent problem — "produce a CIGAR string
+describing how this read aligns to the reference" — reads like an alignment problem, and
+the obvious solution is to write an aligner. **It is not an alignment problem.** A
+simulator already knows every edit it applied, so the CIGAR is bookkeeping accumulated
+during generation, not an inference recovered afterwards:
+
+```rust
+// eidolon-core/src/file_tools/fastq_tools.rs:548-563
+if is_first_base { cigar_ops.push('M'); is_first_base = false; }
+else             { cigar_ops.push('I'); }
+...
+for _ in 0..deletion_skip { cigar_ops.push('D'); }   // reference bases skipped
+```
+
+Verifiable consequence: **there is no aligner anywhere in this codebase.** The whole
+class of work — implementing it, testing it, tuning it, and carrying its performance cost
+on every simulated read — was avoided.
+
+**This matters methodologically, and it cuts against the rest of this document.**
+§0 notes that defects never found cannot appear in the defect list, which biases the
+audit *toward* Claude. This is the mirror bias, running the other way: **work that was
+correctly not done leaves no artifact.** There is no commit, no diff, no test, no line
+of code to link — I searched the history and found nothing, exactly as expected. Every
+metric in §3, every taxonomy entry in §5, and the entire evidentiary standard of this
+report can only measure code that exists.
+
+So the honest statement of this document's coverage is narrower than it looks:
+
+| | measurable here | invisible here |
+|---|---|---|
+| Code written correctly | ✅ tests, density, parity | |
+| Code written wrongly | ✅ the defect taxonomy | |
+| Defects never found | | ❌ (§0 — biases toward Claude) |
+| **Work correctly avoided** | | ❌ **(biases against Claude)** |
+
+The second bias is probably the larger of the two in a codebase this size, and it has no
+remedy short of the human writing down near-misses when they happen. The one above is
+recorded because he remembered it, not because the method surfaced it.
+
+> **For a slide:** *"The best thing the model did on this project produced no code, so
+> nothing in this audit can measure it. A custom aligner was about to be written; it
+> wasn't needed, because a simulator already knows what it changed. There is no commit
+> to point at — that is the point."*
 
 **Caught only because the human intervened:**
 
