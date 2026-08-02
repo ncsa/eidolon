@@ -681,6 +681,27 @@ is **5/9 ≈ 0.556**.
 post-geometry campaign has now run — jobs 20719077 and 20745149, soy whole assembly, 466
 junctions against the 7 the numbers above rest on. **The numbers above are superseded.**
 
+> **⚠ Read these as MECHANISM verification, not DATA verification.** Both jobs ran at
+> `SV_RATE_SCALE=40` — forty times the model's nominal rate — chosen to get enough
+> junctions for a four-way geometry distribution to be readable. `sv_pipeline.sbatch`
+> defaults to `1.0`, so this was a deliberate override and not the pipeline's normal
+> setting.
+>
+> What that does and does not affect:
+> - **Unaffected:** the geometry mix (226/256/224/226) and reciprocity. Geometry is drawn
+>   per junction, independently of how many junctions there are.
+> - **Affected, and unquantified:** every recall/precision figure, including
+>   `BNDinv = 0.738`. A genome carrying 40x the realistic SV density is not the genome a
+>   caller is tuned for — junctions sit closer together, overlap rejection saturates
+>   (visible as `requested N ... only placed M` warnings), and the realized SV spectrum
+>   can drift from the model's. Whether caller recall moves with SV density has not been
+>   measured here.
+>
+> A data-verification run means `SV_RATE_SCALE=1.0` on a real genome, at whatever scale
+> is needed to accumulate junctions — not extrapolation from a rate-inflated one. That
+> run has not been done, and until it is, §3.7's recall numbers characterise the
+> mechanism working, not the caller's performance on realistic input.
+
 Measured on the real truth, all four VCF 4.2 forms present and indistinguishable from the
 model's declared uniform weights (χ² ≈ 1.5, df = 2, p ≈ 0.47), with 0 unpaired and 0
 mispaired records across 932:
