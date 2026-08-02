@@ -482,9 +482,33 @@ where the caller fails to recover it.
   in the reads and correctly tumor-restricted.
 - **BND signal is in the reads even when uncalled.** Every truth-BND locus
   inspected carried **8–73 discordant/split reads** — the same range as the
-  *detected* BNDs. Manta calls only ~half of them (re-representing tandem-dup
-  pairs as `DUP:TANDEM` at the correct coordinates); the misses are a *caller*
-  limitation — translocations are the hardest short-read class — not absent signal.
+  *detected* BNDs. Manta calls only ~half of them, re-representing them as
+  `DUP:TANDEM`/`DEL` at the correct coordinates.
+
+  > **⚠️ Retraction (2026-08-01).** This bullet previously concluded: *"the misses
+  > are a *caller* limitation — translocations are the hardest short-read class —
+  > not absent signal."* The first and last clauses stand: the signal is present,
+  > and the reads are correct. **The attribution does not.** eidolon has never
+  > generated a translocation — the de novo sampler hardcodes the breakend mate to
+  > the same contig (`sv_model.rs:810`, `:936`), so all 466 junctions in job 20719077
+  > were intra-chromosomal by construction. The explanation invoked a class of event
+  > that was not in the data.
+  >
+  > The measured cause is our own representation. We type every junction `SVTYPE=BND`
+  > regardless of geometry, but a direct same-contig adjacency *is* a deletion or a
+  > tandem duplication, and Manta calls it as one. Job 20745149 confirmed this
+  > exactly — of 932 truth BND records, **all 452 direct-form records were false
+  > negatives and none appeared in `tp-base`**:
+  >
+  > ```
+  > tp-base: t[p[ 0    t]p] 188  [p[t 166  ]p]t 0     -> direct 0,   inv-oriented 354
+  > fn:      t[p[ 226  t]p] 68   [p[t 58   ]p]t 226   -> direct 452, inv-oriented 126
+  > ```
+  >
+  > Manta's recall over junctions it can represent as breakends is **354/480 = 0.738**
+  > (head-to-head 0.734, tail-to-tail 0.741 — no bias within the class). The
+  > "~half" figure was a ceiling set by us, not a caller limitation. See
+  > `docs/cancer_simulator.md` for the full retraction and its cause.
 
 Per-type recovery (Manta + truvari, 60×/0.8):
 
@@ -574,9 +598,20 @@ DUP-enriched (24 %, ~2× the others)** — the last exactly the expected BRCA1/2
 tandem-duplicator phenotype, and all three consistent with the PCAWG-derived models
 (#202 / #237). Two caveats: differentiation requires enough events (a scale
 requirement, not a defect — a small target won't show it), and BND is elevated
-across all tissues (a generation tendency, and unscored downstream since truvari
-does not benchmark breakends), so the tissue signal lives in the *relative*
-enrichments rather than the absolute mode.
+across all tissues, so the tissue signal lives in the *relative* enrichments rather
+than the absolute mode.
+
+> **⚠️ Correction (2026-08-01).** This paragraph previously called the BND elevation
+> "a generation tendency, and unscored downstream since truvari does not benchmark
+> breakends." Both halves were wrong. Truvari has matched breakends since v5.0.0 via
+> `-B/--bnddist` and Delta runs v5.4.0 — see §3.7.1, where the same inherited belief is
+> retracted. And the elevation is not a tendency but a direct inheritance: the BND share
+> is the PCAWG per-donor mean of `svclass == "TRA"` rows
+> (`normalize_pcawg_sv_model.py:108-114`), i.e. the **inter-chromosomal translocation
+> rate** — while the generator emits only same-contig junctions. The per-tissue BND
+> column therefore reports each tissue's translocation burden attached to events that are
+> not translocations. The *relative* enrichments across tissues may still be meaningful;
+> the absolute BND fraction is not. See the retraction in `docs/cancer_simulator.md`.
 
 **Honest caveats — tracked as realism enhancements (epic #311).** The simulated SVs
 are *idealized*: clean cuts in unique sequence, lacking the microhomology, imprecise
@@ -642,12 +677,34 @@ Confirmed by matching each FP's `END` against the truth's junction mates — 7 l
 junctions, 4 on real inversions (Manta redundancy). Excluding our own artifact, precision
 is **5/9 ≈ 0.556**.
 
-**Status of this section.** BND geometry sampling has since been implemented (#458 item
-2), so junctions will no longer all be inversion-shaped. **The numbers above predate that
-change and will move.** They are reported now because they are the first genuine BND
-measurements this project has produced, not because they are final. A post-geometry
-campaign is required before §3.7 is submittable, and until then *"BND recall"* here means
-**head-to-head junction recall**, seven junctions, not breakend detection in general.
+**Status of this section.** BND geometry sampling was implemented (#458 item 2) and the
+post-geometry campaign has now run — jobs 20719077 and 20745149, soy whole assembly, 466
+junctions against the 7 the numbers above rest on. **The numbers above are superseded.**
+
+Measured on the real truth, all four VCF 4.2 forms present and indistinguishable from the
+model's declared uniform weights (χ² ≈ 1.5, df = 2, p ≈ 0.47), with 0 unpaired and 0
+mispaired records across 932:
+
+```
+t[p[ 226 (24.2%)   t]p] 256 (27.5%)   [p[t 224 (24.0%)   ]p]t 226 (24.2%)
+```
+
+The headline correction: **`manta_BND recall = 0.380` is not a caller result.** Callers
+bucket only inversion-oriented adjacencies as BND; a direct same-contig adjacency is a
+deletion or tandem duplication and is called as one. All 452 direct-form truth records
+were false negatives and none appeared in `tp-base`. Manta's recall over the junctions it
+can represent as breakends is **354/480 = 0.738** (head-to-head 0.734, tail-to-tail 0.741).
+The harness now reports this as `BNDinv` alongside the aggregate, and asserts truth
+reciprocity before scoring.
+
+**§3.7 is still not submittable, for a deeper reason than the one previously given.**
+eidolon has never generated a translocation — the de novo sampler hardcodes the breakend
+mate to the same contig. "BND recall" here means **same-contig junction recall**, and the
+BND category itself is under audit: its 23.2% share is inherited from PCAWG's
+inter-chromosomal `TRA` count, and `BND` in a VCF is a representation convention rather
+than an event class (Manta and Delly typed identical junctions differently in job
+20745149). See the retraction in `docs/cancer_simulator.md`. A PCAWG measurement pass
+precedes any further BND claims here.
 
 ### 3.8 At-scale validation (chr1–3 subset, ~690 Mb)
 
@@ -934,8 +991,14 @@ remaining defects of the kind already found.
    somatic specificity confirmed — the first end-to-end check of the SV machinery.
    The BND half of this claim, and the "no simulator defect found" that accompanied
    it, are **retracted**: a de novo breakend defect had been misread as a scorer
-   limitation (§3.7.1). Corrected `manta_BND recall = 1.000`, pending a
-   post-geometry campaign.
+   limitation (§3.7.1). The post-geometry campaign has since run (jobs 20719077 /
+   20745149): the interim `manta_BND recall = 1.000` on 7 junctions is superseded by
+   **0.738 over 480 inversion-oriented records** across 466 junctions, and the
+   aggregate 0.380 is floored by our own SVTYPE choice rather than by the caller.
+   **A second, deeper retraction applies to this item:** the BND work cannot be
+   called DONE at all, because eidolon has never generated a translocation — the de
+   novo sampler places every breakend mate on the same contig. See the retraction in
+   `docs/cancer_simulator.md`; a PCAWG measurement pass precedes any further BND claim.
    Remaining sub-items: exercise the **per-tissue cancer models** (BRCA / skin /
    lung) to confirm tissue-specific SV spectra downstream, and sweep the
    **purity-mixing** machinery across purity/coverage.
