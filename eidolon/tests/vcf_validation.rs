@@ -411,6 +411,53 @@ fn golden_vcf_with_svs_is_well_formed() {
 
 /// Every BND must be a reciprocal mate pair whose two ALTs name each other's
 /// position. Before #451 the de-novo path emitted a single ID-less breakend.
+/// Every de novo breakend must join TWO DIFFERENT contigs.
+///
+/// This is the end-to-end proof of the whole chain, and the thing that was false for
+/// eidolon's entire BND history: the per-contig sampler hardcoded the mate to the
+/// anchor's own contig, so 466 of 466 junctions in job 20719077 were same-contig while
+/// the docs advertised BCR-ABL-style translocations. PCAWG's TRA class — the source of
+/// the BND rate — is 100% inter-chromosomal (docs/pcawg_sv_measurement.md M1).
+///
+/// A unit test on the sampler is not enough here: the records have to survive placement,
+/// the mutated-map merge, and VCF writing, on two different contigs, to reach this file.
+#[test]
+fn every_denovo_bnd_joins_two_different_contigs() {
+    let (v, _r) = golden_vcf("vcfval_bnd_interchrom", Some(8.0));
+    let bnds: Vec<&Record> = v.records.iter().filter(|r| r.is_bnd()).collect();
+    assert!(
+        !bnds.is_empty(),
+        "no BND records emitted — test would vacuously pass"
+    );
+    for r in &bnds {
+        // The ALT embeds the mate locus as `contig:pos` inside [] or ][.
+        let mate_locus = r
+            .alt
+            .split(|c| c == '[' || c == ']')
+            .find(|piece| piece.contains(':'))
+            .unwrap_or_else(|| panic!("BND ALT has no mate locus: {}", r.raw));
+        let mate_contig = mate_locus
+            .rsplit_once(':')
+            .map(|(c, _)| c)
+            .unwrap_or_else(|| panic!("unparsable mate locus {mate_locus}"));
+        assert_ne!(
+            mate_contig, r.chrom,
+            "de novo BND at {}:{} points at its OWN contig — that is a deletion or \
+             duplication by orientation, not a translocation: {}",
+            r.chrom, r.pos, r.raw
+        );
+    }
+    // Coverage of the input, not just the metric: at least two distinct contigs must
+    // actually carry breakends, or a single-contig run could satisfy the loop above by
+    // emitting nothing on the others.
+    let contigs: std::collections::HashSet<&str> = bnds.iter().map(|r| r.chrom.as_str()).collect();
+    assert!(
+        contigs.len() >= 2,
+        "breakends landed on only {} contig(s): {contigs:?}",
+        contigs.len()
+    );
+}
+
 #[test]
 fn every_bnd_is_a_reciprocal_mate_pair() {
     let (v, _r) = golden_vcf("vcfval_bnd", Some(8.0));
