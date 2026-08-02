@@ -55,8 +55,16 @@ pub fn default_sv_model() -> SvModel {
     //      where `svclass == "TRA"` is 100% inter-chromosomal
     //      (docs/pcawg_sv_measurement.md M1). That measurement is about the CANCER
     //      corpus and does not license the same reading of this germline share.
-    //   2. If the germline BND rate is wanted, it should be re-derived from gnomAD
-    //      CTX counts rather than left at a literature guess.
+    //   2. MEASURED 2026-08-02, streaming gnomAD-SV v4.1 sites (2,154,486 records):
+    //        CTX               99  (0.0046%)  — 99/99 inter-chromosomal
+    //        BND          356,035  (16.5%)    — 210,397 inter (59%), 145,638 intra (41%)
+    //        DEL 56.0%  INS 14.1%  DUP 12.5%  CPX 0.7%  INV 0.10%  CNV 0.03%
+    //      So gnomAD's BND is genuinely mixed and is NOT a translocation class; CTX is,
+    //      and it is vanishingly rare. Depending on which eidolon means:
+    //        BND == resolved translocation (CTX)          -> 0.005%, this is ~4,000x high
+    //        BND == any inter-chromosomal junction        -> 9.8%,   this is ~2x high
+    //      Either way 0.1943 is not supportable, and 41% of germline breakends are
+    //      intra-chromosomal — a class eidolon now emits none of.
     //
     // Flagged rather than silently corrected: guessing a replacement number here
     // would repeat the exact defect (see docs/claude_engineering_audit.md §5.1).
