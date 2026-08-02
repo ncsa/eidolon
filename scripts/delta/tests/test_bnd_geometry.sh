@@ -56,6 +56,8 @@ single-geometry NOTE always fires@if (nd==1 && parsed>=24)@if (nd>=1 && parsed>=
 geometry check always exits 0@exit (bad+unpaired+mismatch > 0) ? 1 : 0@exit 0
 split puts records in the wrong bucket@if ((k=="direct" && d) || (k=="inv" && i)) print@if ((k=="direct" && i) || (k=="inv" && d)) print
 split stops checking for lost records@if [[ $((n_inv + n_dir)) -ne "$n_src" ]]; then@if [[ 1 -eq 0 ]]; then
+scoring loop goes back to globbing@for svt in "${SV_TYPES_SCORED_IN_LOOP[@]}"; do@for typed in "$OUTDIR"/truth_sv_*.vcf.gz; do
+a derived artifact stops being scored separately@BND|CNV) continue ;;@BND) continue ;;
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -187,6 +189,40 @@ bcftools index -f -t "$WORK/lossy.vcf.gz" >/dev/null 2>&1
 out="$(split_bnd_by_geometry "$WORK/lossy.vcf.gz" "$WORK/i2.vcf.gz" "$WORK/d2.vcf.gz" 2>&1)"; rc=$?
 is  "rejects a split that loses a record (rc)" "1" "$rc"
 has "says how many were lost" "$out" "lost 1 record(s)"
+
+echo "=== cross-component: a derived truth artifact must not become an SVTYPE ==="
+# REGRESSION GUARD, job 20745149. The scoring loop globbed truth_sv_*.vcf.gz and relied
+# on a hand-maintained exclusion list, so writing truth_sv_BNDinv.vcf.gz silently
+# promoted it to an SVTYPE. The harness then printed, for the same label:
+#     manta_BNDinv recall=0.000  (caller emitted no BNDinv records)
+#     manta_BNDinv       recall=0.738 ... TP=354  FN=126
+# Neither split_bnd_by_geometry nor the scoring loop is wrong on its own — they simply
+# disagreed about what a truth_sv_* file means. That is an invariant BETWEEN two
+# components, and it needs its own assertion or it is nobody's test.
+# Anchored to non-comment lines: the fix's own comment quotes the old glob verbatim,
+# and a check that cannot tell code from a comment would fail on the correct code.
+is "scoring loop does not glob the truth directory" "0" \
+   "$(grep -cE '^[^#]*for +typed +in .*truth_sv_\*' "$PIPELINE")"
+is "scoring loop iterates the canonical type list" "1" \
+   "$(grep -cF 'for svt in "${SV_TYPES_SCORED_IN_LOOP[@]}"' "$PIPELINE")"
+
+# The loop must cover exactly the types not handled separately. Hardcoded here on
+# purpose: if someone edits SV_TYPES, this must be reviewed rather than silently follow.
+SV_TYPES=(); SV_TYPES_SCORED_IN_LOOP=()
+eval "$(awk '/^SV_TYPES=\(/,/^done$/' "$PIPELINE")"
+is "canonical SVTYPEs"            "DEL DUP INV INS BND CNV" "${SV_TYPES[*]}"
+is "types scored by the generic loop" "DEL DUP INV INS"     "${SV_TYPES_SCORED_IN_LOOP[*]}"
+
+# Every truth_sv_<X> file the script writes must be a canonical SVTYPE or a KNOWN
+# derived artifact. A new artifact that is neither shows up here, not on Delta.
+KNOWN_DERIVED=" BNDspan BNDinv BNDdirect scoreable "
+unclassified=""
+for nm in $(grep -oE 'truth_sv_[A-Za-z]+' "$PIPELINE" | sed 's/^truth_sv_//' | sort -u); do
+    case " ${SV_TYPES[*]} " in *" $nm "*) continue ;; esac
+    case "$KNOWN_DERIVED"     in *" $nm "*) continue ;; esac
+    unclassified="$unclassified $nm"
+done
+is "no unclassified truth_sv_* artifact" "" "$unclassified"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
