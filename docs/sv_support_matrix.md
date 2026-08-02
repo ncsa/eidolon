@@ -25,15 +25,22 @@ a variant that silently fails to appear is a broken tool.
 | `<DUP>` symbolic | preserved | het **1.61** vs 1.50; hom **2.17** vs 2.00 | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
 | `<CNV>` symbolic | preserved | CN 0/2 exact; CN 1,3,4,6 all **~8% high** | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) |
 | `<INV>` symbolic | preserved | deep interior **1.00**; junction-proximal **0.74–0.82** | ✅ (see note) |
-| `<INS>` symbolic | preserved | not measured | ❓ untested |
+| `<INS>` symbolic | preserved | **identical to no-variant control** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) silent no-op |
 | BND, inter-chromosomal | both records preserved | 30 chimeric reads | ✅ |
 | BND, intra-chromosomal | both records preserved | 30 chimeric reads | ✅ |
 | BND + inserted sequence | preserved **with the insert** | **0 of 30** chimeric reads carry it | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) |
 | BND, mate contig absent | — | — | ✅ hard error (correct) |
-| BND, single/unpaired (`A.`) | — | — | ❓ untested |
+| BND, single/unpaired (`A.`) | preserved | 0 chimeric; **depth 42.4 vs 72.0** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
 | Fragment spanning a whole DUP | — | *"4 of 30 reads match no haplotype"* | ❌ #474 |
-| Fragment spanning two junctions | — | — | ❓ untested |
-| Literal DEL / INS (non-symbolic) | — | — | ❓ untested |
+| Two junctions within one fragment | all 4 preserved | 60 chimeric; depth matches derived haplotype | ✅ |
+| Literal INS (`A`→`ACTGACTGCATG`) | preserved | **I=46** vs 15 baseline | ✅ |
+| Literal DEL (`TTTT…`→`A`) | preserved | **D=49** vs 20 baseline | ✅ |
+
+### Untested cells: none remain
+
+Every row above is measured. Read-level evidence is depth against a **separate no-variant
+control run**, or BAM CIGAR `I`/`D` counts against that control's sequencing-error
+background (15 `I`, 20 `D` in the probed window), or chimeric-read counts.
 
 ### The confirmed failures
 
@@ -43,6 +50,18 @@ sequence at the breakpoint. `parse_bnd_alt` accepts it, but `get_bnd_pieces` reb
 read from reference pieces only, so the insert never reaches the output. The truth VCF
 keeps it. **A benchmark built from that data asserts an insertion the reads do not
 contain.**
+
+**[#500] Symbolic `<INS>` is a silent no-op.** `SVTYPE=INS;SVLEN=60` is preserved in the
+truth VCF, and the reads are behaviourally identical to the no-variant control — same `I`
+count, same `D` count, same depth. A 60 bp insertion was requested and nothing inserted.
+The de novo path *does* synthesise novel sequence for INS, so the capability exists; it is
+simply not reached from `input_vcf`.
+
+**[#500] A single breakend (`A.`) destroys coverage.** VCF 4.2 allows an unresolved
+partner. `parse_bnd_alt` returns no mate, and the result is worse than being ignored:
+depth falls **72.0 → 42.4** (−41%) with **zero** chimeric reads. The truth declares a
+breakend, the reads contain no junction, and a depth caller sees a partial deletion no
+record describes.
 
 **[#474] Fragment spanning a whole DUP.** Needs a three-piece stitch `get_dup_pieces`
 cannot express. Known and open; `chimeric_sequence_content.rs` is deliberately
