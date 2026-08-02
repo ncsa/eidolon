@@ -12,139 +12,82 @@ Hand-written guidance below; the GitNexus block that follows is auto-generated
   `git merge-base --is-ancestor <sha> origin/develop`; recover a missed commit with
   `git cherry-pick`.
 
-## Vetting standard for new work (standing requirement)
+## Vetting standard (standing requirement)
 "It ran and produced output" is not evidence of correctness, and it is the bar this repo
-keeps accidentally settling for. Before calling anything done:
+keeps accidentally settling for. **Nothing is "done" until there is evidence it works as
+intended; until then it is in progress** — and that governs how work is *reported*, not
+just how it is tested. A merged PR is not evidence. A tagged release is not evidence.
+Passing CI is evidence about the tests, which is only as good as the tests. Say what
+level of evidence exists and what is missing: *"vetted on a known-answer fixture; not yet
+run on real data"* beats a checkmark.
 
-1. **Assert on content, not existence.** A file existing, a non-zero record count, or
-   exit 0 proves nothing. The `nsom -gt 0` guard passed while every value was the
-   malformed string `AF=AF=0.3000`; `truth $svt: N` counted records while two of three
-   VAF clusters were being discarded downstream.
-2. **Prove the test fails without the fix.** Every check added this cycle was verified
-   non-vacuous by reverting the fix and watching it fail. That is what exposed an
-   `##ALT` assertion of mine that could never fail, because `compare-vcfs` excludes
-   symbolic ALTs by design.
-3. **Vet the premise, not just the implementation.** `bnd_proximity.py` was correct
-   code that should not have existed: it was built on an inherited claim that "truvari
-   cannot benchmark breakends", true of truvari v4 and explicitly reversed in v5.0.0.
-   Check a third-party tool's actual version and capabilities before writing anything
-   that works around its supposed limits. (Retracted in the report 2026-08-01; a stale
-   copy of the same belief survived in §3.6 until 2026-08-02, so grep for a claim before
-   assuming one correction fixed every instance.)
+Each rule below was earned by a defect that shipped green. Case histories live in
+`docs/claude_engineering_audit.md` — **add new ones there, not here.**
+
+1. **Assert content, not existence.** A file existing, a non-zero count, or exit 0 is
+   necessary and not sufficient. The `nsom -gt 0` guard passed while every value was the
+   malformed string `AF=AF=0.3000`. If a wrong value would still pass, the test is
+   decoration.
+2. **Prove non-vacuity by mutation.** Break the code a test covers and watch it fail; if
+   it still passes it is not a test. Free for a fix (revert it), deliberate for a
+   feature. A coverage claim with no mutation experiment behind it is an opinion.
+3. **Vet the premise, not just the implementation.** `bnd_proximity.py` was correct code
+   that should not have existed — built on an inherited "truvari cannot benchmark
+   breakends", true of v4 and reversed in v5.0.0. Check a third-party tool's actual
+   version before working around its supposed limits, and **grep for every instance of a
+   claim**: a stale copy of that same belief survived one retraction by a day.
 4. **Check coverage of the inputs, not just the metric.** Report `n_scored` vs
-   `n_planted` per stratum. A metric over an unknown denominator is not a result — #450
-   reported a clean bias while silently excluding the sites it existed to test.
-5. **Chase the evidence past the first plausible story.** `BND recall=0.000` got three
-   confident explanations in sequence (unpaired truth, then truvari's inability, then
-   ALT orientation) before the actual cause: the truth was fine, the reads were fine,
-   truvari was fine — Manta had not called those junctions. Each wrong answer was
-   plausible enough to stop at.
-6. **Say what was NOT verified.** If something was checked by hand rather than by CI,
-   or on a fixture rather than real data, state it. Partial progress: `scripts/delta/tests/`
-   now covers two `sv_pipeline.sbatch` functions in CI (mutation-proven), but **12 of its
-   14 functions remain uncovered**, including `score_caller` and `check_denominator`,
-   which produce every recall figure in ACCESS §3.5–3.7. `sbs96_compare.py` is still
-   untested (#466).
+   `n_planted` per stratum; a metric over an unknown denominator is not a result. A zero
+   or unexpectedly-small denominator is a **hard failure, never a `WARNING`**. If a step
+   drops data deliberately (filters, LoD, min-depth), log how much.
+5. **Chase the evidence past the first plausible story.** `BND recall=0.000` drew three
+   confident explanations before the real cause. Each was plausible enough to stop at.
+6. **Say what was NOT verified** — checked by hand rather than CI, on a fixture rather
+   than real data. Current example: `scripts/delta/tests/` covers 2 of
+   `sv_pipeline.sbatch`'s 14 functions; `score_caller` and `check_denominator` produce
+   every recall figure in ACCESS §3.5–3.7 and are untested, as is `sbs96_compare.py` (#466).
 
-**The bar is HIGHER for new features than for fixes**, because a fix has a
-known-bad baseline and a feature has none. With a fix you can revert it and watch the
-test fail — non-vacuity is free. With a feature, "it works" has no counterfactual, so
-the negative case has to be built deliberately:
+**The recurring shape**, every quiet failure so far — a harness reporting a metric
+without asserting it measured everything it planted:
 
-- **State the correctness criterion before implementing it**, and how it will be
-  falsified. If that cannot be written down, the feature is not ready to build.
-- **Include a known-answer fixture** — inputs whose correct output is computable
-  independently of the code under test. A 7-alt-in-100-reads BAM has an observed VAF of
-  exactly 0.070 whatever the implementation thinks.
-- **Include a case where it must NOT fire.** Most defects this cycle were things
-  matching or counting when they should not have, or vice versa.
-- **Verify the whole chain, not the unit.** #405's subclonal VAF passed its unit tests
-  and shipped; the harness validating it was itself excluding the sites it existed to
-  test, so the end-to-end claim was wrong from #405 landing (2026-07-24) until the
-  harness was audited a week later. BND junction reads were correct
-  the whole time and nobody had confirmed it until it was checked by hand.
+| reported | true |
+|---|---|
+| `VERDICT: PASS`, bias in range (#450) | 160 of 567 planted sites silently excluded — the whole lowest-VAF cluster |
+| `BND recall=0.000` (#451) | truth emitted unpaired/MATEID-less, unmatchable by construction; the reads were fine |
+| `nsom > 0` guard passed | values were `AF=AF=0.3000`; the guard counted **records**, not content |
 
-A feature demonstrated only by "it emitted something plausible" has not been validated,
-it has been exercised.
+**Not a bash problem.** #450 and #451 were `bcftools` genotype semantics and Rust record
+emission. A Rust harness that never asks "did I score all my planted sites?" fails just
+as silently. Bash contributes fragility (footguns below), not blind spots.
+
+### The bar is HIGHER for features than fixes
+A fix has a known-bad baseline; a feature has none, so the negative case must be built
+deliberately.
+
+- **State the correctness criterion before implementing**, and how it will be falsified.
+  If that cannot be written down, the feature is not ready to build.
+- **Include a known-answer fixture** — correct output computable independently of the
+  code under test. A 7-alt-in-100-reads BAM has VAF 0.070 whatever the implementation thinks.
+- **Include a case where it must NOT fire.** Most defects were things matching or
+  counting when they should not have.
+- **Verify the whole chain.** #405's subclonal VAF passed unit tests and shipped while
+  the harness validating it excluded the very sites it existed to test.
 
 ### Test adequacy (not test presence)
+**New code ships with tests that would catch it being wrong. No exemption for "small",
+"obvious", or "hard to test".** Hard to test usually means the seam is wrong — narrow the
+inputs until it is testable (`get_bnd_pieces` took a whole `ContigContext` but used only
+contig lengths).
 
-**New code ships with tests that would catch it being wrong. There is no exemption for
-"small", "obvious", or "hard to test".** If it is hard to test, that is usually a signal
-the seam is in the wrong place — narrow the function's inputs until it is testable
-(`get_bnd_pieces` took a whole `ContigContext` but used only contig lengths; taking the
-reference map instead made it unit-testable with no behaviour change).
-
-Every rule below was earned by a defect that shipped green:
-
-- **Test the path that can break, not the path that works.** `bnd_fastq.rs` "covered"
-  BND read generation by driving the *input-VCF* path — where the parser sets the
-  geometry flags correctly — while the *de novo* path shipped a truth VCF that
-  contradicted its own reads from v1.13.1 to v3.1.0. Ask which path the test
-  actually exercises.
-- **Assert content, not existence.** That same test asserted only that some read was
-  *named* `EIDOLON_chimeric`. Names, counts, non-emptiness, and exit 0 are not content.
-  If a wrong value would still pass, the test is decoration.
+- **Test the path that can break, not the path that works.** `bnd_fastq.rs` "covered" BND
+  generation via the *input-VCF* path while the *de novo* path shipped a truth VCF
+  contradicting its own reads from v1.13.1 to v3.1.0.
 - **A function that makes a decision needs a test of that decision.** `get_bnd_pieces`
-  chooses which piece of a junction is reverse-complemented — the entire semantics of a
-  breakend — and had zero tests.
-- **Invariants that span two components need their own test.** The defect was neither
-  side being wrong: `sv_model.rs` emitted a correct ALT and `runner.rs` honoured its
-  flags correctly. They simply disagreed, and nothing asserted they must agree. Where
-  two components must stay in step, assert it directly, and use the *same* helper both
-  sides use so they cannot drift.
-- **Prove non-vacuity by mutation.** Before believing a new test, break the code it
-  covers and watch it fail. If it still passes, it is not a test. This is cheap for a
-  fix (revert it) and must be done deliberately for a feature. It is how an `##ALT`
-  assertion was found that could never fail.
-
-When auditing, mutation is the method: change the production code to something plausibly
-wrong, run the tests, and record what happened. A coverage claim with no mutation
-experiment behind it is an opinion.
-
-### Status vocabulary
-**Nothing is "done" until there is evidence it works as intended. Until then it is
-in progress.** This governs how work is reported, not just how it is tested:
-
-- Do not write "done", "complete", "verified" or a green check for work whose evidence
-  is "it ran", "tests pass" in isolation, or "the code looks right".
-- Say what level of evidence exists and what is still missing — e.g. *"locally vetted on
-  a known-answer fixture; not yet run against real data"*. That is an honest in-progress
-  status, and it is more useful than a checkmark.
-- A merged PR is not evidence. A tagged release is not evidence. Passing CI is evidence
-  about the tests, which is only as good as the tests.
-- This applies to milestones too: a release whose fixes have not been observed working
-  on real data is in progress, however many PRs are merged.
-
-## Don't trust a green result — read the artifact
-- Harness "overall: PASS" / summary lines can be **false passes** — e.g. a run that
-  found no inputs still printed PASS over an empty `summary.tsv` (job 19887446). Open
-  the actual output (per-item rows, counts, sizes) before believing a success.
-
-### The recurring failure mode: harnesses that don't check their own coverage
-Every quiet failure found so far has the same shape — the harness reports a *metric*
-without asserting it actually **measured everything it planted**. Verified instances:
-
-| what it reported | what was true |
-|---|---|
-| `VERDICT: PASS`, bias/MAE in range (#450) | 160 of 567 planted sites silently excluded — the whole lowest-VAF cluster, i.e. the case the harness exists to test |
-| `BND recall=0.000` (#451) | truth was emitted unpaired/MATEID-less, so BND was unmatchable by construction; the reads were fine |
-| `nsom > 0` abort guard passed | the VAF values were the malformed string `AF=AF=0.3000`; the guard counted **records**, not content |
-
-**Rules when writing or reviewing a harness:**
-- Assert on **coverage of its own inputs**, not just on the metric: `n_scored` vs
-  `n_planted`, and report the shortfall per stratum. A metric over an unknown
-  denominator is not a result.
-- A zero or unexpectedly-small denominator is a **hard failure**, never a `WARNING`.
-  `cancer_pipeline.sbatch` only warned on an empty somatic truth, so it would have
-  scored every caller against nothing and printed results.
-- Guards must check **content**, not counts. Record counts pass while values are garbage.
-- If a step drops data deliberately (filters, LoD, min-depth), log how much it dropped.
-
-**This is not purely a bash problem.** The two deepest defects (#450, #451) were
-`bcftools` genotype semantics and Rust record emission — a Rust harness that likewise
-never asked "did I score all my planted sites?" would have failed just as silently. Bash
-contributed the *fragility* (see the footguns below), not the blind spots.
+  chooses which piece is reverse-complemented — the entire semantics of a breakend — and
+  had zero tests.
+- **Invariants spanning two components need their own test.** Neither side was wrong:
+  `sv_model.rs` emitted a correct ALT, `runner.rs` honoured its flags. They disagreed and
+  nothing asserted they must agree. Use the *same* helper both sides use so they cannot drift.
 
 ### Bash footguns actually hit in this repo
 - `set -euo pipefail` + `zcat … | head` makes `zcat` take SIGPIPE (exit 141) and `set -e`
@@ -167,8 +110,8 @@ contributed the *fragility* (see the footguns below), not the blind spots.
   declares **no runtime requirements** (build-only). Verify before adding anything that
   would change that.
 - **Do not introduce new Python.** Product logic is Rust; harness orchestration is bash.
-  Python is acceptable only where an **external tool forces it** — truvari and
-  SigProfiler are Python packages, so parsing their output in their own env is fine.
+  Python is acceptable only where an **external tool forces it** — We will keep existing parsers for truvari and
+  SigProfiler are Python packages, but avoid adding more.
 - **Vet what exists** (all validation/prep only, none shipped):
   `scripts/delta/sbs96_compare.py` is a per-validation measurement helper. It parses
   SigProfiler's output in SigProfiler's own env, which is the one justification for
@@ -178,13 +121,6 @@ contributed the *fragility* (see the footguns below), not the blind spots.
   for byte plus known-answer tests. `tools/{build_pcawg_sv_vcf,normalize_pcawg_sv_model,graft_sv_model}.py` are
   offline corpus prep. `tools/inject_cancer_sv_model.py` is **dead** — deprecated in
   v1.14.0, no live caller, safe to delete.
-- Before writing a helper that works *around* a third-party tool, **check that tool's
-  actual capabilities and version.** A `bnd_proximity.py` was written on the inherited
-  belief that "truvari cannot benchmark breakends" — true of truvari v4, and explicitly
-  reversed by v5.0.0 ("BNDs which were always filtered are now analyzed"). The deployed
-  version was v5.4.0 with `--bnddist`. The helper was redundant; reading the changelog
-  was the whole job. The claim still sits uncorrected in
-  `docs/access_report_draft.md` §3.7.
 
 ## Delta / HPC (`scripts/delta/`)
 - Real-data validation runs on **NCSA Delta** (SLURM, account `bhrd-delta-cpu`). The
@@ -201,8 +137,6 @@ contributed the *fragility* (see the footguns below), not the blind spots.
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.
-- Shell footguns that bite here are listed once under "Bash footguns actually hit in
-  this repo" above — the `zcat … | head` SIGPIPE trap in particular.
 
 ## Where the evidence lives (so this file can stay a rulebook)
 - `docs/claude_engineering_audit.md` — defect taxonomy, timeline, and the case studies
