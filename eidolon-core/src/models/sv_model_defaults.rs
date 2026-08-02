@@ -66,6 +66,26 @@ pub fn default_sv_model() -> SvModel {
     //      Either way 0.1943 is not supportable, and 41% of germline breakends are
     //      intra-chromosomal — a class eidolon now emits none of.
     //
+    //   3. DECISION (2026-08-02): de novo SVs are not recommended for human germline
+    //      simulation at all. Constitutional balanced translocations occur in roughly
+    //      1 in 500 live births, so a normal human genome carries ~zero — any nonzero
+    //      Bnd share here models something that essentially does not happen. Note also
+    //      that gnomAD BNDs reach AF > 0.1 (one record: AC=8474, AN=74246,
+    //      AF=0.114134); a translocation carried by 11% of humans would be a landmark
+    //      cytogenetic finding, so that class is dominated by mapping artifacts in
+    //      repetitive regions rather than real rearrangements.
+    //
+    //      This costs little in practice because `sv_rate_scale` DEFAULTS TO 0.0 —
+    //      de novo SVs are opt-in, and the shipped default emits none. A researcher
+    //      wanting a specific rearrangement should supply it via `input_vcf`, which
+    //      preserves the record verbatim (IDs, POS, ALT) and generates junction reads;
+    //      that path is verified and is the right one when you need to KNOW your
+    //      variant reached the output.
+    //
+    //      The de novo machinery stays for CANCER (somatic rates are real and
+    //      PCAWG-derived) and is expected to matter for PLANTS, where SV burden is far
+    //      higher. It is human GERMLINE where the rate is the problem.
+    //
     // Flagged rather than silently corrected: guessing a replacement number here
     // would repeat the exact defect (see docs/claude_engineering_audit.md §5.1).
     // Inversions and Insertions are added here at nominal rates (heuristic) since they
