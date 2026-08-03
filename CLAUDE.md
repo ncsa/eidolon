@@ -125,15 +125,23 @@ contig lengths).
 ## Delta / HPC (`scripts/delta/`)
 - Real-data validation runs on **NCSA Delta** (SLURM, account `bhrd-delta-cpu`). The
   cluster filesystem is **not reachable from this workstation** — the user runs jobs
-  and pastes results. Artifacts archive to **two** roots — the project was renamed
-  partway through, so Phase 1 / pre-v2.0.0 runs are under
-  `/projects/bhrd/jallen17/rneat-access-results/` (germline, cancer, sv, benchmark,
-  baseline, tune, threadscale, ppn, modelbuild — the corpus behind the ACCESS report's
-  §3.1–3.11) and v2.0.0-onward runs under
-  `/projects/bhrd/jallen17/eidolon-access-results/`. `lib_report.sh` writes only to the
-  latter (`RESULTS_DIR`, overridable), and `collect_report.sh` scans one root at a time —
-  so pass `RESULTS_DIR=` explicitly when looking for historical runs, or you will
-  conclude they are missing.
+  and pastes results. Artifacts archive to **one** root:
+  `/projects/bhrd/jallen17/eidolon-access-results/`. `rneat-access-results/` no longer
+  exists — the pre-v2.0.0 runs were merged in when the project rename settled (confirmed
+  gone 2026-08-02), so **do not check for it**; a search there wastes a round trip and
+  its absence is not evidence a run is missing.
+
+- **Disk is the binding constraint on Delta, and quota views lie about it.** `df` inside a
+  project-quota'd directory reports the *quota*, not the mount: `df -h /work/nvme/bhrd`
+  showed `500G/500G/0` while `df -h /work/nvme` showed 8.5P at 56%. The `quota` table and
+  `df` also disagreed for `/scratch` (1000G vs a 500G mount). What actually stops a job is
+  the **project quota** — check it with
+  `lfs quota -h -p <projid> /work/nvme`, and read `Disk quota exceeded` literally.
+  Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~113 GB peak per
+  replicate** (normal + tumor + `cat`-merged FASTQ held together; pruning only runs at the
+  end). So `--array=1-8%2` needs ~900 GB and will die ~3 h in at the merge. Serialize with
+  `%1` and clear finished replicates down to `truvari_*/summary.json`, which is all
+  `aggregate_sv_reps.sh` reads.
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.
