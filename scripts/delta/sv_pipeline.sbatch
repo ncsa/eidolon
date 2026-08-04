@@ -44,7 +44,15 @@
 #SBATCH --account=bhrd-delta-cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
+# 128, not 64: --mem=240G on a 256 GB node already reserves the WHOLE node, so asking
+# for half its cores left 64 idle at zero scheduling benefit. Measured on job 20719077
+# (soy whole assembly, full pipeline): 2h54m wall, 14.13% CPU efficiency at 64 cores —
+# most time is in serial phases, so this speeds up bwa-mem2 and the callers rather than
+# the whole run. Do NOT lower --mem to schedule more easily: that same job peaked at
+# 91.78 GB on a 1 Gb genome, and GRCh38 is ~3x, so 240G is closer to necessary than
+# padded. (Job 20745149's 39.86 GB is NOT a counter-example — that run re-scored existing
+# artifacts and never simulated or aligned.)
+#SBATCH --cpus-per-task=128
 #SBATCH --mem=240G
 #SBATCH --time=12:00:00
 #SBATCH --output=%x_%j.out
