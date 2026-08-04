@@ -929,8 +929,28 @@ selftest_truvari() {  # <truth.vcf.gz> <label> [extra args...]
 decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     local truth="$1" label="$2"; shift 2
     local decoy="$OUTDIR/.decoy_${label}.vcf.gz" out="$OUTDIR/truvari_decoy_$label"
+    # Displace each record by MORE THAN ITS OWN LENGTH. A flat shift does not decoy a
+    # variant larger than the shift: truvari matches sized variants on reciprocal overlap,
+    # so a 19.6 Mb deletion moved 2 Mb still overlaps 90% and matching it is CORRECT.
+    # Measured on job 20824321, where the old flat 2 Mb shift gave decoy recall=0.202 with
+    # TP=17 — and all 17 were larger than the shift (min 2,048,336 bp vs a 2,000,000 bp
+    # shift, median 4.3 Mb, max 19.6 Mb). Not one match was smaller than the displacement,
+    # so the control was reporting "the shift is too small", not "the scorer is too loose",
+    # while its warning text claimed the latter.
+    # A breakend has no SVLEN and END==POS, so it falls back to the 2 Mb floor, which
+    # displaces a point event completely.
     { bcftools view -h "$truth"
-      bcftools view -H "$truth" | awk -F'\t' 'BEGIN{OFS="\t"}{$2=$2+2000000; print}'; } \
+      bcftools view -H "$truth" | awk -F'\t' 'BEGIN{OFS="\t"}
+        { len=0
+          if (match($8, /SVLEN=-?[0-9]+/)) { len=substr($8, RSTART+6, RLENGTH-6); if (len<0) len=-len }
+          shift_by = 2000000; if (2*len > shift_by) shift_by = 2*len
+          $2 = $2 + shift_by
+          # END must move with POS or the record describes a span it no longer occupies.
+          if (match($8, /END=[0-9]+/)) {
+              e = substr($8, RSTART+4, RLENGTH-4) + shift_by
+              $8 = substr($8, 1, RSTART-1) "END=" e substr($8, RSTART+RLENGTH)
+          }
+          print }'; } \
       | bcftools sort -O z -o "$decoy" 2>/dev/null || { echo "  decoy $label: could not build (skipped)"; return 0; }
     bcftools index -f -t "$decoy" 2>/dev/null || true
     rm -rf "$out"
@@ -941,8 +961,10 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then
         echo "  decoy    $label: PASS (shifted truth recall=$r, expected 0)"
     else
-        echo "  WARNING: decoy control for $label matched (recall=$r) — the configuration" >&2
-        echo "  is matching on position far more loosely than intended. See $out." >&2
+        echo "  WARNING: decoy control for $label matched (recall=$r). Displacement now" >&2
+        echo "  scales with SVLEN, so this is no longer explained by an undersized shift —" >&2
+        echo "  the scorer is matching on position more loosely than intended, or records" >&2
+        echo "  ran off the end of their contig. Inspect $out/tp-base.vcf.gz." >&2
     fi
     return 0
 }
@@ -1138,6 +1160,12 @@ if [[ -f "$TRUTH_SCOREABLE" ]]; then
 fi
 if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST" || CAL_FAIL=1
+    # BND had a positive control and NO negative one, which is the half that bounds
+    # whether a recall figure means detection or coincidence. `--bnddist` sets a
+    # proximity window; without a decoy nothing measures how often a *displaced*
+    # breakend still lands inside it. Cheap, and this is exactly where the decoy works
+    # best: a breakend is a point (END==POS), so any shift displaces it fully.
+    decoy_truvari    "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST"
 fi
 if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
