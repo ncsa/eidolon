@@ -44,7 +44,14 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+# 96G, sized from measurement rather than guessed. Two runs of this script:
+#   job 20553463  --mem=48G  -> OUT_OF_MEMORY, killed at 47.99 GB after 2h49m
+#   job 20556912  --mem=96G  -> COMPLETED, peak 60.33 GB (62.85% of 96)
+# The 48G failure was bumped to 64G, but 64 was a guess and sits BELOW the 60.33 GB
+# the only successful run actually consumed — under 4 GB of margin, i.e. one unlucky
+# draw from another OOM. bwa-mem2 + samtools sort on chr1 is the peak.
+# Check `seff <jobid>` before lowering this.
+#SBATCH --mem=96G
 #SBATCH --time=8:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
