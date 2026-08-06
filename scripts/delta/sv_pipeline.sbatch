@@ -901,6 +901,26 @@ build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
     return 0
 }
 
+# Read one numeric metric out of a truvari summary.json. Prints the value and returns 0;
+# returns 1 if the summary is MISSING or unparseable.
+#
+# WHY THE DISTINCTION IS THE WHOLE POINT: both calibration controls used to open with
+# `local r=0` and then overwrite it only `[[ -f "$out/summary.json" ]]`. A truvari that
+# crashed therefore left r=0, which the selftest reads as "recall 0 → FAIL" (safe) but the
+# decoy reads as "recall 0 → PASS" — a negative control that passes *because it never ran*.
+# `truvari … >/dev/null 2>&1 || true` then discarded the only evidence of why.
+# Job 20853511 printed no decoy verdict at all with an empty truvari_decoy_scoreable/,
+# which is what sent us looking. An absent measurement must never be spellable as a
+# passing one; that is the same "assert content, not existence" rule as everywhere else.
+truvari_metric() {  # <summary.json> <key>
+    [[ -f "$1" ]] || return 1
+    python3 - "$1" "$2" <<'PY' || return 1
+import json, sys
+v = json.load(open(sys.argv[1])).get(sys.argv[2])
+print(float(v) if v is not None else 0.0)
+PY
+}
+
 # ── Rule 0: calibrate the scorer before believing it ────────────────────
 # A scorer must reproduce a PERFECT score against itself in the configuration the real
 # run uses. If truth-vs-truth is not 1.000, the configuration is broken and nothing it
@@ -911,11 +931,19 @@ build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
 selftest_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     local truth="$1" label="$2"; shift 2
     local out="$OUTDIR/truvari_selftest_$label"
+    local err="$OUTDIR/.selftest_${label}.stderr"
     rm -rf "$out"
     truvari bench -b "$truth" -c "$truth" -f "$REFERENCE" -o "$out" \
-        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >/dev/null 2>&1 || true
-    local r=0
-    [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
+        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >"$err" 2>&1 || true
+    # "Did not run" is reported separately from "ran and scored 0". Both fail, but only
+    # one of them is a scoring-threshold problem, and conflating them cost a day.
+    local r
+    if ! r=$(truvari_metric "$out/summary.json" recall); then
+        echo "ERROR: scorer selftest for $label DID NOT RUN — no readable" >&2
+        echo "  $out/summary.json. truvari's own output follows:" >&2
+        sed -n '1,20p' "$err" >&2 2>/dev/null || true
+        return 1
+    fi
     if awk -v r="$r" 'BEGIN{exit !(r > 0.999)}'; then
         # recall=1.000 is necessary but NOT sufficient: a filter that discards a record
         # removes it from base AND comp alike, so the subset still matches itself
@@ -962,19 +990,28 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
       | bcftools sort -O z -o "$decoy" 2>/dev/null || { echo "  decoy $label: could not build (skipped)"; return 0; }
     bcftools index -f -t "$decoy" 2>/dev/null || true
     rm -rf "$out"
+    local err="$OUTDIR/.decoy_${label}.stderr"
     truvari bench -b "$truth" -c "$decoy" -f "$REFERENCE" -o "$out" \
-        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >/dev/null 2>&1 || true
-    local r=0
-    [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
+        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >"$err" 2>&1 || true
+    local r
+    if ! r=$(truvari_metric "$out/summary.json" recall); then
+        echo "ERROR: decoy control for $label DID NOT RUN — no readable" >&2
+        echo "  $out/summary.json. This is NOT a pass: the decoy is the only evidence that" >&2
+        echo "  a recall figure means detection rather than a matching window loose enough" >&2
+        echo "  to accept anything, so every number from this run would be uncalibrated." >&2
+        echo "  truvari's own output follows:" >&2
+        sed -n '1,20p' "$err" >&2 2>/dev/null || true
+        return 1
+    fi
     if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then
         echo "  decoy    $label: PASS (shifted truth recall=$r, expected 0)"
-    else
-        echo "  WARNING: decoy control for $label matched (recall=$r). Displacement now" >&2
-        echo "  scales with SVLEN, so this is no longer explained by an undersized shift —" >&2
-        echo "  the scorer is matching on position more loosely than intended, or records" >&2
-        echo "  ran off the end of their contig. Inspect $out/tp-base.vcf.gz." >&2
+        return 0
     fi
-    return 0
+    echo "ERROR: decoy control for $label matched (recall=$r). Displacement scales with" >&2
+    echo "  SVLEN, so this is not an undersized shift — the scorer is matching on position" >&2
+    echo "  more loosely than intended, or records ran off the end of their contig." >&2
+    echo "  Inspect $out/tp-base.vcf.gz." >&2
+    return 1
 }
 
 # Score one caller's VCF against the truth — aggregate + per-type + BND (#457).
@@ -1164,7 +1201,7 @@ fi
 echo "[5/5] Calibrating scorers (truth-vs-truth must be perfect; decoy must be zero)..."
 if [[ -f "$TRUTH_SCOREABLE" ]]; then
     selftest_truvari "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
-    decoy_truvari    "$TRUTH_SCOREABLE" scoreable
+    decoy_truvari    "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
 fi
 if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST" || CAL_FAIL=1
@@ -1173,7 +1210,7 @@ if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
     # proximity window; without a decoy nothing measures how often a *displaced*
     # breakend still lands inside it. Cheap, and this is exactly where the decoy works
     # best: a breakend is a point (END==POS), so any shift displaces it fully.
-    decoy_truvari    "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST"
+    decoy_truvari    "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST" || CAL_FAIL=1
 fi
 if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
@@ -1197,10 +1234,12 @@ fi
 # archiving precisely BECAUSE the scorer misbehaved, and the exit below runs after
 # archive_run. Scoring itself is pointless with a scorer that cannot score a known answer.
 if [[ "$CAL_FAIL" -ne 0 ]]; then
-    echo "ERROR: at least one scorer cannot match the truth to itself — refusing to" >&2
-    echo "  report caller results computed with a configuration that demonstrably" >&2
-    echo "  cannot score a perfect answer. Skipping caller scoring; see the selftest" >&2
-    echo "  output above and the archived truvari_selftest_* directories." >&2
+    echo "ERROR: at least one scorer failed calibration — either it cannot match the" >&2
+    echo "  truth to itself (positive control) or it matched a deliberately displaced" >&2
+    echo "  copy of it (negative control), and a control that DID NOT RUN counts as a" >&2
+    echo "  failure, not a pass. Refusing to report caller results from a configuration" >&2
+    echo "  not demonstrated to discriminate. Skipping caller scoring; see the output" >&2
+    echo "  above and the archived truvari_selftest_*/truvari_decoy_* directories." >&2
 else
     score_caller manta "$MANTA_SV" "$MANTA_SV_RAW"
     # Delly emits no BND at all and is not converted, so raw and scored are the same file.
