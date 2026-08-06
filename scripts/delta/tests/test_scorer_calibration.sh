@@ -60,6 +60,10 @@ decoy always passes@if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then@if true; t
 decoy tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: decoy control for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=0; if false; then echo "ERROR: decoy control for $label DID NOT RUN
 selftest tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: scorer selftest for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=1.0; if false; then echo "ERROR: scorer selftest for $label DID NOT RUN
 decoy match is only a warning@echo "ERROR: decoy control for $label matched@return 0; echo "ERROR: decoy control for $label matched
+empty stratum silently dropped (pre-fix)@TYPES_UNMEASURED+=("$svt")@:
+coverage-hole summary never printed@echo "  SV types with an EMPTY denominator@echo "  suppressed
+empty stratum reported for every type@if [[ "$n" -eq 0 ]]; then@if [[ "$n" -ge 0 ]]; then
+empty type leaves a stray truth file@rm -f "$typed" "${typed}.tbi"@:
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -88,7 +92,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -229,6 +233,45 @@ STUB_MODE=json; STUB_RECALL=1.0; STUB_TPBASE=3; STUB_FN=0
 outp="$(selftest_truvari "$TRUTH" st_subset 2>&1)"; rc=$?
 is  "selftest(perfect over 3 of 4) returns non-zero" 1 "$rc"
 has "selftest(subset) names the wrong denominator"   "$outp" "WRONG DENOMINATOR"
+
+echo "── split_truth_by_type: an empty stratum is named, not dropped ──"
+# The known answer is hand-counted from build_truth: DEL 1, DUP 2, INV 1, and INS/BND/CNV
+# absent entirely. So exactly INS BND CNV must be reported unmeasured, in SV_TYPES order.
+SV_TYPES=(DEL DUP INV INS BND CNV)
+TYPES_UNMEASURED=()
+mkdir -p "$WORK/split"
+# NOT in $( ): the function sets a global, and a command substitution runs it in a subshell
+# where that assignment is discarded — which made this assertion pass vacuously at first.
+split_truth_by_type "$TRUTH" "$WORK/split" >"$WORK/split.log" 2>&1
+outp="$(cat "$WORK/split.log")"
+is  "planted types are counted"            "1" "$(grep -cF 'truth DEL: 1' <<<"$outp")"
+is  "a type with 2 records counts 2"       "1" "$(grep -cF 'truth DUP: 2' <<<"$outp")"
+is  "empty strata are exactly INS BND CNV" "INS BND CNV" "${TYPES_UNMEASURED[*]}"
+has "an empty stratum is called out"       "$outp" "NOT MEASURED: 0 INS planted"
+has "it is not framed as a pass"           "$outp" "not a passing stratum"
+has "the count of holes is reported"       "$outp" "EMPTY denominator: INS BND CNV (3 of 6)"
+# A zero-count type must leave NO file behind: the scoring loop skips on `[[ -f ]]`, and a
+# stray empty file would make it run truvari against an empty truth instead.
+is "no file is left for an empty type" "0" \
+   "$(ls "$WORK/split"/truth_sv_INS.vcf.gz 2>/dev/null | wc -l)"
+is "files remain for planted types"    "1" \
+   "$(ls "$WORK/split"/truth_sv_DEL.vcf.gz 2>/dev/null | wc -l)"
+
+echo "── split_truth_by_type: must NOT fire when every type is planted ──"
+# The negative case. Most defects in this repo were things firing when they should not.
+{ bcftools view -h "$TRUTH"
+  printf 'c1\t70000\t.\tG\t<INS>\t60\tPASS\tSVTYPE=INS;SVLEN=300;END=70000\n'
+  printf 'c1\t80000\t.\tG\t<CNV>\t60\tPASS\tSVTYPE=CNV;SVLEN=5000;END=85000\n'
+  printf 'c1\t90000\t.\tN\tN[c1:95000[\t60\tPASS\tSVTYPE=BND\n'
+  bcftools view -H "$TRUTH"; } > "$WORK/full.vcf"
+bcftools sort -O z -o "$WORK/full.vcf.gz" "$WORK/full.vcf" 2>/dev/null
+bcftools index -f -t "$WORK/full.vcf.gz"
+TYPES_UNMEASURED=(); mkdir -p "$WORK/split_full"
+split_truth_by_type "$WORK/full.vcf.gz" "$WORK/split_full" >"$WORK/split_full.log" 2>&1
+outp="$(cat "$WORK/split_full.log")"
+is    "no type reported unmeasured"        "" "${TYPES_UNMEASURED[*]}"
+hasnt "no NOT MEASURED line is emitted"    "$outp" "NOT MEASURED"
+hasnt "no coverage-hole summary is emitted" "$outp" "EMPTY denominator"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

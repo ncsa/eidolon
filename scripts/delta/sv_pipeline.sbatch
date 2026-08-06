@@ -279,7 +279,8 @@ fi
 
 # Pre-generate per-type truth subsets NOW, while bcftools (bioinf) is active, so
 # the truvari scoring stage needs only truvari on its PATH (no bcftools in that
-# env). Empty types are removed so the scoring loop skips them.
+# env). Empty types are removed so the scoring loop skips them — and RECORDED, because a
+# skipped type is an unmeasured stratum that has to be reported rather than dropped.
 # The canonical SVTYPE list, declared ONCE. The scoring loop iterates this same array
 # rather than globbing truth_sv_*.vcf.gz, so a derived artifact can never be mistaken
 # for an SVTYPE — see SV_TYPES_SCORED_IN_LOOP below.
@@ -292,14 +293,47 @@ for svt in "${SV_TYPES[@]}"; do
     case "$svt" in BND|CNV) continue ;; esac
     SV_TYPES_SCORED_IN_LOOP+=("$svt")
 done
-for svt in "${SV_TYPES[@]}"; do
-    typed="$OUTDIR/truth_sv_${svt}.vcf.gz"
-    bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$typed" "$TRUTH_SV" 2>/dev/null || continue
-    bcftools index -f -t "$typed" 2>/dev/null || true
-    n=$(bcftools view -H "$typed" 2>/dev/null | wc -l)
-    echo "  truth $svt: $n"
-    [[ "$n" -eq 0 ]] && rm -f "$typed" "${typed}.tbi"
-done
+# A type the model ASKS FOR but that no record realises is an UNMEASURED STRATUM, not a
+# result. The zero-count file is deleted here and the scoring loop then skips it on
+# `[[ -f "$typed" ]] || continue`, so before this change the run printed a bare
+# `truth INS: 0` and never mentioned INS again — and the aggregate recall silently meant
+# "of the types we happened to draw". Job 20853511 reported manta_overall=0.861 over
+# DEL/DUP/INV only, with INS absent from 123 records.
+#
+# NOT a hard failure, deliberately: the pancancer model draws Ins at p=0.0279, so ~6% of
+# runs legitimately plant none and failing those would be a false alarm. What is not
+# acceptable is the silence, so the stratum is named here and again in the summary. Chasing
+# a real generation defect needs replicates, not one run — see docs/sv_support_matrix.md,
+# which records symbolic <INS> as a silent no-op from input_vcf (#500) while asserting the
+# de novo path synthesises sequence. That claim is untested and this is the run that would
+# have surfaced it.
+# Sets TYPES_UNMEASURED (global) to every SV_TYPES entry with zero truth records. A
+# function rather than an inline loop so it is reachable from the test suite: the
+# behaviour that matters is "an empty stratum is named", and asserting that by grepping
+# the source would only check that the code looks right.
+split_truth_by_type() {  # <truth_sv.vcf.gz> <outdir>
+    local truth="$1" dir="$2" svt typed n
+    TYPES_UNMEASURED=()
+    for svt in "${SV_TYPES[@]}"; do
+        typed="$dir/truth_sv_${svt}.vcf.gz"
+        bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$typed" "$truth" 2>/dev/null || continue
+        bcftools index -f -t "$typed" 2>/dev/null || true
+        n=$(bcftools view -H "$typed" 2>/dev/null | wc -l)
+        echo "  truth $svt: $n"
+        if [[ "$n" -eq 0 ]]; then
+            rm -f "$typed" "${typed}.tbi"
+            TYPES_UNMEASURED+=("$svt")
+            echo "    NOT MEASURED: 0 $svt planted, so no $svt recall exists for any caller." >&2
+            echo "      This is a hole in the run's coverage, not a passing stratum." >&2
+        fi
+    done
+    if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
+        echo "  SV types with an EMPTY denominator: ${TYPES_UNMEASURED[*]} (${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]})"
+        echo "    Every recall below is over the remaining types only."
+    fi
+}
+TYPES_UNMEASURED=()
+split_truth_by_type "$TRUTH_SV" "$OUTDIR"
 
 # The aggregate must cover only what truvari can match. A BND has no SVLEN and
 # END==POS, and CNV is a copy-ratio call — truvari matches neither, so including
@@ -1284,6 +1318,20 @@ the other misses (especially BND) = a caller limitation, not a simulator defect.
 Low overall with high per-type recall = truvari SVTYPE/SVLEN representation
 mismatch (inspect the pre-flight schema dump).
 EOF
+
+# Repeated here on purpose. Stage 3b prints this ~900 lines earlier in the log, and the
+# banner above is what actually gets read and pasted — an empty denominator that only
+# appears upstream is an empty denominator nobody sees.
+if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
+    cat <<EOF
+COVERAGE HOLE: ${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]} SV type(s) had NO truth records and were
+not measured at all: ${TYPES_UNMEASURED[*]}
+  Every recall above is over the remaining types. There is no caller result for these,
+  neither pass nor fail. If a type here is one the model requests with p>0, replicate
+  before concluding anything: the draw is stochastic, and a single empty stratum is
+  weak evidence either way.
+EOF
+fi
 
 # Reclaim scratch once scoring is done: FASTQ is the bulk (~GBs/run at 60x) and
 # isn't needed afterward — BAMs, Manta calls, the truth VCFs, and the truvari
