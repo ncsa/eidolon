@@ -279,7 +279,8 @@ fi
 
 # Pre-generate per-type truth subsets NOW, while bcftools (bioinf) is active, so
 # the truvari scoring stage needs only truvari on its PATH (no bcftools in that
-# env). Empty types are removed so the scoring loop skips them.
+# env). Empty types are removed so the scoring loop skips them — and RECORDED, because a
+# skipped type is an unmeasured stratum that has to be reported rather than dropped.
 # The canonical SVTYPE list, declared ONCE. The scoring loop iterates this same array
 # rather than globbing truth_sv_*.vcf.gz, so a derived artifact can never be mistaken
 # for an SVTYPE — see SV_TYPES_SCORED_IN_LOOP below.
@@ -292,14 +293,47 @@ for svt in "${SV_TYPES[@]}"; do
     case "$svt" in BND|CNV) continue ;; esac
     SV_TYPES_SCORED_IN_LOOP+=("$svt")
 done
-for svt in "${SV_TYPES[@]}"; do
-    typed="$OUTDIR/truth_sv_${svt}.vcf.gz"
-    bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$typed" "$TRUTH_SV" 2>/dev/null || continue
-    bcftools index -f -t "$typed" 2>/dev/null || true
-    n=$(bcftools view -H "$typed" 2>/dev/null | wc -l)
-    echo "  truth $svt: $n"
-    [[ "$n" -eq 0 ]] && rm -f "$typed" "${typed}.tbi"
-done
+# A type the model ASKS FOR but that no record realises is an UNMEASURED STRATUM, not a
+# result. The zero-count file is deleted here and the scoring loop then skips it on
+# `[[ -f "$typed" ]] || continue`, so before this change the run printed a bare
+# `truth INS: 0` and never mentioned INS again — and the aggregate recall silently meant
+# "of the types we happened to draw". Job 20853511 reported manta_overall=0.861 over
+# DEL/DUP/INV only, with INS absent from 123 records.
+#
+# NOT a hard failure, deliberately: the pancancer model draws Ins at p=0.0279, so ~6% of
+# runs legitimately plant none and failing those would be a false alarm. What is not
+# acceptable is the silence, so the stratum is named here and again in the summary. Chasing
+# a real generation defect needs replicates, not one run — see docs/sv_support_matrix.md,
+# which records symbolic <INS> as a silent no-op from input_vcf (#500) while asserting the
+# de novo path synthesises sequence. That claim is untested and this is the run that would
+# have surfaced it.
+# Sets TYPES_UNMEASURED (global) to every SV_TYPES entry with zero truth records. A
+# function rather than an inline loop so it is reachable from the test suite: the
+# behaviour that matters is "an empty stratum is named", and asserting that by grepping
+# the source would only check that the code looks right.
+split_truth_by_type() {  # <truth_sv.vcf.gz> <outdir>
+    local truth="$1" dir="$2" svt typed n
+    TYPES_UNMEASURED=()
+    for svt in "${SV_TYPES[@]}"; do
+        typed="$dir/truth_sv_${svt}.vcf.gz"
+        bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$typed" "$truth" 2>/dev/null || continue
+        bcftools index -f -t "$typed" 2>/dev/null || true
+        n=$(bcftools view -H "$typed" 2>/dev/null | wc -l)
+        echo "  truth $svt: $n"
+        if [[ "$n" -eq 0 ]]; then
+            rm -f "$typed" "${typed}.tbi"
+            TYPES_UNMEASURED+=("$svt")
+            echo "    NOT MEASURED: 0 $svt planted, so no $svt recall exists for any caller." >&2
+            echo "      This is a hole in the run's coverage, not a passing stratum." >&2
+        fi
+    done
+    if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
+        echo "  SV types with an EMPTY denominator: ${TYPES_UNMEASURED[*]} (${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]})"
+        echo "    Every recall below is over the remaining types only."
+    fi
+}
+TYPES_UNMEASURED=()
+split_truth_by_type "$TRUTH_SV" "$OUTDIR"
 
 # The aggregate must cover only what truvari can match. A BND has no SVLEN and
 # END==POS, and CNV is a copy-ratio call — truvari matches neither, so including
@@ -901,6 +935,26 @@ build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
     return 0
 }
 
+# Read one numeric metric out of a truvari summary.json. Prints the value and returns 0;
+# returns 1 if the summary is MISSING or unparseable.
+#
+# WHY THE DISTINCTION IS THE WHOLE POINT: both calibration controls used to open with
+# `local r=0` and then overwrite it only `[[ -f "$out/summary.json" ]]`. A truvari that
+# crashed therefore left r=0, which the selftest reads as "recall 0 → FAIL" (safe) but the
+# decoy reads as "recall 0 → PASS" — a negative control that passes *because it never ran*.
+# `truvari … >/dev/null 2>&1 || true` then discarded the only evidence of why.
+# Job 20853511 printed no decoy verdict at all with an empty truvari_decoy_scoreable/,
+# which is what sent us looking. An absent measurement must never be spellable as a
+# passing one; that is the same "assert content, not existence" rule as everywhere else.
+truvari_metric() {  # <summary.json> <key>
+    [[ -f "$1" ]] || return 1
+    python3 - "$1" "$2" <<'PY' || return 1
+import json, sys
+v = json.load(open(sys.argv[1])).get(sys.argv[2])
+print(float(v) if v is not None else 0.0)
+PY
+}
+
 # ── Rule 0: calibrate the scorer before believing it ────────────────────
 # A scorer must reproduce a PERFECT score against itself in the configuration the real
 # run uses. If truth-vs-truth is not 1.000, the configuration is broken and nothing it
@@ -911,11 +965,19 @@ build_bnd_spans() {  # <bnd_truth.vcf.gz> <out.vcf.gz>
 selftest_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     local truth="$1" label="$2"; shift 2
     local out="$OUTDIR/truvari_selftest_$label"
+    local err="$OUTDIR/.selftest_${label}.stderr"
     rm -rf "$out"
     truvari bench -b "$truth" -c "$truth" -f "$REFERENCE" -o "$out" \
-        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >/dev/null 2>&1 || true
-    local r=0
-    [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
+        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >"$err" 2>&1 || true
+    # "Did not run" is reported separately from "ran and scored 0". Both fail, but only
+    # one of them is a scoring-threshold problem, and conflating them cost a day.
+    local r
+    if ! r=$(truvari_metric "$out/summary.json" recall); then
+        echo "ERROR: scorer selftest for $label DID NOT RUN — no readable" >&2
+        echo "  $out/summary.json. truvari's own output follows:" >&2
+        sed -n '1,20p' "$err" >&2 2>/dev/null || true
+        return 1
+    fi
     if awk -v r="$r" 'BEGIN{exit !(r > 0.999)}'; then
         # recall=1.000 is necessary but NOT sufficient: a filter that discards a record
         # removes it from base AND comp alike, so the subset still matches itself
@@ -962,19 +1024,28 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
       | bcftools sort -O z -o "$decoy" 2>/dev/null || { echo "  decoy $label: could not build (skipped)"; return 0; }
     bcftools index -f -t "$decoy" 2>/dev/null || true
     rm -rf "$out"
+    local err="$OUTDIR/.decoy_${label}.stderr"
     truvari bench -b "$truth" -c "$decoy" -f "$REFERENCE" -o "$out" \
-        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >/dev/null 2>&1 || true
-    local r=0
-    [[ -f "$out/summary.json" ]] && r=$(python3 -c "import json,sys;print(json.load(open('$out/summary.json')).get('recall') or 0)")
+        --passonly --sizemax "$TRUVARI_SIZEMAX" "$@" >"$err" 2>&1 || true
+    local r
+    if ! r=$(truvari_metric "$out/summary.json" recall); then
+        echo "ERROR: decoy control for $label DID NOT RUN — no readable" >&2
+        echo "  $out/summary.json. This is NOT a pass: the decoy is the only evidence that" >&2
+        echo "  a recall figure means detection rather than a matching window loose enough" >&2
+        echo "  to accept anything, so every number from this run would be uncalibrated." >&2
+        echo "  truvari's own output follows:" >&2
+        sed -n '1,20p' "$err" >&2 2>/dev/null || true
+        return 1
+    fi
     if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then
         echo "  decoy    $label: PASS (shifted truth recall=$r, expected 0)"
-    else
-        echo "  WARNING: decoy control for $label matched (recall=$r). Displacement now" >&2
-        echo "  scales with SVLEN, so this is no longer explained by an undersized shift —" >&2
-        echo "  the scorer is matching on position more loosely than intended, or records" >&2
-        echo "  ran off the end of their contig. Inspect $out/tp-base.vcf.gz." >&2
+        return 0
     fi
-    return 0
+    echo "ERROR: decoy control for $label matched (recall=$r). Displacement scales with" >&2
+    echo "  SVLEN, so this is not an undersized shift — the scorer is matching on position" >&2
+    echo "  more loosely than intended, or records ran off the end of their contig." >&2
+    echo "  Inspect $out/tp-base.vcf.gz." >&2
+    return 1
 }
 
 # Score one caller's VCF against the truth — aggregate + per-type + BND (#457).
@@ -1164,7 +1235,7 @@ fi
 echo "[5/5] Calibrating scorers (truth-vs-truth must be perfect; decoy must be zero)..."
 if [[ -f "$TRUTH_SCOREABLE" ]]; then
     selftest_truvari "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
-    decoy_truvari    "$TRUTH_SCOREABLE" scoreable
+    decoy_truvari    "$TRUTH_SCOREABLE" scoreable || CAL_FAIL=1
 fi
 if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST" || CAL_FAIL=1
@@ -1173,7 +1244,7 @@ if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
     # proximity window; without a decoy nothing measures how often a *displaced*
     # breakend still lands inside it. Cheap, and this is exactly where the decoy works
     # best: a breakend is a point (END==POS), so any shift displaces it fully.
-    decoy_truvari    "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST"
+    decoy_truvari    "$OUTDIR/truth_sv_BND.vcf.gz" BND --bnddist "$BND_DIST" || CAL_FAIL=1
 fi
 if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
     selftest_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" BNDspan -t || CAL_FAIL=1
@@ -1197,10 +1268,12 @@ fi
 # archiving precisely BECAUSE the scorer misbehaved, and the exit below runs after
 # archive_run. Scoring itself is pointless with a scorer that cannot score a known answer.
 if [[ "$CAL_FAIL" -ne 0 ]]; then
-    echo "ERROR: at least one scorer cannot match the truth to itself — refusing to" >&2
-    echo "  report caller results computed with a configuration that demonstrably" >&2
-    echo "  cannot score a perfect answer. Skipping caller scoring; see the selftest" >&2
-    echo "  output above and the archived truvari_selftest_* directories." >&2
+    echo "ERROR: at least one scorer failed calibration — either it cannot match the" >&2
+    echo "  truth to itself (positive control) or it matched a deliberately displaced" >&2
+    echo "  copy of it (negative control), and a control that DID NOT RUN counts as a" >&2
+    echo "  failure, not a pass. Refusing to report caller results from a configuration" >&2
+    echo "  not demonstrated to discriminate. Skipping caller scoring; see the output" >&2
+    echo "  above and the archived truvari_selftest_*/truvari_decoy_* directories." >&2
 else
     score_caller manta "$MANTA_SV" "$MANTA_SV_RAW"
     # Delly emits no BND at all and is not converted, so raw and scored are the same file.
@@ -1245,6 +1318,20 @@ the other misses (especially BND) = a caller limitation, not a simulator defect.
 Low overall with high per-type recall = truvari SVTYPE/SVLEN representation
 mismatch (inspect the pre-flight schema dump).
 EOF
+
+# Repeated here on purpose. Stage 3b prints this ~900 lines earlier in the log, and the
+# banner above is what actually gets read and pasted — an empty denominator that only
+# appears upstream is an empty denominator nobody sees.
+if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
+    cat <<EOF
+COVERAGE HOLE: ${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]} SV type(s) had NO truth records and were
+not measured at all: ${TYPES_UNMEASURED[*]}
+  Every recall above is over the remaining types. There is no caller result for these,
+  neither pass nor fail. If a type here is one the model requests with p>0, replicate
+  before concluding anything: the draw is stochastic, and a single empty stratum is
+  weak evidence either way.
+EOF
+fi
 
 # Reclaim scratch once scoring is done: FASTQ is the bulk (~GBs/run at 60x) and
 # isn't needed afterward — BAMs, Manta calls, the truth VCFs, and the truvari

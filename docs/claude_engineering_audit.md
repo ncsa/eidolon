@@ -292,6 +292,41 @@ Harness-level instances follow the same pattern: a metric reported without check
 covered its own inputs. `VERDICT: PASS` over 160 silently-excluded sites; `nsom -gt 0`
 passing while every value was the malformed string `AF=AF=0.3000`.
 
+**The negative control that passed by not running (job 20853511, 2026-08-05).** The worst
+instance of this class so far, because the thing that failed silently was the check whose
+entire job is to catch silent failure. `decoy_truvari` in `sv_pipeline.sbatch` scores the
+truth against a deliberately displaced copy of itself; recall must be 0, and it is the only
+evidence that a reported recall means *detection* rather than a matching window loose enough
+to accept anything. Three defects compounded:
+
+```bash
+truvari bench … >/dev/null 2>&1 || true        # 1. every diagnostic discarded
+local r=0                                       # 2. absent measurement == measured zero
+[[ -f "$out/summary.json" ]] && r=$(… recall)
+if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then
+    echo "  decoy    $label: PASS (shifted truth recall=$r, expected 0)"
+else
+    echo "  WARNING: …" >&2                     # 3. never a failure, only a warning
+fi
+return 0                                        #    and the call sites ignored the status
+```
+
+A truvari that crashed left `r=0`, which satisfies `r < 0.001`, so the function *printed a
+PASS citing a recall it had never measured* and returned 0. The identical `local r=0` idiom
+in `selftest_truvari` fails safe purely because its comparison runs the other way
+(`r > 0.999`) — the same bug, invisible, in the control next door.
+
+Note the shape: this was not found by the control failing. It was found by its output being
+*absent* from a run log, and the run still reporting `complete`. A control that cannot
+distinguish "0" from "never ran" is indistinguishable from no control, but it is worse,
+because it is affirmatively reported as evidence that calibration happened.
+
+Fixed by routing both controls through a `truvari_metric` helper that returns non-zero for a
+missing or unparseable summary, making a decoy match *and* a decoy that did not run set
+`CAL_FAIL` like the selftest does, and keeping truvari's stderr. Covered by
+`scripts/delta/tests/test_scorer_calibration.sh` (31 assertions, 5 mutations, 0 survivors);
+the first mutation restores the `local r=0` default exactly and the suite catches it.
+
 ### 5.4 Confident wrong causal explanation
 
 `BND recall = 0.000` received three sequential confident explanations — unpaired truth,

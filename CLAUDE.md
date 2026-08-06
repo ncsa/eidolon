@@ -131,6 +131,16 @@ contig lengths).
   gone 2026-08-02), so **do not check for it**; a search there wastes a round trip and
   its absence is not evidence a run is missing.
 
+- **The Delta checkout is a separate working copy and goes stale silently.** A queued job
+  runs the script as it was when the job *started*, which on a busy queue can be days after
+  it was submitted — so a result can predate a fix you believe is in it. Establish the SHA
+  **before** interpreting any number:
+  `cd /projects/bhrd/jallen17/eidolon && git log -1 --format='%h %ci' -- <script>`, then
+  `git merge-base --is-ancestor <sha> origin/develop`. Job 20853511 was diagnosed for two
+  findings before the checkout turned out to be three days behind (`6e4c288`, predating
+  #508), which invalidated the run regardless. Ask for the SHA in the same round trip as
+  the results, not after.
+
 - **Disk is the binding constraint on Delta, and quota views lie about it.** `df` inside a
   project-quota'd directory reports the *quota*, not the mount: `df -h /work/nvme/bhrd`
   showed `500G/500G/0` while `df -h /work/nvme` showed 8.5P at 56%. The `quota` table and
