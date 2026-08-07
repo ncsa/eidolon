@@ -327,6 +327,60 @@ missing or unparseable summary, making a decoy match *and* a decoy that did not 
 `scripts/delta/tests/test_scorer_calibration.sh` (31 assertions, 5 mutations, 0 survivors);
 the first mutation restores the `local r=0` default exactly and the suite catches it.
 
+**The stratum that was never selectable — and the near-retraction of a correct doc
+(2026-08-06).** `truth INS: 0` appeared in every SV validation `.out` file ever produced. The
+model asks for insertions at `p=0.0279`, so across 1,628 sampled events roughly 45 were
+expected; observing zero is a ~10⁻²⁰ outcome. The conclusion drawn — that de novo INS
+generation was dead, and that `docs/sv_support_matrix.md`'s claim it worked should be deleted
+— was wrong in both parts.
+
+De novo insertions are emitted as **literal** records (`REF=A`, `ALT=A<novel bases>`) so the
+novel sequence reaches the reads. They carried no `SVTYPE`, on the reasoning quoted verbatim
+from the emit site:
+
+```rust
+// No symbolic INFO needed — the SVLEN is implicit in
+// the REF/ALT length difference.
+info: None,
+```
+
+True, and beside the point: an untagged literal insertion is indistinguishable from a
+small-indel insertion of the same size. `sv_pipeline.sbatch` selects SVs on
+`ALT[0]~"<" || INFO/SVTYPE!="."` and matched neither arm, so the records were dropped before
+the per-type split and `truth INS: 0` was computed from `INFO/SVTYPE="INS"` — a query that
+could never match anything. The insertions were in the truth VCF the whole time: 4 across two
+replicates at 296/1057/1492/2500 bp, against ~5.2 expected-visible. **A p-value of 10⁻²⁰
+characterising the harness's own selector rather than the thing under test.**
+
+Three lessons the rest of this document does not already carry:
+
+1. **An empty stratum has two causes, and they look identical.** Nothing was planted, or
+   nothing was *selectable*. The `COVERAGE HOLE` reporting added the day before correctly
+   flagged the empty denominator and then suggested the wrong cause ("replicate before
+   concluding anything"), which is what sent the investigation toward more runs instead of
+   toward the selector.
+2. **Verify before retracting.** Rule 3 says grep for every instance of a claim and check the
+   premise. It does not say the claim is usually wrong. A correct, measured doc line was one
+   step from deletion on the strength of a mismeasurement; the thing that stopped it was
+   being asked "or are they getting mistaken for something else?"
+3. **The bimodality was the tell, and it was visible in the raw data.** 15 records at
+   50–93 bp thinning monotonically (an indel tail) plus 3 at 296–1492 bp (a lognormal) — the
+   mean of 209 bp that made both populations look like one was the artifact. Two hypotheses
+   were floated and discarded before the distribution was simply printed and sorted.
+
+Fixed in `eidolon-core` by emitting `SVTYPE=INS;END=POS;SVLEN=+n` on the literal record while
+keeping the literal ALT — which is what Manta emits for a resolved insertion. Pinned by a
+known-answer test (`SVLEN == ALT.len()-REF.len()`, `END == POS`), a must-not-fire test that no
+non-INS sampled type claims `SVTYPE=INS`, and a cross-component test driving the real sampler
+through the real writer. Both fixes were mutation-verified independently: reverting the
+sampler fails the unit test, and breaking the writer's literal-INFO branch fails *only* the
+cross-component test while the unit test still passes.
+
+Postscript, in the same session and the same class: the `awk` used to read
+`EIDOLON_PROVENANCE` was written as `substr($8, RSTART+20, ...)` against a 19-character token,
+silently reporting the provenance of all 18 records as `enovo`. The hardcoded-offset footgun
+is in `CLAUDE.md`'s bash section, and was committed while quoting that file.
+
 ### 5.4 Confident wrong causal explanation
 
 `BND recall = 0.000` received three sequential confident explanations — unpaired truth,

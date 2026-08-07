@@ -803,9 +803,23 @@ impl SvModel {
                     id: None,
                     quality_score: None,
                     filter: None,
-                    // No symbolic INFO needed — the SVLEN is implicit in
-                    // the REF/ALT length difference.
-                    info: None,
+                    // SVTYPE/SVLEN are what make this identifiable as a STRUCTURAL
+                    // insertion, and omitting them is not cosmetic. The SVLEN is indeed
+                    // implicit in the REF/ALT length difference — but so is a 60 bp
+                    // insertion from the small-indel model, so an untagged record is
+                    // indistinguishable from one, by any means. Every SV validation run
+                    // to date reported `truth INS: 0` while planting insertions, because
+                    // the harness selects SVs on a symbolic ALT or an SVTYPE tag and
+                    // these had neither: job 20885875 planted 3 (296/1057/1492 bp) and
+                    // scored none of them. Below MIN_SV_LENGTH_BP-ish sizes the record
+                    // was not merely unscored but unattributable.
+                    //
+                    // END == POS because an insertion spans no reference bases; place_sv
+                    // already returns anchor+1 for Ins, which is that. The literal ALT is
+                    // KEPT — it routes the novel bases through gen-reads' insertion
+                    // machinery so the reads actually carry them, and SVTYPE=INS beside a
+                    // literal ALT is exactly what Manta emits for a resolved insertion.
+                    info: Some(build_info_field(SvType::Ins, sv_end_1based, length, None)),
                     format: vec!["GT".to_string()],
                     sample: vec![genotype_str],
                     provenance: Provenance::Denovo,
@@ -2161,6 +2175,148 @@ mod tests {
                 inserted_len >= MIN_SV_LENGTH_BP,
                 "inserted-sequence length {inserted_len} must be ≥ {MIN_SV_LENGTH_BP}"
             );
+        }
+    }
+
+    /// A de novo INS must be identifiable as a STRUCTURAL insertion, not just as an
+    /// insertion. It is emitted with a literal ALT (so the reads carry the bases), which
+    /// makes it byte-identical in form to a small-indel-model insertion — SVTYPE is the
+    /// only thing that separates them. Without it the SV harness selects on
+    /// `ALT[0]~"<" || INFO/SVTYPE!="."`, matches neither, and reports `truth INS: 0`
+    /// while insertions were planted (jobs 20885875 / 20892075, 4 planted, 0 scored).
+    ///
+    /// KNOWN ANSWER, independent of the implementation: for `REF=<1 anchor base>` and
+    /// `ALT=<anchor><n novel bases>`, SVLEN must be exactly `n` = `ALT.len() - REF.len()`,
+    /// positive, and END must equal POS because an insertion consumes no reference span.
+    #[test]
+    fn sampled_ins_carry_svtype_and_svlen_so_they_are_separable_from_indels() {
+        use crate::structs::variants::parse_sv_info;
+        let m = model_with_single_type(SvType::Ins, 5e-3);
+        let seq = acgt_sequence(100_000);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+        assert!(!out.is_empty(), "fixture must plant at least one INS");
+        for v in &out {
+            let info = v
+                .info
+                .as_deref()
+                .expect("de novo INS must carry INFO or it cannot be told from an indel");
+            let parsed = parse_sv_info(info);
+            assert_eq!(
+                parsed.svtype.as_deref(),
+                Some("INS"),
+                "INS must be tagged SVTYPE=INS; got {info}"
+            );
+
+            // SVLEN computed from the record itself, not from the sampler's internals.
+            let alt = v.alternate.as_literal().expect("INS must be literal-ALT");
+            let inserted = (alt.len() - v.reference.len()) as i64;
+            assert!(inserted > 0);
+            assert_eq!(
+                parsed.svlen,
+                Some(inserted),
+                "SVLEN must equal ALT.len()-REF.len() = {inserted}; got {info}"
+            );
+
+            // MUST NOT FIRE: END must be POS, never POS+SVLEN. Claiming a reference span
+            // an insertion does not occupy is the same defect the BND arm carries a long
+            // comment about, and truvari sizes records off END.
+            let pos_1based = v.location + 1;
+            assert_eq!(
+                parsed.end,
+                Some(pos_1based),
+                "END must equal POS ({pos_1based}) for an insertion; got {info}"
+            );
+            assert_ne!(
+                parsed.end,
+                Some(pos_1based + inserted as usize),
+                "END must not span the inserted sequence"
+            );
+        }
+    }
+
+    /// CROSS-COMPONENT INVARIANT (sv_model -> vcf_tools). The sampler tagging the record
+    /// and the writer emitting the tag are separate components, and each can be correct
+    /// while the pair is not — which is the shape of most defects found in this repo. The
+    /// writer routes literal records down a *different* INFO branch than symbolic ones
+    /// (`vcf_tools.rs`, on `is_symbolic`), and that branch is documented as carrying only
+    /// simulator tags like EIDOLON_CCF/EIDOLON_VAF. A literal INS carrying SVTYPE could be
+    /// dropped there and every unit test above would still pass, because none of them
+    /// touch a file. Drive the real sampler through the real writer.
+    #[test]
+    fn sampled_ins_svtype_survives_the_vcf_writer() {
+        use crate::file_tools::vcf_tools::write_vcf;
+        use crate::structs::mutated_map::MutatedMap;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let contig_len = 100_000usize;
+        let m = model_with_single_type(SvType::Ins, 5e-3);
+        let seq = acgt_sequence(contig_len);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", contig_len, &[], &seq, 2, 1.0, 0.25, &mut rng);
+        assert!(!out.is_empty(), "fixture must plant at least one INS");
+        let n_ins = out.len();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = temp_dir.path().join("ins.vcf");
+        let map = MutatedMap::from_interval(0, contig_len, out).unwrap();
+        let maps = HashMap::from([("chr1".to_string(), vec![map])]);
+        write_vcf(
+            &maps,
+            &vec!["chr1".to_string()],
+            &HashMap::from([("chr1".to_string(), contig_len)]),
+            &PathBuf::from("ref.fa"),
+            false,
+            &output,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let body: Vec<String> = crate::file_tools::file_io::read_gzip_lines(&output)
+            .unwrap()
+            .map(|l| l.unwrap())
+            .filter(|l| !l.starts_with('#'))
+            .collect();
+        let tagged = body.iter().filter(|l| l.contains("SVTYPE=INS")).count();
+        assert_eq!(
+            tagged,
+            n_ins,
+            "all {n_ins} sampled INS must reach the VCF carrying SVTYPE=INS; \
+             got {tagged} of {} record(s): {body:?}",
+            body.len()
+        );
+        // The SV tags must be appended BESIDE provenance, not instead of it — the writer
+        // builds that INFO column by concatenation and either side could win.
+        assert!(
+            body.iter().all(|l| l.contains("EIDOLON_PROVENANCE=denovo")),
+            "provenance must survive beside SVTYPE: {body:?}"
+        );
+    }
+
+    /// MUST NOT FIRE, the other direction: tagging INS must not have leaked SVTYPE onto
+    /// the *other* literal variants, or small indels would be promoted to structural
+    /// variants and every future INS denominator would be inflated. Only the SV sampler's
+    /// insertions are in scope here, so assert the converse invariant that holds within
+    /// this sampler: nothing it emits with a non-INS type claims to be an INS.
+    #[test]
+    fn no_non_ins_sampled_variant_claims_svtype_ins() {
+        use crate::structs::variants::parse_sv_info;
+        for t in [SvType::Del, SvType::Dup, SvType::Cnv, SvType::Inv] {
+            let m = model_with_single_type(t, 5e-3);
+            let seq = acgt_sequence(100_000);
+            let mut rng = deterministic_rng();
+            let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+            assert!(!out.is_empty(), "fixture must plant at least one {t:?}");
+            for v in &out {
+                if let Some(info) = v.info.as_deref() {
+                    assert_ne!(
+                        parse_sv_info(info).svtype.as_deref(),
+                        Some("INS"),
+                        "{t:?} must not be tagged SVTYPE=INS; got {info}"
+                    );
+                }
+            }
         }
     }
 

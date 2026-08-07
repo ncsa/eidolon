@@ -1327,9 +1327,18 @@ if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
 COVERAGE HOLE: ${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]} SV type(s) had NO truth records and were
 not measured at all: ${TYPES_UNMEASURED[*]}
   Every recall above is over the remaining types. There is no caller result for these,
-  neither pass nor fail. If a type here is one the model requests with p>0, replicate
-  before concluding anything: the draw is stochastic, and a single empty stratum is
-  weak evidence either way.
+  neither pass nor fail. An empty stratum has TWO causes that look identical here, and
+  they are diagnosed in opposite directions:
+    (a) nothing was PLANTED  -> the draw is stochastic; replicate before concluding.
+    (b) nothing was SELECTABLE -> records exist but this harness cannot see them,
+        because the SV selector needs a symbolic ALT or an INFO/SVTYPE tag.
+  Check (b) FIRST — it is cheap and it is what actually happened with INS, where the
+  truth VCF held insertions as untagged literal records for every run before v3.1.x
+  and 'truth INS: 0' was a statement about the selector, not the simulator:
+    bcftools view -H -i 'INFO/EIDOLON_ORIGIN="somatic"' <merged truth> \\
+      | awk 'length(\$5)-length(\$4) >= 50 && \$5 !~ /</ {n++} END {print n+0" untagged"}'
+  A non-zero count there means the stratum is a selector gap, and no number of
+  replicates will fix it.
 EOF
 fi
 
