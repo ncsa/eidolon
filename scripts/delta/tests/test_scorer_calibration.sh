@@ -64,6 +64,10 @@ empty stratum silently dropped (pre-fix)@TYPES_UNMEASURED+=("$svt")@:
 coverage-hole summary never printed@echo "  SV types with an EMPTY denominator@echo "  suppressed
 empty stratum reported for every type@if [[ "$n" -eq 0 ]]; then@if [[ "$n" -ge 0 ]]; then
 empty type leaves a stray truth file@rm -f "$typed" "${typed}.tbi"@:
+commit check accepts any commit@elif [[ "$ver" != *"+$want"* ]]; then@elif false; then
+unstamped binary accepted@elif [[ "$ver" == *"+unknown"* ]]; then@elif false; then
+dirty tree not detected@[[ -n "$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null)" ]] && dirty="-dirty"@:
+provenance failure is advisory only@    [[ "$rc" -eq 0 ]] && return 0@    return 0; [[ "$rc" -eq 0 ]] && return 0
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -92,7 +96,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -272,6 +276,57 @@ outp="$(cat "$WORK/split_full.log")"
 is    "no type reported unmeasured"        "" "${TYPES_UNMEASURED[*]}"
 hasnt "no NOT MEASURED line is emitted"    "$outp" "NOT MEASURED"
 hasnt "no coverage-hole summary is emitted" "$outp" "EMPTY denominator"
+
+echo "── check_binary_provenance: a stale binary within one version must be caught ──"
+# Build a throwaway repo so the function has a real git HEAD to compare against. The
+# defect (#513) is that the semver half passes whenever Cargo.toml is unchanged, which is
+# every commit in this project — so every case below holds the version CONSTANT and varies
+# only the commit.
+PROV_REPO="$WORK/provrepo"
+mkdir -p "$PROV_REPO"
+printf "[workspace]\nversion = '3.1.0'\n" > "$PROV_REPO/Cargo.toml"
+git -C "$PROV_REPO" init -q
+git -C "$PROV_REPO" add Cargo.toml
+git -C "$PROV_REPO" -c user.email=t@example.com -c user.name=t commit -q -m init
+PROV_SHA="$(git -C "$PROV_REPO" rev-parse --short=7 HEAD)"
+
+prov() { ALLOW_STALE_BIN="${2:-0}" check_binary_provenance "$1" "$PROV_REPO" >/dev/null 2>&1; echo $?; }
+
+is "matching version and commit passes"        0 "$(prov "eidolon 3.1.0+$PROV_SHA")"
+is "same version, DIFFERENT commit fails"      1 "$(prov "eidolon 3.1.0+deadbee")"
+is "unstamped binary (+unknown) fails"         1 "$(prov "eidolon 3.1.0+unknown")"
+is "version mismatch still fails"              1 "$(prov "eidolon 3.0.0+$PROV_SHA")"
+is "no stamp at all fails"                     1 "$(prov "eidolon 3.1.0")"
+is "ALLOW_STALE_BIN=1 overrides a bad commit"  0 "$(prov "eidolon 3.1.0+deadbee" 1)"
+
+# The message must name the actual defect, not just say "stale" — the semver wording sent
+# a previous investigation looking for a version problem that did not exist.
+outp="$(ALLOW_STALE_BIN=0 check_binary_provenance "eidolon 3.1.0+deadbee" "$PROV_REPO" 2>&1)"
+has "commit mismatch names the commit"  "$outp" "DIFFERENT COMMIT"
+has "commit mismatch shows both sides"  "$outp" "checkout: $PROV_SHA"
+
+# An UNSTAMPED binary and a WRONG-COMMIT binary both fail, so asserting the exit status
+# alone does not distinguish them — a mutation disabling the +unknown branch survived on
+# that basis, because control fell through to the commit check and failed anyway. The two
+# point at different fixes ("rebuild where git is available" vs "rebuild this checkout"),
+# so the diagnosis is part of the contract.
+outp="$(ALLOW_STALE_BIN=0 check_binary_provenance "eidolon 3.1.0+unknown" "$PROV_REPO" 2>&1)"
+has   "unstamped binary is diagnosed as unstamped" "$outp" "no git stamp"
+hasnt "unstamped is not misreported as wrong commit" "$outp" "DIFFERENT COMMIT"
+
+# A dirty tree means the stamp does not describe what was compiled, so the binary built
+# FROM that dirty tree must match and a clean-stamped binary must not.
+printf "[workspace]\nversion = '3.1.0'\n# edited\n" > "$PROV_REPO/Cargo.toml"
+is "dirty tree accepts the -dirty stamp"        0 "$(prov "eidolon 3.1.0+${PROV_SHA}-dirty")"
+is "dirty tree rejects a clean stamp"           1 "$(prov "eidolon 3.1.0+$PROV_SHA")"
+git -C "$PROV_REPO" checkout -q -- Cargo.toml
+
+# MUST NOT FIRE: outside a git repo there is nothing to compare, so warn and pass rather
+# than failing every conda/tarball install that never claimed a commit.
+NOGIT="$WORK/nogit"; mkdir -p "$NOGIT"
+printf "[workspace]\nversion = '3.1.0'\n" > "$NOGIT/Cargo.toml"
+is "non-git checkout warns but passes" 0 \
+   "$(ALLOW_STALE_BIN=0 check_binary_provenance "eidolon 3.1.0" "$NOGIT" >/dev/null 2>&1; echo $?)"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

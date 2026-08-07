@@ -150,13 +150,57 @@ echo "eidolon binary: $EIDOLON_BIN"
 echo "eidolon version: ${EIDOLON_VERSION:-unknown}"
 echo "repo HEAD:      $(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 # A binary older than the checkout is almost always a forgotten rebuild.
-_repo_ver="$(awk -F\' '/^version = /{print $2; exit}' "$REPO_ROOT/Cargo.toml" 2>/dev/null)"
-if [[ -n "$_repo_ver" && "${EIDOLON_VERSION:-}" != *"$_repo_ver"* ]]; then
-    echo "ERROR: binary reports '${EIDOLON_VERSION:-unknown}' but the checkout is $_repo_ver." >&2
-    echo "  The binary is stale — rebuild before running, or the results describe code" >&2
-    echo "  that is not the code you think you are testing. Set ALLOW_STALE_BIN=1 to override." >&2
-    [[ "${ALLOW_STALE_BIN:-0}" == "1" ]] || exit 1
-fi
+#
+# The SEMVER half of this check cannot see a stale binary within a version, which is every
+# build in this repo (#513). `develop` carries 116 commits since v3.0.0 under one Cargo
+# version, and that version reads 3.1.0 against main's 3.0.0 with no release behind it — it
+# was bumped partly to make this very check fire. So the commit is compared too, from the
+# stamp `eidolon/build.rs` puts in `--version` ("3.1.0+abc1234", "+abc1234-dirty", or
+# "+unknown"). Job 20682989 reproduced job 20675480's numbers exactly and the log could not
+# answer "was the fix even in this build?"; the semver alone still could not.
+check_binary_provenance() {  # <eidolon --version output> <repo root>
+    local ver="$1" root="$2" rc=0
+    # dirty MUST be initialised, not merely declared: `local dirty` leaves it unset, and
+    # "${repo_sha}${dirty}" then aborts the whole job under `set -u` on a CLEAN checkout —
+    # i.e. the normal case. Caught by the suite before it reached Delta.
+    local repo_ver repo_sha want
+    local dirty=""
+
+    repo_ver="$(awk -F\' '/^version = /{print $2; exit}' "$root/Cargo.toml" 2>/dev/null)"
+    if [[ -n "$repo_ver" && "$ver" != *"$repo_ver"* ]]; then
+        echo "ERROR: binary reports '${ver:-unknown}' but the checkout is $repo_ver." >&2
+        echo "  The binary is stale — rebuild before running, or the results describe code" >&2
+        echo "  that is not the code you think you are testing." >&2
+        rc=1
+    fi
+
+    repo_sha="$(git -C "$root" rev-parse --short=7 HEAD 2>/dev/null)"
+    # -uno: the pipeline's own SLURM .out/.err files land in the submit dir, which IS the
+    # repo, so counting untracked files would report every run as dirty.
+    [[ -n "$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null)" ]] && dirty="-dirty"
+    want="${repo_sha}${dirty}"
+
+    if [[ -z "$repo_sha" ]]; then
+        echo "WARNING: cannot read the checkout's git commit; build provenance unverified." >&2
+    elif [[ "$ver" == *"+unknown"* ]]; then
+        # "Cannot verify" must not read as "verified" — the #509 lesson, one guard over.
+        echo "ERROR: the binary carries no git stamp (+unknown), so it cannot be matched to" >&2
+        echo "  this checkout. Rebuild where git is available." >&2
+        rc=1
+    elif [[ "$ver" != *"+$want"* ]]; then
+        echo "ERROR: the binary was built from a DIFFERENT COMMIT than this checkout — the" >&2
+        echo "  forgotten rebuild the version check above cannot see." >&2
+        echo "    binary:   $ver" >&2
+        echo "    checkout: $want" >&2
+        echo "  Run 'cargo build --release' before scoring." >&2
+        rc=1
+    fi
+
+    [[ "$rc" -eq 0 ]] && return 0
+    echo "  Set ALLOW_STALE_BIN=1 to override (the results then describe an unknown build)." >&2
+    [[ "${ALLOW_STALE_BIN:-0}" == "1" ]]
+}
+check_binary_provenance "${EIDOLON_VERSION:-}" "$REPO_ROOT" || exit 1
 
 if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
     echo "[1/5] Simulation outputs already present — skipping."

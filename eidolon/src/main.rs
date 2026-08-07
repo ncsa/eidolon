@@ -182,7 +182,17 @@ fn main() -> Result<(), NeatErrors> {
         .multicall(true)
         .subcommand(
             Command::new("eidolon")
-                .version(env!("CARGO_PKG_VERSION"))
+                // Version carries the build's git commit (build.rs, #513). The bare
+                // semver could not distinguish two binaries built from different commits
+                // of the same unreleased version, which is every build in this repo, so
+                // the validation pipeline's stale-binary guard was structurally unable to
+                // catch a forgotten rebuild. Format: "3.1.0+abc1234", or "+abc1234-dirty",
+                // or "+unknown" when built without git.
+                .version(concat!(
+                    env!("CARGO_PKG_VERSION"),
+                    "+",
+                    env!("EIDOLON_GIT_SHA")
+                ))
                 .arg_required_else_help(true)
                 .subcommand_value_name("SUB-COMMAND")
                 .subcommand_help_heading("SUB-COMMANDS")
