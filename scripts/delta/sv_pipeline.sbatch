@@ -202,6 +202,21 @@ check_binary_provenance() {  # <eidolon --version output> <repo root>
 }
 check_binary_provenance "${EIDOLON_VERSION:-}" "$REPO_ROOT" || exit 1
 
+# Disk state, in every log, before any work. Job 20904141 rep 5 died ~3h in when the
+# project quota filled at the FASTQ merge, having already spent simulation and alignment —
+# and the log gave no way to see how close the preceding replicates had come. Printed RAW
+# and never parsed: `df` misreports inside a project-quota'd directory (it shows the quota,
+# not the mount), the quota table and df have disagreed for /scratch, and a guard built on
+# fragile parsing is worse than no guard. One replicate needs ~113 GB peak (30 GB normal
+# BAM + 71 GB tumor + FASTQ held together at the merge), measured on job 20892075.
+echo "── disk before start (one replicate needs ~113 GB peak) ──"
+_projid="$(lfs project -d "$(dirname "$OUTDIR")" 2>/dev/null | awk '{print $1}')" || true
+if [[ -n "${_projid:-}" && "$_projid" != "0" ]]; then
+    lfs quota -h -p "$_projid" "$(df -P "$(dirname "$OUTDIR")" 2>/dev/null | awk 'NR==2{print $6}')" 2>&1 || true
+else
+    echo "  (no Lustre project id on $(dirname "$OUTDIR"); quota unknown)"
+fi
+
 if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then
     echo "[1/5] Simulation outputs already present — skipping."
 else
@@ -1395,6 +1410,42 @@ if [[ "${PRUNE_FASTQ:-1}" == "1" ]]; then
     echo "[prune] removing FASTQ intermediates (set PRUNE_FASTQ=0 to keep)..."
     rm -f "$OUTDIR"/sample_*_r1.fastq.gz "$OUTDIR"/sample_*_r2.fastq.gz
 fi
+
+# The BAMs are the rest of the bulk — ~101 GB of a ~113 GB replicate (30 GB normal +
+# 71 GB tumor, measured on job 20892075). Pruning them here, INSIDE the pipeline, rather
+# than from a dependent cleanup job.
+#
+# WHY INLINE: the external strip job failed four different ways in one week — a script
+# path under $HOME that did not exist, a glob pointing at /work/nvme while runs landed on
+# /scratch, a missing --account, and a script whose creation was never confirmed. Each
+# time it exited quietly and nothing downstream noticed, because a cleanup job that does
+# nothing looks exactly like one that had nothing to do. An `--array=4-8%1` campaign then
+# accumulated ~100 GB per finished replicate until rep 5 hit the project quota and the
+# array died. A separate job is a separate thing to forget; this cannot be forgotten.
+#
+# GUARD: only when scoring actually produced a summary. A run that failed calibration, or
+# died before stage 5, keeps its BAMs — that is exactly when someone needs to re-call.
+# Note this makes the replicate re-SCOREABLE but not re-CALLABLE; the FASTQ prune above
+# already removed re-alignment, and CLAUDE.md's guidance for a campaign is to clear
+# finished replicates down to truvari_*/summary.json, which is all aggregate_sv_reps.sh
+# reads. Set PRUNE_BAM=0 to keep them (do that for a single diagnostic run, not a sweep).
+prune_bams() {  # <outdir>
+    local dir="$1" bam_kb
+    [[ "${PRUNE_BAM:-1}" == "1" ]] || { echo "[prune] keeping BAMs (PRUNE_BAM=0)"; return 0; }
+    # MUST NOT FIRE without a completed score. Deleting the BAMs of a run that died before
+    # stage 5 destroys the only artifact that makes it re-callable, and the FASTQ is already
+    # gone by this point, so there is no way back.
+    if [[ ! -f "$dir/truvari_manta_overall/summary.json" ]]; then
+        echo "[prune] KEEPING BAMs: no truvari_manta_overall/summary.json, so scoring did" >&2
+        echo "  not complete and this is a run someone will need to re-call." >&2
+        return 0
+    fi
+    bam_kb=$(du -sk "$dir"/normal.bam "$dir"/tumor.bam 2>/dev/null | awk '{s+=$1} END{print s+0}')
+    rm -f "$dir"/normal.bam "$dir"/normal.bam.bai "$dir"/tumor.bam "$dir"/tumor.bam.bai
+    echo "[prune] removed aligned BAMs, reclaimed $((bam_kb / 1048576)) GB" \
+         "(PRUNE_BAM=0 keeps them; replicate stays re-scoreable, not re-callable)"
+}
+prune_bams "$OUTDIR"
 
 # Persist report artifacts off scratch + record provenance/resources.
 # (manta overall always exists; delly summaries remain under $OUTDIR/truvari_delly_*)

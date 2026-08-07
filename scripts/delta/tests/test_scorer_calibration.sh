@@ -68,6 +68,9 @@ commit check accepts any commit@elif [[ "$ver" != *"+$want"* ]]; then@elif false
 unstamped binary accepted@elif [[ "$ver" == *"+unknown"* ]]; then@elif false; then
 dirty tree not detected@[[ -n "$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null)" ]] && dirty="-dirty"@:
 provenance failure is advisory only@    [[ "$rc" -eq 0 ]] && return 0@    return 0; [[ "$rc" -eq 0 ]] && return 0
+prune deletes BAMs of an unscored run@    if [[ ! -f "$dir/truvari_manta_overall/summary.json" ]]; then@    if false; then
+prune ignores PRUNE_BAM=0@[[ "${PRUNE_BAM:-1}" == "1" ]] || { echo "[prune] keeping BAMs (PRUNE_BAM=0)"; return 0; }@:
+prune leaves the .bai files behind@rm -f "$dir"/normal.bam "$dir"/normal.bam.bai "$dir"/tumor.bam "$dir"/tumor.bam.bai@rm -f "$dir"/normal.bam "$dir"/tumor.bam
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -96,7 +99,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -327,6 +330,40 @@ NOGIT="$WORK/nogit"; mkdir -p "$NOGIT"
 printf "[workspace]\nversion = '3.1.0'\n" > "$NOGIT/Cargo.toml"
 is "non-git checkout warns but passes" 0 \
    "$(ALLOW_STALE_BIN=0 check_binary_provenance "eidolon 3.1.0" "$NOGIT" >/dev/null 2>&1; echo $?)"
+
+echo "── prune_bams: reclaim a scored replicate, never an unscored one ──"
+# Job 20904141 died at rep 5 with the project quota full because the external cleanup jobs
+# never ran at all. This moved inline, so the destructive half needs its own assertions.
+mk_rep() {  # <dir> <scored: yes|no>
+    rm -rf "$1"; mkdir -p "$1"
+    head -c 1048576 /dev/zero > "$1/normal.bam"; : > "$1/normal.bam.bai"
+    head -c 2097152 /dev/zero > "$1/tumor.bam";  : > "$1/tumor.bam.bai"
+    if [[ "$2" == "yes" ]]; then
+        mkdir -p "$1/truvari_manta_overall"
+        printf '{"recall": 0.9}\n' > "$1/truvari_manta_overall/summary.json"
+    fi
+}
+n_bams() { ls "$1"/normal.bam "$1"/tumor.bam 2>/dev/null | wc -l; }
+
+mk_rep "$WORK/rep_scored" yes
+outp="$(PRUNE_BAM=1 prune_bams "$WORK/rep_scored" 2>&1)"
+is  "scored replicate loses its BAMs"     0 "$(n_bams "$WORK/rep_scored")"
+is  "the .bai files go too"               0 "$(ls "$WORK/rep_scored"/*.bai 2>/dev/null | wc -l)"
+has "it reports what it reclaimed"        "$outp" "reclaimed"
+is  "the summary it keyed on survives"    1 \
+    "$(ls "$WORK/rep_scored/truvari_manta_overall/summary.json" 2>/dev/null | wc -l)"
+
+# THE DESTRUCTIVE MUST-NOT-FIRE. A run that died before stage 5 has no summary; its FASTQ is
+# already pruned, so deleting the BAMs makes it permanently un-re-callable.
+mk_rep "$WORK/rep_unscored" no
+outp="$(PRUNE_BAM=1 prune_bams "$WORK/rep_unscored" 2>&1)"
+is  "UNSCORED replicate keeps its BAMs"   2 "$(n_bams "$WORK/rep_unscored")"
+has "and says why"                        "$outp" "KEEPING BAMs"
+
+mk_rep "$WORK/rep_optout" yes
+outp="$(PRUNE_BAM=0 prune_bams "$WORK/rep_optout" 2>&1)"
+is  "PRUNE_BAM=0 keeps them"              2 "$(n_bams "$WORK/rep_optout")"
+has "and says so"                         "$outp" "PRUNE_BAM=0"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
