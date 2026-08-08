@@ -209,12 +209,63 @@ check_binary_provenance "${EIDOLON_VERSION:-}" "$REPO_ROOT" || exit 1
 # not the mount), the quota table and df have disagreed for /scratch, and a guard built on
 # fragile parsing is worse than no guard. One replicate needs ~113 GB peak (30 GB normal
 # BAM + 71 GB tumor + FASTQ held together at the merge), measured on job 20892075.
-echo "── disk before start (one replicate needs ~113 GB peak) ──"
-_projid="$(lfs project -d "$(dirname "$OUTDIR")" 2>/dev/null | awk '{print $1}')" || true
-if [[ -n "${_projid:-}" && "$_projid" != "0" ]]; then
-    lfs quota -h -p "$_projid" "$(df -P "$(dirname "$OUTDIR")" 2>/dev/null | awk 'NR==2{print $6}')" 2>&1 || true
+# Peak footprint of ONE replicate, measured on job 20884022: FASTQ 116 GB (merged 29+29,
+# tumor 17+17, normal 12+12) plus BAMs 91 GB (normal 30, tumor 61), coexisting because the
+# prune only runs at the end. A previous "113 GB" figure counted the FASTQ alone.
+REPLICATE_PEAK_GB="${REPLICATE_PEAK_GB:-207}"
+
+# Extract used/limit in KB from `lfs quota -p` output. Separated from the check so the
+# decision logic is testable without Lustre: the parsing is the fragile half, and the real
+# output is not guessable — an over-quota row marks values with a trailing '*' and adds a
+# grace column, which naive field-splitting silently mangles.
+#   Filesystem   used  bquota  blimit  bgrace       files iquota ilimit igrace
+#     /scratch 549.9G*   500G    550G  6d6h28m43s  21516* 850000 935000      -
+# Called WITHOUT -h so the values are plain KB and no unit parsing is needed.
+parse_lfs_quota_kb() {  # <lfs-quota-output> <filesystem-path>; echoes "<used_kb> <limit_kb>"
+    awk -v fs="$2" '
+        $1 == fs {
+            used = $2; hard = $4
+            gsub(/\*/, "", used); gsub(/\*/, "", hard)
+            # blimit (hard) is what actually stops a write; 0 means "no hard limit set",
+            # in which case fall back to bquota (soft).
+            if (hard + 0 == 0) { soft = $3; gsub(/\*/, "", soft); hard = soft }
+            if (used ~ /^[0-9]+$/ && hard ~ /^[0-9]+$/) { print used, hard; found = 1 }
+        }
+        END { exit !found }
+    ' <<< "$1"
+}
+
+# Refuse to START a replicate that cannot fit. Task 4 of array 20904141 burned 8 h 45 m
+# against a full filesystem to produce an 8 KB output directory, and tasks 5-8 then failed
+# in turn; the log's only clue was `cat: write error: Disk quota exceeded` on stderr. The
+# footprint is known and the quota is one command, so this is answerable in a second, up
+# front. Advisory when the quota cannot be read — a check that cannot run must say so, but
+# must not invent a reason to stop a run that would have been fine.
+echo "── disk pre-flight (one replicate needs ~${REPLICATE_PEAK_GB} GB peak) ──"
+_scratch_root="$(dirname "$OUTDIR")"
+_projid="$(lfs project -d "$_scratch_root" 2>/dev/null | awk '{print $1}')" || true
+if [[ -z "${_projid:-}" || "$_projid" == "0" ]]; then
+    echo "  WARNING: no Lustre project id on $_scratch_root — free space UNVERIFIED." >&2
 else
-    echo "  (no Lustre project id on $(dirname "$OUTDIR"); quota unknown)"
+    _fsmount="$(df -P "$_scratch_root" 2>/dev/null | awk 'NR==2{print $6}')"
+    lfs quota -h -p "$_projid" "$_fsmount" 2>&1 || true
+    _raw="$(lfs quota -p "$_projid" "$_fsmount" 2>/dev/null)" || true
+    if _kb="$(parse_lfs_quota_kb "${_raw:-}" "$_fsmount")"; then
+        _free_gb=$(( ( ${_kb% *} > ${_kb#* } ? 0 : ${_kb#* } - ${_kb% *} ) / 1048576 ))
+        echo "  free before start: ${_free_gb} GB (need ~${REPLICATE_PEAK_GB} GB)"
+        if [[ "$_free_gb" -lt "$REPLICATE_PEAK_GB" ]]; then
+            echo "ERROR: only ${_free_gb} GB free; one replicate needs ~${REPLICATE_PEAK_GB} GB." >&2
+            echo "  Refusing to start rather than fail hours in with a partial output dir" >&2
+            echo "  that itself holds ~207 GB and starves the next replicate (job 20884022)." >&2
+            echo "  Largest consumers:" >&2
+            du -sh "$_scratch_root"/* 2>/dev/null | sort -rh | head -5 >&2
+            echo "  A FAILED replicate keeps its FASTQ, so clear those directories first." >&2
+            echo "  Set SKIP_DISK_PREFLIGHT=1 to override." >&2
+            [[ "${SKIP_DISK_PREFLIGHT:-0}" == "1" ]] || exit 1
+        fi
+    else
+        echo "  WARNING: could not parse the quota output — free space UNVERIFIED." >&2
+    fi
 fi
 
 if [[ "$FORCE_RESIM" == "0" && -f "$MERGED_R1" && -f "$NORMAL_R1" && -f "$TRUTH_VCF" ]]; then

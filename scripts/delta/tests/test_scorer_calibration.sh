@@ -71,6 +71,9 @@ provenance failure is advisory only@    [[ "$rc" -eq 0 ]] && return 0@    return
 prune deletes BAMs of an unscored run@    if [[ ! -f "$dir/truvari_manta_overall/summary.json" ]]; then@    if false; then
 prune ignores PRUNE_BAM=0@[[ "${PRUNE_BAM:-1}" == "1" ]] || { echo "[prune] keeping BAMs (PRUNE_BAM=0)"; return 0; }@:
 prune leaves the .bai files behind@rm -f "$dir"/normal.bam "$dir"/normal.bam.bai "$dir"/tumor.bam "$dir"/tumor.bam.bai@rm -f "$dir"/normal.bam "$dir"/tumor.bam
+quota parser ignores the over-quota marker@gsub(/\\*/, "", used); gsub(/\\*/, "", hard)@;
+quota parser accepts non-numeric values@if (used ~ /^[0-9]+$/ && hard ~ /^[0-9]+$/) { print used, hard; found = 1 }@{ print used, hard; found = 1 }
+quota parser reads the soft limit as the cap@$1 == fs {@$1 == fs { $4 = $3 }
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -99,7 +102,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -364,6 +367,39 @@ mk_rep "$WORK/rep_optout" yes
 outp="$(PRUNE_BAM=0 prune_bams "$WORK/rep_optout" 2>&1)"
 is  "PRUNE_BAM=0 keeps them"              2 "$(n_bams "$WORK/rep_optout")"
 has "and says so"                         "$outp" "PRUNE_BAM=0"
+
+echo "── parse_lfs_quota_kb: the real output format, including over-quota ──"
+# VERBATIM from Delta (job 20904141's aftermath). The over-quota row is the one that
+# matters and the one that is not guessable: values carry a trailing '*' and a grace
+# column appears, so naive field-splitting mangles it. -h is NOT used in production, so
+# the numbers are plain KB; the -h form below only exists to prove it is REJECTED rather
+# than silently misread as kilobytes.
+OVER=$'Disk quotas for prj 21649 (pid 21649):\n      Filesystem    used   bquota  blimit  bgrace   files   iquota  ilimit  igrace\n        /scratch 576458752*  524288000 576716800 6d6h28m43s   21516*  850000  935000       -'
+UNDER=$'Disk quotas for prj 21649 (pid 21649):\n      Filesystem    used   bquota  blimit  bgrace   files   iquota  ilimit  igrace\n        /scratch 255852544  524288000 576716800       -   18131  850000  935000       -'
+HUMAN=$'      Filesystem    used   bquota  blimit  bgrace   files\n        /scratch  549.9G*    500G    550G 6d6h28m43s   21516*'
+
+is "over-quota row parses used and hard limit" "576458752 576716800" \
+   "$(parse_lfs_quota_kb "$OVER" /scratch)"
+is "under-quota row parses"                    "255852544 576716800" \
+   "$(parse_lfs_quota_kb "$UNDER" /scratch)"
+# MUST NOT FIRE: a human-readable row must be REJECTED, not read as kilobytes. "549.9G"
+# silently taken as 549 KB would report ~550 TB free and wave through a full filesystem —
+# a check that confidently returns the wrong answer, which is worse than none.
+is "human-readable (-h) output is rejected"    1 \
+   "$(parse_lfs_quota_kb "$HUMAN" /scratch >/dev/null 2>&1; echo $?)"
+is "a filesystem not in the output is rejected" 1 \
+   "$(parse_lfs_quota_kb "$OVER" /work/nvme >/dev/null 2>&1; echo $?)"
+is "empty input is rejected"                   1 \
+   "$(parse_lfs_quota_kb "" /scratch >/dev/null 2>&1; echo $?)"
+
+# The arithmetic the gate depends on: 576458752 - ... is NEGATIVE here (over hard limit),
+# and free must clamp to 0 rather than wrapping to a huge positive number.
+kb="$(parse_lfs_quota_kb "$OVER" /scratch)"
+is "over-hard-limit free space clamps to 0" 0 \
+   "$(( ( ${kb% *} > ${kb#* } ? 0 : ${kb#* } - ${kb% *} ) / 1048576 ))"
+kb="$(parse_lfs_quota_kb "$UNDER" /scratch)"
+is "under-quota free space is 306 GB" 306 \
+   "$(( ( ${kb% *} > ${kb#* } ? 0 : ${kb#* } - ${kb% *} ) / 1048576 ))"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
