@@ -147,15 +147,15 @@ contig lengths).
   `df` also disagreed for `/scratch` (1000G vs a 500G mount). What actually stops a job is
   the **project quota** — check it with
   `lfs quota -h -p <projid> /work/nvme`, and read `Disk quota exceeded` literally.
-  Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~207 GB peak per
+  Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~214 GB peak per
   replicate**, itemised from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
-  normal 12+12) **plus** BAMs 91 GB (normal 30, tumor 61), which coexist because pruning
-  only runs at the end. An earlier "~113 GB" figure here counted the FASTQ only and was
-  wrong; every capacity estimate built on it was ~half of reality. With a ~171 GB fixed
+  normal 12+12) **plus** BAMs 98 GB (the figure `prune_bams` itself reported across
+  campaign 20925151), which coexist because pruning only runs at the end. An earlier
+  "~113 GB" figure here counted the FASTQ only and was wrong; every capacity estimate built on it was ~half of reality. With a ~171 GB fixed
   baseline (`neat_data` + bwa-mem2 index) **one replicate at a time is all that fits** in a
-  500 GB quota (171 + 207 = 378 GB), so serialize with `%1` — `%2` cannot work at any array
+  500 GB quota (171 + 214 = 385 GB), so serialize with `%1` — `%2` cannot work at any array
   size.
-  **A replicate that FAILS keeps all 207 GB**: its FASTQ prune never runs. Job 20884022 died
+  **A replicate that FAILS keeps all ~214 GB**: its FASTQ prune never runs. Job 20884022 died
   incomplete, held 203 GB indefinitely, and starved array 20904141 — all five tasks failed,
   task 4 spending 8 h 45 m producing 8 KB against a full filesystem. Clear a failed
   replicate's directory before the next campaign, and clear finished ones down to

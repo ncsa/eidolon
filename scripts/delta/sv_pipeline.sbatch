@@ -209,10 +209,11 @@ check_binary_provenance "${EIDOLON_VERSION:-}" "$REPO_ROOT" || exit 1
 # not the mount), the quota table and df have disagreed for /scratch, and a guard built on
 # fragile parsing is worse than no guard. One replicate needs ~113 GB peak (30 GB normal
 # BAM + 71 GB tumor + FASTQ held together at the merge), measured on job 20892075.
-# Peak footprint of ONE replicate, measured on job 20884022: FASTQ 116 GB (merged 29+29,
-# tumor 17+17, normal 12+12) plus BAMs 91 GB (normal 30, tumor 61), coexisting because the
-# prune only runs at the end. A previous "113 GB" figure counted the FASTQ alone.
-REPLICATE_PEAK_GB="${REPLICATE_PEAK_GB:-207}"
+# Peak footprint of ONE replicate: FASTQ 116 GB (merged 29+29, tumor 17+17, normal 12+12,
+# itemised from job 20884022) plus BAMs 98 GB (the figure prune_bams itself reported across
+# campaign 20925151), coexisting because the prune only runs at the end. A previous "113 GB"
+# figure in CLAUDE.md counted the FASTQ alone and was half of reality.
+REPLICATE_PEAK_GB="${REPLICATE_PEAK_GB:-214}"
 
 # Extract used/limit in KB from `lfs quota -p` output. Separated from the check so the
 # decision logic is testable without Lustre: the parsing is the fragile half, and the real
