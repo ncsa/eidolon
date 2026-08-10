@@ -74,6 +74,8 @@ prune leaves the .bai files behind@rm -f "$dir"/normal.bam "$dir"/normal.bam.bai
 quota parser ignores the over-quota marker@gsub(/\\*/, "", used); gsub(/\\*/, "", hard)@;
 quota parser accepts non-numeric values@if (used ~ /^[0-9]+$/ && hard ~ /^[0-9]+$/) { print used, hard; found = 1 }@{ print used, hard; found = 1 }
 quota parser reads the soft limit as the cap@$1 == fs {@$1 == fs { $4 = $3 }
+probe matcher ignores the reverse strand@{ for (i = 1; i <= n; i++) if (index($0, fwd[i]) || index($0, rev[i])) hits[i]++ }@{ for (i = 1; i <= n; i++) if (index($0, fwd[i])) hits[i]++ }
+probe matcher drops zero-support probes@END { for (i = 1; i <= n; i++) print chrom[i], pos[i], len[i], hits[i] }@END { for (i = 1; i <= n; i++) if (hits[i] > 0) print chrom[i], pos[i], len[i], hits[i] }
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -102,7 +104,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -400,6 +402,37 @@ is "over-hard-limit free space clamps to 0" 0 \
 kb="$(parse_lfs_quota_kb "$UNDER" /scratch)"
 is "under-quota free space is 306 GB" 306 \
    "$(( ( ${kb% *} > ${kb#* } ? 0 : ${kb#* } - ${kb% *} ) / 1048576 ))"
+
+echo "── count_probe_hits: read-level support for planted insertions ──"
+# KNOWN ANSWER, hand-built. Probe P1 appears forward in one sequence, P2 only reverse
+# complemented, P3 not at all. #516 is exactly the P3 case, so a probe reading zero must
+# report zero rather than being lost.
+P1=AAACCCGGGTTTAAACCCGGGTTTAAACCC          # 30bp
+P2=CGCGATATCGCGATATCGCGATATCGCGAT          # 30bp
+P3=TTTTGGGGCCCCAAAATTTTGGGGCCCCAA          # 30bp, absent
+rc() { printf '%s' "$1" | rev | tr ACGT TGCA; }
+printf 'chr1\t100\t500\t%s\nchr2\t200\t900\t%s\nchr3\t300\t1200\t%s\n' "$P1" "$P2" "$P3" \
+  > "$WORK/probes.tsv"
+{ printf 'GGGG%sGGGG\n' "$P1"
+  printf 'TTTT%sTTTT\n' "$P1"
+  printf 'AAAA%sAAAA\n' "$(rc "$P2")"
+  printf 'ACGTACGTACGTACGTACGTACGTACGTACGT\n'; } > "$WORK/seqs.txt"
+
+out="$(count_probe_hits "$WORK/probes.tsv" < "$WORK/seqs.txt")"
+is "forward-orientation probe counts both reads" "chr1	100	500	2" \
+   "$(grep -P '^chr1\t' <<<"$out")"
+# MUST NOT MISS: half of all reads are reverse complemented, so a matcher that only checks
+# the forward strand would silently halve every support count and could report 0 for a
+# genuinely present insertion.
+is "reverse-complemented probe is found"        "chr2	200	900	1" \
+   "$(grep -P '^chr2\t' <<<"$out")"
+# MUST NOT FIRE: an absent probe must be reported with 0, not dropped — a dropped row would
+# shrink the denominator and hide exactly the #516 case this exists to catch.
+is "absent probe is reported as zero, not dropped" "chr3	300	1200	0" \
+   "$(grep -P '^chr3\t' <<<"$out")"
+is "every probe appears in the output"          3 "$(wc -l <<<"$out")"
+is "no sequences at all still reports all probes" 3 \
+   "$(count_probe_hits "$WORK/probes.tsv" < /dev/null | wc -l)"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
