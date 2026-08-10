@@ -147,11 +147,19 @@ contig lengths).
   `df` also disagreed for `/scratch` (1000G vs a 500G mount). What actually stops a job is
   the **project quota** — check it with
   `lfs quota -h -p <projid> /work/nvme`, and read `Disk quota exceeded` literally.
-  Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~113 GB peak per
-  replicate** (normal + tumor + `cat`-merged FASTQ held together; pruning only runs at the
-  end). So `--array=1-8%2` needs ~900 GB and will die ~3 h in at the merge. Serialize with
-  `%1` and clear finished replicates down to `truvari_*/summary.json`, which is all
-  `aggregate_sv_reps.sh` reads.
+  Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~214 GB peak per
+  replicate**, itemised from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
+  normal 12+12) **plus** BAMs 98 GB (the figure `prune_bams` itself reported across
+  campaign 20925151), which coexist because pruning only runs at the end. An earlier
+  "~113 GB" figure here counted the FASTQ only and was wrong; every capacity estimate built on it was ~half of reality. With a ~171 GB fixed
+  baseline (`neat_data` + bwa-mem2 index) **one replicate at a time is all that fits** in a
+  500 GB quota (171 + 214 = 385 GB), so serialize with `%1` — `%2` cannot work at any array
+  size.
+  **A replicate that FAILS keeps all ~214 GB**: its FASTQ prune never runs. Job 20884022 died
+  incomplete, held 203 GB indefinitely, and starved array 20904141 — all five tasks failed,
+  task 4 spending 8 h 45 m producing 8 KB against a full filesystem. Clear a failed
+  replicate's directory before the next campaign, and clear finished ones down to
+  `truvari_*/summary.json`, which is all `aggregate_sv_reps.sh` reads.
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.

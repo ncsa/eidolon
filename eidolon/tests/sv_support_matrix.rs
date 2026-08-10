@@ -333,6 +333,146 @@ fn coverage_modulation_over_delivers_by_about_eight_percent() {
     );
 }
 
+/// Deterministic, varied ACGT filler. A 30-mer of it has a ~4^-30 chance of occurring in the
+/// reference by accident, so finding one in a read is proof the NOVEL sequence reached the
+/// output rather than something spliced from the fixture.
+fn synthetic_insert(n: usize) -> String {
+    let mut s = String::with_capacity(n);
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..n {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        s.push(match (x >> 33) & 3 {
+            0 => 'A',
+            1 => 'C',
+            2 => 'G',
+            _ => 'T',
+        });
+    }
+    s
+}
+
+fn revcomp(s: &str) -> String {
+    s.chars()
+        .rev()
+        .map(|c| match c {
+            'A' => 'T',
+            'T' => 'A',
+            'C' => 'G',
+            'G' => 'C',
+            o => o,
+        })
+        .collect()
+}
+
+/// Insertions LARGER than a read must still reach the reads — the size regime the rest of
+/// this file never covered.
+///
+/// WHY THIS EXISTS: campaign 20925151 planted 22 de novo insertions of 61–2155 bp. Manta
+/// reported nothing at any of the 21 above 61 bp — not even the `IMPRECISE <INS>` its own
+/// user guide says it emits from a breakend signature for insertions it cannot fully
+/// assemble, and its documented full-assembly ceiling (~2x fragment size) sits above most of
+/// the planted set. That points at the reads rather than the caller, and the question was
+/// being chased through 8-hour whole-genome runs when it is answerable here in seconds.
+///
+/// `literal_indels_reach_the_reads` above covers an ELEVEN base insert. A de novo INS is
+/// emitted as the same `VariantType::Insertion` + `AlternateType::Literal` variant that an
+/// `input_vcf` literal insertion parses to, so both share this machinery downstream — which
+/// makes a size sweep here a valid probe of the de novo path.
+///
+/// KNOWN ANSWER: at coverage 60, a heterozygous insertion gets ~30x over the inserted
+/// sequence, so reads falling wholly inside it must exist for any size above a read length.
+/// The probe is a 30-mer from the MIDDLE of the insert, checked in both orientations.
+#[test]
+fn large_literal_insertions_reach_the_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    // MEASURED (read_len=100, fragment_mean=250): support degrades with size and hits zero
+    // at the FRAGMENT length, not the read length.
+    //   50bp -> 13 reads    150bp -> 5 reads    200bp -> ?    300bp -> 0    600bp -> 0
+    let mut carried: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for size in [50usize, 150, 200, 300, 600] {
+        let insert = synthetic_insert(size);
+        let at = size / 2 - 15;
+        let probe = &insert[at..at + 30];
+
+        let rec = format!(
+            "{}\t500\tinsbig{size}\tA\tA{insert}\t60\tPASS\t.\tGT\t0/1",
+            EV.0
+        );
+        let out = run_cell(tmp.path(), &format!("ins_big_{size}"), &[rec.as_str()]);
+
+        let hits = seq_lines_containing(&out, probe) + seq_lines_containing(&out, &revcomp(probe));
+        // Probe the START and END as well as the middle. With 100bp reads from 250bp
+        // fragments there is a ~50bp unsequenced gap inside every fragment, so a middle-only
+        // probe could read zero for GEOMETRIC reasons. If the start appears and the middle
+        // does not, the insert is spliced but only partly sequenced; if none appear, the
+        // novel sequence never reached the output at all. Different bugs, different fixes.
+        let head = &insert[..30];
+        let tail = &insert[size - 30..];
+        let h = seq_lines_containing(&out, head) + seq_lines_containing(&out, &revcomp(head));
+        let t = seq_lines_containing(&out, tail) + seq_lines_containing(&out, &revcomp(tail));
+        eprintln!("[INS {size}bp] 30-mer hits — head={h} middle={hits} tail={t}");
+
+        // The truth VCF preserves every size — which is the problem, not the reassurance.
+        assert!(
+            truth_has_id(&out, &format!("insbig{size}")),
+            "{size}bp insertion lost from the truth VCF"
+        );
+        carried.push((size, h, hits, t));
+    }
+
+    // MEASURED, read_len=100 / fragment_mean=250:
+    //   size  head middle tail
+    //     50    16     13    8   fully realized
+    //    150    21      5    0   middle thinning, tail already gone
+    //    200    25      0    0   only the head survives
+    //    300    26      0    0
+    //    600    27      0    0
+    //
+    // REGRESSION GUARD. The head must ALWAYS reach the reads — that is what proves the
+    // insertion is spliced into the haplotype at all, and it is the part that makes this bug
+    // look like a working feature.
+    for &(size, h, _, _) in &carried {
+        assert!(
+            h > 0,
+            "{size}bp insertion: not even its first 30 bases reach the reads. This is worse \
+             than the known partial-realization gap — the splice itself is broken."
+        );
+    }
+    // Small insertions are fully realized, and must stay that way.
+    for &(size, _, m, _) in &carried {
+        if size <= 150 {
+            assert!(
+                m > 0,
+                "{size}bp insertion no longer reaches the reads mid-sequence — a regression, \
+                 not the known #516 gap"
+            );
+        }
+    }
+
+    // CHARACTERIZATION of the open bug. Beyond ~a read length, an insertion's interior and
+    // far end are never sequenced while the truth VCF keeps declaring the full SVLEN — so a
+    // benchmark built from this data asserts insertions the reads cannot support. Filed as
+    // #516. Same family as #498 (BND insert dropped) and #474 (a fragment spanning a whole
+    // DUP needs a stitch the fragment builder cannot express). It is why campaign 20925151
+    // measured Manta INS recall at 1/22: only the 61bp event had evidence for its declared
+    // length, and Manta called only that one.
+    //
+    // If any of these starts finding reads, the bug is FIXED: promote the size into the
+    // guards above and delete it from here.
+    for &(size, _, m, t) in &carried {
+        if size >= 200 {
+            assert_eq!(
+                (m, t),
+                (0, 0),
+                "{size}bp insertion now reaches the reads mid-sequence or at its tail \
+                 (middle={m}, tail={t}) — #516 may be FIXED."
+            );
+        }
+    }
+}
+
 #[test]
 fn literal_indels_reach_the_reads() {
     let tmp = tempfile::tempdir().unwrap();

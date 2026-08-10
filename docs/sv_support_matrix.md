@@ -33,7 +33,8 @@ a variant that silently fails to appear is a broken tool.
 | BND, single/unpaired (`A.`) | preserved | 0 chimeric; **depth 42.4 vs 72.0** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
 | Fragment spanning a whole DUP | — | *"4 of 30 reads match no haplotype"* | ❌ #474 |
 | Two junctions within one fragment | all 4 preserved | 60 chimeric; depth matches derived haplotype | ✅ |
-| Literal INS (`A`→`ACTGACTGCATG`) | preserved | **I=46** vs 15 baseline | ✅ |
+| Literal INS, ≤ ~150 bp | preserved | inserted bases present in reads | ✅ |
+| Literal INS, ≳ 200 bp | preserved **with full SVLEN** | **head only** — interior and far end in 0 reads | ❌ [#516](https://github.com/ncsa/eidolon/issues/516) partial |
 | Literal DEL (`TTTT…`→`A`) | preserved | **D=49** vs 20 baseline | ✅ |
 
 ### Untested cells: none remain
@@ -62,6 +63,38 @@ novel bases are present in the truth VCF, at a rate consistent with the model's
 in 2026-08 on the strength of `truth INS: 0` in the SV harness — which turned out to be
 measuring the harness's own selector, not the generator. See §"De novo generation" below and
 `docs/claude_engineering_audit.md` §5.3.
+
+**[#516] Large insertions are only PARTIALLY realized, which is worse than not at all.** An
+insertion longer than roughly one read is spliced into the haplotype, but only its first
+~100–150 bases are ever sequenced. Measured on the H1N1 fixture at `read_len=100`,
+`fragment_mean=250`, counting reads containing a 30-mer from the head / middle / far end of the
+inserted sequence:
+
+| insert | head | middle | tail |
+|---|---|---|---|
+| 50 bp | 16 | 13 | 8 |
+| 150 bp | 21 | 5 | 0 |
+| 200 bp | 25 | **0** | **0** |
+| 600 bp | 27 | **0** | **0** |
+
+The head count *rises* with size while the interior collapses to zero — so any probe near the
+insertion's start says it works, which is where a casual check looks. The truth VCF meanwhile
+declares the full `SVLEN`. **Read support saturates at ~one read length regardless of the
+declared size.**
+
+Consequence, measured: SV validation campaign 20925151 planted 22 de novo somatic insertions of
+61–2155 bp and Manta detected exactly one — the 61 bp event, and only at `MinSomaticScore`.
+That is not primarily a caller limitation. Manta documents a *fully assembled* ceiling of
+"approximately twice the read-pair fragment size" and states it also reports very large
+insertions from a breakend signature alone, as `IMPRECISE <INS>` with
+`LEFT_SVINSSEQ`/`RIGHT_SVINSSEQ`. Most of the planted set was inside that range, and Manta
+reported nothing within 2 kb of any of them — because the evidence for the declared length was
+not in the reads. **INS recall figures are invalid above ~a read length; DEL/DUP/INV/BND/CNV
+are unaffected.**
+
+Suspected mechanism, same family as #474 and #498: fragments are placed against *reference*
+coordinates and the insert is spliced in afterwards, so a fragment can reach into the start of
+an insertion but none ever *begins* inside it — nothing samples the interior.
 
 **[#500] A single breakend (`A.`) destroys coverage.** VCF 4.2 allows an unresolved
 partner. `parse_bnd_alt` returns no mate, and the result is worse than being ignored:
