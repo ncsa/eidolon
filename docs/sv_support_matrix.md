@@ -114,6 +114,28 @@ Suspected mechanism, same family as #498: fragments are placed against *referenc
 coordinates and the insert is spliced in afterwards, so a fragment can reach into the start of
 an insertion but none ever *begins* inside it — nothing samples the interior.
 
+**De novo insertions are now CAPPED at `read_len - 1` (interim, pending #516).** Rather than
+emit a truth record the reads cannot support, `gen-reads` refuses to plant a de novo insertion
+whose novel sequence exceeds what a read can carry, logging the count dropped. Two consequences,
+both intended:
+
+- **The realized INS rate is below the model's `Ins` probability.** The bundled default puts
+  `Ins` at log-normal (5.7, 1.0) — median ~299 bp — so at `read_len=150` roughly three quarters
+  of INS draws are refused. The truth VCF is now self-consistent; the *distribution* is
+  deliberately truncated and no longer matches the source corpus at the upper tail.
+- **`input_vcf` insertions are NOT capped.** Input fidelity is the stronger contract — what you
+  supply comes out — and silently discarding a user-supplied variant is worse than rendering it
+  partially. A large insertion supplied via `input_vcf` still behaves as the #516 row describes.
+
+Pinned by `runner.rs`'s `unrealizable_insertions_are_dropped_at_exactly_the_boundary` and
+`the_insertion_cap_does_not_touch_other_variant_types` (a must-not-fire: dropping large
+DELs/DUPs/INVs would be far worse than the bug being worked around), plus an end-to-end
+assertion in `multi_sv_integration.rs` that no de novo INS in the truth VCF exceeds
+`read_len - 1`. Removing the call site makes that fail with eleven oversized records.
+
+This is an interim measure. It removes the false-truth problem, not the capability gap: eidolon
+still cannot simulate insertions longer than a read.
+
 **[#500] A single breakend (`A.`) destroys coverage.** VCF 4.2 allows an unresolved
 partner. `parse_bnd_alt` returns no mate, and the result is worse than being ignored:
 depth falls **72.0 → 42.4** (−41%) with **zero** chimeric reads. The truth declares a
