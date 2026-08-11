@@ -74,6 +74,10 @@ prune leaves the .bai files behind@rm -f "$dir"/normal.bam "$dir"/normal.bam.bai
 quota parser ignores the over-quota marker@gsub(/\\*/, "", used); gsub(/\\*/, "", hard)@;
 quota parser accepts non-numeric values@if (used ~ /^[0-9]+$/ && hard ~ /^[0-9]+$/) { print used, hard; found = 1 }@{ print used, hard; found = 1 }
 quota parser reads the soft limit as the cap@$1 == fs {@$1 == fs { $4 = $3 }
+query coverage never escalates@    if [[ "$scored" -eq 0 ]]; then@    if false; then
+query coverage assumes --passonly@    [[ "$nonpass" -gt 0 ]] && why="--passonly ($nonpass non-PASS)"@    why="--passonly ($nonpass non-PASS)"
+query coverage chatters on a healthy stratum@    [[ "$scored" -eq "$n_query" ]] && return 0    # fully accounted for@    :
+query coverage computes a negative drop@    if [[ "$scored" -gt "$n_query" ]]; then@    if false; then
 probe matcher ignores the reverse strand@{ for (i = 1; i <= n; i++) if (index($0, fwd[i]) || index($0, rev[i])) hits[i]++ }@{ for (i = 1; i <= n; i++) if (index($0, fwd[i])) hits[i]++ }
 probe matcher drops zero-support probes@END { for (i = 1; i <= n; i++) print chrom[i], pos[i], len[i], hits[i] }@END { for (i = 1; i <= n; i++) if (hits[i] > 0) print chrom[i], pos[i], len[i], hits[i] }
 MUTATIONS
@@ -104,7 +108,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -433,6 +437,48 @@ is "absent probe is reported as zero, not dropped" "chr3	300	1200	0" \
 is "every probe appears in the output"          3 "$(wc -l <<<"$out")"
 is "no sequences at all still reports all probes" 3 \
    "$(count_probe_hits "$WORK/probes.tsv" < /dev/null | wc -l)"
+
+echo "── report_query_coverage: precision must not rest on an unverified denominator ──"
+# THE MOTIVATING CASE (#511), campaign 20925151. manta_INS reported TP=0 FP=0, which reads as
+# "the caller emitted nothing". Manta had emitted THREE INS calls, one a true detection
+# (chr7:3198935 SVLEN 61 vs truth chr7:3198936 SVLEN 61), all non-PASS and so removed by
+# --passonly before comparison.
+outp="$(report_query_coverage manta_INS 3 0 3 2>&1)"; rc=$?
+is   "wholly-filtered stratum returns 1"        1 "$rc"
+has  "says NONE were scored"                    "$outp" "scored NONE of its 3 query record(s)"
+has  "names --passonly with the count"          "$outp" "--passonly (3 non-PASS)"
+has  "says the number describes the filter"     "$outp" "FILTER, not the caller"
+has  "names it as the pipeline's own choice"    "$outp" "THIS PIPELINE'S choice"
+
+# Wholly filtered, but NOT by --passonly: the attribution must change, not be assumed.
+outp="$(report_query_coverage manta_DEL 5 0 0 2>&1)"; rc=$?
+is   "wholly filtered without non-PASS still returns 1" 1 "$rc"
+has  "attributes to size/other, not --passonly"  "$outp" "size/other filters"
+hasnt "does not blame --passonly"                "$outp" "non-PASS"
+
+# PARTIAL loss — the original 60-vs-58 case from job 20853511. Reported, but not escalated:
+# precision is still meaningful over 58 records, it just was not 60.
+outp="$(report_query_coverage manta_BND 60 58 2 2>&1)"; rc=$?
+is   "partial loss returns 0"                    0 "$rc"
+has  "reports both numbers"                      "$outp" "58 of 60 record(s) scored, 2 dropped"
+
+# MUST NOT FIRE: a fully-accounted query must be SILENT. Chattering on every healthy
+# comparison is how a real warning gets skimmed past.
+outp="$(report_query_coverage manta_DUP 37 37 0 2>&1)"; rc=$?
+is "fully-scored query returns 0"  0 "$rc"
+is "fully-scored query is silent"  "" "$outp"
+
+# MUST NOT FIRE: an empty query is the harness's own doing (it skips truvari), not a filter
+# problem, and the caller-emitted-nothing message is printed elsewhere.
+outp="$(report_query_coverage manta_INS 0 0 0 2>&1)"; rc=$?
+is "empty query returns 0"  0 "$rc"
+is "empty query is silent"  "" "$outp"
+
+# Impossible arithmetic must be reported, never turned into a negative "dropped" count.
+outp="$(report_query_coverage manta_BND 10 12 0 2>&1)"; rc=$?
+is  "more scored than supplied returns 0"  0 "$rc"
+has "flags it as not understood"           "$outp" "MORE than were"
+hasnt "does not print a negative drop"     "$outp" "-2"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

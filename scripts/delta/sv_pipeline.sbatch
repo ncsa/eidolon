@@ -476,6 +476,10 @@ fi
 # is well before the scoring stage that consumes it (set -u).
 CAL_FAIL=0
 SCORE_COVERAGE_FAIL=0
+# Strata whose ENTIRE query was filtered out before comparison (#511). Not fatal — a caller
+# emitting only low-confidence calls in one stratum is normal — but it must reach the banner,
+# because TP=0/FP=0 is indistinguishable from "the caller emitted nothing".
+QUERY_FILTERED=()
 
 MANTA_DIR="$OUTDIR/manta"
 MANTA_SV="$MANTA_DIR/results/variants/somaticSV.vcf.gz"
@@ -740,6 +744,7 @@ print(f"  {name:<18} recall={(s.get('recall') or 0):.3f}  precision={(s.get('pre
       f"f1={(s.get('f1') or 0):.3f}  TP={s.get('TP-base') or 0}  FN={s.get('FN') or 0}  FP={s.get('FP') or 0}")
 PY
         check_denominator "$truth" "$out" "$label" || true
+        check_query_denominator "$comp" "$out" "$label" || QUERY_FILTERED+=("$label")
     else
         echo "  $label: truvari produced no summary.json (see $out)"
         SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
@@ -759,6 +764,78 @@ PY
 # or fn.vcf.gz, so truth-minus-those is exactly the discarded set, printed with SVTYPE/SVLEN
 # so the responsible filter is obvious. eidolon's own floor is MIN_SV_LENGTH_BP=50, equal to
 # truvari's --sizemin default, so a size-driven drop here means the LARGE end (--sizemax).
+# Coverage of the QUERY side, which nothing checked (#511). `check_denominator` below
+# reconciles the TRUTH (n_truth vs TP-base+FN) and hard-fails when records were discarded
+# before comparison. Nothing did the equivalent for the comp VCF, so every `precision` this
+# pipeline reports was computed over a denominator no one verified — the same defect on the
+# other axis.
+#
+# The motivating case, campaign 20925151: `manta_INS` reported TP=0 FP=0, which reads as "the
+# caller emitted nothing". It emitted three INS calls, one of them a TRUE detection
+# (chr7:3198935 SVLEN 61 against truth chr7:3198936 SVLEN 61 — one base off, exact size). All
+# three were non-PASS, so `--passonly` removed them BEFORE comparison and the stratum scored
+# 0/0. The reported 0.000 was a statement about the FILTER, not the caller, and nothing said so.
+#
+# Split into a numbers-only verdict plus thin plumbing, so the decision logic is testable
+# without truvari or a BAM — the same seam as parse_lfs_quota_kb.
+#
+# LOUD, NOT FATAL, deliberately. A caller emitting only low-confidence calls in one stratum is
+# normal behaviour, not a harness bug; failing the run would let it abort an 8-hour campaign.
+# It surfaces in the closing banner instead, so it cannot be missed while reading the numbers.
+report_query_coverage() {  # <label> <n_query> <n_scored> <n_nonpass>; rc 1 = wholly filtered
+    local label="$1" n_query="$2" scored="$3" nonpass="$4"
+
+    [[ "$n_query" -gt 0 ]] || return 0            # nothing was handed over; not our business
+    if [[ "$scored" -gt "$n_query" ]]; then
+        # More classified than handed over should be impossible. Report rather than compute a
+        # negative "dropped" count and present it as a fact.
+        echo "  WARNING: $label scored $scored of $n_query query record(s) — MORE than were" >&2
+        echo "    supplied, so this arithmetic is not understood. Do not quote its precision." >&2
+        return 0
+    fi
+    [[ "$scored" -eq "$n_query" ]] && return 0    # fully accounted for
+
+    local dropped=$((n_query - scored))
+    local why="size/other filters"
+    [[ "$nonpass" -gt 0 ]] && why="--passonly ($nonpass non-PASS)"
+
+    if [[ "$scored" -eq 0 ]]; then
+        # The dangerous case: TP=0 FP=0 is indistinguishable from "the caller emitted nothing".
+        echo "ERROR: $label scored NONE of its $n_query query record(s) — all removed before" >&2
+        echo "  comparison by $why. recall/precision for this stratum therefore describe the" >&2
+        echo "  FILTER, not the caller, and must not be reported as a caller result (#511)." >&2
+        [[ "$nonpass" -gt 0 ]] && \
+            echo "  --passonly is THIS PIPELINE'S choice, not a property of the caller." >&2
+        return 1
+    fi
+    echo "    ^ query coverage: $scored of $n_query record(s) scored, $dropped dropped by $why"
+    return 0
+}
+
+check_query_denominator() {  # <comp.vcf.gz> <truvari_out_dir> <label>
+    local comp="$1" out="$2" label="$3"
+    local n_query nonpass kv tp fp
+    n_query=$(bcftools view -H "$comp" 2>/dev/null | wc -l)
+    # Read TP-comp and FP together, and FAIL if either key is absent rather than defaulting to
+    # zero — an absent key would make every record look dropped and manufacture the exact alarm
+    # this function exists to raise. #509's lesson, one guard over.
+    kv=$(python3 - "$out/summary.json" <<'PYQ' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in ("TP-comp", "FP"):
+    if k not in d:
+        sys.exit(3)
+print(int(d["TP-comp"] or 0), int(d["FP"] or 0))
+PYQ
+    ) || {
+        echo "  ($label: query coverage UNVERIFIED — summary.json lacks TP-comp/FP)" >&2
+        return 0
+    }
+    read -r tp fp <<< "$kv"
+    nonpass=$(bcftools view -H -i 'FILTER!="PASS" && FILTER!="."' "$comp" 2>/dev/null | wc -l)
+    report_query_coverage "$label" "$n_query" "$((tp + fp))" "$nonpass"
+}
+
 check_denominator() {  # <truth.vcf.gz> <truvari_out_dir> <label>
     local truth="$1" out="$2" label="$3"
     local n_truth base
@@ -1484,6 +1561,18 @@ EOF
 # Repeated here on purpose. Stage 3b prints this ~900 lines earlier in the log, and the
 # banner above is what actually gets read and pasted — an empty denominator that only
 # appears upstream is an empty denominator nobody sees.
+if [[ "${#QUERY_FILTERED[@]}" -gt 0 ]]; then
+    cat <<EOF
+QUERY WHOLLY FILTERED: ${#QUERY_FILTERED[@]} stratum/strata scored NONE of the caller's records
+because every one was removed before comparison: ${QUERY_FILTERED[*]}
+  Their recall/precision describe the FILTER, not the caller, and must not be quoted as a
+  caller result. --passonly is this pipeline's choice; a caller emitting only low-confidence
+  calls in a stratum is normal behaviour. To see what was actually emitted:
+    bcftools query -f '%CHROM\t%POS\t%FILTER\t%INFO/SVTYPE\t%INFO/SVLEN\n' <caller vcf>
+  Campaign 20925151 is the case history: manta_INS read TP=0 FP=0 while Manta had emitted
+  three INS calls, one of them a true detection, all non-PASS. See #511.
+EOF
+fi
 if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
     cat <<EOF
 COVERAGE HOLE: ${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]} SV type(s) had NO truth records and were
