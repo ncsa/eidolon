@@ -77,10 +77,28 @@ inserted sequence:
 | 200 bp | 25 | **0** | **0** |
 | 600 bp | 27 | **0** | **0** |
 
-The head count *rises* with size while the interior collapses to zero — so any probe near the
+The head is always present while the interior collapses to zero — so any probe near the
 insertion's start says it works, which is where a casual check looks. The truth VCF meanwhile
-declares the full `SVLEN`. **Read support saturates at ~one read length regardless of the
-declared size.**
+declares the full `SVLEN`.
+
+**Located mechanism.** Fragments and read windows are chosen purely in *reference* offsets
+(`cover_dataset`, `generate_fragments.rs:323`), and an insertion has zero reference width, so no
+read window can ever *begin* inside one. Reads are assembled per-read by walking a reference
+slice and expanding variants inline, bounded by `bases_written < read_length`
+(`fastq_tools.rs:429`) with a `break 'outer` at `:555` that discards the rest of the insert
+silently — no log, no counter. Hence:
+
+> novel bases visible in one read = `min(L, read_length − anchor_offset − 1)`
+
+**At most `read_length − 1` inserted bases are ever realized, at any declared SVLEN.** Probe
+visibility follows exactly: head needs `anchor_offset ≤ 69` (no `L` term), middle needs
+`anchor_offset ≤ 84 − L/2` (impossible for `L ≥ 170`), tail needs `≤ 99 − L` (impossible for
+`L ≥ 100`) — which reproduces all fifteen measured cells.
+
+The head count is **size-independent**: with the heterozygous coin removed (`GT 1/1`) it is
+42/41/**50/50/50** across the five sizes. An earlier version of this note claimed it "rises with
+size" and read meaning into 16 → 27; that was RNG drift, since a larger insert fires
+`break 'outer` sooner and consumes fewer sequencing-error draws.
 
 Consequence, measured: SV validation campaign 20925151 planted 22 de novo somatic insertions of
 61–2155 bp and Manta detected exactly one — the 61 bp event, and only at `MinSomaticScore`.

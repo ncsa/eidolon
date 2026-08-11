@@ -387,9 +387,28 @@ fn revcomp(s: &str) -> String {
 #[test]
 fn large_literal_insertions_reach_the_reads() {
     let tmp = tempfile::tempdir().unwrap();
-    // MEASURED (read_len=100, fragment_mean=250): support degrades with size and hits zero
-    // at the FRAGMENT length, not the read length.
-    //   50bp -> 13 reads    150bp -> 5 reads    200bp -> ?    300bp -> 0    600bp -> 0
+    // MECHANISM (located, not inferred — see #516). Fragments and read windows are chosen
+    // purely in REFERENCE offsets (`cover_dataset`, generate_fragments.rs), and an insertion
+    // has zero reference width, so no read window can ever BEGIN inside one. Reads are then
+    // assembled per-read by walking a reference slice and expanding variants inline, capped by
+    // `bases_written < read_length` (fastq_tools.rs:429) with `break 'outer` at :555 dropping
+    // the remainder of `ins_buf` silently. Hence the invariant:
+    //
+    //     novel bases visible in one read = min(L, read_length - anchor_offset - 1)
+    //
+    // so AT MOST read_length-1 = 99 inserted bases can be realized at ANY declared SVLEN.
+    // Probe visibility follows: head needs anchor_offset <= 69 (no L term), middle needs
+    // anchor_offset <= 84 - L/2 (impossible for L >= 170), tail needs <= 99 - L (impossible
+    // for L >= 100).
+    //
+    // MEASURED, het (this test):     head 16/21/25/26/27   middle 13/5/0/0/0   tail 8/0/0/0/0
+    // MEASURED, hom control (1/1):   head 42/41/50/50/50   middle 36/6/0/0/0   tail 29/0/0/0/0
+    //
+    // The head count is SIZE-INDEPENDENT above saturation — 50/50/50 for 200/300/600 with the
+    // het coin removed. An earlier writeup of this bug claimed the head count "rises with
+    // size" and read meaning into 16 -> 27; that was RNG drift (a larger insert fires
+    // `break 'outer` sooner, consuming fewer sequencing-error draws and shifting the stream).
+    // Corrected by rerunning with GT 1/1, which short-circuits the coin at fastq_tools.rs:471.
     let mut carried: Vec<(usize, usize, usize, usize)> = Vec::new();
     for size in [50usize, 150, 200, 300, 600] {
         let insert = synthetic_insert(size);
