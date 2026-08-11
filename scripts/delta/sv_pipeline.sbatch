@@ -207,13 +207,47 @@ check_binary_provenance "${EIDOLON_VERSION:-}" "$REPO_ROOT" || exit 1
 # and the log gave no way to see how close the preceding replicates had come. Printed RAW
 # and never parsed: `df` misreports inside a project-quota'd directory (it shows the quota,
 # not the mount), the quota table and df have disagreed for /scratch, and a guard built on
-# fragile parsing is worse than no guard. One replicate needs ~113 GB peak (30 GB normal
-# BAM + 71 GB tumor + FASTQ held together at the merge), measured on job 20892075.
-# Peak footprint of ONE replicate: FASTQ 116 GB (merged 29+29, tumor 17+17, normal 12+12,
-# itemised from job 20884022) plus BAMs 98 GB (the figure prune_bams itself reported across
-# campaign 20925151), coexisting because the prune only runs at the end. A previous "113 GB"
-# figure in CLAUDE.md counted the FASTQ alone and was half of reality.
-REPLICATE_PEAK_GB="${REPLICATE_PEAK_GB:-214}"
+# fragile parsing is worse than no guard.
+#
+# Peak footprint of ONE replicate, ANCHORED on the only full measurement available: ~214 GB for
+# GRCh38 (3.1 Gbp) at 30x — FASTQ 116 GB (merged 29+29, tumor 17+17, normal 12+12, itemised from
+# job 20884022) plus BAMs 98 GB (the figure prune_bams itself reported across campaign 20925151),
+# coexisting because the prune only runs at the end. An earlier "113 GB" figure counted the FASTQ
+# alone and was half of reality.
+#
+# SCALED, not constant. Both FASTQ and BAM grow with genome size x coverage, so a fixed 214 GB
+# demanded 61x more than a chr22 replicate actually needs (~3.5 GB) and would have refused every
+# smoke run once /scratch passed 336 GB used — breaking the smoke-first workflow exactly when
+# disk is tight and a cheap run matters most. Job 21035422 passed only because 343 GB happened to
+# be free.
+scaled_replicate_peak_gb() {  # <reference_bp> <coverage>; echoes whole GB
+    awk -v bp="$1" -v cov="$2" 'BEGIN {
+        # Cannot scale -> assume the worst rather than wave a run through. "Unknown" must not
+        # read as "small", which is the same rule as the calibration controls.
+        if (bp <= 0 || cov <= 0) { print 214; exit }
+        gb = 214.0 * (bp / 3100000000.0) * (cov / 30.0)
+        # Floor: below this the reference index, Manta workspace and temp files dominate and the
+        # read-proportional model understates the real need.
+        if (gb < 5) gb = 5
+        printf "%d", (gb == int(gb) ? gb : int(gb) + 1)
+    }'
+}
+
+# Reference size in bases. Prefers the .fai (exact); falls back to the FASTA byte count, which is
+# a fine proxy for a capacity gate (~60 bases per 61 bytes with newlines) and — unlike the .fai —
+# always exists, since the index is not built until stage 2.
+reference_bp() {  # <reference.fa>
+    local ref="$1" bytes
+    if [[ -s "$ref.fai" ]]; then
+        awk '{s += $2} END {print s + 0}' "$ref.fai"
+        return
+    fi
+    bytes=$(stat -c %s "$ref" 2>/dev/null || echo 0)
+    awk -v b="$bytes" 'BEGIN {printf "%d", b * 0.98}'
+}
+
+REPLICATE_PEAK_GB="${REPLICATE_PEAK_GB:-$(scaled_replicate_peak_gb \
+    "$(reference_bp "$REFERENCE")" "$TOTAL_COVERAGE")}"
 
 # Extract used/limit in KB from `lfs quota -p` output. Separated from the check so the
 # decision logic is testable without Lustre: the parsing is the fragile half, and the real

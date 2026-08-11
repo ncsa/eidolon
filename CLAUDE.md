@@ -148,7 +148,9 @@ contig lengths).
   the **project quota** — check it with
   `lfs quota -h -p <projid> /work/nvme`, and read `Disk quota exceeded` literally.
   Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~214 GB peak per
-  replicate**, itemised from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
+  replicate** — the pipeline's disk gate scales this by genome size and coverage, so chr22 at
+  30x asks for the 5 GB floor rather than 214 (a constant would have refused every smoke run
+  once `/scratch` passed 336 GB used). Itemised from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
   normal 12+12) **plus** BAMs 98 GB (the figure `prune_bams` itself reported across
   campaign 20925151), which coexist because pruning only runs at the end. An earlier
   "~113 GB" figure here counted the FASTQ only and was wrong; every capacity estimate built on it was ~half of reality. With a ~171 GB fixed
