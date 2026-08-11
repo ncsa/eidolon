@@ -3417,7 +3417,11 @@ mod tests {
         assert_eq!((kept.len(), dropped), (1, 0), "99bp must be KEPT at max=99");
 
         let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(100)], 99);
-        assert_eq!((kept.len(), dropped), (0, 1), "100bp must be DROPPED at max=99");
+        assert_eq!(
+            (kept.len(), dropped),
+            (0, 1),
+            "100bp must be DROPPED at max=99"
+        );
 
         // Count is over the whole batch, not just the first offender.
         let batch = vec![
@@ -3440,8 +3444,10 @@ mod tests {
     #[test]
     fn the_insertion_cap_does_not_touch_other_variant_types() {
         use eidolon_core::structs::nucleotides::Nucleotide;
-        let huge_dup = sv_variant_with_span(1000, 900_000, SvType::Dup, Genotype::Heterozygous, None);
-        let huge_del = sv_variant_with_span(1000, 900_000, SvType::Del, Genotype::Heterozygous, None);
+        let huge_dup =
+            sv_variant_with_span(1000, 900_000, SvType::Dup, Genotype::Heterozygous, None);
+        let huge_del =
+            sv_variant_with_span(1000, 900_000, SvType::Del, Genotype::Heterozygous, None);
         let mut literal_del = literal_ins(0);
         // REF spans the deleted bases, ALT is the anchor alone — the reverse of an insertion.
         literal_del.variant_type = VariantType::Deletion;

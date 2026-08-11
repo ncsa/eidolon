@@ -559,11 +559,8 @@ fn dup_chimeric_reads_duplicate_the_vcf_conventional_block() {
 fn short_dup_spanned_by_a_fragment_still_matches_the_derived_haplotype() {
     assert_derived(
         "chim_dup_short",
-        "H1N1_HA	600	.	G	<DUP>	60	PASS	SVTYPE=DUP;END=750	GT	1/1",
-        Sv::Dup {
-            pos: 600,
-            end: 750,
-        },
+        "H1N1_HA\t600\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;END=750\tGT\t1/1",
+        Sv::Dup { pos: 600, end: 750 },
         750,
     );
 }

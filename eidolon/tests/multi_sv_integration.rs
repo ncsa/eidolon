@@ -170,7 +170,10 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
         .iter()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            if f.len() < 5 || f[3].len() != 1 || !f[4].chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T')) {
+            if f.len() < 5
+                || f[3].len() != 1
+                || !f[4].chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T'))
+            {
                 return None;
             }
             let novel = f[4].len().saturating_sub(f[3].len());
