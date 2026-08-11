@@ -476,6 +476,10 @@ fi
 # is well before the scoring stage that consumes it (set -u).
 CAL_FAIL=0
 SCORE_COVERAGE_FAIL=0
+# Strata whose ENTIRE query was filtered out before comparison (#511). Not fatal — a caller
+# emitting only low-confidence calls in one stratum is normal — but it must reach the banner,
+# because TP=0/FP=0 is indistinguishable from "the caller emitted nothing".
+QUERY_FILTERED=()
 
 MANTA_DIR="$OUTDIR/manta"
 MANTA_SV="$MANTA_DIR/results/variants/somaticSV.vcf.gz"
@@ -740,6 +744,7 @@ print(f"  {name:<18} recall={(s.get('recall') or 0):.3f}  precision={(s.get('pre
       f"f1={(s.get('f1') or 0):.3f}  TP={s.get('TP-base') or 0}  FN={s.get('FN') or 0}  FP={s.get('FP') or 0}")
 PY
         check_denominator "$truth" "$out" "$label" || true
+        check_query_denominator "$comp" "$out" "$label" || QUERY_FILTERED+=("$label")
     else
         echo "  $label: truvari produced no summary.json (see $out)"
         SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
@@ -759,6 +764,78 @@ PY
 # or fn.vcf.gz, so truth-minus-those is exactly the discarded set, printed with SVTYPE/SVLEN
 # so the responsible filter is obvious. eidolon's own floor is MIN_SV_LENGTH_BP=50, equal to
 # truvari's --sizemin default, so a size-driven drop here means the LARGE end (--sizemax).
+# Coverage of the QUERY side, which nothing checked (#511). `check_denominator` below
+# reconciles the TRUTH (n_truth vs TP-base+FN) and hard-fails when records were discarded
+# before comparison. Nothing did the equivalent for the comp VCF, so every `precision` this
+# pipeline reports was computed over a denominator no one verified — the same defect on the
+# other axis.
+#
+# The motivating case, campaign 20925151: `manta_INS` reported TP=0 FP=0, which reads as "the
+# caller emitted nothing". It emitted three INS calls, one of them a TRUE detection
+# (chr7:3198935 SVLEN 61 against truth chr7:3198936 SVLEN 61 — one base off, exact size). All
+# three were non-PASS, so `--passonly` removed them BEFORE comparison and the stratum scored
+# 0/0. The reported 0.000 was a statement about the FILTER, not the caller, and nothing said so.
+#
+# Split into a numbers-only verdict plus thin plumbing, so the decision logic is testable
+# without truvari or a BAM — the same seam as parse_lfs_quota_kb.
+#
+# LOUD, NOT FATAL, deliberately. A caller emitting only low-confidence calls in one stratum is
+# normal behaviour, not a harness bug; failing the run would let it abort an 8-hour campaign.
+# It surfaces in the closing banner instead, so it cannot be missed while reading the numbers.
+report_query_coverage() {  # <label> <n_query> <n_scored> <n_nonpass>; rc 1 = wholly filtered
+    local label="$1" n_query="$2" scored="$3" nonpass="$4"
+
+    [[ "$n_query" -gt 0 ]] || return 0            # nothing was handed over; not our business
+    if [[ "$scored" -gt "$n_query" ]]; then
+        # More classified than handed over should be impossible. Report rather than compute a
+        # negative "dropped" count and present it as a fact.
+        echo "  WARNING: $label scored $scored of $n_query query record(s) — MORE than were" >&2
+        echo "    supplied, so this arithmetic is not understood. Do not quote its precision." >&2
+        return 0
+    fi
+    [[ "$scored" -eq "$n_query" ]] && return 0    # fully accounted for
+
+    local dropped=$((n_query - scored))
+    local why="size/other filters"
+    [[ "$nonpass" -gt 0 ]] && why="--passonly ($nonpass non-PASS)"
+
+    if [[ "$scored" -eq 0 ]]; then
+        # The dangerous case: TP=0 FP=0 is indistinguishable from "the caller emitted nothing".
+        echo "ERROR: $label scored NONE of its $n_query query record(s) — all removed before" >&2
+        echo "  comparison by $why. recall/precision for this stratum therefore describe the" >&2
+        echo "  FILTER, not the caller, and must not be reported as a caller result (#511)." >&2
+        [[ "$nonpass" -gt 0 ]] && \
+            echo "  --passonly is THIS PIPELINE'S choice, not a property of the caller." >&2
+        return 1
+    fi
+    echo "    ^ query coverage: $scored of $n_query record(s) scored, $dropped dropped by $why"
+    return 0
+}
+
+check_query_denominator() {  # <comp.vcf.gz> <truvari_out_dir> <label>
+    local comp="$1" out="$2" label="$3"
+    local n_query nonpass kv tp fp
+    n_query=$(bcftools view -H "$comp" 2>/dev/null | wc -l)
+    # Read TP-comp and FP together, and FAIL if either key is absent rather than defaulting to
+    # zero — an absent key would make every record look dropped and manufacture the exact alarm
+    # this function exists to raise. #509's lesson, one guard over.
+    kv=$(python3 - "$out/summary.json" <<'PYQ' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in ("TP-comp", "FP"):
+    if k not in d:
+        sys.exit(3)
+print(int(d["TP-comp"] or 0), int(d["FP"] or 0))
+PYQ
+    ) || {
+        echo "  ($label: query coverage UNVERIFIED — summary.json lacks TP-comp/FP)" >&2
+        return 0
+    }
+    read -r tp fp <<< "$kv"
+    nonpass=$(bcftools view -H -i 'FILTER!="PASS" && FILTER!="."' "$comp" 2>/dev/null | wc -l)
+    report_query_coverage "$label" "$n_query" "$((tp + fp))" "$nonpass"
+}
+
 check_denominator() {  # <truth.vcf.gz> <truvari_out_dir> <label>
     local truth="$1" out="$2" label="$3"
     local n_truth base
@@ -891,61 +968,6 @@ check_bnd_geometry() {  # <bnd_truth.vcf.gz>
           }'
 }
 
-# ── Split the BND truth by geometry, because only half of it is BND-scoreable ──
-# Callers bucket only INVERSION-ORIENTED adjacencies (t]p], [p[t) as BND. A direct
-# adjacency inside one contig IS a deletion or a tandem duplication, and Manta calls it
-# <DEL>/<DUP:TANDEM>. Our truth types every junction BND regardless of geometry, so
-# scoring all of it against a caller's BND records asks truvari to match records that
-# cannot match by construction.
-#
-# MEASURED, not assumed — job 20719077, 466 junctions, geometry ~uniform:
-#   tp-base:  t[p[ 0    t]p] 188  [p[t 166  ]p]t 0     -> direct=0    inv-oriented=354
-#   fn:       t[p[ 226  t]p] 68   [p[t 58   ]p]t 226   -> direct=452  inv-oriented=126
-# Every single direct-form record was a false negative and none appeared in tp-base.
-# So manta_BND recall=0.380 (354/932) was a statement about OUR SVTYPE choice; the
-# caller number is 354/480 = 0.738, and the two geometries inside that agree closely
-# (head-to-head 0.734, tail-to-tail 0.741), so there is no bias within the class.
-#
-# Reporting the aggregate alone repeats the INV precision-floor mistake one layer down:
-# a number floored by our own representation, printed as if it described the caller.
-split_bnd_by_geometry() {  # <bnd_truth.vcf.gz> <inv_out.vcf.gz> <direct_out.vcf.gz>
-    local src="$1" inv="$2" dir="$3"
-    [[ -f "$src" ]] || { echo "  ERROR: BND split: no BND truth at $src" >&2; return 1; }
-    local hdr="$OUTDIR/.bnd_split_hdr" tmp="$OUTDIR/.bnd_split_tmp.vcf"
-    bcftools view -h "$src" > "$hdr" || return 1
-
-    local kind out n_inv=0 n_dir=0
-    for kind in inv direct; do
-        [[ "$kind" == inv ]] && out="$inv" || out="$dir"
-        { cat "$hdr"
-          bcftools view -H "$src" | awk -F'\t' -v k="$kind" '
-              { a=$5
-                # direct: t[p[ (base then open-bracket) or ]p]t (leading close-bracket)
-                d = (a ~ /^[ACGTNacgtn]+\[/ || a ~ /^\]/)
-                # inversion-oriented: t]p] (base then close) or [p[t (leading open)
-                i = (a ~ /^[ACGTNacgtn]+\]/ || a ~ /^\[/)
-                if ((k=="direct" && d) || (k=="inv" && i)) print }'
-        } > "$tmp"
-        bcftools view -O z -o "$out" "$tmp" || { rm -f "$tmp" "$hdr"; return 1; }
-        bcftools index -f -t "$out" || { rm -f "$tmp" "$hdr"; return 1; }
-    done
-    n_inv=$(bcftools view -H "$inv" | wc -l)
-    n_dir=$(bcftools view -H "$dir" | wc -l)
-    rm -f "$tmp" "$hdr"
-
-    local n_src
-    n_src=$(bcftools view -H "$src" | wc -l)
-    printf "  BND truth split by geometry: %d inversion-oriented, %d direct (of %d)\n" \
-        "$n_inv" "$n_dir" "$n_src"
-    # Coverage of the split's own input. A record that lands in neither bucket would
-    # silently shrink the denominator of whatever is scored next.
-    if [[ $((n_inv + n_dir)) -ne "$n_src" ]]; then
-        echo "  ERROR: BND split lost $((n_src - n_inv - n_dir)) record(s) — every record" >&2
-        echo "    must be exactly one of direct or inversion-oriented." >&2
-        return 1
-    fi
-    return 0
-}
 
 # ── BND junction spans: a comparable representation ──────────────────────
 # A BND pair at (A,B) and a caller's <DUP:TANDEM>/<DEL>/<INV> spanning A..B describe the
@@ -1262,27 +1284,25 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
             bcftools index -f -t "$qb" 2>/dev/null || true
             run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
                 --bnddist "$BND_DIST"
-            # The aggregate above has a CEILING SET BY US, not by the caller: direct
-            # junctions are correctly called <DEL>/<DUP:TANDEM>, so they can never match
-            # a BND record. Job 20719077: every one of the 452 direct-form records was a
-            # FN and none appeared in tp-base, making the 0.380 aggregate a statement
-            # about our SVTYPE choice. BNDinv restricts the truth to the junctions a
-            # caller can actually represent as breakends, which is the caller number.
-            if [[ -f "$OUTDIR/truth_sv_BNDinv.vcf.gz" ]]; then
-                local n_inv n_dir
-                n_inv=$(bcftools view -H "$OUTDIR/truth_sv_BNDinv.vcf.gz" | wc -l)
-                n_dir=$(bcftools view -H "$OUTDIR/truth_sv_BNDdirect.vcf.gz" 2>/dev/null | wc -l)
-                if [[ "$n_inv" -gt 0 ]]; then
-                    run_truvari "$OUTDIR/truth_sv_BNDinv.vcf.gz" "${caller}_BNDinv" "$qb" \
-                        --bnddist "$BND_DIST"
-                    echo "    ^ BNDinv is the interpretable BND number: truth restricted to the"
-                    echo "      $n_inv inversion-oriented record(s) a caller CAN emit as breakends."
-                    echo "      The ${caller}_BND figure above additionally counts $n_dir direct-form"
-                    echo "      record(s) that are called <DEL>/<DUP:TANDEM> and cannot match by"
-                    echo "      construction — a ceiling of $n_inv/$((n_inv + n_dir)), set by our"
-                    echo "      representation. Quote BNDinv when describing the caller."
-                fi
-            fi
+            # RETIRED: the BND/BNDinv split (#507). It existed because the de novo
+            # sampler hardcoded the mate to the anchor's own contig, and within one
+            # chromosome a direct adjacency genuinely IS a deletion or tandem
+            # duplication — so a caller emitted <DEL>/<DUP:TANDEM> and all 452
+            # direct-form records of job 20719077 were unmatchable as BND by
+            # construction, flooring the aggregate at 0.380.
+            #
+            # BND is now inter-chromosomal only. Across two chromosomes there is no
+            # deletion or duplication interpretation, so a caller emits BND for all four
+            # geometries and the direct-form records match fine. Measured on job
+            # 20824321 the two collapsed (BND 0.935 vs BNDinv 0.929), and pooled over
+            # campaign 20925151 they agree to within noise (manta 0.868 vs 0.876, delly
+            # 0.417 vs 0.412). `${caller}_BND` is simply the BND number now.
+            #
+            # It was also actively misleading: BNDinv restricted the TRUTH to the
+            # inversion-oriented records while leaving the QUERY as every BND call, so
+            # each unmatched call became a false positive and precision read 0.245
+            # against BND's 0.547 on an identical query set (#512). The surrounding text
+            # told the reader to quote that row.
         else
             rm -f "$qb" "${qb}.tbi"
             echo "  ${caller}_BND recall=0.000  (caller emitted no BND records)"
@@ -1327,10 +1347,6 @@ if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
         echo "  would measure our emission defect and report it as caller performance." >&2
         CAL_FAIL=1
     fi
-    # Split the truth by geometry so BND recall can be reported against the junctions a
-    # caller can actually emit as breakends, separately from the direct ones it cannot.
-    split_bnd_by_geometry "$OUTDIR/truth_sv_BND.vcf.gz" \
-        "$OUTDIR/truth_sv_BNDinv.vcf.gz" "$OUTDIR/truth_sv_BNDdirect.vcf.gz" || CAL_FAIL=1
     build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
         || BND_SPAN_RC=$?
     case "$BND_SPAN_RC" in
@@ -1545,6 +1561,18 @@ EOF
 # Repeated here on purpose. Stage 3b prints this ~900 lines earlier in the log, and the
 # banner above is what actually gets read and pasted — an empty denominator that only
 # appears upstream is an empty denominator nobody sees.
+if [[ "${#QUERY_FILTERED[@]}" -gt 0 ]]; then
+    cat <<EOF
+QUERY WHOLLY FILTERED: ${#QUERY_FILTERED[@]} stratum/strata scored NONE of the caller's records
+because every one was removed before comparison: ${QUERY_FILTERED[*]}
+  Their recall/precision describe the FILTER, not the caller, and must not be quoted as a
+  caller result. --passonly is this pipeline's choice; a caller emitting only low-confidence
+  calls in a stratum is normal behaviour. To see what was actually emitted:
+    bcftools query -f '%CHROM\t%POS\t%FILTER\t%INFO/SVTYPE\t%INFO/SVLEN\n' <caller vcf>
+  Campaign 20925151 is the case history: manta_INS read TP=0 FP=0 while Manta had emitted
+  three INS calls, one of them a true detection, all non-PASS. See #511.
+EOF
+fi
 if [[ "${#TYPES_UNMEASURED[@]}" -gt 0 ]]; then
     cat <<EOF
 COVERAGE HOLE: ${#TYPES_UNMEASURED[@]} of ${#SV_TYPES[@]} SV type(s) had NO truth records and were
