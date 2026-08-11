@@ -162,8 +162,11 @@ contig lengths).
   `truvari_*/summary.json`, which is all `aggregate_sv_reps.sh` reads.
 - **Smoke first, and never learn a mechanism from a 16-hour run.** `sv_pipeline.sbatch`
   defaults `REFERENCE` to `$SCRATCH/neat_data/chr22.fa` — use that default with
-  `SV_RATE_SCALE=20` for a fast run that plants every SV type and exercises every stage in
-  well under an hour. Only then spend GRCh38 at `SV_RATE_SCALE=1.0`, which is for *numbers*,
+  `SV_RATE_SCALE=30` for a fast run that exercises every stage. Job 21025737 did the whole
+  pipeline in **4 minutes and 25 core-hours**, against 1215–1445 core-hours for GRCh38.
+  **Caveat, measured on that run: chr22 alone cannot plant BND at all.** De novo BND is
+  inter-chromosomal only (P3a), so a single-contig reference yields `truth BND: 0` and a
+  COVERAGE HOLE for BND by construction. Use a ≥2-contig reference to smoke the BND path. Only then spend GRCh38 at `SV_RATE_SCALE=1.0`, which is for *numbers*,
   not for finding out whether the machinery works. Faster still: most read-level questions are
   answerable on the H1N1 fixture in **seconds** via `eidolon/tests/sv_support_matrix.rs` — that
   is where #516 was finally caught, after being chased through three multi-hour campaigns.

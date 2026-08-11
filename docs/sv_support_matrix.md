@@ -31,7 +31,7 @@ a variant that silently fails to appear is a broken tool.
 | BND + inserted sequence | preserved **with the insert** | **0 of 30** chimeric reads carry it | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) |
 | BND, mate contig absent | — | — | ✅ hard error (correct) |
 | BND, single/unpaired (`A.`) | preserved | 0 chimeric; **depth 42.4 vs 72.0** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
-| Fragment spanning a whole DUP | — | *"4 of 30 reads match no haplotype"* | ❌ #474 |
+| Fragment spanning a whole DUP | — | 60–800 bp blocks all match the derived haplotype | ✅ measured; earlier ❌ was noise |
 | Two junctions within one fragment | all 4 preserved | 60 chimeric; depth matches derived haplotype | ✅ |
 | Literal INS, ≤ ~150 bp | preserved | inserted bases present in reads | ✅ |
 | Literal INS, ≳ 200 bp | preserved **with full SVLEN** | **head only** — interior and far end in 0 reads | ❌ [#516](https://github.com/ncsa/eidolon/issues/516) partial |
@@ -110,7 +110,7 @@ reported nothing within 2 kb of any of them — because the evidence for the dec
 not in the reads. **INS recall figures are invalid above ~a read length; DEL/DUP/INV/BND/CNV
 are unaffected.**
 
-Suspected mechanism, same family as #474 and #498: fragments are placed against *reference*
+Suspected mechanism, same family as #498: fragments are placed against *reference*
 coordinates and the insert is spliced in afterwards, so a fragment can reach into the start of
 an insertion but none ever *begins* inside it — nothing samples the interior.
 
@@ -120,9 +120,25 @@ depth falls **72.0 → 42.4** (−41%) with **zero** chimeric reads. The truth d
 breakend, the reads contain no junction, and a depth caller sees a partial deletion no
 record describes.
 
-**[#474] Fragment spanning a whole DUP.** Needs a three-piece stitch `get_dup_pieces`
-cannot express. Known and open; `chimeric_sequence_content.rs` is deliberately
-parameterised to avoid it.
+**Fragment spanning a whole DUP — retracted, it was never broken.** This cell previously read
+❌, citing a three-piece stitch (`left + block + right`) that `get_dup_pieces` cannot express,
+and "4 of 30 reads match no haplotype". All three parts are withdrawn:
+
+- **Measured false.** `short_dup_spanned_by_a_fragment_still_matches_the_derived_haplotype`
+  sweeps DUP blocks of 60/100/150/200/400/800 bp against a ~200 bp fragment — every one
+  spannable by a fragment — and all match the derived haplotype at the ≥90% threshold used
+  throughout that file.
+- **The 13% was the error model.** `matches_with_one_small_indel` exists because a purely
+  positional comparison frameshifts on sequencing-error indels; its own note says that without
+  it "a correct implementation looks ~9% broken". 4 of 30 = 13% sits inside that band, so the
+  original measurement almost certainly predates that tolerance.
+- **The issue reference was wrong.** #474 is closed and concerns INV/DUP anchor-base
+  conventions, not stitching — it never covered this.
+
+Residual, and why this is ✅ rather than settled: the test asserts the reads that exist are
+correct, not that none are missing. Fragments needing three pieces being silently *dropped*
+would dip coverage across a short DUP and leave the test green. A depth comparison against a
+no-variant control would close that.
 
 ### `<INV>` — investigated, and the *test* was wrong, not the code
 
