@@ -1144,6 +1144,28 @@ fn generate_mutated_map(
             config.sv_max_length_fraction,
             &mut rng,
         );
+        // #516: refuse to PLANT an insertion the engine cannot render. Reads carry at most
+        // `read_len - 1` of an insertion's novel bases (fragments are placed in reference
+        // offsets, so none can begin inside a zero-reference-width event), while the truth VCF
+        // declares the full SVLEN — a benchmark built from that asserts insertions the reads
+        // cannot support. Until the fragment sampler can place reads in haplotype coordinates,
+        // not emitting the record is strictly better than emitting a false one.
+        //
+        // De novo ONLY. An `input_vcf` insertion is kept regardless, because input fidelity is
+        // the stronger contract ("what you put in comes out") and silently discarding a
+        // user-supplied variant would be worse than rendering it partially; that case stays
+        // documented in docs/sv_support_matrix.md.
+        let (de_novo, dropped) =
+            drop_unrealizable_insertions(de_novo, config.read_len.saturating_sub(1));
+        if dropped > 0 {
+            warn!(
+                "{contig_name}: dropped {dropped} de novo insertion(s) longer than {} bp — \
+                 reads cannot carry more than that of an insertion's novel sequence (#516), so \
+                 planting them would put a length in the truth VCF that the reads do not \
+                 support. The realized INS rate is therefore below the model's Ins probability.",
+                config.read_len.saturating_sub(1)
+            );
+        }
         sv_variants.extend(de_novo);
     }
 
@@ -2646,6 +2668,39 @@ fn rate_at(segments: &[(usize, usize, f64)], pos: usize) -> f64 {
 
 /// Splits segments to remove individual excluded positions (e.g. positions already
 /// occupied by input variants). `excluded` must be sorted.
+/// Novel-base count of a LITERAL insertion, or `None` for anything else.
+///
+/// A literal insertion is `REF=<anchor>`, `ALT=<anchor><novel…>`, so the novel length is
+/// `ALT.len() - REF.len()`. Returns `None` for symbolic SVs (whose length lives in INFO, not in
+/// the ALT) and for deletions (where the subtraction underflows) — both must be left alone.
+fn literal_insertion_novel_len(v: &Variant) -> Option<usize> {
+    if v.variant_type != VariantType::Insertion {
+        return None;
+    }
+    let alt = v.alternate.as_literal()?;
+    alt.len().checked_sub(v.reference.len()).filter(|&n| n > 0)
+}
+
+/// Drop de novo insertions longer than `max_novel_bp`; returns the survivors and the count
+/// dropped. See the call site for why (#516).
+///
+/// REJECTS rather than clamps. Clamping the upper tail to exactly `max_novel_bp` would pile
+/// every large draw at one length and produce a spike that reads as a real size distribution.
+/// Rejection just thins the tail, which is the honest statement: eidolon does not currently
+/// simulate insertions longer than a read.
+fn drop_unrealizable_insertions(vars: Vec<Variant>, max_novel_bp: usize) -> (Vec<Variant>, usize) {
+    let before = vars.len();
+    let kept: Vec<Variant> = vars
+        .into_iter()
+        .filter(|v| match literal_insertion_novel_len(v) {
+            Some(n) => n <= max_novel_bp,
+            None => true,
+        })
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
 fn exclude_positions(
     segments: Vec<(usize, usize, f64)>,
     excluded: &[usize],
@@ -3328,6 +3383,88 @@ mod tests {
         let locs: Vec<usize> = filtered["chr1"].iter().map(|v| v.location).collect();
         assert!(locs.contains(&100));
         assert!(locs.contains(&500));
+    }
+
+    /// Build a LITERAL insertion of `novel` novel bases: REF=A, ALT=A + novel*'C'.
+    fn literal_ins(novel: usize) -> Variant {
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let mut alt = vec![Nucleotide::A];
+        alt.extend(std::iter::repeat_n(Nucleotide::C, novel));
+        Variant {
+            variant_type: VariantType::Insertion,
+            location: 1000,
+            reference: vec![Nucleotide::A],
+            alternate: AlternateType::Literal(alt),
+            genotype_str: "0/1".to_string(),
+            genotype: Genotype::Heterozygous,
+            allele_fraction: None,
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: vec!["GT".to_string()],
+            sample: vec!["0/1".to_string()],
+            provenance: Provenance::Denovo,
+        }
+    }
+
+    /// #516: an insertion longer than a read is only partially realized, so it must not be
+    /// planted. KNOWN ANSWER: the boundary is exactly `max_novel_bp` — kept at the boundary,
+    /// dropped one past it.
+    #[test]
+    fn unrealizable_insertions_are_dropped_at_exactly_the_boundary() {
+        let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(99)], 99);
+        assert_eq!((kept.len(), dropped), (1, 0), "99bp must be KEPT at max=99");
+
+        let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(100)], 99);
+        assert_eq!(
+            (kept.len(), dropped),
+            (0, 1),
+            "100bp must be DROPPED at max=99"
+        );
+
+        // Count is over the whole batch, not just the first offender.
+        let batch = vec![
+            literal_ins(50),
+            literal_ins(500),
+            literal_ins(99),
+            literal_ins(2155),
+        ];
+        let (kept, dropped) = drop_unrealizable_insertions(batch, 99);
+        assert_eq!((kept.len(), dropped), (2, 2));
+        for v in &kept {
+            assert!(literal_insertion_novel_len(v).unwrap() <= 99);
+        }
+    }
+
+    /// MUST NOT FIRE. The cap is about insertions only: a symbolic SV carries its length in
+    /// INFO rather than the ALT, and a literal DELETION has a longer REF than ALT. Dropping
+    /// either would silently delete large DELs/DUPs/INVs from every de novo run — a far worse
+    /// bug than the one being worked around.
+    #[test]
+    fn the_insertion_cap_does_not_touch_other_variant_types() {
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let huge_dup =
+            sv_variant_with_span(1000, 900_000, SvType::Dup, Genotype::Heterozygous, None);
+        let huge_del =
+            sv_variant_with_span(1000, 900_000, SvType::Del, Genotype::Heterozygous, None);
+        let mut literal_del = literal_ins(0);
+        // REF spans the deleted bases, ALT is the anchor alone — the reverse of an insertion.
+        literal_del.variant_type = VariantType::Deletion;
+        literal_del.reference = std::iter::repeat_n(Nucleotide::T, 400).collect();
+        literal_del.alternate = AlternateType::Literal(vec![Nucleotide::T]);
+
+        assert_eq!(literal_insertion_novel_len(&huge_dup), None);
+        assert_eq!(literal_insertion_novel_len(&huge_del), None);
+        assert_eq!(literal_insertion_novel_len(&literal_del), None);
+
+        let (kept, dropped) =
+            drop_unrealizable_insertions(vec![huge_dup, huge_del, literal_del], 99);
+        assert_eq!(
+            (kept.len(), dropped),
+            (3, 0),
+            "no non-insertion may be dropped by the insertion cap"
+        );
     }
 
     fn sv_variant_with_span(

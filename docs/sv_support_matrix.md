@@ -31,7 +31,7 @@ a variant that silently fails to appear is a broken tool.
 | BND + inserted sequence | preserved **with the insert** | **0 of 30** chimeric reads carry it | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) |
 | BND, mate contig absent | — | — | ✅ hard error (correct) |
 | BND, single/unpaired (`A.`) | preserved | 0 chimeric; **depth 42.4 vs 72.0** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
-| Fragment spanning a whole DUP | — | *"4 of 30 reads match no haplotype"* | ❌ #474 |
+| Fragment spanning a whole DUP | — | 60–800 bp blocks all match the derived haplotype | ✅ measured; earlier ❌ was noise |
 | Two junctions within one fragment | all 4 preserved | 60 chimeric; depth matches derived haplotype | ✅ |
 | Literal INS, ≤ ~150 bp | preserved | inserted bases present in reads | ✅ |
 | Literal INS, ≳ 200 bp | preserved **with full SVLEN** | **head only** — interior and far end in 0 reads | ❌ [#516](https://github.com/ncsa/eidolon/issues/516) partial |
@@ -77,10 +77,28 @@ inserted sequence:
 | 200 bp | 25 | **0** | **0** |
 | 600 bp | 27 | **0** | **0** |
 
-The head count *rises* with size while the interior collapses to zero — so any probe near the
+The head is always present while the interior collapses to zero — so any probe near the
 insertion's start says it works, which is where a casual check looks. The truth VCF meanwhile
-declares the full `SVLEN`. **Read support saturates at ~one read length regardless of the
-declared size.**
+declares the full `SVLEN`.
+
+**Located mechanism.** Fragments and read windows are chosen purely in *reference* offsets
+(`cover_dataset`, `generate_fragments.rs:323`), and an insertion has zero reference width, so no
+read window can ever *begin* inside one. Reads are assembled per-read by walking a reference
+slice and expanding variants inline, bounded by `bases_written < read_length`
+(`fastq_tools.rs:429`) with a `break 'outer` at `:555` that discards the rest of the insert
+silently — no log, no counter. Hence:
+
+> novel bases visible in one read = `min(L, read_length − anchor_offset − 1)`
+
+**At most `read_length − 1` inserted bases are ever realized, at any declared SVLEN.** Probe
+visibility follows exactly: head needs `anchor_offset ≤ 69` (no `L` term), middle needs
+`anchor_offset ≤ 84 − L/2` (impossible for `L ≥ 170`), tail needs `≤ 99 − L` (impossible for
+`L ≥ 100`) — which reproduces all fifteen measured cells.
+
+The head count is **size-independent**: with the heterozygous coin removed (`GT 1/1`) it is
+42/41/**50/50/50** across the five sizes. An earlier version of this note claimed it "rises with
+size" and read meaning into 16 → 27; that was RNG drift, since a larger insert fires
+`break 'outer` sooner and consumes fewer sequencing-error draws.
 
 Consequence, measured: SV validation campaign 20925151 planted 22 de novo somatic insertions of
 61–2155 bp and Manta detected exactly one — the 61 bp event, and only at `MinSomaticScore`.
@@ -92,9 +110,31 @@ reported nothing within 2 kb of any of them — because the evidence for the dec
 not in the reads. **INS recall figures are invalid above ~a read length; DEL/DUP/INV/BND/CNV
 are unaffected.**
 
-Suspected mechanism, same family as #474 and #498: fragments are placed against *reference*
+Suspected mechanism, same family as #498: fragments are placed against *reference*
 coordinates and the insert is spliced in afterwards, so a fragment can reach into the start of
 an insertion but none ever *begins* inside it — nothing samples the interior.
+
+**De novo insertions are now CAPPED at `read_len - 1` (interim, pending #516).** Rather than
+emit a truth record the reads cannot support, `gen-reads` refuses to plant a de novo insertion
+whose novel sequence exceeds what a read can carry, logging the count dropped. Two consequences,
+both intended:
+
+- **The realized INS rate is below the model's `Ins` probability.** The bundled default puts
+  `Ins` at log-normal (5.7, 1.0) — median ~299 bp — so at `read_len=150` roughly three quarters
+  of INS draws are refused. The truth VCF is now self-consistent; the *distribution* is
+  deliberately truncated and no longer matches the source corpus at the upper tail.
+- **`input_vcf` insertions are NOT capped.** Input fidelity is the stronger contract — what you
+  supply comes out — and silently discarding a user-supplied variant is worse than rendering it
+  partially. A large insertion supplied via `input_vcf` still behaves as the #516 row describes.
+
+Pinned by `runner.rs`'s `unrealizable_insertions_are_dropped_at_exactly_the_boundary` and
+`the_insertion_cap_does_not_touch_other_variant_types` (a must-not-fire: dropping large
+DELs/DUPs/INVs would be far worse than the bug being worked around), plus an end-to-end
+assertion in `multi_sv_integration.rs` that no de novo INS in the truth VCF exceeds
+`read_len - 1`. Removing the call site makes that fail with eleven oversized records.
+
+This is an interim measure. It removes the false-truth problem, not the capability gap: eidolon
+still cannot simulate insertions longer than a read.
 
 **[#500] A single breakend (`A.`) destroys coverage.** VCF 4.2 allows an unresolved
 partner. `parse_bnd_alt` returns no mate, and the result is worse than being ignored:
@@ -102,9 +142,25 @@ depth falls **72.0 → 42.4** (−41%) with **zero** chimeric reads. The truth d
 breakend, the reads contain no junction, and a depth caller sees a partial deletion no
 record describes.
 
-**[#474] Fragment spanning a whole DUP.** Needs a three-piece stitch `get_dup_pieces`
-cannot express. Known and open; `chimeric_sequence_content.rs` is deliberately
-parameterised to avoid it.
+**Fragment spanning a whole DUP — retracted, it was never broken.** This cell previously read
+❌, citing a three-piece stitch (`left + block + right`) that `get_dup_pieces` cannot express,
+and "4 of 30 reads match no haplotype". All three parts are withdrawn:
+
+- **Measured false.** `short_dup_spanned_by_a_fragment_still_matches_the_derived_haplotype`
+  sweeps DUP blocks of 60/100/150/200/400/800 bp against a ~200 bp fragment — every one
+  spannable by a fragment — and all match the derived haplotype at the ≥90% threshold used
+  throughout that file.
+- **The 13% was the error model.** `matches_with_one_small_indel` exists because a purely
+  positional comparison frameshifts on sequencing-error indels; its own note says that without
+  it "a correct implementation looks ~9% broken". 4 of 30 = 13% sits inside that band, so the
+  original measurement almost certainly predates that tolerance.
+- **The issue reference was wrong.** #474 is closed and concerns INV/DUP anchor-base
+  conventions, not stitching — it never covered this.
+
+Residual, and why this is ✅ rather than settled: the test asserts the reads that exist are
+correct, not that none are missing. Fragments needing three pieces being silently *dropped*
+would dip coverage across a short DUP and leave the test green. A depth comparison against a
+no-variant control would close that.
 
 ### `<INV>` — investigated, and the *test* was wrong, not the code
 

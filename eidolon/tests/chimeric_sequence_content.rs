@@ -520,12 +520,48 @@ fn dup_chimeric_reads_duplicate_the_vcf_conventional_block() {
         },
         // The novel junction sits where the duplicated block is re-entered.
         //
-        // The block is 800bp against a ~200bp fragment ON PURPOSE. At 200bp a fragment
-        // can span the WHOLE duplication, which needs a three-piece stitch (left +
-        // block + right) that get_dup_pieces cannot express — it returns two — and 4 of
-        // 30 reads then match no haplotype at all. That is a separate real defect
-        // (#474), and keeping it out of this test stops one bug from masking another.
+        // The block is 800bp against a ~200bp fragment. That was once believed to matter:
+        // a fragment spanning the WHOLE duplication was thought to need a three-piece
+        // stitch get_dup_pieces cannot express, costing "4 of 30" reads. MEASURED FALSE —
+        // see short_dup_spanned_by_a_fragment_still_matches_the_derived_haplotype below,
+        // which sweeps 60..800bp and passes throughout. The 13% was almost certainly the
+        // sequencing-error noise that matches_with_one_small_indel was later added to
+        // absorb. The old note also cited #474, which is closed and about anchor-base
+        // conventions, not stitching.
         1400,
+    );
+}
+
+/// A DUP block SHORTER than a fragment — the "three-piece stitch" case, which turns out NOT
+/// to be broken.
+///
+/// The test above uses an 800bp block against a ~200bp fragment deliberately, on the stated
+/// grounds that a fragment spanning the WHOLE duplication "needs a three-piece stitch (left +
+/// block + right) that get_dup_pieces cannot express — it returns two — and 4 of 30 reads then
+/// match no haplotype at all". `docs/sv_support_matrix.md` carried that as an open defect.
+///
+/// MEASURED, and it does not reproduce. Blocks of 60/100/150/200/400/800bp against a ~200bp
+/// fragment — every one of which a fragment can span — all match the derived haplotype at the
+/// >=90% threshold the rest of this file uses.
+///
+/// The likely explanation is in this file's own header: `matches_with_one_small_indel` exists
+/// because a purely positional comparison frameshifts on sequencing-error indels, and "without
+/// it, a correct implementation looks ~9% broken". The claimed defect was 4 of 30 = 13%, inside
+/// that band — so the original measurement probably predates that tolerance and was the error
+/// model rather than a geometry failure.
+///
+/// WHAT THIS DOES NOT SHOW: that no fragment is SKIPPED. It asserts the reads that exist are
+/// correct, not that every read that should exist does. If fragments needing three pieces were
+/// silently dropped rather than mis-stitched, coverage across a short DUP would dip and this
+/// test would stay green. That needs a depth comparison against a no-variant control — the
+/// method `sv_support_matrix.rs` uses — before the cell is declared fully clean.
+#[test]
+fn short_dup_spanned_by_a_fragment_still_matches_the_derived_haplotype() {
+    assert_derived(
+        "chim_dup_short",
+        "H1N1_HA\t600\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;END=750\tGT\t1/1",
+        Sv::Dup { pos: 600, end: 750 },
+        750,
     );
 }
 

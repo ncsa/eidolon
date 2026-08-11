@@ -1500,6 +1500,17 @@ if [[ "$CAL_FAIL" -ne 0 ]]; then
     RUN_STATUS="FAILED (scorer calibration) — no caller results"
 elif [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
     RUN_STATUS="FAILED ($SCORE_COVERAGE_FAIL comparison(s) scored a SUBSET of the truth)"
+elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
+    # verify_planted_ins set this and NOTHING READ IT — the check reported to stderr and could
+    # not affect the banner or the exit status, so job 21025737 printed "complete" over
+    # "1 of 4 planted insertion(s) present in the reads". A control that cannot change the
+    # outcome is the exact failure this pipeline keeps re-earning; the variable was written and
+    # then dropped on the floor.
+    #
+    # Deliberately not a hard failure while #516 is open: every campaign planting insertions
+    # above ~a read length would fail, which would block DEL/DUP/INV work that is unaffected.
+    # It is a distinct, visible status instead — the numbers are usable EXCEPT for INS.
+    RUN_STATUS="complete, but INS INVALID ($INS_UNSUPPORTED insertion(s) absent from the reads — #516)"
 else
     RUN_STATUS="complete"
 fi
