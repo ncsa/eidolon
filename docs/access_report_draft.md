@@ -715,12 +715,24 @@ bucket only inversion-oriented adjacencies as BND; a direct same-contig adjacenc
 deletion or tandem duplication and is called as one. All 452 direct-form truth records
 were false negatives and none appeared in `tp-base`. Manta's recall over the junctions it
 can represent as breakends is **354/480 = 0.738** (head-to-head 0.734, tail-to-tail 0.741).
-The harness now reports this as `BNDinv` alongside the aggregate, and asserts truth
-reciprocity before scoring.
+The harness asserts truth reciprocity before scoring. It also used to report the
+inversion-oriented subset separately as `BNDinv`; **that split was retired in #507** and the
+paragraph above should be read as history. It was a consequence of the de novo sampler
+hardcoding the breakend mate to the anchor's own contig — within one chromosome a direct
+adjacency genuinely *is* a deletion or tandem duplication. Since P3a, BND means an
+inter-chromosomal translocation, where no deletion or duplication interpretation exists and a
+caller emits BND for all four geometries. The two figures then collapse (job 20824321: BND
+0.935 vs BNDinv 0.929; pooled over campaign 20925151, manta 0.868 vs 0.876 and delly 0.417 vs
+0.412), so `manta_BND` is simply the BND number. `BNDinv` precision was additionally an
+artifact — the truth was restricted while the query was not, so every unmatched call became a
+false positive (#512).
 
 **§3.7 is still not submittable, for a deeper reason than the one previously given.**
-eidolon has never generated a translocation — the de novo sampler hardcodes the breakend
-mate to the same contig. "BND recall" here means **same-contig junction recall**, and the
+eidolon had never generated a translocation at the time of writing — the de novo sampler
+hardcoded the breakend mate to the same contig. **Superseded: P3a made de novo BND
+inter-chromosomal**, so the paragraph below describes the state that motivated §3.7's caveat
+rather than the current one. The caveat itself stands until a translocation-era run is
+scored. "BND recall" here means **same-contig junction recall**, and the
 BND category itself is under audit: its 23.2% share is inherited from PCAWG's
 inter-chromosomal `TRA` count, and `BND` in a VCF is a representation convention rather
 than an event class (Manta and Delly typed identical junctions differently in job

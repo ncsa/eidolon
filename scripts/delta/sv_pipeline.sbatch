@@ -891,61 +891,6 @@ check_bnd_geometry() {  # <bnd_truth.vcf.gz>
           }'
 }
 
-# ── Split the BND truth by geometry, because only half of it is BND-scoreable ──
-# Callers bucket only INVERSION-ORIENTED adjacencies (t]p], [p[t) as BND. A direct
-# adjacency inside one contig IS a deletion or a tandem duplication, and Manta calls it
-# <DEL>/<DUP:TANDEM>. Our truth types every junction BND regardless of geometry, so
-# scoring all of it against a caller's BND records asks truvari to match records that
-# cannot match by construction.
-#
-# MEASURED, not assumed — job 20719077, 466 junctions, geometry ~uniform:
-#   tp-base:  t[p[ 0    t]p] 188  [p[t 166  ]p]t 0     -> direct=0    inv-oriented=354
-#   fn:       t[p[ 226  t]p] 68   [p[t 58   ]p]t 226   -> direct=452  inv-oriented=126
-# Every single direct-form record was a false negative and none appeared in tp-base.
-# So manta_BND recall=0.380 (354/932) was a statement about OUR SVTYPE choice; the
-# caller number is 354/480 = 0.738, and the two geometries inside that agree closely
-# (head-to-head 0.734, tail-to-tail 0.741), so there is no bias within the class.
-#
-# Reporting the aggregate alone repeats the INV precision-floor mistake one layer down:
-# a number floored by our own representation, printed as if it described the caller.
-split_bnd_by_geometry() {  # <bnd_truth.vcf.gz> <inv_out.vcf.gz> <direct_out.vcf.gz>
-    local src="$1" inv="$2" dir="$3"
-    [[ -f "$src" ]] || { echo "  ERROR: BND split: no BND truth at $src" >&2; return 1; }
-    local hdr="$OUTDIR/.bnd_split_hdr" tmp="$OUTDIR/.bnd_split_tmp.vcf"
-    bcftools view -h "$src" > "$hdr" || return 1
-
-    local kind out n_inv=0 n_dir=0
-    for kind in inv direct; do
-        [[ "$kind" == inv ]] && out="$inv" || out="$dir"
-        { cat "$hdr"
-          bcftools view -H "$src" | awk -F'\t' -v k="$kind" '
-              { a=$5
-                # direct: t[p[ (base then open-bracket) or ]p]t (leading close-bracket)
-                d = (a ~ /^[ACGTNacgtn]+\[/ || a ~ /^\]/)
-                # inversion-oriented: t]p] (base then close) or [p[t (leading open)
-                i = (a ~ /^[ACGTNacgtn]+\]/ || a ~ /^\[/)
-                if ((k=="direct" && d) || (k=="inv" && i)) print }'
-        } > "$tmp"
-        bcftools view -O z -o "$out" "$tmp" || { rm -f "$tmp" "$hdr"; return 1; }
-        bcftools index -f -t "$out" || { rm -f "$tmp" "$hdr"; return 1; }
-    done
-    n_inv=$(bcftools view -H "$inv" | wc -l)
-    n_dir=$(bcftools view -H "$dir" | wc -l)
-    rm -f "$tmp" "$hdr"
-
-    local n_src
-    n_src=$(bcftools view -H "$src" | wc -l)
-    printf "  BND truth split by geometry: %d inversion-oriented, %d direct (of %d)\n" \
-        "$n_inv" "$n_dir" "$n_src"
-    # Coverage of the split's own input. A record that lands in neither bucket would
-    # silently shrink the denominator of whatever is scored next.
-    if [[ $((n_inv + n_dir)) -ne "$n_src" ]]; then
-        echo "  ERROR: BND split lost $((n_src - n_inv - n_dir)) record(s) — every record" >&2
-        echo "    must be exactly one of direct or inversion-oriented." >&2
-        return 1
-    fi
-    return 0
-}
 
 # ── BND junction spans: a comparable representation ──────────────────────
 # A BND pair at (A,B) and a caller's <DUP:TANDEM>/<DEL>/<INV> spanning A..B describe the
@@ -1262,27 +1207,25 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
             bcftools index -f -t "$qb" 2>/dev/null || true
             run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
                 --bnddist "$BND_DIST"
-            # The aggregate above has a CEILING SET BY US, not by the caller: direct
-            # junctions are correctly called <DEL>/<DUP:TANDEM>, so they can never match
-            # a BND record. Job 20719077: every one of the 452 direct-form records was a
-            # FN and none appeared in tp-base, making the 0.380 aggregate a statement
-            # about our SVTYPE choice. BNDinv restricts the truth to the junctions a
-            # caller can actually represent as breakends, which is the caller number.
-            if [[ -f "$OUTDIR/truth_sv_BNDinv.vcf.gz" ]]; then
-                local n_inv n_dir
-                n_inv=$(bcftools view -H "$OUTDIR/truth_sv_BNDinv.vcf.gz" | wc -l)
-                n_dir=$(bcftools view -H "$OUTDIR/truth_sv_BNDdirect.vcf.gz" 2>/dev/null | wc -l)
-                if [[ "$n_inv" -gt 0 ]]; then
-                    run_truvari "$OUTDIR/truth_sv_BNDinv.vcf.gz" "${caller}_BNDinv" "$qb" \
-                        --bnddist "$BND_DIST"
-                    echo "    ^ BNDinv is the interpretable BND number: truth restricted to the"
-                    echo "      $n_inv inversion-oriented record(s) a caller CAN emit as breakends."
-                    echo "      The ${caller}_BND figure above additionally counts $n_dir direct-form"
-                    echo "      record(s) that are called <DEL>/<DUP:TANDEM> and cannot match by"
-                    echo "      construction — a ceiling of $n_inv/$((n_inv + n_dir)), set by our"
-                    echo "      representation. Quote BNDinv when describing the caller."
-                fi
-            fi
+            # RETIRED: the BND/BNDinv split (#507). It existed because the de novo
+            # sampler hardcoded the mate to the anchor's own contig, and within one
+            # chromosome a direct adjacency genuinely IS a deletion or tandem
+            # duplication — so a caller emitted <DEL>/<DUP:TANDEM> and all 452
+            # direct-form records of job 20719077 were unmatchable as BND by
+            # construction, flooring the aggregate at 0.380.
+            #
+            # BND is now inter-chromosomal only. Across two chromosomes there is no
+            # deletion or duplication interpretation, so a caller emits BND for all four
+            # geometries and the direct-form records match fine. Measured on job
+            # 20824321 the two collapsed (BND 0.935 vs BNDinv 0.929), and pooled over
+            # campaign 20925151 they agree to within noise (manta 0.868 vs 0.876, delly
+            # 0.417 vs 0.412). `${caller}_BND` is simply the BND number now.
+            #
+            # It was also actively misleading: BNDinv restricted the TRUTH to the
+            # inversion-oriented records while leaving the QUERY as every BND call, so
+            # each unmatched call became a false positive and precision read 0.245
+            # against BND's 0.547 on an identical query set (#512). The surrounding text
+            # told the reader to quote that row.
         else
             rm -f "$qb" "${qb}.tbi"
             echo "  ${caller}_BND recall=0.000  (caller emitted no BND records)"
@@ -1327,10 +1270,6 @@ if [[ -f "$OUTDIR/truth_sv_BND.vcf.gz" ]]; then
         echo "  would measure our emission defect and report it as caller performance." >&2
         CAL_FAIL=1
     fi
-    # Split the truth by geometry so BND recall can be reported against the junctions a
-    # caller can actually emit as breakends, separately from the direct ones it cannot.
-    split_bnd_by_geometry "$OUTDIR/truth_sv_BND.vcf.gz" \
-        "$OUTDIR/truth_sv_BNDinv.vcf.gz" "$OUTDIR/truth_sv_BNDdirect.vcf.gz" || CAL_FAIL=1
     build_bnd_spans "$OUTDIR/truth_sv_BND.vcf.gz" "$OUTDIR/truth_sv_BNDspan.vcf.gz" \
         || BND_SPAN_RC=$?
     case "$BND_SPAN_RC" in

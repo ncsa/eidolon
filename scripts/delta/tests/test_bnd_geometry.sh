@@ -54,8 +54,6 @@ unpaired mates not counted@if (!(t in g)) { u@if (!(t in g)) { u0
 unparsable ALTs not counted@{ bad++; badex@{ badex
 single-geometry NOTE always fires@if (nd==1 && parsed>=24)@if (nd>=1 && parsed>=1)
 geometry check always exits 0@exit (bad+unpaired+mismatch > 0) ? 1 : 0@exit 0
-split puts records in the wrong bucket@if ((k=="direct" && d) || (k=="inv" && i)) print@if ((k=="direct" && i) || (k=="inv" && d)) print
-split stops checking for lost records@if [[ $((n_inv + n_dir)) -ne "$n_src" ]]; then@if [[ 1 -eq 0 ]]; then
 scoring loop goes back to globbing@for svt in "${SV_TYPES_SCORED_IN_LOOP[@]}"; do@for typed in "$OUTDIR"/truth_sv_*.vcf.gz; do
 a derived artifact stops being scored separately@BND|CNV) continue ;;@BND) continue ;;
 MUTATIONS
@@ -86,12 +84,12 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in check_bnd_geometry split_bnd_by_geometry; do
+for fn in check_bnd_geometry; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
 done
-OUTDIR="$WORK"   # split_bnd_by_geometry writes its scratch files here
+OUTDIR="$WORK"   # check_bnd_geometry writes its scratch files here
 
 # ── Fixture builder ────────────────────────────────────────────────────────────
 vcf_header() {
@@ -163,33 +161,6 @@ out="$(check_bnd_geometry "$WORK/all_h2h.vcf" 2>&1)"; rc=$?
 is  "a single-geometry truth is still internally consistent (rc)" "0" "$rc"
 has "flags the single-geometry regression" "$out" "share ONE geometry"
 
-echo "=== split_bnd_by_geometry: known-answer split (8 inv-oriented / 4 direct) ==="
-build_mixed
-bcftools view -O z -o "$WORK/mixed.vcf.gz" "$WORK/mixed.vcf" >/dev/null 2>&1
-bcftools index -f -t "$WORK/mixed.vcf.gz" >/dev/null 2>&1
-out="$(split_bnd_by_geometry "$WORK/mixed.vcf.gz" "$WORK/inv.vcf.gz" "$WORK/dir.vcf.gz" 2>&1)"; rc=$?
-is "splits a well-formed truth (rc)" "0" "$rc"
-is "inversion-oriented count (hand-count: 8)" "8" "$(bcftools view -H "$WORK/inv.vcf.gz" | wc -l | tr -d ' ')"
-is "direct count (hand-count: 4)"             "4" "$(bcftools view -H "$WORK/dir.vcf.gz" | wc -l | tr -d ' ')"
-has "reports the split" "$out" "8 inversion-oriented, 4 direct (of 12)"
-
-# Content, not counts: the right RECORDS must be in each bucket. A split that put 8
-# arbitrary records in the inv file would satisfy every count assertion above.
-is "inv bucket holds only t]p] and [p[t" "0" \
-   "$(bcftools query -f '%ALT\n' "$WORK/inv.vcf.gz" | grep -cE '^([ACGTNacgtn]+\[|\])')"
-is "direct bucket holds only t[p[ and ]p]t" "0" \
-   "$(bcftools query -f '%ALT\n' "$WORK/dir.vcf.gz" | grep -cE '^([ACGTNacgtn]+\]|\[)')"
-
-echo "=== split_bnd_by_geometry: a record in neither bucket is a hard failure ==="
-# The coverage-of-its-own-input rule. A record matching neither pattern would silently
-# shrink the denominator of whatever is scored next, which is the #450 shape exactly.
-sed 's/\[c1:12000\[G/<BND>/' "$WORK/mixed.vcf" > "$WORK/lossy.vcf"
-bcftools view -O z -o "$WORK/lossy.vcf.gz" "$WORK/lossy.vcf" >/dev/null 2>&1
-bcftools index -f -t "$WORK/lossy.vcf.gz" >/dev/null 2>&1
-out="$(split_bnd_by_geometry "$WORK/lossy.vcf.gz" "$WORK/i2.vcf.gz" "$WORK/d2.vcf.gz" 2>&1)"; rc=$?
-is  "rejects a split that loses a record (rc)" "1" "$rc"
-has "says how many were lost" "$out" "lost 1 record(s)"
-
 echo "=== cross-component: a derived truth artifact must not become an SVTYPE ==="
 # REGRESSION GUARD, job 20745149. The scoring loop globbed truth_sv_*.vcf.gz and relied
 # on a hand-maintained exclusion list, so writing truth_sv_BNDinv.vcf.gz silently
@@ -215,9 +186,16 @@ is "types scored by the generic loop" "DEL DUP INV INS"     "${SV_TYPES_SCORED_I
 
 # Every truth_sv_<X> file the script writes must be a canonical SVTYPE or a KNOWN
 # derived artifact. A new artifact that is neither shows up here, not on Delta.
-KNOWN_DERIVED=" BNDspan BNDinv BNDdirect scoreable "
+# BNDinv/BNDdirect retired with the split (#507); if either reappears as a truth_sv_*
+# artifact it is a genuine unclassified artifact and this must fail.
+KNOWN_DERIVED=" BNDspan scoreable "
 unclassified=""
-for nm in $(grep -oE 'truth_sv_[A-Za-z]+' "$PIPELINE" | sed 's/^truth_sv_//' | sort -u); do
+# Comment lines are excluded, for the same reason the glob assertion above is anchored to
+# non-comment lines: the retirement of BNDinv (#507) leaves a historical note quoting
+# `truth_sv_BNDinv.vcf.gz` verbatim, and a check that cannot tell code from a comment fails
+# on correct code. Only artifacts the script actually WRITES are in scope.
+for nm in $(grep -vE '^[[:space:]]*#' "$PIPELINE" \
+            | grep -oE 'truth_sv_[A-Za-z]+' | sed 's/^truth_sv_//' | sort -u); do
     case " ${SV_TYPES[*]} " in *" $nm "*) continue ;; esac
     case "$KNOWN_DERIVED"     in *" $nm "*) continue ;; esac
     unclassified="$unclassified $nm"
