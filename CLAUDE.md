@@ -160,6 +160,24 @@ contig lengths).
   task 4 spending 8 h 45 m producing 8 KB against a full filesystem. Clear a failed
   replicate's directory before the next campaign, and clear finished ones down to
   `truvari_*/summary.json`, which is all `aggregate_sv_reps.sh` reads.
+- **Smoke first, and never learn a mechanism from a 16-hour run.** `sv_pipeline.sbatch`
+  defaults `REFERENCE` to `$SCRATCH/neat_data/chr22.fa` — use that default with
+  `SV_RATE_SCALE=20` for a fast run that plants every SV type and exercises every stage in
+  well under an hour. Only then spend GRCh38 at `SV_RATE_SCALE=1.0`, which is for *numbers*,
+  not for finding out whether the machinery works. Faster still: most read-level questions are
+  answerable on the H1N1 fixture in **seconds** via `eidolon/tests/sv_support_matrix.rs` — that
+  is where #516 was finally caught, after being chased through three multi-hour campaigns.
+  Ask "can a local test answer this?" before submitting anything long.
+
+- **Evaluate the BAMs before pruning them.** `prune_bams` reclaims ~98 GB per replicate, and
+  for three campaigns the pipeline produced BAMs, scored VCF-against-VCF, and deleted them
+  without ever asking whether the reads contained what the truth VCF declared. That is exactly
+  how #516 survived. `verify_planted_ins` now probes the reads for a 30-mer from the **middle**
+  of each planted insertion before anything is deleted (the middle, not the head — a partially
+  realized insertion has a perfectly good head). Any new SV type added to the pipeline wants
+  the same treatment: **a caller recall of 0 is uninterpretable until you know the evidence was
+  there to find.** `PRUNE_BAM=0` keeps the BAMs when a run is specifically diagnostic.
+
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.

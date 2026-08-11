@@ -1391,6 +1391,107 @@ else
     [[ -n "$DELLY_SV" ]] && score_caller delly "$DELLY_SV"
 fi
 
+# Count, per probe, how many input SEQUENCES contain it or its reverse complement. Probes come
+# from a TSV (chrom, pos, inserted-length, probe); sequences arrive on stdin, one per line.
+# Split out from verify_planted_ins so the matching is testable without samtools or a BAM.
+count_probe_hits() {  # <probes.tsv>  < sequences
+    awk -v pf="$1" '
+        function rc(s,   i, o, c) {
+            o = ""
+            for (i = length(s); i >= 1; i--) {
+                c = substr(s, i, 1)
+                o = o (c == "A" ? "T" : c == "T" ? "A" : c == "C" ? "G" : c == "G" ? "C" : c)
+            }
+            return o
+        }
+        BEGIN {
+            FS = OFS = "\t"
+            while ((getline line < pf) > 0) {
+                split(line, f, "\t")
+                if (f[4] == "") continue
+                n++; chrom[n] = f[1]; pos[n] = f[2]; len[n] = f[3]
+                fwd[n] = f[4]; rev[n] = rc(f[4]); hits[n] = 0
+            }
+        }
+        { for (i = 1; i <= n; i++) if (index($0, fwd[i]) || index($0, rev[i])) hits[i]++ }
+        END { for (i = 1; i <= n; i++) print chrom[i], pos[i], len[i], hits[i] }
+    '
+}
+
+# READ-LEVEL verification of what we PLANTED, before anything is pruned.
+#
+# WHY THIS EXISTS: every campaign to date produced BAMs, scored VCF-against-VCF, and deleted
+# the BAMs without ever asking whether the reads contained what the truth VCF declared. #516
+# survived all of them that way — insertions above ~a read length are spliced in but only their
+# first ~100bp is sequenced, so campaign 20925151 reported Manta INS recall 1/22 and the
+# missing evidence was ours. A caller recall of 0 is uninterpretable until you know the
+# evidence was there to find.
+#
+# INS is what gets checked because the truth VCF carries the inserted sequence LITERALLY, so a
+# probe is derivable with no extra input and no assumptions. Reads carrying novel sequence are
+# either soft-clipped near the locus or have no reference home at all, so both the locus
+# neighbourhood and the unmapped pile are searched. Set VERIFY_INS_READS=0 to skip (the
+# unmapped scan streams the whole BAM — minutes, against a multi-hour run).
+verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
+    local truth="$1" bam="$2" dir="$3"
+    [[ "${VERIFY_INS_READS:-1}" == "1" ]] || { echo "  (INS read verification skipped)"; return 0; }
+    [[ -f "$bam" ]] || { echo "  (no $bam — cannot verify INS at read level)" >&2; return 0; }
+
+    local probes="$dir/.ins_probes.tsv"
+    # ALT is anchor+novel for a literal insertion, so the inserted bases are ALT past REF's
+    # length. A 30-mer from the MIDDLE is the probe: it cannot come from the reference
+    # (~4^-30 by chance), and the middle is the part #516 showed is missing while the head
+    # is present — probing the head would report success on a partially-realized insertion.
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' -i 'INFO/SVTYPE="INS"' "$truth" 2>/dev/null \
+      | awk -F'\t' 'BEGIN{OFS="\t"} {
+            ins = substr($4, length($3) + 1); L = length(ins)
+            if (L < 30) next
+            s = int(L / 2) - 14; if (s < 1) s = 1
+            print $1, $2, L, substr(ins, s, 30)
+        }' > "$probes" || true
+
+    local n_probes; n_probes=$(wc -l < "$probes" 2>/dev/null || echo 0)
+    if [[ "$n_probes" -eq 0 ]]; then
+        echo "  INS read check: no INS record carries >=30bp of novel sequence — nothing to verify"
+        return 0
+    fi
+
+    local seqs="$dir/.ins_seqs.txt"
+    : > "$seqs"
+    while IFS=$'\t' read -r c p _ _; do
+        local lo=$(( p > 1000 ? p - 1000 : 1 ))
+        samtools view "$bam" "$c:$lo-$((p + 1000))" 2>/dev/null | cut -f10 >> "$seqs" || true
+    done < "$probes"
+    # A read lying wholly inside a large insertion has no reference home, so it lands here.
+    samtools view -@ 4 -f 4 "$bam" 2>/dev/null | cut -f10 >> "$seqs" || true
+
+    echo "  INS read-level support (30-mer from the MIDDLE of each inserted sequence):"
+    local supported=0 unsupported=0
+    while read -r c p l h; do
+        if [[ "${h:-0}" -gt 0 ]]; then
+            supported=$((supported + 1))
+            printf '    %s:%s  %s bp  %s read(s)\n' "$c" "$p" "$l" "$h"
+        else
+            unsupported=$((unsupported + 1))
+            printf '    %s:%s  %s bp  NO READ SUPPORT\n' "$c" "$p" "$l" >&2
+        fi
+    done < <(count_probe_hits "$probes" < "$seqs")
+
+    echo "  INS read support: $supported of $n_probes planted insertion(s) present in the reads"
+    if [[ "$unsupported" -gt 0 ]]; then
+        echo "ERROR: $unsupported of $n_probes planted insertion(s) have NO read evidence for" >&2
+        echo "  their declared length. Any INS recall reported above is a statement about our" >&2
+        echo "  own read generation, not about the caller — see #516. DEL/DUP/INV/BND/CNV are" >&2
+        echo "  unaffected." >&2
+        INS_UNSUPPORTED="$unsupported"
+    fi
+    rm -f "$seqs"
+}
+INS_UNSUPPORTED=0
+if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
+    verify_planted_ins "$OUTDIR/truth_sv_INS.vcf.gz" "$TUMOR_BAM" "$OUTDIR" || true
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────
 # Never print an unqualified "complete" over a run whose numbers are not usable — a
 # summary banner that reads as success regardless of outcome is how a bad run gets
