@@ -75,6 +75,28 @@ if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
         echo "      is current. If a pull failed earlier, you may be building stale code." >&2
     fi
 fi
+# LINK WITH gcc, NOT the Cray `cc` wrapper.
+#
+# Delta's site-wide `default` module set loads PrgEnv-gnu together with
+# craype-accel-nvidia80, which tells the Cray compiler driver to target NVIDIA A100s. `cc`
+# then composes its link line from pkg-config's `virtual:world`, which pulls in a CUDA
+# runtime plus cray-mpich, cray-libsci, cray-dsmml and libfabric. eidolon uses NONE of
+# those — it is pure Rust plus zlib-ng/libdeflate via cmake.
+#
+# After the RHEL/PE upgrade that world referenced cray-sdk-cudatoolkit-25.3_11.8, whose .pc
+# file is absent, so `cc` refused to link ANYTHING — including a hello-world, and including
+# every dependency build script. Every build failed with "Package 'cray-sdk-cudatoolkit...',
+# required by 'virtual:world', not found" (2026-08-12).
+#
+# `module unload craype-accel-nvidia80` also clears it, but does not persist: `default`
+# reloads at every login, and the next change to the site's default set brings it back. This
+# is immune to that. rustc already does the real linking with its own bundled lld
+# (-fuse-ld=lld); `cc` was only ever supplying a driver front-end that insisted on resolving
+# a GPU stack we do not use. gcc-native/13.2 is in the default set, so `gcc` is present.
+#
+# Override CARGO_LINKER=cc to go back to the wrapper if a future PE actually needs it.
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_LINKER:-gcc}"
+echo "      Linker: $CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER (see the comment above; Cray cc pulls in CUDA)"
 cargo build --release 2>&1 | tail -5
 echo "      Binary: $CARGO_TARGET_DIR/release/eidolon"
 # Report the version actually produced. This is the line whose absence cost a run.
