@@ -55,6 +55,9 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 | Intra-tumor heterogeneity (subclones)      | ❌                             | ❌                                        | ✅ CCF mixtures; `purity × dosage × CCF`; PyClone-VI / DPClust ingest; `EIDOLON_CCF` / `EIDOLON_VAF` truth |
 | Empirical mutation model (trinucleotide)   | ✅                             | ✅                                        | ✅ (incl. positional trinucleotide bias — SBS-96 cosine 0.99) |
 | Sequencing error model                     | ✅                             | ✅                                        | ✅                                                       |
+| SNP transition matrix source               | fit from VCF                   | fit from VCF                              | ✅ VCF, **or inferred from a BAM's MD tags**, or a custom 4×4 TSV |
+| Quality-score binning                      | ❌                             | ✅ + named instrument presets (`--quality-preset novaseq`) | ✅ explicit bin list (`binned_quality_bins`); no named presets |
+| Default het/hom ratio (bundled model)      | ~99 (`homozygous_frequency` 0.010) | ~999 (0.001)                          | ✅ ~2.0 (0.333) — human-realistic, locked by a test      |
 | Fragment-length + GC-bias models           | ✅                             | ✅                                        | ✅ (incl. one-pass `gen-bam-models`)                     |
 | BED targeting / VCF variant insertion      | ✅                             | ✅                                        | ✅                                                       |
 | Continuous per-variant allele fraction     | ❌ (genotype `{0.5, 1.0}`)     | ❌ (genotype `{0.5, 1.0}`)                | ✅ input-VCF `AF`/`AD` → matched AF spectrum (pooled / somatic) |
