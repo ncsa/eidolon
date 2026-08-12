@@ -78,6 +78,10 @@ query coverage never escalates@    if [[ "$scored" -eq 0 ]]; then@    if false; 
 query coverage assumes --passonly@    [[ "$nonpass" -gt 0 ]] && why="--passonly ($nonpass non-PASS)"@    why="--passonly ($nonpass non-PASS)"
 query coverage chatters on a healthy stratum@    [[ "$scored" -eq "$n_query" ]] && return 0    # fully accounted for@    :
 query coverage computes a negative drop@    if [[ "$scored" -gt "$n_query" ]]; then@    if false; then
+peak is a constant again@        gb = 214.0 * (bp / 3100000000.0) * (cov / 30.0)@        gb = 214.0
+peak ignores coverage@ * (cov / 30.0)@ * 1.0
+unknown reference size reads as small@        if (bp <= 0 || cov <= 0) { print 214; exit }@        if (bp <= 0 || cov <= 0) { print 5; exit }
+reference_bp ignores the .fai@    if [[ -s "$ref.fai" ]]; then@    if false; then
 probe matcher ignores the reverse strand@{ for (i = 1; i <= n; i++) if (index($0, fwd[i]) || index($0, rev[i])) hits[i]++ }@{ for (i = 1; i <= n; i++) if (index($0, fwd[i])) hits[i]++ }
 probe matcher drops zero-support probes@END { for (i = 1; i <= n; i++) print chrom[i], pos[i], len[i], hits[i] }@END { for (i = 1; i <= n; i++) if (hits[i] > 0) print chrom[i], pos[i], len[i], hits[i] }
 MUTATIONS
@@ -108,7 +112,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage; do
+for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage scaled_replicate_peak_gb reference_bp; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -479,6 +483,35 @@ outp="$(report_query_coverage manta_BND 10 12 0 2>&1)"; rc=$?
 is  "more scored than supplied returns 0"  0 "$rc"
 has "flags it as not understood"           "$outp" "MORE than were"
 hasnt "does not print a negative drop"     "$outp" "-2"
+
+echo "── scaled_replicate_peak_gb: the gate must not over-demand on a small reference ──"
+# ANCHOR, measured: 214 GB for GRCh38 (3.1 Gbp) at 30x. Everything else scales from it, because
+# both FASTQ and BAM grow with genome size x coverage.
+is "GRCh38 at 30x reproduces the anchor" 214 "$(scaled_replicate_peak_gb 3100000000 30)"
+is "double the coverage doubles it"      428 "$(scaled_replicate_peak_gb 3100000000 60)"
+is "half the genome halves it"           107 "$(scaled_replicate_peak_gb 1550000000 30)"
+
+# THE REGRESSION THIS EXISTS FOR. A constant 214 demanded 61x what a chr22 replicate needs and
+# would have refused every smoke run once /scratch passed 336 GB used — breaking the
+# smoke-first workflow precisely when disk is tight.
+is "chr22 at 30x is bounded by the floor, not 214" 5 "$(scaled_replicate_peak_gb 50818468 30)"
+is "a tiny reference still gets the floor"          5 "$(scaled_replicate_peak_gb 100000 30)"
+
+# MUST NOT FIRE: an unmeasurable reference must assume the WORST, not the smallest. "Unknown"
+# reading as "small" would wave through a run that cannot fit — the same rule as the
+# calibration controls.
+is "unknown size falls back to the full anchor" 214 "$(scaled_replicate_peak_gb 0 30)"
+is "unknown coverage falls back too"           214 "$(scaled_replicate_peak_gb 3100000000 0)"
+
+echo "── reference_bp: exact from .fai, proxy from the FASTA ──"
+printf 'c1\t1000\t0\t60\t61\nc2\t2500\t0\t60\t61\n' > "$WORK/r.fa.fai"
+: > "$WORK/r.fa"
+is "sums contig lengths from the .fai" 3500 "$(reference_bp "$WORK/r.fa")"
+# No .fai (the index is not built until stage 2), so fall back to the byte count.
+rm -f "$WORK/r.fa.fai"
+head -c 10000 /dev/zero > "$WORK/r.fa"
+is "falls back to ~0.98x the FASTA bytes" 9800 "$(reference_bp "$WORK/r.fa")"
+is "a missing reference reports 0 (-> worst case)" 0 "$(reference_bp "$WORK/nope.fa")"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
