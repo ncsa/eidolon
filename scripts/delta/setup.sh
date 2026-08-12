@@ -88,11 +88,13 @@ fi
 # every dependency build script. Every build failed with "Package 'cray-sdk-cudatoolkit...',
 # required by 'virtual:world', not found" (2026-08-12).
 #
-# `module unload craype-accel-nvidia80` also clears it, but does not persist: `default`
-# reloads at every login, and the next change to the site's default set brings it back. This
-# is immune to that. rustc already does the real linking with its own bundled lld
-# (-fuse-ld=lld); `cc` was only ever supplying a driver front-end that insisted on resolving
-# a GPU stack we do not use. gcc-native/13.2 is in the default set, so `gcc` is present.
+# Confirmed working 2026-08-12. Unloading cudatoolkit ALONE was measured and still fails — it
+# removes the package while leaving craype-accel-nvidia80, which is what demands it. Unloading
+# craype-accel-nvidia80 instead is untested, and would not persist regardless: `default`
+# reloads at every login. This export is immune to that. rustc already does the real linking
+# with its own bundled lld (-fuse-ld=lld); `cc` was only ever supplying a driver front-end
+# that insisted on resolving a GPU stack we do not use. gcc-native/13.2 is in the default
+# set, so `gcc` is present.
 #
 # Override CARGO_LINKER=cc to go back to the wrapper if a future PE actually needs it.
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_LINKER:-gcc}"

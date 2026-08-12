@@ -147,9 +147,12 @@ contig lengths).
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
     CARGO_TARGET_DIR=$SCRATCH/cargo-target/eidolon cargo build --release
   ```
-  `setup.sh` now exports this. `module unload craype-accel-nvidia80` also clears it but does
-  **not** persist — `default` reloads at every login. Note rustc already links with its own
-  bundled `lld`; `cc` only ever supplied a driver front-end.
+  `setup.sh` now exports this. **Confirmed working 2026-08-12.** Note rustc already links with
+  its own bundled `lld`; `cc` only ever supplied a driver front-end.
+  What does NOT work: **`module unload cudatoolkit/25.3_11.8` alone — measured, still fails.**
+  It removes the package while leaving `craype-accel-nvidia80`, the module that demands it.
+  Unloading `craype-accel-nvidia80` instead is untested; it should work by the same reasoning,
+  but it would not persist anyway since `default` reloads at every login.
   **Symptom to recognise:** every dependency *build script* fails to link on a fresh
   `CARGO_TARGET_DIR`, while a cached target dir gets all the way to the final binary and fails
   there. Same cause; the cache only changes where it surfaces.
