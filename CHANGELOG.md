@@ -21,8 +21,8 @@ the reverse *is* a duplication. eidolon has been planting DELs and DUPs and labe
 them BNDs since v1.13.1 (#224) — the #451 fix only replaced the literal `N` with the real
 anchor base, leaving the bracket form untouched.
 
-This is the root cause of `BND recall=0.000`, which survived five explanations across a
-year. It was never a caller failure and never a scoring artifact. On Delta job 20675480
+This is the root cause of `BND recall=0.000`, which survived repeated confident
+explanations. It was never a caller failure and never a scoring artifact. On Delta job 20675480
 Manta placed DEL/DUP candidates within **1–2 bp of all seven planted junctions**, emitted
 no INV and no breakend anywhere near them, and was marked as having found none of them:
 
