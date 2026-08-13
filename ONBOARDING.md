@@ -1,163 +1,157 @@
-# Welcome to eidolon
+# eidolon for NEAT users
 
-A tour of the project for new teammates. **Everything marked *Deeper* is safely skippable** —
-the top of each section carries the whole idea, and the deep dives are there for when you need
-them.
+Written for people who already know NEAT — what `gen_reads` does, why you train models from your
+own data, what a golden BAM is for. This is the **delta**, not an introduction.
 
-If you are here to *contribute code*, read [`CONTRIBUTING.md`](CONTRIBUTING.md) after this.
+Short version: eidolon is NEAT reimplemented in Rust, tracking the NEAT feature set, plus a
+native tumour/normal cancer workflow that has no NEAT counterpart. The conceptual model is
+unchanged — reference in, models trained from real data, FASTQ + golden BAM + truth VCF out.
+
+Sections marked *Deeper* are skippable.
 
 ---
 
-## The whole idea, in one paragraph
+## What is the same
 
-**eidolon makes realistic fake DNA sequencing data where we already know the right answer.**
+Everything you already reason about. Subcommand shape (`gen-reads`, `gen-mut-model`,
+`gen-seq-error-model`, `gen-frag-length-model`, `gen-gc-bias-model`), YAML config, models trained
+once and reused, BED targeting, variant insertion from an input VCF, golden BAM + truth VCF
+alongside the FASTQ, single or paired end.
 
-You hand it a reference genome and a description of what genetic changes to plant. It writes out
-sequencing files that look like they came off a real instrument — and, alongside them, a "truth"
-file listing exactly what it planted and where. You then run your normal analysis software on the
-fake data and check whether it found what was actually there.
+If you can read NEAT's outputs you can read these.
 
-That last step is the point, and it is something you **cannot** do with real patient data: for a
-real genome, nobody knows the complete correct answer. Simulated data is the only place you can
-measure "how much did my pipeline miss?" rather than guess at it.
+## What is different in practice
 
-## Why anyone needs that
-
-- **Benchmarking.** Two variant callers disagree on a real sample. Which is right? On simulated
-  data you can just check.
-- **Pipeline validation.** Before running a study on real samples, confirm the pipeline actually
-  recovers what it should — and quantify what it drops.
-- **Cancer.** A tumour biopsy is a *mixture*: some cancer cells, some normal tissue, often several
-  competing cancer subpopulations. eidolon can build that mixture at a known composition, so you
-  can measure how well a tool copes with it. This is the part of the project with the most
-  original work in it.
-- **Development.** Small, fast, known-answer datasets to test against.
-
-## The mental model
-
-```
-   reference genome                          your analysis pipeline
-   + trained models      ┌──────────┐        (aligner, variant caller)
-   + what to plant  ───► │ eidolon  │ ───►  FASTQ reads  ───►  called variants
-                         └──────────┘                                │
-                                     └───►  TRUTH file  ────────────┐│
-                                            (what was planted)      ▼▼
-                                                              compare  ───►  "it found 86%
-                                                                               of deletions"
-```
-
-Two outputs matter. The **reads** are what your pipeline consumes; they are meant to be
-indistinguishable from real data in their statistical behaviour. The **truth file** is the answer
-key, and your pipeline never sees it.
-
-> ### Deeper: what "trained models" means *(skip freely)*
->
-> Real sequencing data has quirks — some machines make more errors at the end of a read, some
-> genome regions get read more often than others, fragment lengths follow a particular
-> distribution. If simulated data ignores that, it is too clean and every tool looks better than
-> it is.
->
-> So eidolon *learns* those quirks from your own real data first, then reproduces them. Each
-> `gen-*-model` subcommand builds one reusable model file: mutation patterns from a VCF,
-> sequencing-error behaviour from FASTQ, fragment lengths and GC bias from a BAM. You build them
-> once and reuse them across runs.
-
-## What you can run
-
-| Command | In plain terms |
+| Change | Practical consequence |
 |---|---|
-| `gen-reads` | The main event: make reads + truth from a reference |
-| `gen-cancer-reads` | Make a tumour/normal mixture at a chosen purity |
-| `gen-mut-model` | Learn mutation patterns from real variant data |
-| `gen-seq-error-model` | Learn a sequencer's error behaviour from real reads |
-| `gen-frag-length-model` / `gen-gc-bias-model` / `gen-bam-models` | Learn physical/coverage properties from a real alignment |
-| `compare-vcfs` | Score a caller's output against the truth file |
-| `compare-af` | Check that per-variant allele fractions came out as requested |
-| `validate` | Check an emitted file against what downstream tools will accept |
-| `filter-reads` | Post-filter generated reads |
+| **~10–13× faster, 3–7× less memory** | chr22 at 10×: 61 s / 227 MB against NEAT 4.6.1's 810 s / 1525 MB, single thread. Shared-allocation runs stop being painful |
+| **Deterministic for a given seed at any thread count** | Byte-identical output. NEAT's varies with `--threads`, so a rerun is not a rerun |
+| **Output token names changed at v3.0.0** | `EIDOLON_*`, not `NEAT_*` / `RNEAT_*`. **Breaks any script that parses eidolon VCFs or read names** — see "Upgrading from 2.0.0" in the README |
+| **Quality binning is explicit** | You spell out `binned_quality_bins`. NEAT 4 has named presets (`--quality-preset novaseq`); eidolon does not, which is a real ergonomic loss |
+| **Default model Ts/Tv is 2.21** | NEAT 4's is 2.33. Default model only — a trained model uses your data ([#410](https://github.com/ncsa/eidolon/issues/410)) |
+| **Structural variants are actually generated** | NEAT 4.6.1 ships `Inversion`/`Duplication`/`Translocation`/`CopyNumberVariant` classes that are exported from nothing and referenced nowhere; `VariantTypes.types` lists only SNV/insertion/deletion/unknown. It also cannot render an SV from an input VCF — symbolic ALTs become `UnknownVariant`, whose accessors raise. Verified against tag `4.6.1` |
+| **SemVer since v3.0.0** | With a declared public API, so a MAJOR bump is a real signal |
 
-Everything is driven by a YAML config file:
-`eidolon gen-reads -c my_config.yml`.
+## What is new
 
-## Try it in five minutes
+Cancer work is where the original effort went.
 
-```bash
-cargo build --release                  # or: conda install -c bioconda eidolon
-./target/release/eidolon --help
-./target/release/eidolon gen-reads --help
-```
+- **`gen-cancer-reads`** — two `gen-reads` passes (normal-genotype and tumour) over one reference,
+  merged at a configurable purity into a single biopsy FASTQ that Mutect2 / Strelka / Manta
+  consume directly, plus a truth VCF tagged `INFO/EIDOLON_ORIGIN ∈ {germline, somatic, shared}`
+  so you can score germline and somatic separately.
+- **Intra-tumour heterogeneity** — a tumour as subclones at distinct cancer-cell fractions,
+  specified inline, fitted from PyClone-VI / DPClust output, or replayed from a real tumour's
+  observed VAF. Per-site VAF is `purity × dosage × CCF`, and the truth carries `EIDOLON_CCF` and
+  `EIDOLON_VAF`. Validated on SEQC2 HCC1395 at r = 0.99 against intended VAF.
+- **Per-tissue somatic models** — bundled pan-cancer plus BRCA / skin / lung, fitted from
+  COSMIC and PCAWG.
+- **Continuous per-variant allele fraction** from an input VCF's `AF`/`AD`, rather than genotype
+  `{0.5, 1.0}`. This is what makes pooled and somatic AF spectra reproducible.
+- **Trinucleotide-context-aware SNP placement**, so SBS-96 signatures reproduce (cosine 0.99).
+- **Sequencing-error transition matrix inferrable from a BAM's MD tags**, or a custom 4×4 TSV —
+  NEAT's builders never open a BAM for this.
+- **`compare-af`** (per-allele AF correlation, truth vs simulated) and **`validate`** (checks an
+  emitted file against what downstream tools actually accept, before you spend a pipeline run
+  finding out).
 
-[`docs/cancer_howto.md`](docs/cancer_howto.md) is the best starting point for a real worked
-example — copy-paste configs with explanations.
+## What to trust, and what not to
+
+The part worth reading before you design an experiment.
+
+**[`docs/sv_support_matrix.md`](docs/sv_support_matrix.md) is the authority on structural
+variants** — every row is a measurement against read-level evidence, and the broken cells are
+pinned by tests rather than quietly omitted. Current state worth knowing:
+
+- **Insertions above ~a read length are not fully realised** and the engine now refuses to plant
+  them de novo rather than write a truth record the reads cannot support
+  ([#516](https://github.com/ncsa/eidolon/issues/516)). Consequence: the realised INS rate sits
+  below the model's, and any insertion benchmark is limited to short insertions for now.
+- **DEL / DUP / CNV coverage runs ~8% high** whenever the copy-number multiplier is not 0 or 1
+  ([#499](https://github.com/ncsa/eidolon/issues/499)) — fine for detection, not for dosage
+  estimation.
+- **Symbolic `<INS>` from an input VCF is a silent no-op**, and a single unpaired breakend
+  destroys local coverage ([#500](https://github.com/ncsa/eidolon/issues/500)).
+- BND, INV and literal indels are measured good.
+
+Caller recall figures from the HPC tier live in `docs/access_report_draft.md`. Treat its section
+caveats as load-bearing — several sections say explicitly that they are not yet submittable and
+why.
+
+> ### Deeper: how the project decides something is verified *(skip freely)*
+>
+> A simulator that generates *wrong* truth data is worse than one that crashes: a crash you
+> notice, wrong truth silently invalidates every benchmark built on it. So the standard is that
+> nothing is "done" until there is evidence, and reports state which kind of evidence exists —
+> "known-answer fixture, not yet real data" is a normal thing to read here.
+>
+> In practice two habits do the work. **Assert content, not existence**: a check that a file
+> appeared passes just as happily when the file is garbage, and one here confirmed a non-zero
+> count while every value was the malformed string `AF=AF=0.3000`. **Prove a test can fail**:
+> deliberately break the code it covers and confirm it notices. That has repeatedly exposed
+> thorough-looking tests asserting nothing.
+>
+> `docs/claude_engineering_audit.md` collects the case histories, including the ones where the
+> tooling misled us for weeks. Unusually candid for a project document, and the best single read
+> for how this codebase thinks.
+
+> ### Deeper: the HPC validation tier *(skip freely)*
+>
+> Unit tests prove the machinery runs; they cannot prove genome-scale output resembles real data.
+> So `scripts/delta/` simulates a whole tumour genome on NCSA Delta, runs production callers
+> (Manta, Delly, GATK CNV) and scores them against the truth with truvari.
+>
+> It carries its own controls, which is the interesting part: the truth is scored against
+> **itself** (must be perfect) and against a **deliberately displaced copy** (must find nothing),
+> because a matching configuration loose enough to accept anything would otherwise report
+> excellent recall. Findings feed back into the SV support matrix.
+
+## Reading the outputs
+
+Truth-VCF INFO tags you will actually encounter:
+
+| Tag | Meaning |
+|---|---|
+| `EIDOLON_PROVENANCE` | `denovo` (sampled from a model) vs supplied via `input_vcf` |
+| `EIDOLON_ORIGIN` | `germline` \| `somatic` \| `shared` — cancer runs only |
+| `EIDOLON_CCF` | Cancer-cell fraction of the subclone carrying this variant |
+| `EIDOLON_VAF` | Intended observed VAF after purity mixing |
+| `EIDOLON_REASON` | Written by `compare-vcfs` on FN/FP records, explaining the classification |
+
+Read names carry `EIDOLON_chimeric` for reads spanning a structural-variant junction, which is
+how you find them without an aligner.
 
 ## Where things live
 
 | Path | What is in it |
 |---|---|
-| `eidolon/` | The command-line program: argument parsing, per-subcommand runners |
-| `eidolon-core/` | The engine: models, variant types, file readers/writers |
-| `eidolon/tests/` | Integration tests — the ones that run the real binary end to end |
-| `docs/` | Design documents, how-tos, and measurement records |
-| `scripts/delta/` | The HPC validation harness (see below) |
-| `CLAUDE.md` | Working practices, written for AI coding agents but useful to anyone |
+| `docs/cancer_howto.md` | **Start here** — copy-paste configs with worked examples |
+| `docs/sv_support_matrix.md` | What is measured, broken, and unverified |
+| `docs/cancer_simulator.md` | Cancer design rationale and calibration caveats |
+| `docs/hpc_guide.md` | Running on a cluster |
+| `eidolon/` | CLI: argument parsing, per-subcommand runners |
+| `eidolon-core/` | Engine: models, variant types, readers/writers |
+| `scripts/delta/` | The HPC validation harness (bash) |
+| `CLAUDE.md` | Working practices — written for AI agents, useful to anyone |
 
-## The unusual thing about this project
+## Getting it
 
-Most simulators are validated by "we ran it and it produced output." This one is not, and that is
-deliberate — because a simulator that quietly generates *wrong* data is worse than one that
-crashes. A crash you notice. Wrong truth data silently invalidates every benchmark built on it,
-and you may not find out for months.
+```bash
+conda install -c bioconda eidolon        # or cargo build --release
+eidolon --help
+```
 
-So the project holds an explicit standard: **nothing is "done" until there is evidence it works as
-intended, and reports say which kind of evidence exists.** "Checked on a small known-answer
-fixture, not yet on real data" is a normal and respectable thing to write here.
+## Working on it
 
-> ### Deeper: how that plays out *(skip freely)*
->
-> Two habits do most of the work.
->
-> **Assert content, not existence.** A test that checks "a file was produced" passes just as
-> happily when the file is garbage. Real example from this repo: a check confirmed a count was
-> above zero while every value in it was the malformed text `AF=AF=0.3000`.
->
-> **Prove a test can fail.** Deliberately break the code a test covers and confirm the test
-> notices. If it still passes, it was never testing anything. This has repeatedly caught tests
-> that looked thorough and asserted nothing — in one case, eleven separate ways of breaking the
-> code that the whole suite ignored.
->
-> `docs/claude_engineering_audit.md` collects the case histories, including the ones where the
-> tooling fooled us for weeks. It is unusually candid for a project document and it is the best
-> single read for understanding how this codebase thinks.
+PRs target **`develop`**; `main` holds releases. GitHub issues track bugs and planned work, and
+there is a **Feedback** issue type for things that are not quite bugs — a confusing message, a
+rough edge, or something that worked well. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the testing
+bar if you are writing code.
 
-> ### Deeper: HPC validation *(skip freely)*
->
-> Small tests prove the machinery runs. They cannot prove the output looks like real data at
-> genome scale. So there is a second tier on NCSA Delta: simulate a whole tumour genome, run it
-> through production variant callers (Manta, Delly, GATK), and score their output against the
-> truth with an independent tool (truvari).
->
-> That harness lives in `scripts/delta/` and is written in bash. It carries its own positive and
-> negative controls — it scores the truth against *itself* (must be perfect) and against a
-> deliberately shifted copy (must find nothing), because a scoring configuration loose enough to
-> match anything would otherwise report excellent results. Findings from those runs feed back into
-> `docs/sv_support_matrix.md`, which records exactly which capabilities are measured, which are
-> broken, and which are unverified.
-
-## How the work is organised
-
-Changes go through pull requests targeting the **`develop`** branch. `main` holds releases.
-Issues on GitHub track bugs and planned work — including a **Feedback** issue type for things
-that are not quite bugs, like a confusing error message or a rough edge.
-
-Versions follow [Semantic Versioning](https://semver.org) as of v3.0.0. The project was called
-`rusty-neat` / `rneat` before v2.0.0, so older notes and links use those names; the emitted output
-tokens changed at v3.0.0 as well, which matters if you have scripts that parse eidolon's output.
+The project was `rusty-neat` / `rneat` before v2.0.0, so older notes, links and issue titles use
+those names.
 
 ## Questions
 
-Open an issue, or message **Joshua Allen** (links on the repo page). Questions that turn out to be
-gaps in the documentation are useful — say so and it gets fixed.
-
-Worth knowing if you are wondering whether to ask: nobody here expects you to have read the whole
-codebase, and "I could not tell from the docs" is treated as a docs bug rather than a
-you-problem.
+Open an issue or message **Joshua Allen** (links on the repo page). If something was unclear here,
+that is a docs bug — say so and it gets fixed.

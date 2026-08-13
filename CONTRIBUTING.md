@@ -33,7 +33,12 @@ After a PR merges, **confirm your commits actually landed**:
 git merge-base --is-ancestor <sha> origin/develop
 ```
 
-Late pushes have missed a merge more than once here. Recover with `git cherry-pick`.
+Keep PRs in draft form and tag an admin when you feel it is ready for review. If for any reason 
+you missed a commit after submitting a PR, pull the PR back and send the admin a note to let them
+know to hold off on a review. If you missed a commit but feel it is important, check if the PR has
+been merged before pushing any new code. If it has been, you recover your work commit locally with 
+`git cherry-pick` and submit a follow-up PR with a note for reviewers. If it's a breaking commit, 
+tests should fail and the PR would be rejected and you can add your commit at that time.
 
 ## The testing bar
 
@@ -43,7 +48,8 @@ green, and the case histories are in
 
 **Assert content, not existence.** A file existing, a non-zero count, or exit 0 is necessary and
 not sufficient. A guard once checked `count > 0` while every value was the malformed string
-`AF=AF=0.3000`. If a wrong value would still pass, the test is decoration.
+`AF=AF=0.3000`. If a wrong value would still pass, the test is decoration. Try to write tests with
+malformed inputs and stress the code.
 
 **Prove non-vacuity by mutation.** Break the code a test covers and watch it fail. If it still
 passes, it is not a test. This is free for a bug fix — you already have the broken state, so
