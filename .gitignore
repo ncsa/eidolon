@@ -16,6 +16,7 @@
 # AI junk
 .mcp.json
 /gnomad_validation_work/
+/.junie/
 
 # Test drift dumps (written by model_parity when a baseline mismatches)
 *.canonical.actual.json
