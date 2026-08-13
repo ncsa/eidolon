@@ -13,12 +13,16 @@ Sections marked *Deeper* are skippable.
 
 ## What is the same
 
-Everything you already reason about. Subcommand shape (`gen-reads`, `gen-mut-model`,
-`gen-seq-error-model`, `gen-frag-length-model`, `gen-gc-bias-model`), YAML config, models trained
-once and reused, BED targeting, variant insertion from an input VCF, golden BAM + truth VCF
-alongside the FASTQ, single or paired end.
+If you've tried the latest versions of NEAT, you'll find the user interface very familiar. 
+* Subcommand shape (`gen-reads`, `gen-mut-model`, `gen-seq-error-model`, `gen-frag-length-model`, 
+`gen-gc-bias-model`)
+* YAML config
+* models trained once, stored, and reused as input
+* BED targeting
+* variant insertion from an input VCF
+* golden BAM + truth VCF alongside the FASTQ, single or paired end.
 
-If you can read NEAT's outputs you can read these.
+The outputs are very similar, with some added features in the VCF output, and potential for much greater complexity.
 
 ## What is different in practice
 
@@ -48,9 +52,15 @@ Cancer work is where the original effort went.
   COSMIC and PCAWG.
 - **Continuous per-variant allele fraction** from an input VCF's `AF`/`AD`, rather than genotype
   `{0.5, 1.0}`. This is what makes pooled and somatic AF spectra reproducible.
-- **Trinucleotide-context-aware SNP placement**, so SBS-96 signatures reproduce (cosine 0.99).
-- **Sequencing-error transition matrix inferrable from a BAM's MD tags**, or a custom 4×4 TSV —
-  NEAT's builders never open a BAM for this.
+- **Trinucleotide-context-aware SNP placement**, so SBS-96 signatures reproduce (cosine 0.99). Originally 
+  trimmed from `rneat` for simplicity and because it's effects were difficult to detect, we discovered this 
+  came into play in `eidolon` while looking for cancer signals, as cancer detection looks for high-SNV regions, 
+  which were missing in the fully random placement. Signals began to show up once the placement became 
+  context-aware again.
+- **Sequencing-error nucleotide substitution matrix trainable from data** — from a BAM's MD tags, or a custom 
+  4×4 TSV. NEAT 4.6.1 hardcodes this matrix (model_sequencing_error/runner.py, with its own TODO incorporate 
+  these into the calculations); its trainable Markov model covers quality-score transitions from FASTQ, 
+  a different axis.
 - **`compare-af`** (per-allele AF correlation, truth vs simulated) and **`validate`** (checks an
   emitted file against what downstream tools actually accept, before you spend a pipeline run
   finding out).
