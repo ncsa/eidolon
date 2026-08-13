@@ -209,6 +209,14 @@ impl SequencingErrorModel {
     pub fn quality_score_model(&self) -> &QualityScoreModel {
         &self.quality_score_model
     }
+
+    /// Borrow the SNP transition matrix. Exists so a test can assert which matrix a
+    /// built model actually carries — a BAM-inferred one, a TSV-supplied one, or the
+    /// default. Without this the only reachable assertion was "the file exists and
+    /// deserializes", which passes just as happily when the matrix is wrong.
+    pub fn transition_distros(&self) -> &TransitionMatrix {
+        &self.transition_distros
+    }
 }
 
 #[cfg(test)]
