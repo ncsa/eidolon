@@ -642,3 +642,180 @@ fn built_seq_error_model_reproduces_the_positional_quality_profile() {
         "final-cycle quality {tail:.1} does not track the trained {end_q}"
     );
 }
+
+// ── sequencing-error transition matrix ─────────────────────────────────────────
+
+/// Write a single-contig all-A reference plus its `.fai`.
+///
+/// A homopolymer reference makes every true base an A, so every sequencing-error
+/// substitution must be drawn from the matrix's A row. That is what lets the assertion
+/// below name an expected base without reconstructing each read's alignment.
+fn write_homopolymer_reference(dir: &Path, len: usize) -> std::path::PathBuf {
+    let seq = "A".repeat(len);
+    let path = dir.join("polyA.fa");
+    let hdr = ">polyA\n";
+    fs::write(&path, format!("{hdr}{seq}\n")).unwrap();
+    fs::write(
+        dir.join("polyA.fa.fai"),
+        format!("polyA\t{}\t{}\t{}\t{}\n", len, hdr.len(), len, len + 1),
+    )
+    .unwrap();
+    path
+}
+
+/// Base composition of a gzipped FASTQ's sequence lines, as (A, C, G, T, other).
+fn base_counts(path: &Path) -> (usize, usize, usize, usize, usize) {
+    let mut raw = String::new();
+    GzDecoder::new(fs::File::open(path).unwrap())
+        .read_to_string(&mut raw)
+        .unwrap();
+    let mut c = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for (i, line) in raw.lines().enumerate() {
+        if i % 4 != 1 {
+            continue; // sequence lines only
+        }
+        for b in line.bytes() {
+            match b {
+                b'A' => c.0 += 1,
+                b'C' => c.1 += 1,
+                b'G' => c.2 += 1,
+                b'T' => c.3 += 1,
+                _ => c.4 += 1,
+            }
+        }
+    }
+    c
+}
+
+/// Build a sequencing-error model (optionally with a forced transition matrix), simulate
+/// over an all-A reference with mutations disabled, and return the output base counts.
+fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usize, usize, usize) {
+    let read_len = 100;
+    // Phred 8 → ~0.158 per-base error probability, so errors are plentiful.
+    let fq = tmp.join(format!("{tag}_train.fastq.gz"));
+    write_uniform_quality_fastq_gz(&fq, 500, read_len, 8);
+
+    let model = tmp.join(format!("{tag}_model.json.gz"));
+    let mut body = format!(
+        "fastq_file: {}\noutput_file: {}\noverwrite_output: true\n",
+        fq.display(),
+        model.display()
+    );
+    if let Some(tsv) = tsv {
+        body.push_str(&format!("transition_matrix_file: {}\n", tsv.display()));
+    }
+    let build_cfg = write_yaml(tmp, &format!("{tag}_build"), &body);
+    eidolon()
+        .args(["gen-seq-error-model", "-c"])
+        .arg(&build_cfg)
+        .assert()
+        .success();
+
+    let reference = write_homopolymer_reference(tmp, 20_000);
+    let sim_cfg = write_yaml(
+        tmp,
+        &format!("{tag}_sim"),
+        &format!(
+            "reference: {ref}\nread_len: {rl}\ncoverage: 30\npaired_ended: false\n\
+             sequence_error_model: {model}\nmutation_rate: 0.0\nproduce_fastq: true\n\
+             produce_bam: false\nproduce_vcf: false\noverwrite_output: true\n\
+             output_dir: {out}\noutput_filename: {tag}\nrng_seed: transition fidelity\n\
+             num_threads: 1\n",
+            ref = reference.display(),
+            rl = read_len,
+            model = model.display(),
+            out = tmp.display(),
+        ),
+    );
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(&sim_cfg)
+        .assert()
+        .success();
+
+    let (a, c, g, t, other) = base_counts(&tmp.join(format!("{tag}_r1.fastq.gz")));
+    assert_eq!(other, 0, "{tag}: unexpected non-ACGT bases in output");
+    (a, c, g, t)
+}
+
+/// The SNP transition matrix in a built sequencing-error model must decide WHICH base a
+/// sequencing error substitutes in the output reads — not merely be present in the file.
+///
+/// The unit tests in `gen_seq_error_model::utils::runner` establish that a BAM's MD-tagged
+/// mismatches produce the right matrix, and that a TSV overrides a BAM. Neither can show
+/// the matrix reaching the reads, which is the claim that matters: a model file carrying a
+/// perfect matrix is worth nothing if `gen-reads` ignores it.
+///
+/// Setup: an all-A reference, so every true base is an A and every substitution must come
+/// from the matrix's A row. Two runs at the same seed — one with the default matrix
+/// (0.4918 C / 0.3377 G / 0.1705 T), one with the A row forced entirely to T.
+///
+/// This is differential rather than absolute because a forced run does NOT reach 100% T.
+/// The model's `indel_probability` is 0.4 and its `insertion_bias` is uniform over ACGT, so
+/// roughly 40% of sequencing errors are indels whose inserted bases never consult the
+/// transition matrix. That floor puts a few hundred C and G into the output no matter what
+/// the matrix says — which is correct behavior, and the reason an absolute `>98% T`
+/// assertion would fail on working code. The control run pins where the substitution
+/// spectrum sits without the override, so the comparison isolates the matrix's effect.
+#[test]
+fn built_seq_error_transition_matrix_decides_the_substituted_base() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A row: all weight on T. Diagonals are ignored by the loader. The remaining rows are
+    // never consulted — an all-A reference has no other true base.
+    let tsv = tmp.path().join("a_to_t.tsv");
+    fs::write(
+        &tsv,
+        "A\tC\tG\tT\n\
+         0.0\t0.0\t0.0\t1.0\n\
+         1.0\t0.0\t0.0\t0.0\n\
+         1.0\t0.0\t0.0\t0.0\n\
+         1.0\t0.0\t0.0\t0.0\n",
+    )
+    .unwrap();
+
+    let (_, c_def, g_def, t_def) = simulate_over_polya(tmp.path(), "ctrl", None);
+    let (_, c_for, g_for, t_for) = simulate_over_polya(tmp.path(), "forced", Some(&tsv));
+
+    let subs_def = c_def + g_def + t_def;
+    let subs_for = c_for + g_for + t_for;
+    let share_def = t_def as f64 / subs_def as f64;
+    let share_for = t_for as f64 / subs_for as f64;
+    eprintln!(
+        "[fidelity] default matrix: C={c_def} G={g_def} T={t_def} → T share {:.3}\n\
+         [fidelity] forced A→T:     C={c_for} G={g_for} T={t_for} → T share {:.3}",
+        share_def, share_for
+    );
+
+    // Non-vacuity: with no substitutions at all, every ratio below is meaningless.
+    assert!(
+        subs_def > 500 && subs_for > 500,
+        "too few substitutions to compare (default {subs_def}, forced {subs_for})"
+    );
+
+    // The control must look like the default matrix — mostly C, T in the minority.
+    assert!(
+        share_def < 0.35,
+        "default-matrix run put {:.1}% of substitutions on T; the default A row is only \
+         0.1705 T, so this run is not using the default matrix and the comparison below \
+         proves nothing",
+        share_def * 100.0
+    );
+
+    // Forcing the A row to T must dominate the spectrum. The residual C/G is the uniform
+    // insertion floor described above, not a matrix that went unread.
+    assert!(
+        share_for > 0.80,
+        "forcing the A row to T only moved the T share to {:.1}% (C={c_for}, G={g_for}) — \
+         the model's transition matrix is NOT deciding the substituted base in output reads",
+        share_for * 100.0
+    );
+
+    // State the causal claim directly: the override, not chance, moved the spectrum.
+    assert!(
+        share_for > share_def * 2.0,
+        "T share barely moved between the default ({:.3}) and forced ({:.3}) runs",
+        share_def,
+        share_for
+    );
+}
