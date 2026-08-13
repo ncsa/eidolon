@@ -676,9 +676,33 @@ mod tests {
         }
     }
 
-    /// The default matrix's A row, as a CDF. Any test asserting "this model did NOT take
-    /// its matrix from the data" compares against this.
-    const DEFAULT_A_ROW_CDF: [f64; 4] = [0.0, 0.4918, 0.8295, 1.0];
+    /// The default SEQUENCING-ERROR matrix's A row as a CDF, derived rather than transcribed.
+    ///
+    /// A hardcoded copy would be a vacuity hazard precisely here: the assertions below use
+    /// this to prove a built matrix is *not* the default. If the default changed and a
+    /// transcribed constant did not, the check would compare against a value that is no
+    /// longer the default — and could pass while the built matrix IS the new default.
+    ///
+    /// DO NOT reach for `TransitionMatrix::default()`. Two differently-valued defaults share
+    /// that name: `TransitionMatrix::default()` is NEAT 2.0's *mutation* matrix (A row
+    /// 0.0/0.1695/0.6878/0.1427), while the sequencing-error default is a separate literal
+    /// inside `SequencingErrorModel` (A row 0.0/0.4918/0.3377/0.1705). Deriving from the
+    /// wrong one makes this test fail against correct code, which is how the distinction was
+    /// found.
+    ///
+    /// Residual, pre-existing: that literal appears TWICE in `sequencing_error_model.rs`
+    /// (`default()` and `from_raw_data`'s `None` arm). This reads the former while the
+    /// runner's fallback path uses the latter, so a drift between the two copies would slip
+    /// past. They are identical today.
+    fn default_a_row_cdf() -> [f64; 4] {
+        let m = SequencingErrorModel::default()
+            .expect("the default sequencing error model must be constructible");
+        let row = row_cdf(
+            m.transition_distros(),
+            eidolon_core::structs::nucleotides::Nucleotide::A,
+        );
+        [row[0], row[1], row[2], row[3]]
+    }
 
     #[test]
     fn test_runner_with_bam_md_tags_puts_all_a_weight_on_c() {
@@ -719,7 +743,7 @@ mod tests {
         // And it must not simply be the default matrix wearing a disguise.
         let a_row = row_cdf(tm, Nucleotide::A);
         assert!(
-            (a_row[1] - DEFAULT_A_ROW_CDF[1]).abs() > 1e-6,
+            (a_row[1] - default_a_row_cdf()[1]).abs() > 1e-6,
             "A row matched the default matrix, so the BAM was not consulted: {a_row:?}"
         );
 
@@ -849,7 +873,7 @@ mod tests {
                 model.transition_distros(),
                 eidolon_core::structs::nucleotides::Nucleotide::A,
             ),
-            &DEFAULT_A_ROW_CDF,
+            &default_a_row_cdf(),
             "A row with no MD tags available",
         );
     }

@@ -77,8 +77,11 @@ target, a hand-written count matrix. Three things remain unmeasured:
 ## Delta tier — proposed job
 
 Fits the existing pattern: a `scripts/delta/run_transition_matrix_validation.sh` sibling to
-`run_subclonal_vaf_validation.sh`, archiving to
-`/projects/bhrd/jallen17/rneat-access-results/`.
+`run_subclonal_vaf_validation.sh`, archiving through `archive_run` from `lib_report.sh` rather
+than to a literal path. `RESULTS_DIR` already resolves to the one archive root
+(`/projects/$ACCESS_PROJECT/$USER/eidolon-access-results`); naming a path here is how a doc
+comes to reference `rneat-access-results/`, which was retired in the v2.0.0 rename and no
+longer exists.
 
 ### Inputs
 
