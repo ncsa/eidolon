@@ -33,7 +33,8 @@ test in `eidolon/tests/model_output_fidelity.rs`:
 | The ref/read axes are not swapped | `test_build_transition_matrix_from_counts_is_not_transposed` |
 | Observed counts drive the fitted row | `test_build_transition_matrix_from_counts_uniform_fallback` |
 | A TSV overrides a BAM | `test_tsv_takes_precedence_over_bam` |
-| No MD tags → default matrix, not an invented one | `test_runner_bam_no_md_tags_falls_back` |
+| No MD tags → hard error, not a silent default (#529) | `test_runner_bam_no_md_tags_is_an_error_without_the_flag` |
+| No MD tags **with** `allow_default_transition_matrix` → default matrix, not an invented one | `test_runner_bam_no_md_tags_falls_back_when_flag_set` |
 | **The matrix decides the substituted base in output reads** | `built_seq_error_transition_matrix_decides_the_substituted_base` |
 
 Non-vacuity was established by mutation, not asserted:
@@ -88,9 +89,9 @@ longer exists.
 - GRCh38 chr22 (already staged by `fetch_validation_data.sh`).
 - A real aligned BAM over chr22 **carrying MD tags**. The HG002 / GIAB alignment used by
   `stage_hg002.sh` is the natural choice. If MD is absent:
-  `samtools calmd -b in.bam ref.fa > with_md.bam` — the builder requires it and silently
-  falls back to the default matrix without it, which is exactly the failure this job must
-  not mistake for a result.
+  `samtools calmd -b in.bam ref.fa > with_md.bam` — the builder requires it. Since #529 the
+  builder **errors out** when a BAM yields no mismatches rather than falling back silently, so
+  this failure now announces itself instead of arriving disguised as a result.
 
 ### Steps
 
@@ -128,9 +129,10 @@ longer exists.
 
 ### Failure modes to guard explicitly
 
-- MD tags absent → builder logs a warning and uses the default matrix. The job must detect
-  that the fitted and control matrices are *identical* and fail, rather than reporting a
-  perfect control match as a pass.
+- MD tags absent → since #529 the builder errors out, so the job fails at the build step. Keep
+  the identical-matrix check anyway: it is the backstop for any *other* route to a default
+  matrix, and it is what would catch the guard being regressed or bypassed with
+  `allow_default_transition_matrix`. The job must never report a perfect control match as a pass.
 - `mutation_rate: 0.0` not honored → planted variants inflate the mismatch tally and skew
   the spectrum toward the mutation model. Assert the output VCF is empty.
 - The step-1 tool and eidolon disagreeing on how to count a multi-base MD run, or on

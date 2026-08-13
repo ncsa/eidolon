@@ -24,6 +24,11 @@ pub struct RunConfiguration {
     /// Rows/columns are A/C/G/T. A single header line is ignored.
     /// Takes precedence over bam_file.
     pub transition_matrix_file: Option<PathBuf>,
+    /// Permit falling back to the built-in default transition matrix when `bam_file` yields
+    /// no mismatch evidence (no MD tags, or MD tags with zero mismatches). Default `false`,
+    /// which makes that case a hard error: a model that looks trained and is the default is
+    /// worse than a refusal, because nothing downstream can tell the difference.
+    pub allow_default_transition_matrix: bool,
 }
 
 impl RunConfiguration {
@@ -155,6 +160,11 @@ impl RunConfiguration {
             })
             .transpose()?;
 
+        let allow_default_transition_matrix = scrape_config
+            .get("allow_default_transition_matrix")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Ok(RunConfiguration {
             fastq_file,
             output_file,
@@ -164,6 +174,7 @@ impl RunConfiguration {
             binned_quality_bins,
             bam_file,
             transition_matrix_file,
+            allow_default_transition_matrix,
         })
     }
 }
@@ -401,5 +412,35 @@ mod tests {
             output.display()
         ));
         assert!(RunConfiguration::from(&tmp.path().to_path_buf()).is_err());
+    }
+
+    #[test]
+    fn test_allow_default_transition_matrix_defaults_false() {
+        // The default must be the strict one. If an absent key parsed as `true`, every existing
+        // config would keep the silent-default behaviour #529 exists to remove.
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\n",
+            fastq.display(),
+            output.display()
+        ));
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert!(!config.allow_default_transition_matrix);
+    }
+
+    #[test]
+    fn test_allow_default_transition_matrix_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\nallow_default_transition_matrix: true\n",
+            fastq.display(),
+            output.display()
+        ));
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert!(config.allow_default_transition_matrix);
     }
 }

@@ -18,8 +18,12 @@ qual_offset: 33
 # binned_quality_bins: [2, 12, 23, 37]
 # path to an aligned BAM file [optional] - used to infer the SNP transition matrix from
 # read-vs-reference mismatches. The BAM must have MD tags (run 'samtools calmd' if absent).
-# Ignored if transition_matrix_file is also set.
+# Ignored if transition_matrix_file is also set. If the BAM yields no mismatches, this is an
+# error, not a silent fallback to the default matrix.
 bam_file:
+# accept the built-in default matrix when bam_file yields no mismatch evidence [optional].
+# Default false. Only meaningful alongside bam_file.
+# allow_default_transition_matrix: false
 # path to a custom 4x4 SNP transition matrix TSV [optional] - rows and columns are A/C/G/T.
 # A single header line is allowed and will be skipped. Diagonal values are ignored (set to 0).
 # Takes precedence over bam_file. If neither is set, a default matrix is used.
