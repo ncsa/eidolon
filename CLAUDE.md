@@ -236,6 +236,10 @@ contig lengths).
 ## Git / GitHub mechanics
 - **`gh pr edit` is broken on this repo** (deprecated Projects-classic GraphQL). Patch a
   PR with `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=…`. `gh issue edit` works.
+- **`gh pr view --json commits` has served a STALE commit list** — it showed only the first
+  commit of a branch while `gh api repos/ncsa/eidolon/pulls/<N>/commits` was correct. When
+  checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds
+  the missed-merge hazard above: both the "did it land" checks can lie in the same direction.)
 - End commit messages with `Co-Authored-By: Claude <noreply@anthropic.com>`.
 
 ## GitNexus block (below)
