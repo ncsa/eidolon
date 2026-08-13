@@ -131,6 +131,36 @@ contig lengths).
   gone 2026-08-02), so **do not check for it**; a search there wastes a round trip and
   its absence is not evidence a run is missing.
 
+- **Building on Delta: link with `gcc`, never the Cray `cc` wrapper.** Delta's site-wide
+  `default` module set loads `PrgEnv-gnu` alongside **`craype-accel-nvidia80`**, which points
+  the Cray driver at NVIDIA A100s. `cc` then builds its link line from pkg-config's
+  `virtual:world`, dragging in a CUDA runtime plus `cray-mpich`, `cray-libsci`, `cray-dsmml`
+  and `libfabric`. **eidolon uses none of them** — it is pure Rust plus zlib-ng/libdeflate via
+  cmake. After the RHEL/PE upgrade that world named `cray-sdk-cudatoolkit-25.3_11.8`, whose
+  `.pc` file is gone, and `cc` refused to link anything at all — a hello-world included:
+  ```
+  Package 'cray-sdk-cudatoolkit-25.3_11.8', required by 'virtual:world', not found
+  ```
+  Nobody loaded those modules; they come from `default`, which is why this appeared overnight
+  with no local change (2026-08-12). Build with:
+  ```bash
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+    CARGO_TARGET_DIR=$SCRATCH/cargo-target/eidolon cargo build --release
+  ```
+  `setup.sh` now exports this. **Confirmed working 2026-08-12.** Note rustc already links with
+  its own bundled `lld`; `cc` only ever supplied a driver front-end.
+  What does NOT work: **`module unload cudatoolkit/25.3_11.8` alone — measured, still fails.**
+  It removes the package while leaving `craype-accel-nvidia80`, the module that demands it.
+  Unloading `craype-accel-nvidia80` instead is untested; it should work by the same reasoning,
+  but it would not persist anyway since `default` reloads at every login.
+  **Symptom to recognise:** every dependency *build script* fails to link on a fresh
+  `CARGO_TARGET_DIR`, while a cached target dir gets all the way to the final binary and fails
+  there. Same cause; the cache only changes where it surfaces.
+  **`CARGO_TARGET_DIR` must be `$SCRATCH/cargo-target/eidolon`** — the pipeline reads
+  `$CARGO_TARGET_DIR/release/eidolon` and nothing else. Building into any other path (e.g. the
+  pre-rename `cargo-target/rneat-*`) leaves the old binary in place; #514's provenance guard
+  now catches that at job start rather than letting it produce stale numbers.
+
 - **The Delta checkout is a separate working copy and goes stale silently.** A queued job
   runs the script as it was when the job *started*, which on a busy queue can be days after
   it was submitted — so a result can predate a fix you believe is in it. Establish the SHA
