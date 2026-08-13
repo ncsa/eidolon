@@ -1048,6 +1048,72 @@ mod tests {
         );
     }
 
+    /// End-to-end `runner` over a **real** aligned BAM — the gap #529 left open.
+    ///
+    /// Every other BAM in these tests is written by `write_test_bam` a few records at a time.
+    /// This one is 1000 Genomes HG00096, GRCh37 `20:1000000-1050000`, aligned with bwa 0.5.9 in
+    /// 2012 and left unmodified: soft clips, indels, duplicate-marked reads, unmapped mates,
+    /// `N` bases, and MD strings emitted by an aligner rather than by us. Provenance in
+    /// `eidolon-core/test_data/HG00096.chr20_1Mb.README.md`.
+    ///
+    /// KNOWN ANSWER, computed outside eidolon by an awk walk over MD+CIGAR and corroborated by
+    /// `sum(NM) - sum(indel bases)` from the aligner's own tags: the A row of the raw count
+    /// matrix is `[0, 97, 100, 53]`, 250 substitutions from a reference A. Normalized that is
+    /// C 97/250, G 100/250, T 53/250, which as a CDF is `[0, 0.388, 0.788, 1.0]`.
+    ///
+    /// The assertion is on the fitted row, not merely on "a model was produced": the whole
+    /// failure mode this file keeps guarding against is a model that looks trained and is not.
+    #[test]
+    fn test_runner_infers_from_a_real_aligner_bam() {
+        let bam_path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidolon-core/test_data/HG00096.chr20_1Mb.bam"
+        ));
+        assert!(
+            bam_path.is_file(),
+            "real-data fixture missing: {bam_path:?}"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            output_file: output_path.clone(),
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+            allow_default_transition_matrix: false,
+        };
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let a_row = row_cdf(
+            model.transition_distros(),
+            eidolon_core::structs::nucleotides::Nucleotide::A,
+        );
+        assert_row_cdf_eq(
+            &a_row,
+            &[0.0, 97.0 / 250.0, 197.0 / 250.0, 1.0],
+            "A row fitted from the real HG00096 BAM",
+        );
+
+        // MUST DIFFER from the default. Without this the test would pass just as happily if
+        // inference had silently fallen back -- which is exactly the #529 defect, and exactly
+        // the kind of pass this repo has been fooled by before.
+        let default_row = default_a_row_cdf();
+        assert!(
+            (a_row[1] - default_row[1]).abs() > 1e-6,
+            "fitted A row {a_row:?} is indistinguishable from the default {default_row:?}; \
+             inference did not actually fire"
+        );
+    }
+
     #[test]
     fn test_tsv_takes_precedence_over_bam() {
         // When both transition_matrix_file and bam_file are set, the TSV wins. The BAM is
