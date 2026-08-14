@@ -272,28 +272,24 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             let counts = read_bam_transitions(path)?;
             let total_mismatches: usize = counts.iter().flatten().sum();
             if total_mismatches == 0 {
-                // Hard error, not a warning. `bam_file:` is a request to fit the matrix from
-                // data; silently substituting the default produces a model that is
-                // indistinguishable from a trained one downstream. MD is a *predefined* SAM
-                // tag rather than a required one, so this is easy to hit unintentionally.
-                if !config.allow_default_transition_matrix {
-                    return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                        "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
-                         transition matrix cannot be inferred from it. Most likely the BAM has \
-                         no MD tags, which are optional in SAM and not written by every aligner. \
-                         Either add them with `samtools calmd -b {} reference.fa > with_md.bam`, \
-                         or set `allow_default_transition_matrix: true` in the config to accept \
-                         the built-in default matrix deliberately.",
-                        path,
-                        path.display()
-                    )));
-                }
-                warn!(
-                    "BAM file {:?} yielded no read-vs-reference mismatches; using the default \
-                     transition matrix because allow_default_transition_matrix is set",
-                    path
-                );
-                None
+                // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
+                // fitting the transition matrix -- so a BAM that yields no evidence cannot be
+                // honoured at all. Silently substituting the default produces a model that is
+                // indistinguishable from a trained one downstream. MD is a *predefined* SAM tag
+                // rather than a required one, so this is easy to hit unintentionally.
+                //
+                // There is deliberately no override flag: omitting `bam_file:` already means
+                // "use the default matrix", so a flag would be a second way to say the same
+                // thing, and a config that names a BAM it does not use is a lie worth refusing.
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
+                     transition matrix cannot be inferred from it. Most likely the BAM has no \
+                     MD tags, which are optional in SAM and not written by every aligner. \
+                     Either add them with `samtools calmd -b {} reference.fa > with_md.bam`, \
+                     or remove `bam_file:` from the config to use the built-in default matrix.",
+                    path,
+                    path.display()
+                )));
             } else {
                 info!(
                     "Observed {} SNP mismatches across all records",
@@ -413,7 +409,6 @@ mod tests {
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: None,
-            allow_default_transition_matrix: false,
         }
     }
 
@@ -665,7 +660,6 @@ mod tests {
             qual_offset: 33,
             binned_quality_bins: None,
             bam_file: None,
-            allow_default_transition_matrix: false,
             transition_matrix_file: Some(tsv_path),
         };
         runner(&config).unwrap();
@@ -746,7 +740,6 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
-            allow_default_transition_matrix: false,
         };
         runner(&config).unwrap();
 
@@ -807,7 +800,6 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
-            allow_default_transition_matrix: false,
         };
         runner(&config).unwrap();
 
@@ -864,30 +856,23 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_bam_no_md_tags_falls_back_when_flag_set() {
-        // BAM records without MD tags, WITH the opt-in flag → succeeds on the default matrix.
-        // Without the flag this same input is a hard error (see the must-fail test below).
+    fn test_runner_no_bam_file_uses_the_default_matrix() {
+        // MUST-NOT-FIRE: with no `bam_file:` at all, nothing was requested and nothing errors --
+        // the model carries the default matrix. This is the supported way to ask for the
+        // default, which is why no override flag exists.
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);
-        let bam_path = temp.path().join("nomd.bam");
-        write_test_bam(&bam_path, 5, b"ACGT", b"TGCA", false);
         let output_path = temp.path().join("model.json.gz");
 
-        let config = RunConfiguration {
-            fastq_file: fastq_path,
-            output_file: output_path.clone(),
-            overwrite_output: true,
-            max_reads: 0,
-            qual_offset: 33,
-            binned_quality_bins: None,
-            bam_file: Some(bam_path),
-            transition_matrix_file: None,
-            allow_default_transition_matrix: true,
-        };
+        let config = make_config(fastq_path, output_path.clone());
+        assert!(
+            config.bam_file.is_none(),
+            "this test's premise is no bam_file"
+        );
         runner(&config).unwrap();
 
-        // The case where inference must NOT fire: no MD tags means nothing was observed,
+        // The case where inference must NOT fire: nothing was requested,
         // so the model has to carry the default matrix. Asserting only "a file appeared"
         // could not tell that apart from silently inventing a matrix from zero evidence.
         let model = SequencingErrorModel::from_file(&output_path).unwrap();
@@ -897,7 +882,7 @@ mod tests {
                 eidolon_core::structs::nucleotides::Nucleotide::A,
             ),
             &default_a_row_cdf(),
-            "A row with no MD tags available",
+            "A row with no bam_file at all",
         );
     }
 
@@ -909,7 +894,7 @@ mod tests {
     /// same shape as every other quiet failure in this repo — a value produced by a path that
     /// never ran.
     #[test]
-    fn test_runner_bam_no_md_tags_is_an_error_without_the_flag() {
+    fn test_runner_bam_no_md_tags_is_an_error() {
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);
@@ -926,7 +911,6 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
-            allow_default_transition_matrix: false,
         };
         let err = runner(&config).expect_err("an MD-less bam_file must not silently default");
         let msg = err.to_string();
@@ -939,8 +923,8 @@ mod tests {
             "error must name the MD remedy: {msg}"
         );
         assert!(
-            msg.contains("allow_default_transition_matrix"),
-            "error must name the override flag: {msg}"
+            msg.contains("remove `bam_file:`"),
+            "error must name the other remedy -- dropping the key: {msg}"
         );
 
         // And it must fail BEFORE writing anything. A model on disk next to an error is worse
@@ -974,76 +958,11 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
-            allow_default_transition_matrix: false,
         };
         let err = runner(&config).expect_err("zero mismatches is no evidence, MD tags or not");
         assert!(
             err.to_string().contains("no read-vs-reference mismatches"),
             "{err}"
-        );
-    }
-
-    /// MUST-NOT-FIRE: the flag is inert on the happy path. Setting it must not divert a BAM
-    /// that does have evidence onto the default matrix — otherwise a user who set it once to
-    /// get past the error would silently lose inference forever after.
-    #[test]
-    fn test_flag_does_not_alter_inference_when_evidence_exists() {
-        let temp = tempfile::tempdir().unwrap();
-        let fastq_path = temp.path().join("test.fastq");
-        make_test_fastq(&fastq_path, 20, 4);
-        let bam_path = temp.path().join("withmd.bam");
-        // ref A -> read C at every position: an A row of 1.0 on C, nothing like the default.
-        write_test_bam(&bam_path, 5, b"AAAA", b"CCCC", true);
-        let output_path = temp.path().join("model.json.gz");
-
-        let config = RunConfiguration {
-            fastq_file: fastq_path,
-            output_file: output_path.clone(),
-            overwrite_output: true,
-            max_reads: 0,
-            qual_offset: 33,
-            binned_quality_bins: None,
-            bam_file: Some(bam_path),
-            transition_matrix_file: None,
-            allow_default_transition_matrix: true,
-        };
-        runner(&config).unwrap();
-
-        let model = SequencingErrorModel::from_file(&output_path).unwrap();
-        let a_row = row_cdf(
-            model.transition_distros(),
-            eidolon_core::structs::nucleotides::Nucleotide::A,
-        );
-        // All A->C: the CDF saturates at C and stays there. Distinguishable from the default,
-        // so this assertion can actually tell inference from fallback.
-        assert_row_cdf_eq(
-            &a_row,
-            &[0.0, 1.0, 1.0, 1.0],
-            "A row inferred with flag set",
-        );
-    }
-
-    /// The flag with no `bam_file:` at all is a no-op: no BAM means no inference was requested,
-    /// so the default matrix was never in question and nothing should error.
-    #[test]
-    fn test_flag_without_bam_file_is_a_no_op() {
-        let temp = tempfile::tempdir().unwrap();
-        let fastq_path = temp.path().join("test.fastq");
-        make_test_fastq(&fastq_path, 20, 4);
-        let output_path = temp.path().join("model.json.gz");
-
-        let mut config = make_config(fastq_path, output_path.clone());
-        config.allow_default_transition_matrix = true;
-        runner(&config).unwrap();
-
-        let model = SequencingErrorModel::from_file(&output_path).unwrap();
-        assert_row_cdf_eq(
-            &row_cdf(
-                model.transition_distros(),
-                eidolon_core::structs::nucleotides::Nucleotide::A,
-            ),
-            &default_a_row_cdf(),
-            "A row with no bam_file at all",
         );
     }
 
@@ -1087,7 +1006,6 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
-            allow_default_transition_matrix: false,
         };
         runner(&config).unwrap();
 
@@ -1146,7 +1064,6 @@ mod tests {
             qual_offset: 33,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
-            allow_default_transition_matrix: false,
             transition_matrix_file: Some(tsv_path),
         };
         runner(&config).unwrap();

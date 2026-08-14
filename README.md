@@ -815,12 +815,8 @@ qual_offset: 33
 #   samtools calmd -b aligned.bam reference.fa > aligned_with_md.bam
 # Ignored if transition_matrix_file is also set.
 # If the BAM yields no mismatches at all, eidolon errors out rather than quietly using the
-# default matrix — see allow_default_transition_matrix below.
+# default matrix. To use the default deliberately, omit this key.
 bam_file: /path/to/aligned.bam
-
-# optional: accept the built-in default transition matrix when bam_file yields no mismatch
-# evidence, instead of erroring. Default false. Only relevant alongside bam_file.
-# allow_default_transition_matrix: false
 
 # optional: custom 4x4 SNP transition matrix TSV (rows/columns: A C G T).
 # A single header line is allowed. Diagonal values are ignored.
@@ -836,7 +832,8 @@ transition_matrix_file: /path/to/matrix.tsv
 Supplying `bam_file` is a request to *fit* the matrix from data, so if the BAM yields no
 read-vs-reference mismatches, eidolon **errors out** instead of falling back to the default. A
 model that looks trained and is actually the default is indistinguishable from a trained one
-downstream. Set `allow_default_transition_matrix: true` to accept the default deliberately.
+downstream. There is no override flag: **omitting `bam_file` is how you ask for the default**,
+so a flag would be a second way to say the same thing.
 
 **BAM MD tag requirement:**
 The BAM path requires MD tags to identify reference bases at mismatch positions. MD is an

@@ -33,8 +33,8 @@ test in `eidolon/tests/model_output_fidelity.rs`:
 | The ref/read axes are not swapped | `test_build_transition_matrix_from_counts_is_not_transposed` |
 | Observed counts drive the fitted row | `test_build_transition_matrix_from_counts_uniform_fallback` |
 | A TSV overrides a BAM | `test_tsv_takes_precedence_over_bam` |
-| No MD tags → hard error, not a silent default (#529) | `test_runner_bam_no_md_tags_is_an_error_without_the_flag` |
-| No MD tags **with** `allow_default_transition_matrix` → default matrix, not an invented one | `test_runner_bam_no_md_tags_falls_back_when_flag_set` |
+| No MD tags → hard error, not a silent default (#529) | `test_runner_bam_no_md_tags_is_an_error` |
+| No `bam_file:` → default matrix, not an invented one | `test_runner_no_bam_file_uses_the_default_matrix` |
 | **The matrix decides the substituted base in output reads** | `built_seq_error_transition_matrix_decides_the_substituted_base` |
 
 Non-vacuity was established by mutation, not asserted:
@@ -131,8 +131,8 @@ longer exists.
 
 - MD tags absent → since #529 the builder errors out, so the job fails at the build step. Keep
   the identical-matrix check anyway: it is the backstop for any *other* route to a default
-  matrix, and it is what would catch the guard being regressed or bypassed with
-  `allow_default_transition_matrix`. The job must never report a perfect control match as a pass.
+  matrix, and it is what would catch the guard being regressed. The job must never report a
+  perfect control match as a pass.
 - `mutation_rate: 0.0` not honored → planted variants inflate the mismatch tally and skew
   the spectrum toward the mutation model. Assert the output VCF is empty.
 - The step-1 tool and eidolon disagreeing on how to count a multi-base MD run, or on
