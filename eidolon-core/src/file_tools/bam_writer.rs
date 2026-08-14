@@ -5,6 +5,8 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::file_tools::fastq_tools::reverse_complement;
+use crate::structs::nucleotides::Nucleotide;
 use noodles::bam;
 use noodles::bgzf;
 use noodles::core::Position;
@@ -441,18 +443,62 @@ pub fn build_bam_record(
 ) -> RecordBuf {
     let mut record = RecordBuf::default();
 
-    *record.name_mut() = Some(name.as_bytes().to_vec().into());
+    // SAM v1 §1.4 field 1: segments of one template share a QNAME, and mate identity is carried
+    // by FLAG 0x40/0x80. The `/1` and `/2` suffixes are a FASTQ convention; carried into a BAM
+    // they give mates DIFFERENT names, so nothing can pair them -- MarkDuplicates and fixmate
+    // silently see singletons (#551). The FASTQ writer keeps its suffixes, correctly.
+    let qname = name
+        .strip_suffix("/1")
+        .or_else(|| name.strip_suffix("/2"))
+        .unwrap_or(name);
+
+    // SAM v1 §1.4 fields 10-11: when 0x10 is set, SEQ holds the REVERSE COMPLEMENT of the read as
+    // sequenced and QUAL is reversed, so that POS + CIGAR + SEQ are one consistent statement.
+    //
+    // The `ReadRecord` reaching us is in READ orientation: `fastq_tools` flips R2 via
+    // `reverse_complement_record` because a FASTQ must contain the read as sequenced. Both writers
+    // consume that same record, and only this one needs reference orientation -- so undo the flip
+    // here, keyed off the very flag this function was handed, which is what keeps the two from
+    // disagreeing (#550). Reuses `fastq_tools::reverse_complement` rather than reimplementing the
+    // complement table, so the two paths cannot drift.
+    // The CIGAR needs the same treatment, and this is the part that is easy to miss: it too
+    // arrives in read orientation, so `60M1I39M` on a reverse read describes an insertion 60
+    // bases into the READ. Reference-oriented, that is `39M1I60M`. Measured on 66 reverse records
+    // carrying an indel: identity to the reference is 0.607 with the CIGAR as written and 0.995
+    // with the op order reversed. Fixing SEQ alone leaves SEQ and CIGAR disagreeing with each
+    // other, which is worse than the original bug -- before, the two were at least mutually
+    // consistent in read orientation.
+    let reverse = flags.is_reverse_complemented();
+    let cigar_out: Cigar = if reverse {
+        cigar.as_ref().iter().rev().copied().collect()
+    } else {
+        cigar
+    };
+    let seq_out: String = if reverse {
+        reverse_complement(sequence.chars().map(Nucleotide::from).collect())
+            .into_iter()
+            .map(char::from)
+            .collect()
+    } else {
+        sequence.to_string()
+    };
+
+    *record.name_mut() = Some(qname.as_bytes().to_vec().into());
     *record.flags_mut() = flags;
     *record.reference_sequence_id_mut() = Some(ref_id);
     *record.alignment_start_mut() = Position::new(pos + 1);
     *record.mapping_quality_mut() = MappingQuality::try_from(mapq).ok();
-    *record.cigar_mut() = cigar;
+    *record.cigar_mut() = cigar_out;
     *record.mate_reference_sequence_id_mut() = Some(mate_ref_id);
     *record.mate_alignment_start_mut() = Position::new(mate_pos + 1);
     *record.template_length_mut() = template_length;
-    *record.sequence_mut() = Sequence::from(sequence.as_bytes());
+    *record.sequence_mut() = Sequence::from(seq_out.as_bytes());
 
-    let qual_u8: Vec<u8> = qual_scores.iter().map(|&q| q as u8).collect();
+    let qual_u8: Vec<u8> = if reverse {
+        qual_scores.iter().rev().map(|&q| q as u8).collect()
+    } else {
+        qual_scores.iter().map(|&q| q as u8).collect()
+    };
     *record.quality_scores_mut() = QualityScores::from(qual_u8);
 
     record
