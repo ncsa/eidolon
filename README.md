@@ -840,9 +840,8 @@ downstream. Set `allow_default_transition_matrix: true` to accept the default de
 
 **BAM MD tag requirement:**
 The BAM path requires MD tags to identify reference bases at mismatch positions. MD is an
-*optional* SAM tag: BWA-MEM writes it, `minimap2` needs `--MD`, STAR needs
-`--outSAMattributes MD`, and **eidolon's own golden BAM does not write it at all**. If your BAM
-lacks them, generate them with:
+*optional* SAM tag, so check your aligner: BWA-MEM writes it, `minimap2` needs `--MD`, and STAR
+needs `--outSAMattributes MD`. If your BAM lacks them, generate them with:
 ```bash
 samtools calmd -b aligned.bam reference.fa > aligned_with_md.bam
 samtools index aligned_with_md.bam

@@ -275,13 +275,12 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                 // Hard error, not a warning. `bam_file:` is a request to fit the matrix from
                 // data; silently substituting the default produces a model that is
                 // indistinguishable from a trained one downstream. MD is a *predefined* SAM
-                // tag rather than a required one, so this is easy to hit unintentionally —
-                // and eidolon's own golden BAM writes no MD at all.
+                // tag rather than a required one, so this is easy to hit unintentionally.
                 if !config.allow_default_transition_matrix {
                     return Err(GenSeqErrorModelError::ConfigurationError(format!(
                         "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
                          transition matrix cannot be inferred from it. Most likely the BAM has \
-                         no MD tags (MD is optional in SAM; eidolon's own golden BAM omits it). \
+                         no MD tags, which are optional in SAM and not written by every aligner. \
                          Either add them with `samtools calmd -b {} reference.fa > with_md.bam`, \
                          or set `allow_default_transition_matrix: true` in the config to accept \
                          the built-in default matrix deliberately.",
