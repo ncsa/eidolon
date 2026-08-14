@@ -272,11 +272,24 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             let counts = read_bam_transitions(path)?;
             let total_mismatches: usize = counts.iter().flatten().sum();
             if total_mismatches == 0 {
-                warn!(
-                    "BAM file {:?} had no MD-tagged records; using default transition matrix",
-                    path
-                );
-                None
+                // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
+                // fitting the transition matrix -- so a BAM that yields no evidence cannot be
+                // honoured at all. Silently substituting the default produces a model that is
+                // indistinguishable from a trained one downstream. MD is a *predefined* SAM tag
+                // rather than a required one, so this is easy to hit unintentionally.
+                //
+                // Omitting `bam_file:` is how a user asks for the default matrix, so there is
+                // nothing to fall back to here: a config that names a BAM it does not use would
+                // be a lie about provenance.
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
+                     transition matrix cannot be inferred from it. Most likely the BAM has no \
+                     MD tags, which are optional in SAM and not written by every aligner. \
+                     Either add them with `samtools calmd -b {} reference.fa > with_md.bam`, \
+                     or remove `bam_file:` from the config to use the built-in default matrix.",
+                    path,
+                    path.display()
+                )));
             } else {
                 info!(
                     "Observed {} SNP mismatches across all records",
@@ -843,8 +856,44 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_bam_no_md_tags_falls_back() {
-        // BAM records without MD tags → runner succeeds and uses the default matrix.
+    fn test_runner_no_bam_file_uses_the_default_matrix() {
+        // MUST-NOT-FIRE: with no `bam_file:` at all, nothing was requested and nothing errors --
+        // the model carries the default matrix. This is the supported way to ask for it.
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = make_config(fastq_path, output_path.clone());
+        assert!(
+            config.bam_file.is_none(),
+            "this test's premise is no bam_file"
+        );
+        runner(&config).unwrap();
+
+        // The case where inference must NOT fire: nothing was requested,
+        // so the model has to carry the default matrix. Asserting only "a file appeared"
+        // could not tell that apart from silently inventing a matrix from zero evidence.
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_row_cdf_eq(
+            &row_cdf(
+                model.transition_distros(),
+                eidolon_core::structs::nucleotides::Nucleotide::A,
+            ),
+            &default_a_row_cdf(),
+            "A row with no bam_file at all",
+        );
+    }
+
+    /// MUST-FAIL: `bam_file:` that yields no mismatch evidence is an error, not a warning.
+    ///
+    /// The defect this pins (#529): the runner used to `warn!` and substitute the built-in
+    /// default, producing a model that is byte-identical to an untrained one while the config
+    /// says it was fitted from a BAM. Nothing downstream can distinguish those, which is the
+    /// same shape as every other quiet failure in this repo — a value produced by a path that
+    /// never ran.
+    #[test]
+    fn test_runner_bam_no_md_tags_is_an_error() {
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);
@@ -862,19 +911,122 @@ mod tests {
             bam_file: Some(bam_path),
             transition_matrix_file: None,
         };
+        let err = runner(&config).expect_err("an MD-less bam_file must not silently default");
+        let msg = err.to_string();
+
+        // Assert the message names BOTH remedies. A bare "cannot infer" would leave the user
+        // with no route forward, and the whole point of the flag is that it be discoverable
+        // from the error rather than from the source.
+        assert!(
+            msg.contains("samtools calmd"),
+            "error must name the MD remedy: {msg}"
+        );
+        assert!(
+            msg.contains("remove `bam_file:`"),
+            "error must name the other remedy -- dropping the key: {msg}"
+        );
+
+        // And it must fail BEFORE writing anything. A model on disk next to an error is worse
+        // than either outcome alone, because a rerunning pipeline would pick it up.
+        assert!(
+            !output_path.exists(),
+            "no model file may be written when inference fails"
+        );
+    }
+
+    /// A BAM that HAS MD tags but records zero mismatches is the same failure with a different
+    /// cause — a perfectly-matching alignment carries no transition evidence either. Included
+    /// because the guard keys on the mismatch total, not on tag presence, and a reader could
+    /// reasonably assume otherwise from the error text.
+    #[test]
+    fn test_runner_bam_with_md_but_no_mismatches_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let bam_path = temp.path().join("md_no_mismatch.bam");
+        // ref == read, so the MD tag is written but encodes only matches.
+        write_test_bam(&bam_path, 5, b"ACGT", b"ACGT", true);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            output_file: output_path,
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+        };
+        let err = runner(&config).expect_err("zero mismatches is no evidence, MD tags or not");
+        assert!(
+            err.to_string().contains("no read-vs-reference mismatches"),
+            "{err}"
+        );
+    }
+
+    /// End-to-end `runner` over a **real** aligned BAM — the gap #529 left open.
+    ///
+    /// Every other BAM in these tests is written by `write_test_bam` a few records at a time.
+    /// This one is 1000 Genomes HG00096, GRCh37 `20:1000000-1050000`, aligned with bwa 0.5.9 in
+    /// 2012 and left unmodified: soft clips, indels, duplicate-marked reads, unmapped mates,
+    /// `N` bases, and MD strings emitted by an aligner rather than by us. Provenance in
+    /// `eidolon-core/test_data/HG00096.chr20_1Mb.README.md`.
+    ///
+    /// KNOWN ANSWER, computed outside eidolon by an awk walk over MD+CIGAR and corroborated by
+    /// `sum(NM) - sum(indel bases)` from the aligner's own tags: the A row of the raw count
+    /// matrix is `[0, 97, 100, 53]`, 250 substitutions from a reference A. Normalized that is
+    /// C 97/250, G 100/250, T 53/250, which as a CDF is `[0, 0.388, 0.788, 1.0]`.
+    ///
+    /// The assertion is on the fitted row, not merely on "a model was produced": the whole
+    /// failure mode this file keeps guarding against is a model that looks trained and is not.
+    #[test]
+    fn test_runner_infers_from_a_real_aligner_bam() {
+        let bam_path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidolon-core/test_data/HG00096.chr20_1Mb.bam"
+        ));
+        assert!(
+            bam_path.is_file(),
+            "real-data fixture missing: {bam_path:?}"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            output_file: output_path.clone(),
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+        };
         runner(&config).unwrap();
 
-        // The case where inference must NOT fire: no MD tags means nothing was observed,
-        // so the model has to carry the default matrix. Asserting only "a file appeared"
-        // could not tell that apart from silently inventing a matrix from zero evidence.
         let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let a_row = row_cdf(
+            model.transition_distros(),
+            eidolon_core::structs::nucleotides::Nucleotide::A,
+        );
         assert_row_cdf_eq(
-            &row_cdf(
-                model.transition_distros(),
-                eidolon_core::structs::nucleotides::Nucleotide::A,
-            ),
-            &default_a_row_cdf(),
-            "A row with no MD tags available",
+            &a_row,
+            &[0.0, 97.0 / 250.0, 197.0 / 250.0, 1.0],
+            "A row fitted from the real HG00096 BAM",
+        );
+
+        // MUST DIFFER from the default. Without this the test would pass just as happily if
+        // inference had silently fallen back -- which is exactly the #529 defect, and exactly
+        // the kind of pass this repo has been fooled by before.
+        let default_row = default_a_row_cdf();
+        assert!(
+            (a_row[1] - default_row[1]).abs() > 1e-6,
+            "fitted A row {a_row:?} is indistinguishable from the default {default_row:?}; \
+             inference did not actually fire"
         );
     }
 

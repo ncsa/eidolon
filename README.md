@@ -814,6 +814,8 @@ qual_offset: 33
 # The BAM must have MD tags. If your aligner did not add them, run:
 #   samtools calmd -b aligned.bam reference.fa > aligned_with_md.bam
 # Ignored if transition_matrix_file is also set.
+# If the BAM yields no mismatches at all, eidolon errors out rather than quietly using the
+# default matrix. To use the default deliberately, omit this key.
 bam_file: /path/to/aligned.bam
 
 # optional: custom 4x4 SNP transition matrix TSV (rows/columns: A C G T).
@@ -825,14 +827,22 @@ transition_matrix_file: /path/to/matrix.tsv
 **SNP transition matrix priority:**
 1. `transition_matrix_file` (explicit TSV) — highest priority
 2. `bam_file` (inferred from MD-tagged BAM mismatches)
-3. Default matrix from Python `eidolon` — used when neither is provided
+3. Built-in default matrix (inherited from Python NEAT) — used when neither is provided
+
+Supplying `bam_file` is a request to *fit* the matrix from data, so if the BAM yields no
+read-vs-reference mismatches, eidolon **errors out** instead of falling back to the default. A
+model that looks trained and is actually the default is indistinguishable from a trained one
+downstream. **Omitting `bam_file` is how you ask for the default matrix.**
 
 **BAM MD tag requirement:**
-The BAM path requires MD tags to identify reference bases at mismatch positions. Most aligners (BWA-MEM, STAR with `--outSAMattributes MD`) add them automatically. If yours does not, generate them with:
+The BAM path requires MD tags to identify reference bases at mismatch positions. MD is an
+*optional* SAM tag, so check your aligner: BWA-MEM writes it, `minimap2` needs `--MD`, and STAR
+needs `--outSAMattributes MD`. If your BAM lacks them, generate them with:
 ```bash
 samtools calmd -b aligned.bam reference.fa > aligned_with_md.bam
 samtools index aligned_with_md.bam
 ```
+Without MD tags the inference finds nothing, which is an error rather than a silent fallback.
 
 **TSV format:**
 The transition matrix TSV has 4 data rows (one per reference base: A, C, G, T) and 4 whitespace-separated columns (one per read base: A, C, G, T). The first row is skipped if it is non-numeric (treated as a header). Diagonal values are zeroed automatically. Rows are re-normalized to sum to 1.
