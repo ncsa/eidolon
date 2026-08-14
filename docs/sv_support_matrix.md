@@ -243,6 +243,13 @@ came out. This is *de novo generation as an independent tool can recover it*. Ne
 substitutes for the other, and the gap between them is the subject of
 `docs/sv_polish_roadmap.md`.
 
+> ⚠ **ONE REPLICATE.** Everything below is job 21072620 alone. `aggregate_sv_reps.sh` exists
+> because a single run is not the intended unit of analysis: at `SV_RATE_SCALE=1.0` GRCh38
+> yields ~25 translocations per run, so **~8 replicates** are needed for a meaningful
+> recall/precision figure, pooled as summed TP/FN/FP rather than as a mean of per-replicate
+> ratios. Treat every number here as one draw, not as a result. Replicates from the same array
+> (seeds 9–12) have not been pooled in.
+
 **Job 21072620** (2026-08-13, 1173.7 core-hours, 127 somatic SVs planted):
 
 | type | truth | Manta | Delly | note |
@@ -302,7 +309,8 @@ and a look at the CIGARs.
 
 **A 30× GRCh38 replicate yields ~3 INS draws and ~1 after the cap.** INS cannot be validated at
 caller level from single replicates at any runtime — it needs pooled replicates or an
-INS-enriched model.
+INS-enriched model. Across the ~8 replicates the aggregator targets that is still only ~8
+planted insertions, so an INS-enriched model is likely the only route to a usable denominator.
 
 ### What this tier does NOT establish
 
