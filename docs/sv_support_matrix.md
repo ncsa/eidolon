@@ -232,6 +232,91 @@ multiplier and the depth actually delivered. Mechanism not diagnosed — see #49
 
 ---
 
+## Whole-genome tier — de novo, scored by callers
+
+Everything above is **H1N1**: 8 contigs of 1–2.3 kb, largest event ~1.2 kb. That fixture cannot
+say whether an SV behaves at the sizes anyone simulates. This section is the other tier —
+GRCh38 at 30×, purity 0.6, `SV_RATE_SCALE=1.0`, scored by Manta 1.6.0 and Delly against truvari.
+
+**It answers a different question.** The tables above are *input fidelity* — what you supplied
+came out. This is *de novo generation as an independent tool can recover it*. Neither
+substitutes for the other, and the gap between them is the subject of
+`docs/sv_polish_roadmap.md`.
+
+**Job 21072620** (2026-08-13, 1173.7 core-hours, 127 somatic SVs planted):
+
+| type | truth | Manta | Delly | note |
+|---|---|---|---|---|
+| DEL | 29 | 0.828 | 0.862 | query coverage 28/40 and 37/58 — precision rests on the scored subset |
+| DUP | 32 | 0.875 | 0.875 | identical across two independent callers |
+| INV | 9 | 1.000 | 1.000 | precision 0.500 both — see below, it is our representation |
+| BND | 50 (= 25 junctions) | 0.920 | 0.440 | Delly's figure is a caller limitation, not a simulator defect |
+| CNV | 6 | 4 of 6 by direction | — | denominator of 6 is thin |
+| INS | 1 | 0 | 0 | verified miss; see below |
+
+Calibration controls passed: truth-vs-truth recall 1.000 with **all** 71 scoreable records
+scored, decoy (shifted truth) recall 0.000; same for BND across all 50. So the matching
+configuration is not loose enough to accept anything.
+
+### BND geometry is fixed, confirmed at genome scale
+
+This is the first whole-genome confirmation of the v3.1.0 fix. `BND recall=0.000` was the
+symptom of a truth VCF describing a rearrangement the reads did not carry; it now reads:
+
+```
+BND geometry: 50 record(s), 50 parsed into a form, 0 unparsable
+  t[p[  direct/deletion-like    9      t]p]  head-to-head            18
+  [p[t  tail-to-tail           14      ]p]t  direct/duplication-like  9
+  reciprocity: 0 unpaired, 0 mispaired
+```
+
+All four bracket forms present, every record parsed, **0 unpaired and 0 mispaired** — the
+#451-era failure (truth emitted unmatchable by construction) is gone, and Manta independently
+recovers 46 of the 50 records from the reads alone.
+
+### INV precision 0.500 is ours, not the callers'
+
+Both callers report TP=9, FP=9 — *identically*. The pipeline predicts this in its own pre-flight:
+16 of the truth's junctions are inversion-oriented (`t]p]` or `[p[t`), and a caller's breakends
+for those convert to `<INV>` via Manta's `convertInversion.py`, landing as INV false positives.
+Two independent callers arriving at the same number is the evidence that it is a representation
+artifact. **INV recall 1.000 is real; INV precision from this tier is not quotable.**
+
+### INS: one planted, one verified present, zero found
+
+`truth INS: 1` (65 bp) is the #516 cap working as designed, and the drop log proves it rather
+than implying it: 2 insertions dropped (chr2, chr19) + 1 kept = 3 draws, against ~3.5 expected
+from `Ins = 0.0279` over ~130 SVs, of which ~0.9 were expected to survive the 150 bp cap.
+
+`INS read support: 1 of 1` — 7 reads carry a 30-mer from the **middle** of the inserted
+sequence. This is the first campaign to check that the reads contained what the truth declared
+*before* the BAMs were pruned, which is exactly how #516 survived three campaigns.
+
+Neither caller found it. Manta's only INS call was a false positive on another chromosome
+(`chr11:99348945`, 58 bp, non-PASS); nothing was called within 2 kb of the planted event. Delly
+emitted no INS records at all. So the miss is **verified rather than inferred** — the reads
+demonstrably carried the insertion. With n=1 this does not constrain a recall rate (95% CI
+≈ [0, 0.98]); why it was missed is unresolved, and separating "somatic-score threshold at ~7
+supporting reads" from "the reads lack a signature the aligner can present" needs `PRUNE_BAM=0`
+and a look at the CIGARs.
+
+**A 30× GRCh38 replicate yields ~3 INS draws and ~1 after the cap.** INS cannot be validated at
+caller level from single replicates at any runtime — it needs pooled replicates or an
+INS-enriched model.
+
+### What this tier does NOT establish
+
+- **Input fidelity at scale.** Every cell above this section is still H1N1-only.
+- **Dosage.** Detection is not dosage; the ~8% over-delivery (#499) was measured on a 1.2 kb
+  event and has never been checked at these sizes.
+- **Subclonal behaviour.** SVs receive no CCF at all ([#537](https://github.com/ncsa/eidolon/issues/537)),
+  so every somatic SV here is clonal within the tumor regardless of the subclone model.
+- **Small events.** The planted set skews very large (DUP 3.4 Mb, DEL 9.1 Mb, INV 2.0 Mb).
+  Multi-megabase events are easy to detect by depth; these recall figures say little about the
+  1–50 kb range where callers actually struggle.
+
+---
+
 ## De novo generation
 
 | type | source | status |
