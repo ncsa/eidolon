@@ -41,6 +41,48 @@ pub struct SvSpec {
     pub interior: (usize, usize),
     /// Unaffected baseline on the same contig, so it shares that contig's coverage.
     pub flank: (usize, usize),
+    /// Optional third window, for events whose expectation differs on either side of a
+    /// breakpoint. A breakend needs it: downstream of the junction must collapse while
+    /// immediately upstream must stay intact, and one ratio cannot express both.
+    pub probe: Option<(usize, usize)>,
+    /// For a breakend: the mate locus `(contig, pos)`. When set, `generate_reads` emits a
+    /// **mated pair** of bracket-ALT records rather than one symbolic record, because a lone
+    /// breakend is a different (and broken) thing — an unpaired `A.` destroys local coverage
+    /// (#500). `svtype` is ignored for these; the geometry lives in the ALT.
+    pub mate: Option<(&'static str, usize)>,
+}
+
+/// The reference base at `contig:pos` (1-based).
+///
+/// A breakend's REF must be the real anchor base: #451 was a truth VCF carrying a literal `N`
+/// there, and a mismatched REF is a malformed record rather than a harmless approximation. The
+/// H1N1 fixture has CRLF line endings, so `\r` is stripped — a detail that has already cost one
+/// debugging session via `samtools faidx`.
+pub fn ref_base(contig: &str, pos: usize) -> char {
+    let text = std::fs::read_to_string(h1n1_reference()).unwrap();
+    let mut seq = String::new();
+    let mut in_contig = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(name) = line.strip_prefix('>') {
+            if in_contig {
+                break;
+            }
+            in_contig = name.split_whitespace().next() == Some(contig);
+            continue;
+        }
+        if in_contig {
+            seq.push_str(line);
+        }
+    }
+    assert!(
+        !seq.is_empty(),
+        "contig {contig} not found in the H1N1 fixture"
+    );
+    seq.chars()
+        .nth(pos - 1)
+        .unwrap_or_else(|| panic!("{contig}:{pos} is past the end of a {}bp contig", seq.len()))
+        .to_ascii_uppercase()
 }
 
 /// Locate bwa-mem2, or fail with something actionable. **Never returns a "skip"** — a gate that
@@ -109,12 +151,37 @@ pub fn generate_reads(work: &Path, tag: &str, sv: Option<&SvSpec>) -> (PathBuf, 
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS"
         )
         .unwrap();
-        writeln!(
-            f,
-            "{}\t{}\t.\tG\t<{}>\t60\tPASS\tSVTYPE={};END={}\tGT\t{}",
-            sv.contig, sv.pos, sv.svtype, sv.svtype, sv.end, sv.gt
-        )
-        .unwrap();
+        match sv.mate {
+            None => {
+                writeln!(
+                    f,
+                    "{}\t{}\t.\tG\t<{}>\t60\tPASS\tSVTYPE={};END={}\tGT\t{}",
+                    sv.contig, sv.pos, sv.svtype, sv.svtype, sv.end, sv.gt
+                )
+                .unwrap();
+            }
+            Some((mc, mp)) => {
+                // VCF 4.2 §5.4: a `t[p[` breakend at c1:p1 joining c2:p2 has as its mate the
+                // record `]c1:p1]t'` at c2:p2. Case 1, a direct join with no reverse
+                // complement, which is the geometry a caller reports as DEL/DUP-like rather
+                // than converting to <INV> — chosen so this gate measures the breakend itself
+                // and not the inversion-conversion path.
+                let a = ref_base(sv.contig, sv.pos);
+                let b = ref_base(mc, mp);
+                writeln!(
+                    f,
+                    "{}\t{}\tbnd_a\t{a}\t{a}[{mc}:{mp}[\t60\tPASS\tSVTYPE=BND;MATEID=bnd_b\tGT\t{}",
+                    sv.contig, sv.pos, sv.gt
+                )
+                .unwrap();
+                writeln!(
+                    f,
+                    "{mc}\t{mp}\tbnd_b\t{b}\t]{}:{}]{b}\t60\tPASS\tSVTYPE=BND;MATEID=bnd_a\tGT\t{}",
+                    sv.contig, sv.pos, sv.gt
+                )
+                .unwrap();
+            }
+        }
         config.input_vcf = Some(input_vcf);
     }
 
@@ -207,6 +274,16 @@ pub struct Signatures {
     /// Distinct from everted — an RF pair has mates on opposite strands, an inversion pair does
     /// not, and conflating them would let a DUP satisfy an INV assertion.
     pub same_orientation_pairs: usize,
+    /// Read whose mate aligned to a DIFFERENT contig. The **translocation** signature for
+    /// paired-end callers: an inter-chromosomal junction is the only thing that legitimately
+    /// produces these.
+    pub cross_contig_pairs: usize,
+    /// Read carrying an `SA` tag whose supplementary alignment is on the mate contig — a split
+    /// read spanning the junction. This is what a split-read caller assembles a breakend from,
+    /// and it is strictly stronger evidence than a clip, which says only "something ends here".
+    pub sa_to_mate_contig: usize,
+    /// Mean depth over `SvSpec::probe`, if set.
+    pub depth_probe: f64,
     pub reads: usize,
 }
 
@@ -226,6 +303,37 @@ pub fn analyse(sam_path: &Path, sv: &SvSpec) -> Signatures {
 
     for result in reader.records() {
         let record = result.unwrap();
+
+        // Breakend evidence lives on BOTH contigs, so these three counters are accumulated
+        // before the on-target filter below (which exists for depth, a single-contig measure).
+        if let Some((mate_contig, mate_pos)) = sv.mate {
+            let this: Option<Vec<u8>> = record.reference_sequence_name().map(|n| n.to_vec());
+            let mate: Option<Vec<u8>> = record.mate_reference_sequence_name().map(|n| n.to_vec());
+            let ours = |n: &Option<Vec<u8>>| {
+                n.as_deref()
+                    .is_some_and(|n| n == contig.as_bytes() || n == mate_contig.as_bytes())
+            };
+            if ours(&this) && ours(&mate) && this != mate {
+                sig.cross_contig_pairs += 1;
+            }
+            if ours(&this) {
+                let sa = record
+                    .data()
+                    .get(&noodles::sam::alignment::record::data::field::Tag::OTHER_ALIGNMENTS);
+                if let Some(Ok(value)) = sa {
+                    let text = format!("{value:?}");
+                    let other = if this.as_deref() == Some(contig.as_bytes()) {
+                        mate_contig
+                    } else {
+                        contig
+                    };
+                    if text.contains(other) {
+                        sig.sa_to_mate_contig += 1;
+                    }
+                }
+                let _ = mate_pos;
+            }
+        }
 
         // H1N1 has EIGHT contigs. Without this filter every contig's reads land in one depth
         // array, the event window gets backfilled by unrelated contigs, and the signal vanishes.
@@ -296,6 +404,9 @@ pub fn analyse(sam_path: &Path, sv: &SvSpec) -> Signatures {
     };
     sig.depth_inside = mean(sv.interior.0, sv.interior.1);
     sig.depth_outside = mean(sv.flank.0, sv.flank.1);
+    if let Some((lo, hi)) = sv.probe {
+        sig.depth_probe = mean(lo, hi);
+    }
     sig
 }
 

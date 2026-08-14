@@ -50,6 +50,8 @@ const DEL: SvSpec = SvSpec {
     // 20 bp in from each breakpoint: enough that a read clipped at a junction cannot contribute,
     // and this event is too short (300 bp vs 200 bp fragments) for a fragment-length margin.
     interior: (520, 779),
+    mate: None,
+    probe: None,
     flank: (1_000, 1_400),
 };
 
