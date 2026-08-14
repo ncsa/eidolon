@@ -542,6 +542,76 @@ mod tests {
     // (reference_sequence_id, alignment_start_1based, cigar_ops)
     type TestCoverageRecord<'a> = (usize, usize, &'a [TestCigarOp]);
 
+    /// `read_bam_transitions` against a **real** aligner's output, with a known answer computed
+    /// outside eidolon.
+    ///
+    /// Everything else that tests this path — including the samtools-calmd oracle above — feeds
+    /// the reader a BAM written by the test itself: a handful of records, hand-chosen CIGARs, no
+    /// surprises. Real alignments are not like that. This fixture has soft clips, indels,
+    /// duplicate-marked and unmapped records, `N` bases, and MD strings emitted by bwa 0.5.9
+    /// rather than by us.
+    ///
+    /// Fixture: 1000 Genomes HG00096 low-coverage alignment, GRCh37 `20:1000000-1050000`,
+    /// unmodified. Full provenance and redistribution terms in
+    /// `test_data/HG00096.chr20_1Mb.README.md`.
+    ///
+    /// KNOWN ANSWER. Derived two independent ways, neither of them this code:
+    ///
+    /// 1. An awk walk over `MD` + `CIGAR` (`samtools view -F 0x904`, matching `SKIP_FLAGS`),
+    ///    tallying `counts[ref][read]` — 2548 usable records, **804** substitutions.
+    /// 2. The aligner's own tags: `sum(NM) - sum(inserted + deleted bases)` = **804**.
+    ///
+    /// bwa computed those NM values at alignment time in 2012, knowing nothing about this
+    /// codebase, so (2) is about as independent as an oracle gets. The two agreeing to the
+    /// record is what licenses the per-cell literals below.
+    #[test]
+    fn transition_counts_match_an_independent_oracle_on_a_real_bam() {
+        let path = PathBuf::from("test_data/HG00096.chr20_1Mb.bam");
+        assert!(path.is_file(), "real-data fixture missing: {path:?}");
+
+        let counts = read_bam_transitions(&path).unwrap();
+
+        // ALLOWED_NUCS order: A=0, C=1, G=2, T=3.
+        let expected: [[usize; 4]; 4] = [
+            [0, 97, 100, 53],
+            [62, 0, 15, 75],
+            [91, 21, 0, 39],
+            [46, 120, 85, 0],
+        ];
+        assert_eq!(
+            counts, expected,
+            "real-BAM substitution counts disagree with the awk + NM oracle"
+        );
+
+        // The total is the figure both oracles agree on, asserted separately: a per-cell
+        // regression and a wholesale miscount are different failures, and the total is the one
+        // an outside reader can re-derive with samtools alone.
+        let total: usize = counts.iter().flatten().sum();
+        assert_eq!(
+            total, 804,
+            "total substitutions must match sum(NM) - indels"
+        );
+
+        // The diagonal is not a substitution and must never be counted, whatever the MD says.
+        for (i, row) in counts.iter().enumerate() {
+            assert_eq!(row[i], 0, "diagonal cell [{i}][{i}] must be zero");
+        }
+
+        // Every off-diagonal cell is populated, which is what makes the equality assertion
+        // above meaningful: a parser that silently dropped a whole class of substitution would
+        // leave a zero here rather than failing some aggregate.
+        for (i, row) in counts.iter().enumerate() {
+            for (j, &c) in row.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        c > 0,
+                        "cell [{i}][{j}] is zero; the fixture should populate all 12"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_md_simple() {
         // "10A5G3": 10 matches, mismatch ref=A, 5 matches, mismatch ref=G, 3 matches
@@ -637,76 +707,6 @@ mod tests {
             *record.mate_reference_sequence_id_mut() = mate_ref_id;
             *record.template_length_mut() = tlen;
             writer.write_alignment_record(&header, &record).unwrap();
-        }
-    }
-
-    /// `read_bam_transitions` against a **real** aligner's output, with a known answer computed
-    /// outside eidolon.
-    ///
-    /// Everything else that tests this path — including the samtools-calmd oracle above — feeds
-    /// the reader a BAM written by the test itself: a handful of records, hand-chosen CIGARs, no
-    /// surprises. Real alignments are not like that. This fixture has soft clips, indels,
-    /// duplicate-marked and unmapped records, `N` bases, and MD strings emitted by bwa 0.5.9
-    /// rather than by us.
-    ///
-    /// Fixture: 1000 Genomes HG00096 low-coverage alignment, GRCh37 `20:1000000-1050000`,
-    /// unmodified. Full provenance and redistribution terms in
-    /// `test_data/HG00096.chr20_1Mb.README.md`.
-    ///
-    /// KNOWN ANSWER. Derived two independent ways, neither of them this code:
-    ///
-    /// 1. An awk walk over `MD` + `CIGAR` (`samtools view -F 0x904`, matching `SKIP_FLAGS`),
-    ///    tallying `counts[ref][read]` — 2548 usable records, **804** substitutions.
-    /// 2. The aligner's own tags: `sum(NM) - sum(inserted + deleted bases)` = **804**.
-    ///
-    /// bwa computed those NM values at alignment time in 2012, knowing nothing about this
-    /// codebase, so (2) is about as independent as an oracle gets. The two agreeing to the
-    /// record is what licenses the per-cell literals below.
-    #[test]
-    fn transition_counts_match_an_independent_oracle_on_a_real_bam() {
-        let path = PathBuf::from("test_data/HG00096.chr20_1Mb.bam");
-        assert!(path.is_file(), "real-data fixture missing: {path:?}");
-
-        let counts = read_bam_transitions(&path).unwrap();
-
-        // ALLOWED_NUCS order: A=0, C=1, G=2, T=3.
-        let expected: [[usize; 4]; 4] = [
-            [0, 97, 100, 53],
-            [62, 0, 15, 75],
-            [91, 21, 0, 39],
-            [46, 120, 85, 0],
-        ];
-        assert_eq!(
-            counts, expected,
-            "real-BAM substitution counts disagree with the awk + NM oracle"
-        );
-
-        // The total is the figure both oracles agree on, asserted separately: a per-cell
-        // regression and a wholesale miscount are different failures, and the total is the one
-        // an outside reader can re-derive with samtools alone.
-        let total: usize = counts.iter().flatten().sum();
-        assert_eq!(
-            total, 804,
-            "total substitutions must match sum(NM) - indels"
-        );
-
-        // The diagonal is not a substitution and must never be counted, whatever the MD says.
-        for (i, row) in counts.iter().enumerate() {
-            assert_eq!(row[i], 0, "diagonal cell [{i}][{i}] must be zero");
-        }
-
-        // Every off-diagonal cell is populated, which is what makes the equality assertion
-        // above meaningful: a parser that silently dropped a whole class of substitution would
-        // leave a zero here rather than failing some aggregate.
-        for (i, row) in counts.iter().enumerate() {
-            for (j, &c) in row.iter().enumerate() {
-                if i != j {
-                    assert!(
-                        c > 0,
-                        "cell [{i}][{j}] is zero; the fixture should populate all 12"
-                    );
-                }
-            }
         }
     }
 
