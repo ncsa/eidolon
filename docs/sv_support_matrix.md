@@ -243,23 +243,58 @@ came out. This is *de novo generation as an independent tool can recover it*. Ne
 substitutes for the other, and the gap between them is the subject of
 `docs/sv_polish_roadmap.md`.
 
-> ⚠ **ONE REPLICATE.** Everything below is job 21072620 alone. `aggregate_sv_reps.sh` exists
-> because a single run is not the intended unit of analysis: at `SV_RATE_SCALE=1.0` GRCh38
-> yields ~25 translocations per run, so **~8 replicates** are needed for a meaningful
-> recall/precision figure, pooled as summed TP/FN/FP rather than as a mean of per-replicate
-> ratios. Treat every number here as one draw, not as a result. Replicates from the same array
-> (seeds 9–12) have not been pooled in.
+> ⚠ **Four replicates, pooled — against a target of ~8.** `aggregate_sv_reps.sh` pools summed
+> TP/FN/FP (not a mean of per-replicate ratios, which would weight a replicate with 3 events the
+> same as one with 40). At `SV_RATE_SCALE=1.0` GRCh38 yields ~25 translocations per run, so ~8
+> replicates is the design target. Per-replicate truth counts vary widely — BND 50–76, INV 9–20,
+> DUP 18–34 — so single-replicate figures were never going to be stable.
+>
+> ⚠ **Every recall below is PASS-only.** truvari is run with `--passonly`, so a truth event whose
+> only matching call was non-PASS is scored FN. Measured instance: `chr10:45850637` was called by
+> Manta with *identical* POS/END/SVLEN and scored a DUP false negative because its FILTER was
+> `MinSomaticScore`. These recalls are therefore **underestimates by an unmeasured amount** —
+> see [#541](https://github.com/ncsa/eidolon/issues/541).
 
-**Job 21072620** (2026-08-13, 1173.7 core-hours, 127 somatic SVs planted):
+**Array 21072620** (2026-08-13, seeds 9–12, GRCh38 30x, purity 0.6, `SV_RATE_SCALE=1.0`),
+pooled over 4 replicates:
 
-| type | truth | Manta | Delly | note |
-|---|---|---|---|---|
-| DEL | 29 | 0.828 | 0.862 | query coverage 28/40 and 37/58 — precision rests on the scored subset |
-| DUP | 32 | 0.875 | 0.875 | identical across two independent callers |
-| INV | 9 | 1.000 | 1.000 | precision 0.500 both — see below, it is our representation |
-| BND | 50 (= 25 junctions) | 0.920 | 0.440 | Delly's figure is a caller limitation, not a simulator defect |
-| CNV | 6 | 4 of 6 by direction | — | denominator of 6 is thin |
-| INS | 1 | 0 | 0 | verified miss; see below |
+| scorer | reps | TP | FN | FP | recall | precision |
+|---|---|---|---|---|---|---|
+| `manta_overall` | 4 | 255 | 30 | 84 | 0.895 | 0.752 |
+| `manta_DEL` | 4 | 105 | 11 | 13 | 0.905 | 0.890 |
+| `manta_DUP` | 4 | 91 | 14 | 15 | 0.867 | 0.858 |
+| `manta_INV` | 4 | 59 | 3 | 56 | 0.952 | 0.513 |
+| `manta_BND` | 4 | 214 | 28 | 230 | 0.884 | 0.482 |
+| `manta_INS` | **2** | 0 | 2 | 0 | 0.000 | — |
+| `delly_overall` | 4 | 253 | 32 | 114 | 0.888 | 0.689 |
+| `delly_DEL` | 4 | 104 | 12 | 44 | 0.897 | 0.703 |
+| `delly_DUP` | 4 | 91 | 14 | 17 | 0.867 | 0.843 |
+| `delly_INV` | 4 | 58 | 4 | 52 | 0.935 | 0.527 |
+| `delly_BND` | 4 | 108 | 134 | 0 | 0.446 | **1.000** |
+| `delly_INS` | **1** | 0 | 1 | 1 | 0.000 | — |
+
+The INS rows ran in 1 and 2 of 4 replicates respectively and are **not comparable** with the
+rest; the aggregator says so itself rather than pooling them silently.
+
+### DUP: both callers miss the identical set, and one of them is ours
+
+`manta_DUP` and `delly_DUP` agree to the record — TP=91, FN=14 — differing only in FP. Two
+independent callers missing the same events points at a property of the events, not the callers.
+Examined for one replicate (FN = 4):
+
+| missed DUP | size | N content | called by Manta? |
+|---|---|---|---|
+| chr14:66171649 | 16 kb | 0.0% | nothing |
+| chr11:39805201 | 43 kb | 0.0% | nothing |
+| chr10:45850637 | 122 kb | 0.0% | **yes, exactly — filtered by `--passonly`** |
+| chr15:19940438 | 1.7 Mb | 5.2% | nothing |
+
+So it is **not** a size floor (1.7 Mb is trivially detectable by depth) and **not** assembly
+gaps (three are 0.0% N; SV placement already requires a ±200 bp N-free window at both
+breakpoints, `sv_model.rs` `ALIGNABLE_WINDOW`, #224). One of the four is a filter artifact
+(#541). The remaining three — including a megabase-scale duplication with nothing called
+anywhere near it — are unexplained, and diagnosing them needs reads, so `PRUNE_BAM=0` on a
+future run.
 
 Calibration controls passed: truth-vs-truth recall 1.000 with **all** 71 scoreable records
 scored, decoy (shifted truth) recall 0.000; same for BND across all 50. So the matching
