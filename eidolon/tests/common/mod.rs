@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod gate2;
+
 use assert_cmd::Command;
 use flate2::Compression;
 use flate2::write::GzEncoder;
