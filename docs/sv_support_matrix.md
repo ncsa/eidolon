@@ -232,6 +232,146 @@ multiplier and the depth actually delivered. Mechanism not diagnosed — see #49
 
 ---
 
+## Whole-genome tier — de novo, scored by callers
+
+Everything above is **H1N1**: 8 contigs of 1–2.3 kb, largest event ~1.2 kb. That fixture cannot
+say whether an SV behaves at the sizes anyone simulates. This section is the other tier —
+GRCh38 at 30×, purity 0.6, `SV_RATE_SCALE=1.0`, scored by Manta 1.6.0 and Delly against truvari.
+
+**It answers a different question.** The tables above are *input fidelity* — what you supplied
+came out. This is *de novo generation as an independent tool can recover it*. Neither
+substitutes for the other, and the gap between them is the subject of
+`docs/sv_polish_roadmap.md`.
+
+> ⚠ **Four replicates, pooled — against a target of ~8.** `aggregate_sv_reps.sh` pools summed
+> TP/FN/FP (not a mean of per-replicate ratios, which would weight a replicate with 3 events the
+> same as one with 40). At `SV_RATE_SCALE=1.0` GRCh38 yields ~25 translocations per run, so ~8
+> replicates is the design target. Per-replicate truth counts vary widely — BND 50–76, INV 9–20,
+> DUP 18–34 — so single-replicate figures were never going to be stable.
+>
+> ⚠ **Every recall below is PASS-only.** truvari is run with `--passonly`, so a truth event whose
+> only matching call was non-PASS is scored FN. Measured instance: `chr10:45850637` was called by
+> Manta with *identical* POS/END/SVLEN and scored a DUP false negative because its FILTER was
+> `MinSomaticScore`. These recalls are therefore **underestimates by an unmeasured amount** —
+> see [#541](https://github.com/ncsa/eidolon/issues/541).
+
+**Array 21072620** (2026-08-13, seeds 9–12, GRCh38 30x, purity 0.6, `SV_RATE_SCALE=1.0`),
+pooled over 4 replicates:
+
+| scorer | reps | TP | FN | FP | recall | precision |
+|---|---|---|---|---|---|---|
+| `manta_overall` | 4 | 255 | 30 | 84 | 0.895 | 0.752 |
+| `manta_DEL` | 4 | 105 | 11 | 13 | 0.905 | 0.890 |
+| `manta_DUP` | 4 | 91 | 14 | 15 | 0.867 | 0.858 |
+| `manta_INV` | 4 | 59 | 3 | 56 | 0.952 | 0.513 |
+| `manta_BND` | 4 | 214 | 28 | 230 | 0.884 | 0.482 |
+| `manta_INS` | **2** | 0 | 2 | 0 | 0.000 | — |
+| `delly_overall` | 4 | 253 | 32 | 114 | 0.888 | 0.689 |
+| `delly_DEL` | 4 | 104 | 12 | 44 | 0.897 | 0.703 |
+| `delly_DUP` | 4 | 91 | 14 | 17 | 0.867 | 0.843 |
+| `delly_INV` | 4 | 58 | 4 | 52 | 0.935 | 0.527 |
+| `delly_BND` | 4 | 108 | 134 | 0 | 0.446 | **1.000** |
+| `delly_INS` | **1** | 0 | 1 | 1 | 0.000 | — |
+
+The INS rows ran in 1 and 2 of 4 replicates respectively and are **not comparable** with the
+rest; the aggregator says so itself rather than pooling them silently.
+
+### DUP: both callers miss the identical set, and one of them is ours
+
+`manta_DUP` and `delly_DUP` agree to the record — TP=91, FN=14 — differing only in FP. Two
+independent callers missing the same events points at a property of the events, not the callers.
+Examined for one replicate (FN = 4):
+
+| missed DUP | size | N content | called by Manta? |
+|---|---|---|---|
+| chr14:66171649 | 16 kb | 0.0% | nothing |
+| chr11:39805201 | 43 kb | 0.0% | nothing |
+| chr10:45850637 | 122 kb | 0.0% | **yes, exactly — filtered by `--passonly`** |
+| chr15:19940438 | 1.7 Mb | 5.2% | nothing |
+
+So it is **not** a size floor (1.7 Mb is trivially detectable by depth) and **not** assembly
+gaps (three are 0.0% N; SV placement already requires a ±200 bp N-free window at both
+breakpoints, `sv_model.rs` `ALIGNABLE_WINDOW`, #224). One of the four is a filter artifact
+(#541). The remaining three — including a megabase-scale duplication with nothing called
+anywhere near it — are unexplained, and diagnosing them needs reads, so `PRUNE_BAM=0` on a
+future run.
+
+Calibration controls passed: truth-vs-truth recall 1.000 with **all** 71 scoreable records
+scored, decoy (shifted truth) recall 0.000; same for BND across all 50. So the matching
+configuration is not loose enough to accept anything.
+
+### BND geometry is fixed, confirmed at genome scale
+
+This is the first whole-genome confirmation of the v3.1.0 fix. `BND recall=0.000` was the
+symptom of a truth VCF describing a rearrangement the reads did not carry; it now reads:
+
+```
+BND geometry: 50 record(s), 50 parsed into a form, 0 unparsable
+  t[p[  direct/deletion-like    9      t]p]  head-to-head            18
+  [p[t  tail-to-tail           14      ]p]t  direct/duplication-like  9
+  reciprocity: 0 unpaired, 0 mispaired
+```
+
+All four bracket forms present, every record parsed, **0 unpaired and 0 mispaired** — the
+#451-era failure (truth emitted unmatchable by construction) is gone, and Manta independently
+recovers 46 of the 50 records from the reads alone.
+
+### INV precision 0.500 is ours, not the callers'
+
+Both callers report TP=9, FP=9 — *identically*. The pipeline predicts this in its own pre-flight:
+16 of the truth's junctions are inversion-oriented (`t]p]` or `[p[t`), and a caller's breakends
+for those convert to `<INV>` via Manta's `convertInversion.py`, landing as INV false positives.
+Two independent callers arriving at the same number is the evidence that it is a representation
+artifact. **INV recall 1.000 is real; INV precision from this tier is not quotable.**
+
+### INS: one planted, one verified present, zero found
+
+`truth INS: 1` (65 bp) is the #516 cap working as designed, and the drop log proves it rather
+than implying it: 2 insertions dropped (chr2, chr19) + 1 kept = 3 draws, against ~3.5 expected
+from `Ins = 0.0279` over ~130 SVs, of which ~0.9 were expected to survive the 150 bp cap.
+
+`INS read support: 1 of 1` — 7 reads carry a 30-mer from the **middle** of the inserted
+sequence. This is the first campaign to check that the reads contained what the truth declared
+*before* the BAMs were pruned, which is exactly how #516 survived three campaigns.
+
+> ⚠ **But the check itself is not trustworthy yet.** Job 21076622, same array, reports
+> `INS read support: 0 of 1` — which turned out to measure nothing. Its probe file is well
+> formed (`chr3 92124128 56bp` + a valid 30-mer), yet no per-insertion line was emitted on
+> stdout or stderr: `count_probe_hits` produced no output, the reporting loop ran zero
+> iterations, and the `0` is an untouched initialiser printed against an independently counted
+> `n_probes`. Worse, `unsupported` stayed `0`, so the failure gate never fired and the
+> replicate archived as a clean result ([#540](https://github.com/ncsa/eidolon/issues/540)).
+>
+> The `1 of 1` above came through the same code path. It did print its detail line, so it is
+> probably a true pass, but **treat the #516 cap as unverified in production** until #540 is
+> fixed and both replicates are re-checked.
+
+Neither caller found it. Manta's only INS call was a false positive on another chromosome
+(`chr11:99348945`, 58 bp, non-PASS); nothing was called within 2 kb of the planted event. Delly
+emitted no INS records at all. So the miss is **verified rather than inferred** — the reads
+demonstrably carried the insertion. With n=1 this does not constrain a recall rate (95% CI
+≈ [0, 0.98]); why it was missed is unresolved, and separating "somatic-score threshold at ~7
+supporting reads" from "the reads lack a signature the aligner can present" needs `PRUNE_BAM=0`
+and a look at the CIGARs.
+
+**A 30× GRCh38 replicate yields ~3 INS draws and ~1 after the cap.** INS cannot be validated at
+caller level from single replicates at any runtime — it needs pooled replicates or an
+INS-enriched model. Across the ~8 replicates the aggregator targets that is still only ~8
+planted insertions, so an INS-enriched model is likely the only route to a usable denominator.
+
+### What this tier does NOT establish
+
+- **Input fidelity at scale.** Every cell above this section is still H1N1-only.
+- **Dosage.** Detection is not dosage; the ~8% over-delivery (#499) was measured on a 1.2 kb
+  event and has never been checked at these sizes.
+- **Subclonal behaviour.** SVs receive no CCF at all ([#537](https://github.com/ncsa/eidolon/issues/537)),
+  so every somatic SV here is clonal within the tumor regardless of the subclone model.
+- **Small events.** The planted set skews very large (DUP 3.4 Mb, DEL 9.1 Mb, INV 2.0 Mb).
+  Multi-megabase events are easy to detect by depth; these recall figures say little about the
+  1–50 kb range where callers actually struggle.
+
+---
+
 ## De novo generation
 
 | type | source | status |
