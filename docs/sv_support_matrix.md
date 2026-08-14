@@ -299,14 +299,17 @@ from `Ins = 0.0279` over ~130 SVs, of which ~0.9 were expected to survive the 15
 sequence. This is the first campaign to check that the reads contained what the truth declared
 *before* the BAMs were pruned, which is exactly how #516 survived three campaigns.
 
-> ❌ **And in the very next replicate it failed.** Job 21076622, same array, reports
-> `INS read support: 0 of 1` — a planted insertion whose reads do not contain its middle,
-> which is #516's failure mode occurring *after* the interim cap. Of two insertions planted
-> across four replicates, one is unsupported. **The cap at `read_len - 1` does not guarantee
-> the reads support the truth**; it enforces the *head* visibility condition, which carries no
-> length term, while the middle condition (`anchor_offset <= 84 - L/2`) tightens as the
-> insertion grows. An insertion just under the cap is plantable and still hollow. See #516.
-> Note also that the run reported `0 of 1` and exited 0, archiving the replicate as a result.
+> ⚠ **But the check itself is not trustworthy yet.** Job 21076622, same array, reports
+> `INS read support: 0 of 1` — which turned out to measure nothing. Its probe file is well
+> formed (`chr3 92124128 56bp` + a valid 30-mer), yet no per-insertion line was emitted on
+> stdout or stderr: `count_probe_hits` produced no output, the reporting loop ran zero
+> iterations, and the `0` is an untouched initialiser printed against an independently counted
+> `n_probes`. Worse, `unsupported` stayed `0`, so the failure gate never fired and the
+> replicate archived as a clean result ([#540](https://github.com/ncsa/eidolon/issues/540)).
+>
+> The `1 of 1` above came through the same code path. It did print its detail line, so it is
+> probably a true pass, but **treat the #516 cap as unverified in production** until #540 is
+> fixed and both replicates are re-checked.
 
 Neither caller found it. Manta's only INS call was a false positive on another chromosome
 (`chr11:99348945`, 58 bp, non-PASS); nothing was called within 2 kb of the planted event. Delly
