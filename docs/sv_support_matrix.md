@@ -316,13 +316,20 @@ All four bracket forms present, every record parsed, **0 unpaired and 0 mispaire
 #451-era failure (truth emitted unmatchable by construction) is gone, and Manta independently
 recovers 46 of the 50 records from the reads alone.
 
-### INV precision 0.500 is ours, not the callers'
+### INV precision 0.500 is ours, not the callers' — and Gate 2 now shows the reads are clean
 
 Both callers report TP=9, FP=9 — *identically*. The pipeline predicts this in its own pre-flight:
 16 of the truth's junctions are inversion-oriented (`t]p]` or `[p[t`), and a caller's breakends
 for those convert to `<INV>` via Manta's `convertInversion.py`, landing as INV false positives.
 Two independent callers arriving at the same number is the evidence that it is a representation
 artifact. **INV recall 1.000 is real; INV precision from this tier is not quotable.**
+
+Gate 2 (`eidolon/tests/gate2_realigned_inv.rs`) closes the remaining inference. Realigning a
+homozygous 1.2 kb inversion with bwa-mem2 gives **123 breakpoint-clipped reads against 0 in the
+control**, **98 same-orientation (FF/RR) pairs against 0**, **0 everted (RF) pairs** — so nothing
+suggests a duplication — and interior depth of 1.026x the flank, i.e. balanced. The reads carry
+an unambiguous inversion signature, so the false positives are not attributable to them. That was
+previously an argument from two callers agreeing; it is now a measurement.
 
 ### INS: one planted, one verified present, zero found
 

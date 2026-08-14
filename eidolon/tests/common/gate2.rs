@@ -20,11 +20,12 @@ use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Reference window used as the "unaffected" baseline in every gate. Well clear of the event
-/// loci the gates plant, and on the same contig so it shares that contig's coverage.
-pub const FLANK_WINDOW: (usize, usize) = (1_000, 1_400);
-
-/// A symbolic SV to plant via `input_vcf`.
+/// A symbolic SV to plant via `input_vcf`, with the windows its depth is measured over.
+///
+/// The windows are per-event on purpose. A 1.2 kb inversion cannot share a 300 bp deletion's
+/// interior window, and it cannot share its flank either — `H1N1_HA:1000-1400` sits *inside* an
+/// `H1N1_PB2:500-1700` inversion. Getting this wrong measures the wrong thing quietly, which is
+/// how the first version of this harness turned a homozygous deletion into a 1.2x enrichment.
 pub struct SvSpec {
     pub svtype: &'static str,
     pub contig: &'static str,
@@ -33,6 +34,13 @@ pub struct SvSpec {
     /// `"1/1"` for homozygous. Gates use hom so a signature is present or absent rather than
     /// halved — a het event turns every assertion below into a ratio judgement.
     pub gt: &'static str,
+    /// Depth window strictly inside the event. Must clear each breakpoint by more than a
+    /// fragment length where the event is large enough to allow it: coverage within ~one
+    /// fragment of a junction is depressed by junction effects, not by the event's dosage
+    /// (`docs/sv_support_matrix.md` measures 0.74–0.82 there for an inversion).
+    pub interior: (usize, usize),
+    /// Unaffected baseline on the same contig, so it shares that contig's coverage.
+    pub flank: (usize, usize),
 }
 
 /// Locate bwa-mem2, or fail with something actionable. **Never returns a "skip"** — a gate that
@@ -183,25 +191,36 @@ pub struct Signatures {
     pub clips_at_breakpoints: usize,
     /// Soft clips anywhere else — the background the above must stand out from.
     pub clips_elsewhere: usize,
-    /// Leftmost-read-of-pair with |TLEN| inflated well past the fragment mean. The
-    /// **deletion** signature: a pair spanning a deletion aligns further apart than it was.
+    /// Leftmost-read-of-pair with |TLEN| inflated well past the fragment mean. Necessary for a
+    /// deletion but **not sufficient to identify one**: measured, a 1.2 kb inversion produces
+    /// ~99 of these too, because a mate landing inside the inverted block maps to a mirrored
+    /// position. Orientation is what discriminates — DEL shows long pairs with none of the
+    /// others, DUP shows everted, INV shows same-orientation. Which is exactly why callers use
+    /// insert size and orientation together rather than either alone.
     pub long_pairs: usize,
-    /// Leftmost read of the pair is on the reverse strand — "everted" / RF orientation. The
+    /// Leftmost read reverse, mate forward — "everted" / RF orientation. The
     /// **tandem-duplication** signature: a pair spanning the duplication junction reads out of
     /// the second copy into the first, so the mates appear swapped.
     pub everted_pairs: usize,
+    /// Both mates on the SAME strand (FF or RR). The **inversion** signature: one mate falls
+    /// inside the inverted block and is therefore read from the opposite strand to its partner.
+    /// Distinct from everted — an RF pair has mates on opposite strands, an inversion pair does
+    /// not, and conflating them would let a DUP satisfy an INV assertion.
+    pub same_orientation_pairs: usize,
     pub reads: usize,
 }
 
 /// Accumulate the signatures over `contig` for an event spanning `pos..=end`.
-pub fn analyse(sam_path: &Path, contig: &str, pos: usize, end: usize) -> Signatures {
+pub fn analyse(sam_path: &Path, sv: &SvSpec) -> Signatures {
+    let (contig, pos, end) = (sv.contig, sv.pos, sv.end);
     let mut reader = std::fs::File::open(sam_path)
         .map(std::io::BufReader::new)
         .map(sam::io::Reader::new)
         .unwrap();
     let _header = reader.read_header().unwrap();
 
-    let contig_len = 2_000usize;
+    // Longest H1N1 contig is 2280 bp (PB2). Sized past it so no contig is silently truncated.
+    let contig_len = 3_000usize;
     let mut depth = vec![0usize; contig_len];
     let mut sig = Signatures::default();
 
@@ -255,8 +274,15 @@ pub fn analyse(sam_path: &Path, contig: &str, pos: usize, end: usize) -> Signatu
             if tlen as usize > 250 + event_len / 2 {
                 sig.long_pairs += 1;
             }
-            if record.flags().is_ok_and(|f| f.is_reverse_complemented()) {
-                sig.everted_pairs += 1;
+            if let Ok(flags) = record.flags() {
+                let rev = flags.is_reverse_complemented();
+                let mate_rev = flags.is_mate_reverse_complemented();
+                if rev && !mate_rev {
+                    sig.everted_pairs += 1;
+                }
+                if rev == mate_rev {
+                    sig.same_orientation_pairs += 1;
+                }
             }
         }
     }
@@ -268,8 +294,8 @@ pub fn analyse(sam_path: &Path, contig: &str, pos: usize, end: usize) -> Signatu
         }
         slice.iter().sum::<usize>() as f64 / slice.len() as f64
     };
-    sig.depth_inside = mean(pos + 20, end.saturating_sub(20));
-    sig.depth_outside = mean(FLANK_WINDOW.0, FLANK_WINDOW.1);
+    sig.depth_inside = mean(sv.interior.0, sv.interior.1);
+    sig.depth_outside = mean(sv.flank.0, sv.flank.1);
     sig
 }
 
@@ -281,17 +307,7 @@ pub fn run_gate(sv: &SvSpec) -> (Signatures, Signatures, tempfile::TempDir) {
     let (vr1, vr2) = generate_reads(&work, "withsv", Some(sv));
     let (cr1, cr2) = generate_reads(&work, "control", None);
 
-    let with_sv = analyse(
-        &align(&bwa, &work, "withsv", &vr1, &vr2),
-        sv.contig,
-        sv.pos,
-        sv.end,
-    );
-    let control = analyse(
-        &align(&bwa, &work, "control", &cr1, &cr2),
-        sv.contig,
-        sv.pos,
-        sv.end,
-    );
+    let with_sv = analyse(&align(&bwa, &work, "withsv", &vr1, &vr2), sv);
+    let control = analyse(&align(&bwa, &work, "control", &cr1, &cr2), sv);
     (with_sv, control, dir)
 }
