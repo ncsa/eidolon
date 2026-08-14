@@ -75,15 +75,10 @@ The reads are the ground truth of a simulator. Everything else is derived.
 
 Must-not-fire for every row: a no-variant control run must show none of it.
 
-### Gate 2 — BAM: a researcher can interpret it
+### Gate 2a — the realigned BAM: a caller can interpret it
 
-Two distinct artifacts, and both matter:
-
-- **The golden BAM** is eidolon's own claim about where each read came from. Its CIGARs must
-  reflect the variant (a `D` op spanning a deletion, an `I` op for an insertion), and read
-  names must mark chimeras.
-- **The realigned BAM** — the FASTQ put through a real aligner — is what a researcher actually
-  works from. It must carry the signatures callers depend on:
+The FASTQ put through a real aligner is what a researcher actually works from. It must carry the
+signatures callers depend on:
 
 | type | signature a caller needs |
 |---|---|
@@ -93,9 +88,34 @@ Two distinct artifacts, and both matter:
 | BND | split reads with `SA` tags pointing at the mate locus; cross-contig discordant pairs |
 | INS | soft clips accumulating at the insertion point; assemblable novel sequence |
 
-**This gate has never been run.** We have only ever asked whether a caller found something,
-never whether the evidence it needs is present and well-formed. That is the same gap #516 hid
-in for three campaigns.
+**Status: DONE for DEL, DUP, INV, BND** (`eidolon/tests/gate2_realigned_*.rs`, PRs #542–#545).
+Each passes, each was mutation-verified, and each produced a finding beyond the pass — depth-only
+checking is insufficient (DEL), a measured mechanism for #499 (DUP), the reads cleared of the
+precision artifact (INV), and undocumented copy-number semantics (BND, #546). CNV and INS remain.
+
+Before these, we had only ever asked whether a caller found something, never whether the evidence
+it needs is present and well-formed — the same gap #516 hid in for three campaigns.
+
+Requires `bwa-mem2`, so these tests are `#[ignore]`d and CI never runs them. Run deliberately:
+`conda activate aln && cargo test --test gate2_realigned_del -- --ignored --nocapture`.
+
+### Gate 2b — the golden BAM agrees with the FASTQ
+
+**Its own phase, not a missing piece of 2a** ([#548](https://github.com/ncsa/eidolon/issues/548)).
+
+The golden BAM is eidolon's claim about where each read came from. It and the FASTQ are produced
+by the same generation but written by different code (`fastq_tools.rs`, `bam_writer.rs`), and
+nothing asserts they agree — the shape that let `sv_model.rs` and `runner.rs` disagree about BND
+geometry for eight releases.
+
+Separated because **it needs no aligner.** Consistency between two eidolon outputs is checkable
+from the outputs alone, so unlike 2a it can be an ordinary CI test that never gets skipped. The
+strongest assertion needs no variant at all: for each QNAME the golden BAM's SEQ must equal the
+FASTQ's (reverse-complemented for reverse-strand records). Then CIGARs reflecting the variant
+(`D` for a deletion, `I` for an insertion), and chimeric read marking.
+
+Deliberately ranked **above** the remaining 2a types: cheaper, no aligner, runs in CI, and covers
+every SV type at once rather than one per gate.
 
 ### Gate 3 — VCF: the record is correct and spec-conformant
 
