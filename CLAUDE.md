@@ -31,6 +31,11 @@ Each rule below was earned by a defect that shipped green. Case histories live i
 2. **Prove non-vacuity by mutation.** Break the code a test covers and watch it fail; if
    it still passes it is not a test. Free for a fix (revert it), deliberate for a
    feature. A coverage claim with no mutation experiment behind it is an opinion.
+   **Verify the mutation was applied.** A surviving mutant and an unapplied edit produce
+   identical output, and the failure is silent: a `sed` or `str.replace` whose pattern does not
+   match changes nothing and says nothing. Assert the file changed, or diff it. The tell is a
+   "survivor" whose numbers match the baseline *exactly* — thirteen decimal places of agreement
+   is not tolerance, it is the same code running twice.
 3. **Vet the premise, not just the implementation.** `bnd_proximity.py` was correct code
    that should not have existed — built on an inherited "truvari cannot benchmark
    breakends", true of v4 and reversed in v5.0.0. Check a third-party tool's actual
