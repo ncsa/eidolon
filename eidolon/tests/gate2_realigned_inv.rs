@@ -54,6 +54,8 @@ const INV: SvSpec = SvSpec {
     // 300 bp in from each breakpoint: more than one fragment (mean 200), so the window measures
     // the inverted sequence rather than the junction dip.
     interior: (800, 1_400),
+    mate: None,
+    probe: None,
     flank: (1_750, 2_050),
 };
 
