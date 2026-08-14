@@ -278,9 +278,9 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                 // indistinguishable from a trained one downstream. MD is a *predefined* SAM tag
                 // rather than a required one, so this is easy to hit unintentionally.
                 //
-                // There is deliberately no override flag: omitting `bam_file:` already means
-                // "use the default matrix", so a flag would be a second way to say the same
-                // thing, and a config that names a BAM it does not use is a lie worth refusing.
+                // Omitting `bam_file:` is how a user asks for the default matrix, so there is
+                // nothing to fall back to here: a config that names a BAM it does not use would
+                // be a lie about provenance.
                 return Err(GenSeqErrorModelError::ConfigurationError(format!(
                     "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
                      transition matrix cannot be inferred from it. Most likely the BAM has no \
@@ -858,8 +858,7 @@ mod tests {
     #[test]
     fn test_runner_no_bam_file_uses_the_default_matrix() {
         // MUST-NOT-FIRE: with no `bam_file:` at all, nothing was requested and nothing errors --
-        // the model carries the default matrix. This is the supported way to ask for the
-        // default, which is why no override flag exists.
+        // the model carries the default matrix. This is the supported way to ask for it.
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);

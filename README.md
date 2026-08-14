@@ -832,8 +832,7 @@ transition_matrix_file: /path/to/matrix.tsv
 Supplying `bam_file` is a request to *fit* the matrix from data, so if the BAM yields no
 read-vs-reference mismatches, eidolon **errors out** instead of falling back to the default. A
 model that looks trained and is actually the default is indistinguishable from a trained one
-downstream. There is no override flag: **omitting `bam_file` is how you ask for the default**,
-so a flag would be a second way to say the same thing.
+downstream. **Omitting `bam_file` is how you ask for the default matrix.**
 
 **BAM MD tag requirement:**
 The BAM path requires MD tags to identify reference bases at mismatch positions. MD is an
