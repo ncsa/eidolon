@@ -142,10 +142,11 @@ selftest/decoy calibration stays as the floor.
 
 ## Prerequisites and open decisions
 
-- **No aligner is installed on the workstation** (samtools only). Gate 2 needs one. Installing
-  `bwa-mem2` or `minimap2` locally keeps the fast loop; otherwise every Gate 2 run costs a
-  Delta round trip. This is a development-environment change only — it does not touch the
-  shipped artifact or the conda recipe.
+- **The local toolchain already covers Gates 1–3.** `bwa-mem2` lives in the `aln` conda
+  environment, `samtools`/`bcftools`/`hap.py`/`som.py` in `hap_py_env`, and samtools 1.22 in
+  `samtools122`. Check `conda env list` before concluding a tool is missing — several are
+  installed only inside an environment. What is **not** local: truvari, Manta, Delly, so
+  Phase 2 still needs Delta.
 - **A ≥2-contig real reference** is required for BND (chr22 alone cannot plant one — de novo
   BND is inter-chromosomal by design). chr20 + chr21 is the natural pair.
 - **BED-restricted windows** should keep Phase 1 near the H1N1 loop rather than the 1174
