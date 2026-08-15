@@ -1485,20 +1485,26 @@ count_probe_hits() {  # <probes.tsv>  < sequences
 verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
     local truth="$1" bam="$2" dir="$3"
     [[ "${VERIFY_INS_READS:-1}" == "1" ]] || { echo "  (INS read verification skipped)"; return 0; }
-    [[ -f "$bam" ]] || { echo "  (no $bam — cannot verify INS at read level)" >&2; return 0; }
+    if [[ ! -f "$bam" ]]; then
+        echo "ERROR: $bam is missing — INS read verification was not evaluated" >&2
+        return 1
+    fi
 
     local probes="$dir/.ins_probes.tsv"
     # ALT is anchor+novel for a literal insertion, so the inserted bases are ALT past REF's
     # length. A 30-mer from the MIDDLE is the probe: it cannot come from the reference
     # (~4^-30 by chance), and the middle is the part #516 showed is missing while the head
     # is present — probing the head would report success on a partially-realized insertion.
-    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' -i 'INFO/SVTYPE="INS"' "$truth" 2>/dev/null \
+    if ! bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' -i 'INFO/SVTYPE="INS"' "$truth" 2>/dev/null \
       | awk -F'\t' 'BEGIN{OFS="\t"} {
             ins = substr($4, length($3) + 1); L = length(ins)
             if (L < 30) next
             s = int(L / 2) - 14; if (s < 1) s = 1
             print $1, $2, L, substr(ins, s, 30)
-        }' > "$probes" || true
+        }' > "$probes"; then
+        echo "ERROR: could not extract literal INS probes from $truth — verification was not evaluated" >&2
+        return 1
+    fi
 
     local n_probes; n_probes=$(wc -l < "$probes" 2>/dev/null || echo 0)
     if [[ "$n_probes" -eq 0 ]]; then
@@ -1510,14 +1516,39 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
     : > "$seqs"
     while IFS=$'\t' read -r c p _ _; do
         local lo=$(( p > 1000 ? p - 1000 : 1 ))
-        samtools view "$bam" "$c:$lo-$((p + 1000))" 2>/dev/null | cut -f10 >> "$seqs" || true
+        if ! samtools view "$bam" "$c:$lo-$((p + 1000))" 2>/dev/null | cut -f10 >> "$seqs"; then
+            echo "ERROR: samtools could not read the INS locus $c:$p — verification was not evaluated" >&2
+            rm -f "$seqs"
+            return 1
+        fi
     done < "$probes"
     # A read lying wholly inside a large insertion has no reference home, so it lands here.
-    samtools view -@ 4 -f 4 "$bam" 2>/dev/null | cut -f10 >> "$seqs" || true
+    if ! samtools view -@ 4 -f 4 "$bam" 2>/dev/null | cut -f10 >> "$seqs"; then
+        echo "ERROR: samtools could not read unmapped tumor reads — verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
 
     echo "  INS read-level support (30-mer from the MIDDLE of each inserted sequence):"
     local supported=0 unsupported=0
-    while read -r c p l h; do
+    local hit_rows
+    if ! hit_rows="$(count_probe_hits "$probes" < "$seqs")"; then
+        echo "ERROR: probe matching failed — INS read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    local result_rows=0
+    if [[ -n "$hit_rows" ]]; then
+        result_rows="$(printf '%s\n' "$hit_rows" | awk -F'\t' '$4 ~ /^[0-9]+$/ { n++ } END { print n + 0 }')"
+    fi
+    if [[ "$result_rows" -ne "$n_probes" ]]; then
+        echo "ERROR: probe matcher evaluated $result_rows of $n_probes probes — INS read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r c p l h; do
         if [[ "${h:-0}" -gt 0 ]]; then
             supported=$((supported + 1))
             printf '    %s:%s  %s bp  %s read(s)\n' "$c" "$p" "$l" "$h"
@@ -1525,21 +1556,30 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
             unsupported=$((unsupported + 1))
             printf '    %s:%s  %s bp  NO READ SUPPORT\n' "$c" "$p" "$l" >&2
         fi
-    done < <(count_probe_hits "$probes" < "$seqs")
+    done <<< "$hit_rows"
+
+    if [[ $((supported + unsupported)) -ne "$n_probes" ]]; then
+        echo "ERROR: probe result accounting covered $((supported + unsupported)) of $n_probes probes" >&2
+        rm -f "$seqs"
+        return 1
+    fi
 
     echo "  INS read support: $supported of $n_probes planted insertion(s) present in the reads"
+    INS_UNSUPPORTED="$unsupported"
     if [[ "$unsupported" -gt 0 ]]; then
         echo "ERROR: $unsupported of $n_probes planted insertion(s) have NO read evidence for" >&2
         echo "  their declared length. Any INS recall reported above is a statement about our" >&2
         echo "  own read generation, not about the caller — see #516. DEL/DUP/INV/BND/CNV are" >&2
         echo "  unaffected." >&2
-        INS_UNSUPPORTED="$unsupported"
     fi
     rm -f "$seqs"
 }
 INS_UNSUPPORTED=0
+INS_VERIFY_FAILED=0
 if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
-    verify_planted_ins "$OUTDIR/truth_sv_INS.vcf.gz" "$TUMOR_BAM" "$OUTDIR" || true
+    if ! verify_planted_ins "$OUTDIR/truth_sv_INS.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
+        INS_VERIFY_FAILED=1
+    fi
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────
@@ -1550,13 +1590,9 @@ if [[ "$CAL_FAIL" -ne 0 ]]; then
     RUN_STATUS="FAILED (scorer calibration) — no caller results"
 elif [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
     RUN_STATUS="FAILED ($SCORE_COVERAGE_FAIL comparison(s) scored a SUBSET of the truth)"
+elif [[ "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
+    RUN_STATUS="FAILED (INS read verification was not evaluated)"
 elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
-    # verify_planted_ins set this and NOTHING READ IT — the check reported to stderr and could
-    # not affect the banner or the exit status, so job 21025737 printed "complete" over
-    # "1 of 4 planted insertion(s) present in the reads". A control that cannot change the
-    # outcome is the exact failure this pipeline keeps re-earning; the variable was written and
-    # then dropped on the floor.
-    #
     # Deliberately not a hard failure while #516 is open: every campaign planting insertions
     # above ~a read length would fail, which would block DEL/DUP/INV work that is unaffected.
     # It is a distinct, visible status instead — the numbers are usable EXCEPT for INS.
@@ -1658,6 +1694,10 @@ fi
 prune_bams() {  # <outdir>
     local dir="$1" bam_kb
     [[ "${PRUNE_BAM:-1}" == "1" ]] || { echo "[prune] keeping BAMs (PRUNE_BAM=0)"; return 0; }
+    if [[ "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
+        echo "[prune] KEEPING BAMs: INS read verification failed before evaluating every probe" >&2
+        return 0
+    fi
     # MUST NOT FIRE without a completed score. Deleting the BAMs of a run that died before
     # stage 5 destroys the only artifact that makes it re-callable, and the FASTQ is already
     # gone by this point, so there is no way back.
@@ -1684,7 +1724,7 @@ archive_run sv "$OUTDIR" truvari_manta_overall/summary.json
 # exit non-zero — because a run that published recalls over a subset of the truth, or
 # scored with an uncalibrated scorer, must not look successful to whoever reads the
 # SLURM exit status.
-if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
+if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
     echo "" >&2
     [[ "$CAL_FAIL" -ne 0 ]] && \
         echo "FAILED: scorer calibration (Rule 0) — no caller results were produced." >&2
@@ -1694,5 +1734,7 @@ if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
         echo "  TRUVARI_SIZEMAX (currently $TRUVARI_SIZEMAX) or relax the size filters," >&2
         echo "  then re-score. Artifacts are archived." >&2
     fi
+    [[ "${INS_VERIFY_FAILED:-0}" -eq 0 ]] || \
+        echo "FAILED: INS read verification did not evaluate every probe; BAMs were kept for diagnosis." >&2
     exit 1
 fi

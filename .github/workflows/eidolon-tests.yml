@@ -73,3 +73,7 @@ jobs:
       run: scripts/delta/tests/test_bnd_geometry.sh
     - name: Prove the harness tests are non-vacuous
       run: scripts/delta/tests/test_bnd_geometry.sh --mutate
+    - name: INS read-verification harness tests
+      run: scripts/delta/tests/test_ins_verification.sh
+    - name: Prove the INS harness tests are non-vacuous
+      run: scripts/delta/tests/test_ins_verification.sh --mutate
