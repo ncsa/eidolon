@@ -541,6 +541,14 @@ pub fn run_neat(
                 ordered_bodies.extend(bodies.into_iter().map(|(_, path)| path));
             }
         }
+        // Chimeric reads are staged under a pseudo-contig so they do not appear in the BAM
+        // header's reference dictionary. Their records still carry real contig coordinates and
+        // must be appended after the regular per-contig bodies, just as their FASTQs are appended
+        // in the chimeric pass above.
+        if let Some(mut bodies) = bam_body_files.remove("chimeric") {
+            bodies.sort_by_key(|(start, _)| *start);
+            ordered_bodies.extend(bodies.into_iter().map(|(_, path)| path));
+        }
         concat_temp_bams(bam_ctx, &ordered_bodies, bam_path)?;
         info!("Successfully wrote BAM file: {:?}", bam_path);
         files_written.push(bam_path.clone());
