@@ -75,6 +75,40 @@ pub fn reverse_complement(sequence: Vec<Nucleotide>) -> Vec<Nucleotide> {
     rev_comp
 }
 
+/// Reference bases consumed by a generated-read CIGAR.
+///
+/// The generator currently emits `M`, `I`, `D`, and `S`; retain the full SAM
+/// set of reference-consuming ops so this stays correct if it later emits
+/// explicit match/mismatch or reference-skip operations.
+fn reference_span(cigar_ops: &[char]) -> usize {
+    cigar_ops
+        .iter()
+        .filter(|&&op| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
+        .count()
+}
+
+/// Set SAM TLEN from the realized pair geometry rather than the sampled
+/// fragment length. Insertions and soft clips consume no reference; deletions
+/// do, so the sampled length can disagree with what the two CIGARs cover.
+///
+/// Positions are 0-based and ends are exclusive. For equal starts, retain R1
+/// as the positive mate, which makes the otherwise ambiguous sign stable.
+fn set_observed_template_lengths(r1: &mut ReadRecord, r2: &mut ReadRecord) {
+    let left_start = r1.position.min(r2.position);
+    let right_end = (r1.position + reference_span(&r1.cigar_ops))
+        .max(r2.position + reference_span(&r2.cigar_ops));
+    let template_length =
+        i32::try_from(right_end - left_start).expect("generated template length must fit in i32");
+
+    if r1.position <= r2.position {
+        r1.template_length = template_length;
+        r2.template_length = -template_length;
+    } else {
+        r1.template_length = -template_length;
+        r2.template_length = template_length;
+    }
+}
+
 pub fn write_block_fastq<B1: Write, B2: Write>(
     block_fragments: Vec<(usize, usize)>,
     block_map: &MutatedMap,
@@ -258,7 +292,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // (the literal-DEL skip+D-op fix), which legitimately advances
         // seq_index past the deleted bases and exhausts the buffer for
         // long deletions near a fragment edge.
-        let r2_record = if paired_ended {
+        let mut r2_record = if paired_ended {
             let quality_scores_2 =
                 quality_score_model.generate_quality_scores(effective_read_len, rng)?;
             let r2_pos = abs_end.saturating_sub(effective_read_len);
@@ -323,6 +357,12 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         } else {
             None
         };
+
+        if let Some(r2_record) = r2_record.as_mut() {
+            // Both realized CIGARs are available only here, before either mate
+            // is staged and potentially separated by the coordinate writer.
+            set_observed_template_lengths(&mut r1_record, r2_record);
+        }
 
         write_read_to_fastq(&r1_record, buffer1)?;
         if let Some(ref mut bam) = bam_writer {
@@ -800,6 +840,32 @@ mod tests {
         let read: Vec<Nucleotide> = vec![A, A, A, A, C, C, C, C, C];
         let revcomp: Vec<Nucleotide> = vec![G, G, G, G, G, T, T, T, T];
         assert_eq!(reverse_complement(read), revcomp);
+    }
+
+    #[test]
+    fn observed_template_length_includes_deletions_but_not_insertions_or_soft_clips() {
+        let mut r1 = adapter_rec("A", true, false);
+        r1.position = 27;
+        r1.cigar_ops = vec!['M'; 100];
+
+        let mut r2 = adapter_rec("A", true, true);
+        r2.position = 123;
+        // 62M1D20M1I18M2S consumes 101 reference bases. The I and S do not.
+        r2.cigar_ops = [
+            vec!['M'; 62],
+            vec!['D'],
+            vec!['M'; 20],
+            vec!['I'],
+            vec!['M'; 18],
+            vec!['S'; 2],
+        ]
+        .concat();
+
+        set_observed_template_lengths(&mut r1, &mut r2);
+
+        assert_eq!(reference_span(&r1.cigar_ops), 100);
+        assert_eq!(reference_span(&r2.cigar_ops), 101);
+        assert_eq!((r1.template_length, r2.template_length), (197, -197));
     }
 
     // --- adapter readthrough (#125) ---

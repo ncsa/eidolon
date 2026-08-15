@@ -282,27 +282,15 @@ fn golden_bam_is_structurally_sound_at_volume() {
             left.tlen >= 0 && right.tlen <= 0,
             "{qname}: the leftmost mate must carry the positive TLEN"
         );
-        // |TLEN| against the OBSERVED span, with a deliberate tolerance.
-        //
         // SAM v1 §1.4 field 9 defines TLEN as the observed template length: the number of bases
-        // from the leftmost to the rightmost mapped base. eidolon reports the *sampled* fragment
-        // length instead, so the two diverge by the net indel offset whenever the sequencing-error
-        // model puts an `I` or `D` in either mate. Measured over 2894 pairs: 2098 agree exactly,
-        // 493 differ by 1, 34 by 2, one by 4 — and the example that first exposed it has a mate
-        // CIGAR of `62M1D38M`, i.e. a 101 bp reference span for a 100 bp read.
-        //
-        // Tracked separately; not asserted away here, and not blessed either. The tolerance is
-        // wide enough to absorb realistic indel drift and far too narrow to admit the failures
-        // this check exists for — TLEN of zero, TLEN equal to a read length, or a pair whose
-        // mates were matched to the wrong partner, all of which are off by 100 or more.
+        // from the leftmost to the rightmost mapped base. It must reconcile exactly with POS and
+        // the two CIGARs, including deletions that consume reference but not read bases.
         let observed = (max_end(left, right) + 1).saturating_sub(left.pos);
-        let drift = (left.tlen.unsigned_abs() as i64) - observed as i64;
-        assert!(
-            drift.abs() <= 10,
-            "{qname}: |TLEN| {} is {drift} from the observed span {observed} — beyond what \
-             sequencing-error indels can explain, so the pair's template length is wrong rather \
-             than merely imprecise",
-            left.tlen.unsigned_abs()
+        assert_eq!(
+            left.tlen.unsigned_abs() as usize,
+            observed,
+            "{qname}: |TLEN| must equal the observed span from the leftmost to the rightmost \
+             mapped base"
         );
         assert!(
             left.tlen.unsigned_abs() > 0,
