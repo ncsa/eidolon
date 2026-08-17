@@ -15,6 +15,55 @@ Input fidelity is the higher priority. A researcher modelling a specific variant
 to know it reached the output; a mismatched *distribution* is a modelling argument, but
 a variant that silently fails to appear is a broken tool.
 
+## 2026-08-16 characterization addendum
+
+The focused Gate 2b checks and the first Delta performance/BAM measurements are now complete.
+These are baselines for the current `develop` build, not pooled recall estimates.
+
+### Local performance and BAM baseline
+
+The FASTQ-only benchmark (Delta job `21188169`, three replicates per row) remained consistent
+with the earlier chr22 measurement after the BAM changes:
+
+| genome | eidolon median | NEAT 4 median | eidolon RSS | NEAT 4 RSS |
+|---|---:|---:|---:|---:|
+| *E. coli* K-12 | 14.63 s | 94.36 s | 82.1 MB | 204.9 MB |
+| *S. cerevisiae* S288C | 22.85 s | 230.11 s | 63.8 MB | 182.2 MB |
+| GRCh38 chr22 | 62.01 s | 751.47 s | 251.3 MB | 1530.6 MB |
+
+The yeast thread sweep was 22.85 s (1 thread), 11.15 s (4), 7.18 s (16), and 7.68 s (64).
+This benchmark does not produce BAMs. A separate chr22 BAM timing smoke produced 7,780,196
+records, including 60 chimeric records, in 3:05.39 at 230.5 MB peak RSS; `samtools quickcheck`
+passed and the BAM was 843 MB. The result is a BAM-path baseline, not a before/after comparison
+against an older binary.
+
+### First multi-contig GRCh38 SV smoke
+
+Delta job `21170801` (30×, purity 0.6, `SV_RATE_SCALE=1.0`, Manta only) produced 137 somatic
+SV records: 29 DEL, 32 DUP, 15 INV, 2 INS, 52 BND, and 7 CNV. All 52 BND records parsed, and
+the scorer controls passed (truth-vs-truth recall 1.000; shifted-truth decoy recall 0.000).
+There were no intra-contig BND spans because this smoke's BND set was inter-contig, so BNDspan
+scoring was correctly skipped.
+
+| Manta scorer | TP | FN | FP | recall | precision |
+|---|---:|---:|---:|---:|---:|
+| overall scoreable | 67 | 11 | 21 | 0.859 | 0.761 |
+| DEL | 27 | 2 | 3 | 0.931 | 0.900 |
+| DUP | 26 | 6 | 6 | 0.813 | 0.813 |
+| INV | 14 | 1 | 12 | 0.933 | 0.538 |
+| BND | 40 | 12 | 52 | 0.769 | 0.435 |
+| INS | 0 | 2 | 0 | 0.000 | — |
+
+These are PASS-only caller measurements from one replicate, not simulator correctness verdicts.
+Most importantly, the independent INS probe found **2/2 planted insertions in the reads** even
+though Manta emitted no PASS INS calls. Five de novo insertions longer than the 151 bp read
+length were dropped as expected under #516. The run retained 30 GB normal and 70 GB tumor BAMs
+with `PRUNE_BAM=0` for follow-up inspection.
+
+Next characterization steps are a Delly-enabled comparison and three nominal-rate Manta
+replicates pooled with `aggregate_sv_reps.sh`; neither should be interpreted as stable recall
+until all expected replicate summaries are present.
+
 ---
 
 ## Input VCF → output
