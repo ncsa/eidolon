@@ -60,9 +60,29 @@ though Manta emitted no PASS INS calls. Five de novo insertions longer than the 
 length were dropped as expected under #516. The run retained 30 GB normal and 70 GB tumor BAMs
 with `PRUNE_BAM=0` for follow-up inspection.
 
-Next characterization steps are a Delly-enabled comparison and three nominal-rate Manta
-replicates pooled with `aggregate_sv_reps.sh`; neither should be interpreted as stable recall
-until all expected replicate summaries are present.
+Follow-up characterization is complete. The initial smoke is retained above as a historical
+single-run baseline; the follow-up observations below provide the caller comparison and the
+nominal-rate Manta repeatability check. These are still separate from the larger pooled campaign
+reported in the whole-genome tier below.
+
+### Follow-up multi-contig GRCh38 observations
+
+Delta job `21226562` reran the same 30×/0.6/`SV_RATE_SCALE=1.0` design with both Manta and Delly
+on one simulated tumor/normal pair. The truth again contained 137 somatic records (including
+52 BNDs), all 52 BNDs parsed with zero unpaired or mispaired junctions, and all scorer controls
+passed. Manta recovered 42/52 BNDs (recall 0.808, precision 0.457); Delly recovered 20/52
+(recall 0.385, precision 1.000). Overall scoreable recall/precision were 0.795/0.747 for Manta
+and 0.821/0.660 for Delly. The independent insertion probe found both planted insertions in
+the reads (2/2); the zero `manta_INS` score is therefore a PASS-filter limitation, not evidence
+that the simulator omitted the insertions.
+
+Delta job `21249416` supplied the third nominal-rate Manta observation. It reproduced the same
+truth counts and clean BND geometry (52/52 parsed; 0 unpaired or mispaired), with scorer
+self-tests and decoys passing. Manta scored 67 TP, 11 FN, and 20 FP overall (recall 0.859,
+precision 0.770), and 42 TP, 10 FN, and 50 FP for BND (recall 0.808, precision 0.457). Across
+the three Manta observations, BND recall was approximately 0.77–0.81 while aggregate recall
+remained about 0.86. The consistent truth-side checks and the caller-to-caller difference in
+BND recovery support a caller/representation limitation rather than a simulator defect.
 
 ---
 
