@@ -744,6 +744,7 @@ fi
 # ── Stage 5: Score each caller with truvari (overall + per SV type) ──────
 echo "[5/5] Scoring SVs with truvari..."
 conda_activate "$TRUVARI_ENV"
+printf 'label\tfilter\tTP\tFN\tFP\trecall\tprecision\tf1\n' > "$OUTDIR/scorer_recall.tsv"
 
 # Pick the tumor sample from a caller VCF. truvari otherwise takes the FIRST sample,
 # which for Manta's somaticSV is NORMAL — so every somatic comparison was reading the
@@ -762,14 +763,23 @@ run_truvari() {  # <truth.vcf.gz> <out-label> <comp.vcf.gz> [extra truvari args.
     local label="$2"
     local comp="$3"
     shift 3
-    local out="$OUTDIR/truvari_$label"
+    local all_calls="${TRUVARI_ALL_CALLS:-0}"
+    local filter_name="PASS-only"
+    local suffix=""
+    local filter_args=(--passonly)
+    if [[ "$all_calls" == "1" ]]; then
+        filter_name="all-calls"
+        suffix="_allcalls"
+        filter_args=()
+    fi
+    local out="$OUTDIR/truvari_${label}${suffix}"
     local csample; csample=$(comp_sample "$comp")
     rm -rf "$out"   # truvari requires the output dir not pre-exist
     truvari bench -b "$truth" -c "$comp" -f "$REFERENCE" -o "$out" \
-        --passonly --sizemax "$TRUVARI_SIZEMAX" \
+        "${filter_args[@]}" --sizemax "$TRUVARI_SIZEMAX" \
         ${csample:+--cSample "$csample"} "$@" 2>&1 | tail -3 || true
     if [[ -f "$out/summary.json" ]]; then
-        python3 - "$out/summary.json" "$label" <<'PY'
+        python3 - "$out/summary.json" "${label}${suffix}" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1])); name = sys.argv[2]
 # truvari writes null (None) for metrics when a subset has no comparisons;
@@ -777,12 +787,32 @@ s = json.load(open(sys.argv[1])); name = sys.argv[2]
 print(f"  {name:<18} recall={(s.get('recall') or 0):.3f}  precision={(s.get('precision') or 0):.3f}  "
       f"f1={(s.get('f1') or 0):.3f}  TP={s.get('TP-base') or 0}  FN={s.get('FN') or 0}  FP={s.get('FP') or 0}")
 PY
-        check_denominator "$truth" "$out" "$label" || true
-        check_query_denominator "$comp" "$out" "$label" || QUERY_FILTERED+=("$label")
+        python3 - "$out/summary.json" "$label" "$filter_name" >> "$OUTDIR/scorer_recall.tsv" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+def n(key):
+    return s.get(key) or 0
+def f(key):
+    value = s.get(key)
+    return "" if value is None else f"{value:.6f}"
+print("\t".join([sys.argv[2], sys.argv[3], str(n("TP-base")), str(n("FN")),
+                   str(n("FP")), f("recall"), f("precision"), f("f1")]))
+PY
+        check_denominator "$truth" "$out" "${label}${suffix}" || true
+        check_query_denominator "$comp" "$out" "${label}${suffix}" || QUERY_FILTERED+=("${label}${suffix}")
     else
         echo "  $label: truvari produced no summary.json (see $out)"
         SCORE_COVERAGE_FAIL=$((SCORE_COVERAGE_FAIL + 1))
     fi
+}
+
+# Caller results are reported twice: the existing PASS-only score remains the headline, while
+# the all-calls score attributes matches hidden solely by the pipeline's filter. The paired
+# summaries and scorer_recall.tsv make the distinction durable instead of leaving it implicit
+# in the query-coverage warning (#541).
+run_truvari_both() {  # <truth.vcf.gz> <out-label> <comp.vcf.gz> [extra truvari args...]
+    run_truvari "$@"
+    TRUVARI_ALL_CALLS=1 run_truvari "$@"
 }
 
 # Coverage check: truvari's TP-base+FN is its POST-filter base count. If that is less than
@@ -1270,7 +1300,7 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
             n_all=$(bcftools view -H "$comp" 2>/dev/null | wc -l)
             n_sub=$(bcftools view -H "$qs" 2>/dev/null | wc -l)
             echo "  (aggregate query: $n_sub of $n_all $caller call(s); $((n_all - n_sub)) BND/CNV call(s) excluded, scored separately)"
-            run_truvari "$TRUTH_SCOREABLE" "${caller}_overall" "$qs"
+            run_truvari_both "$TRUTH_SCOREABLE" "${caller}_overall" "$qs"
         fi
     else
         echo "  ($caller: no truvari-scoreable truth types — aggregate skipped)"
@@ -1296,7 +1326,7 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
         bcftools view -i "INFO/SVTYPE=\"$svt\"" -O z -o "$q" "$comp" 2>/dev/null || true
         if [[ -f "$q" ]] && [[ "$(bcftools view -H "$q" 2>/dev/null | wc -l)" -gt 0 ]]; then
             bcftools index -f -t "$q" 2>/dev/null || true
-            run_truvari "$typed" "${caller}_${svt}" "$q"
+            run_truvari_both "$typed" "${caller}_${svt}" "$q"
         else
             rm -f "$q" "${q}.tbi"
             # Recall is 0 by definition; say so rather than emit a precision figure
@@ -1316,7 +1346,7 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
         bcftools view -i 'INFO/SVTYPE="BND"' -O z -o "$qb" "$raw_comp" 2>/dev/null || true
         if [[ -f "$qb" ]] && [[ "$(bcftools view -H "$qb" 2>/dev/null | wc -l)" -gt 0 ]]; then
             bcftools index -f -t "$qb" 2>/dev/null || true
-            run_truvari "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
+            run_truvari_both "$OUTDIR/truth_sv_BND.vcf.gz" "${caller}_BND" "$qb" \
                 --bnddist "$BND_DIST"
             # RETIRED: the BND/BNDinv split (#507). It existed because the de novo
             # sampler hardcoded the mate to the anchor's own contig, and within one
@@ -1350,7 +1380,7 @@ score_caller() {  # <caller> <comp.vcf.gz> [raw_comp.vcf.gz]
     # recall the measurement and FP/precision uninterpretable (every unrelated call is
     # an unmatched comp record), so say so rather than let the number be quoted.
     if [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" && "$BNDSPAN_VALID" -eq 1 ]]; then
-        run_truvari "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$raw_comp" -t
+        run_truvari_both "$OUTDIR/truth_sv_BNDspan.vcf.gz" "${caller}_BNDspan" "$raw_comp" -t
         echo "    ^ BNDspan: recall is the measurement; precision/FP/f1 are NOT — the query"
         echo "      is intentionally unfiltered because the caller may use any SVTYPE here."
     elif [[ -f "$OUTDIR/truth_sv_BNDspan.vcf.gz" ]]; then
@@ -1715,7 +1745,7 @@ prune_bams "$OUTDIR"
 
 # Persist report artifacts off scratch + record provenance/resources.
 # (manta overall always exists; delly summaries remain under $OUTDIR/truvari_delly_*)
-archive_run sv "$OUTDIR" truvari_manta_overall/summary.json
+archive_run sv "$OUTDIR" truvari_manta_overall/summary.json scorer_recall.tsv
 
 # ── Deferred failure gate ────────────────────────────────────────────────
 # Deliberately last. Every discrepancy is reported inline next to the comparison it
