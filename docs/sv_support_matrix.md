@@ -20,6 +20,17 @@ a variant that silently fails to appear is a broken tool.
 The focused Gate 2b checks and the first Delta performance/BAM measurements are now complete.
 These are baselines for the current `develop` build, not pooled recall estimates.
 
+### Post-#537 subclonal SV smoke (develop `4a3ea4a`)
+
+Delta jobs `21281985` and `21282371` exercised the merged subclone-SV implementation on
+multi-contig *S. cerevisiae*. The higher-rate run produced 12 SV records (7 at CCF 0.2,
+1 at CCF 0.5, and 4 clonal at CCF 1.0); all 12 carried `EIDOLON_CCF` and
+`EIDOLON_VAF`. Three reciprocal translocation pairs shared CCFs of 0.2, 1.0, and 0.2.
+After bwa-mem2 alignment, 199 chimeric alignments were retained, 100% of 2,426,389 reads
+mapped, 69 were supplementary, and 99.99% were properly paired. This validates CCF
+stamping, reciprocal-BND pairing, and read-level junction survival; it is not a caller
+recall estimate. A full-GRCh38 run is in progress as the release-candidate stress test.
+
 ### Local performance and BAM baseline
 
 The FASTQ-only benchmark (Delta job `21188169`, three replicates per row) remained consistent
@@ -449,8 +460,12 @@ planted insertions, so an INS-enriched model is likely the only route to a usabl
 - **Input fidelity at scale.** Every cell above this section is still H1N1-only.
 - **Dosage.** Detection is not dosage; the ~8% over-delivery (#499) was measured on a 1.2 kb
   event and has never been checked at these sizes.
-- **Subclonal behaviour.** SVs receive no CCF at all ([#537](https://github.com/ncsa/eidolon/issues/537)),
-  so every somatic SV here is clonal within the tumor regardless of the subclone model.
+- **Subclonal behaviour.** **Resolved for de-novo SVs in #537.** Supported DEL/DUP/INV/INS/CNV
+  records now carry `EIDOLON_CCF`/`EIDOLON_VAF` and use CCF-adjusted depth and junction
+  evidence; reciprocal translocation BND mates share one CCF. Delta yeast validation
+  exercised CCF 0.2/0.5/1.0 and retained 199 chimeric alignments. This section's older
+  nominal-rate campaign predates that fix; the full-GRCh38 post-fix run is the current
+  release-candidate stress test.
 - **Small events.** The planted set skews very large (DUP 3.4 Mb, DEL 9.1 Mb, INV 2.0 Mb).
   Multi-megabase events are easy to detect by depth; these recall figures say little about the
   1–50 kb range where callers actually struggle.

@@ -1,3 +1,36 @@
+Unreleased
+==========
+
+## Release-candidate validation and SV follow-up
+
+The current `develop` line is release-candidate ready pending the full-GRCh38 Delta
+stress run. Gate 2b BAM correctness is now covered by focused orientation, QNAME, TLEN,
+and planted-SV checks, with a full-GRCh38 BAM timing baseline recorded separately.
+
+### Subclonal structural variants (#537)
+
+- De-novo DEL/DUP/INV/INS/CNV records now receive the configured subclone CCF.
+- Reciprocal translocation BND mates share one sampled CCF.
+- CCF now controls SV depth modulation, chimeric/junction evidence, and breakpoint
+  double-count suppression.
+- Somatic truth records carry `INFO/EIDOLON_CCF` and purity-scaled
+  `INFO/EIDOLON_VAF` (`purity × dosage × CCF`).
+- The no-subclone path remains backward-compatible; focused tests, the full Rust suite,
+  and Delta yeast multi-contig runs passed. The larger Delta smoke produced 12 tagged
+  SVs (CCF 0.2/0.5/1.0), 199 chimeric alignments, 100% mapping, and 99.99% proper pairing.
+
+### Known SV limitations
+
+- Large literal insertions are only partially realized beyond the read-length ceiling
+  (#516); the truth VCF retains the declared full `SVLEN`.
+- Inserted sequence in input BND ALT alleles is not yet carried through junction reads
+  (#498), and symbolic `<INS>` remains a separate unsupported/silent path (#500).
+- SV depth modulation has a measured small over-delivery bias for non-binary multipliers
+  (#499).
+- Caller-level INS recall remains underpowered at nominal whole-genome rates and should
+  not be inferred from a single replicate.
+- These are documented follow-ups, not blockers for the current release candidate.
+
 7/31/2026
 =========
 ## eidolon v3.1.0 — de novo breakends now carry the junction they describe

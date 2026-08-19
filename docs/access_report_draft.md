@@ -991,6 +991,29 @@ a *real tumor's* empirical VAF spectrum — a complexity axis (intra-tumor heter
 predecessor could not represent at all. Harnesses: `scripts/delta/run_subclonal_vaf_validation.sh`
 (generative) and `scripts/delta/run_hcc1395_reproductive.sh` (reproductive).
 
+#### 3.12.1 Subclonal SV extension (#537)
+
+The subclone model now applies to de-novo structural variants as well as SNVs/indels.
+Each supported SV receives `dosage × CCF`; reciprocal translocation BND mates share one
+sampled CCF; and the read generator uses that fraction for interval depth, chimeric
+junction evidence, and breakpoint double-count suppression. Somatic truth records carry
+`INFO/EIDOLON_CCF` and the purity-scaled `INFO/EIDOLON_VAF`.
+
+The post-merge Delta smoke on multi-contig *S. cerevisiae* (jobs `21281985` and
+`21282371`, develop `4a3ea4a`) first confirmed the tag and mate-pair invariants, then
+produced 12 SV records spanning CCF 0.2, 0.5, and 1.0. All 12 records carried both
+ground-truth tags. Three reciprocal BND pairs shared CCFs of 0.2, 1.0, and 0.2. After
+bwa-mem2 alignment, 199 chimeric alignments survived; all 2,426,389 reads mapped,
+69 were supplementary, and 99.99% were properly paired.
+
+This is read-level and representation validation, not a caller recall estimate. The
+full-GRCh38 stress run is the remaining release-candidate check. Known SV limitations
+remain: literal insertions beyond `read_len - 1` are only partially realized (#516),
+inserted sequence in input BND alleles is not yet carried through junction reads (#498),
+symbolic `<INS>` is not a supported read-level path (#500), non-binary SV depth has a
+small measured over-delivery bias (#499), and nominal-rate single replicates are too
+sparse to establish INS caller recall.
+
 ---
 
 ## 4. Phase 2 — robustness at scale (planned, key deliverables)
