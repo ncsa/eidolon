@@ -15,6 +15,84 @@ Input fidelity is the higher priority. A researcher modelling a specific variant
 to know it reached the output; a mismatched *distribution* is a modelling argument, but
 a variant that silently fails to appear is a broken tool.
 
+## 2026-08-16 characterization addendum
+
+The focused Gate 2b checks and the first Delta performance/BAM measurements are now complete.
+These are baselines for the current `develop` build, not pooled recall estimates.
+
+### Local performance and BAM baseline
+
+The FASTQ-only benchmark (Delta job `21188169`, three replicates per row) remained consistent
+with the earlier chr22 measurement after the BAM changes:
+
+| genome | eidolon median | NEAT 4 median | eidolon RSS | NEAT 4 RSS |
+|---|---:|---:|---:|---:|
+| *E. coli* K-12 | 14.63 s | 94.36 s | 82.1 MB | 204.9 MB |
+| *S. cerevisiae* S288C | 22.85 s | 230.11 s | 63.8 MB | 182.2 MB |
+| GRCh38 chr22 | 62.01 s | 751.47 s | 251.3 MB | 1530.6 MB |
+
+The yeast thread sweep was 22.85 s (1 thread), 11.15 s (4), 7.18 s (16), and 7.68 s (64).
+This benchmark does not produce BAMs. A separate chr22 BAM timing smoke produced 7,780,196
+records, including 60 chimeric records, in 3:05.39 at 230.5 MB peak RSS; `samtools quickcheck`
+passed and the BAM was 843 MB. The result is a BAM-path baseline, not a before/after comparison
+against an older binary.
+
+A full-primary-assembly BAM-only run (Delta job `21262840`, GRCh38 at 30×, 128 requested
+threads) completed successfully in 23:56.16. It wrote 583,088,206 records to a 62 GB BAM;
+`samtools quickcheck` passed. Process-level `/usr/bin/time` reported 13.6 GiB peak RSS and
+924% CPU utilization (about 9.2 cores), showing that this path does not scale to all 128
+requested threads. Slurm reported a much larger 111 GiB `MaxRSS`; that accounting value is
+retained as a cluster-side note, while the process-level measurement is the comparable RSS
+figure. This run produced no input SVs, so it characterizes full-genome BAM throughput and
+resource use rather than BND recovery.
+
+### First multi-contig GRCh38 SV smoke
+
+Delta job `21170801` (30×, purity 0.6, `SV_RATE_SCALE=1.0`, Manta only) produced 137 somatic
+SV records: 29 DEL, 32 DUP, 15 INV, 2 INS, 52 BND, and 7 CNV. All 52 BND records parsed, and
+the scorer controls passed (truth-vs-truth recall 1.000; shifted-truth decoy recall 0.000).
+There were no intra-contig BND spans because this smoke's BND set was inter-contig, so BNDspan
+scoring was correctly skipped.
+
+| Manta scorer | TP | FN | FP | recall | precision |
+|---|---:|---:|---:|---:|---:|
+| overall scoreable | 67 | 11 | 21 | 0.859 | 0.761 |
+| DEL | 27 | 2 | 3 | 0.931 | 0.900 |
+| DUP | 26 | 6 | 6 | 0.813 | 0.813 |
+| INV | 14 | 1 | 12 | 0.933 | 0.538 |
+| BND | 40 | 12 | 52 | 0.769 | 0.435 |
+| INS | 0 | 2 | 0 | 0.000 | — |
+
+These are PASS-only caller measurements from one replicate, not simulator correctness verdicts.
+Most importantly, the independent INS probe found **2/2 planted insertions in the reads** even
+though Manta emitted no PASS INS calls. Five de novo insertions longer than the 151 bp read
+length were dropped as expected under #516. The run retained 30 GB normal and 70 GB tumor BAMs
+with `PRUNE_BAM=0` for follow-up inspection.
+
+Follow-up characterization is complete. The initial smoke is retained above as a historical
+single-run baseline; the follow-up observations below provide the caller comparison and the
+nominal-rate Manta repeatability check. These are still separate from the larger pooled campaign
+reported in the whole-genome tier below.
+
+### Follow-up multi-contig GRCh38 observations
+
+Delta job `21226562` reran the same 30×/0.6/`SV_RATE_SCALE=1.0` design with both Manta and Delly
+on one simulated tumor/normal pair. The truth again contained 137 somatic records (including
+52 BNDs), all 52 BNDs parsed with zero unpaired or mispaired junctions, and all scorer controls
+passed. Manta recovered 42/52 BNDs (recall 0.808, precision 0.457); Delly recovered 20/52
+(recall 0.385, precision 1.000). Overall scoreable recall/precision were 0.795/0.747 for Manta
+and 0.821/0.660 for Delly. The independent insertion probe found both planted insertions in
+the reads (2/2); the zero `manta_INS` score is therefore a PASS-filter limitation, not evidence
+that the simulator omitted the insertions.
+
+Delta job `21249416` supplied the third nominal-rate Manta observation. It reproduced the same
+truth counts and clean BND geometry (52/52 parsed; 0 unpaired or mispaired), with scorer
+self-tests and decoys passing. Manta scored 67 TP, 11 FN, and 20 FP overall (recall 0.859,
+precision 0.770), and 42 TP, 10 FN, and 50 FP for BND (recall 0.808, precision 0.457). Across
+the three Manta observations, BND recall was approximately 0.77–0.81 while aggregate recall
+remained about 0.86. The consistent truth-side checks and the caller-to-caller difference in
+BND recovery support a caller/representation limitation rather than a simulator defect.
+
 ---
 
 ## Input VCF → output
