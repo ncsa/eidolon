@@ -112,7 +112,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage scaled_replicate_peak_gb reference_bp; do
+for fn in truvari_metric selftest_truvari decoy_truvari comp_sample run_truvari run_truvari_both check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage scaled_replicate_peak_gb reference_bp; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -167,6 +167,18 @@ build_truth() {
 }
 build_truth
 TRUTH="$WORK/truth.vcf.gz"
+
+echo "── run_truvari_both: retain PASS-only and all-calls measurements ──"
+printf 'label\tfilter\tTP\tFN\tFP\trecall\tprecision\tf1\n' > "$OUTDIR/scorer_recall.tsv"
+STUB_MODE=json STUB_RECALL=0.5 STUB_TPBASE=4 STUB_FN=0 \
+    run_truvari_both "$TRUTH" regression "$TRUTH" >/dev/null 2>&1
+is "PASS-only summary is written" 1 \
+   "$(test -f "$OUTDIR/truvari_regression/summary.json" && echo 1 || echo 0)"
+is "all-calls summary is written" 1 \
+   "$(test -f "$OUTDIR/truvari_regression_allcalls/summary.json" && echo 1 || echo 0)"
+is "recall report has header plus both filters" 3 \
+   "$(wc -l < "$OUTDIR/scorer_recall.tsv")"
+has "recall report names all-calls" "$(cat "$OUTDIR/scorer_recall.tsv")" "all-calls"
 
 echo "── truvari_metric: an absent measurement is not a zero ──"
 rm -f "$WORK/none.json"
