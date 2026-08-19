@@ -37,6 +37,15 @@ records, including 60 chimeric records, in 3:05.39 at 230.5 MB peak RSS; `samtoo
 passed and the BAM was 843 MB. The result is a BAM-path baseline, not a before/after comparison
 against an older binary.
 
+A full-primary-assembly BAM-only run (Delta job `21262840`, GRCh38 at 30×, 128 requested
+threads) completed successfully in 23:56.16. It wrote 583,088,206 records to a 62 GB BAM;
+`samtools quickcheck` passed. Process-level `/usr/bin/time` reported 13.6 GiB peak RSS and
+924% CPU utilization (about 9.2 cores), showing that this path does not scale to all 128
+requested threads. Slurm reported a much larger 111 GiB `MaxRSS`; that accounting value is
+retained as a cluster-side note, while the process-level measurement is the comparable RSS
+figure. This run produced no input SVs, so it characterizes full-genome BAM throughput and
+resource use rather than BND recovery.
+
 ### First multi-contig GRCh38 SV smoke
 
 Delta job `21170801` (30×, purity 0.6, `SV_RATE_SCALE=1.0`, Manta only) produced 137 somatic
