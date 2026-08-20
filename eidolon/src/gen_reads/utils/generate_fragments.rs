@@ -1043,14 +1043,8 @@ mod tests {
     #[test]
     fn prototype_insertion_windows_cover_interior_and_tail() {
         let mut rng = make_rng();
-        let windows = prototype_insertion_read_windows(
-            600,
-            100,
-            12,
-            vec![250; 12],
-            &mut rng,
-        )
-        .unwrap();
+        let windows =
+            prototype_insertion_read_windows(600, 100, 12, vec![250; 12], &mut rng).unwrap();
 
         assert!(!windows.is_empty());
         assert!(
@@ -1061,9 +1055,11 @@ mod tests {
             windows.iter().any(|&(_, end)| end >= 570),
             "prototype must reach the far end of a long insertion"
         );
-        assert!(windows.iter().all(|&(start, end)| {
-            end > start && end - start <= 100 && end <= 600
-        }));
+        assert!(
+            windows
+                .iter()
+                .all(|&(start, end)| { end > start && end - start <= 100 && end <= 600 })
+        );
     }
 
     #[test]
