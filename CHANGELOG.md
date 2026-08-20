@@ -1,3 +1,39 @@
+8/19/2026
+=========
+## eidolon v3.1.0 — correctness and validation release
+
+This release is primarily a correctness and validation release: it hardens BAM and
+artifact measurements, corrects SV truth/read mismatches, and records Delta validation
+at primary-assembly scale. It also extends the existing subclone model to structural
+variants. The insertion limitations listed below remain known and documented.
+
+### Subclonal structural variants (#537)
+
+- De-novo DEL/DUP/INV/INS/CNV records now receive the configured subclone CCF.
+- Reciprocal translocation BND mates share one sampled CCF.
+- CCF now controls SV depth modulation, chimeric/junction evidence, and breakpoint
+  double-count suppression.
+- Somatic truth records carry `INFO/EIDOLON_CCF` and purity-scaled
+  `INFO/EIDOLON_VAF` (`purity × dosage × CCF`).
+- The no-subclone path remains backward-compatible; focused tests, the full Rust suite,
+  and Delta yeast multi-contig runs passed. The larger Delta smoke produced 12 tagged
+  SVs (CCF 0.2/0.5/1.0), 199 chimeric alignments, 100% mapping, and 99.99% proper pairing.
+- The full-GRCh38 Delta run produced 140 tagged SVs (31 at CCF 0.2, 43 at CCF 0.5,
+  66 clonal), 2,837 chimeric alignments, 588,995,182 mapped reads, and a 71 GB BAM;
+  99.99% of reads were properly paired.
+
+### Known SV limitations
+
+- Large literal insertions are only partially realized beyond the read-length ceiling
+  (#516); the truth VCF retains the declared full `SVLEN`.
+- Inserted sequence in input BND ALT alleles is not yet carried through junction reads
+  (#498), and symbolic `<INS>` remains a separate unsupported/silent path (#500).
+- SV depth modulation has a measured small over-delivery bias for non-binary multipliers
+  (#499).
+- Caller-level INS recall remains underpowered at nominal whole-genome rates and should
+  not be inferred from a single replicate.
+- These are documented follow-ups, not blockers for the current release candidate.
+
 7/31/2026
 =========
 ## eidolon v3.1.0 — de novo breakends now carry the junction they describe
