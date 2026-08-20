@@ -1,3 +1,236 @@
+8/19/2026
+=========
+## eidolon v3.1.0 — correctness and validation release
+
+This release is primarily a correctness and validation release: it hardens BAM and
+artifact measurements, corrects SV truth/read mismatches, and records Delta validation
+at primary-assembly scale. It also extends the existing subclone model to structural
+variants. The insertion limitations listed below remain known and documented.
+
+### Subclonal structural variants (#537)
+
+- De-novo DEL/DUP/INV/INS/CNV records now receive the configured subclone CCF.
+- Reciprocal translocation BND mates share one sampled CCF.
+- CCF now controls SV depth modulation, chimeric/junction evidence, and breakpoint
+  double-count suppression.
+- Somatic truth records carry `INFO/EIDOLON_CCF` and purity-scaled
+  `INFO/EIDOLON_VAF` (`purity × dosage × CCF`).
+- The no-subclone path remains backward-compatible; focused tests, the full Rust suite,
+  and Delta yeast multi-contig runs passed. The larger Delta smoke produced 12 tagged
+  SVs (CCF 0.2/0.5/1.0), 199 chimeric alignments, 100% mapping, and 99.99% proper pairing.
+- The full-GRCh38 Delta run produced 140 tagged SVs (31 at CCF 0.2, 43 at CCF 0.5,
+  66 clonal), 2,837 chimeric alignments, 588,995,182 mapped reads, and a 71 GB BAM;
+  99.99% of reads were properly paired.
+
+### Known SV limitations
+
+- Large literal insertions are only partially realized beyond the read-length ceiling
+  (#516); the truth VCF retains the declared full `SVLEN`.
+- Inserted sequence in input BND ALT alleles is not yet carried through junction reads
+  (#498), and symbolic `<INS>` remains a separate unsupported/silent path (#500).
+- SV depth modulation has a measured small over-delivery bias for non-binary multipliers
+  (#499).
+- Caller-level INS recall remains underpowered at nominal whole-genome rates and should
+  not be inferred from a single replicate.
+- These are documented follow-ups, not blockers for the current release candidate.
+
+7/31/2026
+=========
+## eidolon v3.1.0 — de novo breakends now carry the junction they describe
+
+**Breaking for anyone benchmarking against the BND truth**, though no emitted format
+changes. What changes is what a BND *is* in the output.
+
+Also carries everything staged as v3.0.1 below, which was never tagged separately.
+
+### The truth VCF described a rearrangement the reads did not carry
+
+The chimeric read generator dispatches on `bnd_join_after` / `bnd_mate_extends_right`,
+not on the ALT string. Those flags are assigned only by the input-VCF parser, so a de
+novo BND left them at their `SvData::new` defaults of `false/false` — VCF 4.2 **case 4,
+`]p]t`, a direct join with no reverse complement** — while the ALT written to the truth
+was **`t]p]`, case 2, head-to-head with the mate piece reverse-complemented**.
+`sv_model.rs` never set them at all.
+
+A direct intra-contig join is not a breakend. Joining A-left to B-right *is* a deletion;
+the reverse *is* a duplication. eidolon has been planting DELs and DUPs and labelling
+them BNDs since v1.13.1 (#224) — the #451 fix only replaced the literal `N` with the real
+anchor base, leaving the bracket form untouched.
+
+This is the root cause of `BND recall=0.000`, which survived repeated confident
+explanations. It was never a caller failure and never a scoring artifact. On Delta job 20675480
+Manta placed DEL/DUP candidates within **1–2 bp of all seven planted junctions**, emitted
+no INV and no breakend anywhere near them, and was marked as having found none of them:
+
+| planted junction | Manta candidate | worst endpoint error |
+|---|---|---|
+| 20592138-49516423 | DUP 20592137-49516423 | 1 bp |
+| 20610778-45788036 | DEL 20610777-45788034 | 2 bp |
+| 26790171-36133098 | DEL 26790171-36133097 | 1 bp |
+| 34999235-36134214 | DUP 34999234-36134214 | 1 bp |
+| 40696874-53467765 | DUP 40696872-53467764 | 2 bp |
+| 47038466-51969855 | DUP 47038465-51969855 | 1 bp |
+| 50310249-51236091 | DEL 50310249-51236090 | 1 bp |
+
+The reads were never at fault: 7–15 discordant pairs and 3–15 split reads at each of the
+14 breakends, which is what a het somatic junction should look like at 18×. The caller
+was right, the reads were right, and the truth was wrong.
+
+`sv_model.rs` now sets both flags to match the `t]p]` ALT it emits, on the anchor and the
+mate. A reciprocal `t]p]` ↔ `t]p]` pair is the spec's own worked example, so the ALT
+stays and the reads move to match it.
+
+### Why the tests did not catch it
+
+`bnd_fastq.rs` drives the **input** path — where the parser sets the flags correctly, so
+the one path that was never broken — and asserts only that some read is named
+`EIDOLON_chimeric`. An existence check on the working case. `get_bnd_pieces` had no tests
+at all, so nothing in the suite could distinguish a direct join from a head-to-head one.
+
+Now pinned at both ends: `denovo_bnd_read_geometry_matches_the_alt_it_declares` parses
+the emitted ALT with the same parser the input path uses and asserts the flags agree
+(verified to fail before the fix), and `bnd_pieces_reverse_complement_exactly_the_spec_
+cases` pins all four VCF 4.2 forms and which piece is reverse-complemented.
+
+## eidolon v3.0.1 — measurement integrity (never tagged; shipped inside v3.1.0)
+
+Staged as its own patch release and then folded in, because the result that would have
+justified tagging it — the #450 subclonal-VAF confirmation from Delta job 20675479 — ran
+*before* the last three measurement fixes merged. A tag cut afterwards would not have
+been the code that produced the number, so there was nothing to cite it for. The
+validation campaign runs on v3.1.0 instead, and everything below ships there.
+
+**Fixes only; no feature work and no change to simulated output.** Every item here is a
+defect in something that *measures* eidolon, not in eidolon's simulation. They are
+grouped into one patch release deliberately, so the Delta validation campaign that
+follows attaches to a tagged version whose only difference from v3.0.0 is that the
+measurements are now correct.
+
+The common shape, and the reason these went unnoticed: each reported a plausible number
+rather than failing. A harness that says `VERDICT: PASS` over a subset it silently
+excluded, or `recall=0.000` for a comparison it could never make, is harder to catch
+than a crash.
+
+### `compare-vcfs` emitted VCFs with undeclared INFO tags (#444)
+
+`FN_with_reasons.vcf` and `FP.vcf` pass each record's INFO column through verbatim but
+wrote a fixed minimal header, so the artifacts carried tags their own header never
+declared. bcftools tolerates that streaming VCF→VCF but hard-fails on BCF translation —
+which `bcftools concat | sort` does internally — so it surfaced far downstream as an
+opaque failure.
+
+A fixed declaration set cannot work, because the two artifacts have different
+provenance: FN records come from the **golden** VCF, FP records from the **called** VCF,
+whose INFO is whatever the caller emitted (Mutect2 `TLOD`/`MBQ`, Strelka `SomaticEVS`).
+Each artifact now inherits `##INFO`/`##FILTER`/`##FORMAT`/`##ALT`/`##contig` from its own
+source, backfills an ID-only `##contig` for any record contig the source itself failed to
+declare, and adds `GT` only when absent.
+
+### Observed VAF was measured through a genotype call, destroying the low-VAF sites (#450)
+
+The subclonal-VAF harness excluded the sites it exists to validate — 160 of 567 planted
+sites, including an entire CCF cluster. Because the exclusion is VAF-dependent, the
+reported bias was optimistic in the direction that flattered the result.
+
+`bcftools mpileup | bcftools call -m -C alleles` was the cause. `-C alleles` constrains
+which alleles are considered, but `call -m` still makes a diploid ML **genotype** call,
+and a hom-ref call discards the uncalled allele together with its read count. On a
+synthetic 200× BAM carrying the three CCF clusters, `call -m` destroyed **two of three**:
+
+| site | intended | `mpileup \| call -m` | `mpileup` alone |
+|---|---|---|---|
+| 331 | 0.350 | `ALT=T` `AD=130,70` | `AD=130,70,0` → 0.350 |
+| 631 | 0.175 | `ALT=.` `AD=165` | `AD=165,35,0` → 0.175 |
+| 931 | 0.070 | `ALT=.` `AD=186` | `AD=186,14,0` → 0.070 |
+
+Coverage cannot rescue it — identical at 100×/300×/600× — because the decision is driven
+by the allele *fraction* against a diploid model, and no diploid genotype predicts 7%.
+
+Both harnesses now read `FORMAT/AD` straight from mpileup. This also fixes
+`run_scn_af_validation.sh` (#398's pool-AF validation), which shared the defect and was
+worse: with no `-C alleles` at all, sites the caller declined to call vanished entirely —
+the low end of the very spectrum it validates. `scn_af_compare.py` gained multi-allelic
+expansion (so the truth's ALT matches against mpileup's `T,<*>` list and selects that
+allele's own AD element), arity-checked per-allele fields (it had been taking `[0]`,
+reporting the *first* allele's fraction for every allele of a multi-allelic record), and
+zero-fill: a truth ALT the observed side never listed at a covered position now scores
+**0.0 observed** rather than being dropped, since otherwise the VAF-dependent exclusion
+just moves to a lower threshold.
+
+### SV scoring reported numbers that were not measurements (#457)
+
+Three defects:
+
+- **Per-type runs filtered the truth but not the query**, so every record of another type
+  counted as a false positive — producing arithmetically impossible output, with
+  `manta_BND FP=39` against `manta_overall FP=20`. A subset cannot have more false
+  positives than the whole. Per-type precision/FP/f1 from this harness were meaningless;
+  only per-type recall was ever sound.
+- **BND was scored with the wrong tool settings, not unscoreable.** truvari **can**
+  benchmark breakends — `-B/--bnddist` has existed since v5.0.0, and Delta runs v5.4.0.
+  The harness simply never passed it, and the resulting `recall=0.000` was misread as a
+  tool limitation. BND is now scored two ways, because callers represent a junction two
+  ways: breakend-to-breakend via `--bnddist`, and against a **derived junction span**
+  (one record per junction, `POS`=min, `END`=max) for callers that re-represent a
+  junction as `<DUP:TANDEM>`/`<DEL>`/`<INV>` — a span and a point record are not
+  interval-comparable, which no similarity threshold can bridge. Both are reported and
+  labelled. Spans are a comparison artifact only; `END` on an emitted BND still equals
+  `POS` per VCF 4.2 §5.4.
+- **The aggregate was dominated by unmatchable types.** BND + CNV were 23 of 47 truth
+  records in one run, all guaranteed misses, capping the aggregate near 0.5 regardless of
+  caller quality — and making v3.0.0's *correct* BND fix look like a regression
+  (0.667 → 0.413). The aggregate now covers only the truvari-scoreable subset and states
+  what it excluded and where each type is scored instead.
+
+#### Coverage of the planted set is now enforced, not warned about
+
+Fixing the cause is not enough, because the harness had no way to *notice* the problem:
+it reported bias and MAE over whatever survived and said `VERDICT: PASS`. A subset that
+drops the lowest-VAF stratum produces numbers that look **better** than an honest
+full-coverage run — on a reproduction of #450, bias `+0.0011` / MAE `0.0227` against
+`+0.0008` / `0.0240` for the complete set — so the metrics can never be the only gate.
+
+`scn_af_compare.py` now prints planted / scored / unscored per AF decile and exits
+non-zero above `--max-uncovered-frac` (default 10%). Every planted bin is printed even
+when nothing in it was scored: previously an excluded stratum simply *vanished from the
+table*, and a missing row is far harder to notice than a row reading
+`0 of 104 — NOTHING SCORED`. `run_subclonal_vaf_validation.sh` folds that status into
+its verdict ahead of bias/MAE, and captures it with `|| rc=$?` so the failure does not
+abort the run before `archive_run`.
+
+### Harnesses now fail instead of reporting an unusable measurement
+
+`signature_check.sh` warned `few SNVs — fit will be noisy` below 50 and fitted anyway.
+SBS-96 has 96 trinucleotide contexts; a spectrum from fewer mutations than contexts
+cannot populate them, and SigProfiler still returns an assignment that was reported as
+though it measured something. Now fatal below `MIN_SNVS` (default 50 — the historical
+bar, enforced rather than moved; §3.9's own analysis used 6,225 SNVs). This was the last
+`WARNING`-on-an-unusable-measurement site from the harness audit.
+
+### Also
+
+- `mpileup -d` is now explicit (`MPILEUP_MAX_DEPTH`, default 2000). Its default of 250
+  would silently downsample a 200×+ run.
+- New read-the-artifact guards: abort when no site carries `FORMAT/AD`, and when a
+  per-type query subset is empty report `recall=0.000` rather than emitting a precision
+  figure computed from nothing.
+- `eidolon/tests/vcf_validation.rs` gained whole-artifact validation of the
+  `compare-vcfs` outputs.
+- **Recall denominators are now verified to cover the whole truth.** truvari's
+  `TP-base + FN` is a *post-filter* count; when a filter discarded truth records the
+  recall was computed over a subset and nothing said so. An audit of the archived runs
+  found 4 such cases in 152 per-type checks (a DEL reporting 0.800 where the full
+  denominator gives 0.727). Each comparison now checks that count against the truth it
+  was handed, prints the discarded records with `SVTYPE`/`SVLEN` (derived by differencing
+  the truth against truvari's own `tp-base`/`fn` output, so the attribution is exact) and
+  the corrected recall, and fails the job — after archiving, so a failure stays
+  diagnosable. This also closes a hole in the Rule 0 selftest: a filter drops a record
+  from base *and* comparison alike, so truth-vs-truth still scored a perfect 1.000 over
+  the surviving subset.
+
+Every fix in this release was reproduced and verified locally; no Delta time was spent
+diagnosing or confirming any of them.
+
 7/28/2026
 =========
 ## eidolon v3.0.0 — subclonal heterogeneity (#405); output tokens renamed NEAT_* / RNEAT_* → EIDOLON_*; adopting SemVer

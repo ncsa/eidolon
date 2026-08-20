@@ -54,6 +54,147 @@ const MIN_OBS_FOR_LENGTH_FIT: usize = 2;
 const FALLBACK_CN_DISTRIBUTION: &[(u32, f64)] =
     &[(0, 0.15), (1, 0.35), (3, 0.30), (4, 0.15), (5, 0.05)];
 
+/// RNG sub-stream namespace for breakend-geometry draws.
+///
+/// A dedicated child stream so adding this draw does not perturb the main sampling
+/// sequence — without it every position, length and genotype downstream would shift and
+/// every pinned baseline would move for a reason unrelated to the change.
+const BND_GEOMETRY_STREAM: u64 = 7_000_000;
+
+/// Window (bp) around a breakend that must be free of N-tracts for the junction to be
+/// recoverable by a caller (#224). Module-scope so the per-contig sampler and the
+/// genome-wide translocation sampler cannot drift apart on this value.
+const ALIGNABLE_WINDOW: usize = 200;
+
+/// Weighted draw over the four geometries. Falls back to head-to-head only if the
+/// weights are empty or unusable, which preserves the pre-#458 behaviour rather than
+/// producing something arbitrary.
+fn sample_bnd_geometry(weights: &HashMap<BndGeometry, f64>, rng: &mut NeatRng) -> BndGeometry {
+    let total: f64 = weights
+        .values()
+        .filter(|w| w.is_finite() && **w > 0.0)
+        .sum();
+    if total <= 0.0 {
+        return BndGeometry::HeadToHead;
+    }
+    let Ok(r) = rng.random() else {
+        return BndGeometry::HeadToHead;
+    };
+    let mut acc = 0.0;
+    // Iterated over the fixed ALL order, not the HashMap's, so a given seed produces the
+    // same geometry across runs regardless of hash ordering.
+    for g in BndGeometry::ALL {
+        let w = weights.get(&g).copied().unwrap_or(0.0);
+        if !w.is_finite() || w <= 0.0 {
+            continue;
+        }
+        acc += w / total;
+        if r < acc {
+            return g;
+        }
+    }
+    BndGeometry::HeadToHead
+}
+
+/// Fallback geometry weights for a model with no BND training data.
+///
+/// **Uniform, deliberately.** Real breakend-orientation spectra are not uniform, but
+/// inventing a plausible-looking split would be a claim about biology that nothing here
+/// supports — and this repo has been bitten by exactly that kind of unexamined inherited
+/// number. Uniform is an explicit non-claim: it says "no information", and any model fit
+/// from a corpus that contains breakends overrides it with the real distribution.
+pub fn default_bnd_geometry_weights() -> HashMap<BndGeometry, f64> {
+    BndGeometry::ALL.iter().map(|g| (*g, 0.25)).collect()
+}
+
+/// The four reciprocal breakend geometries of VCF 4.2 §5.4.
+///
+/// A junction is an adjacency between two loci, and the four orientations are what
+/// distinguish a deletion-like join from an inversion breakpoint. Callers discriminate
+/// them: Manta classifies direct adjacencies as DEL/DUP:TANDEM and only puts
+/// inversion-like orientations in its BND bucket.
+///
+/// eidolon emitted ONLY `HeadToHead` until this existed, which had consequences well
+/// beyond realism (#458 item 2). Head-to-head IS the inversion signature, so every
+/// planted "BND" was geometrically an inversion breakpoint: Manta bucketed them as BND
+/// for that reason, `convertInversion.py` converted them to `<INV>`, and they then
+/// scored as INV false positives against a truth that never contained them — 7 of 11 in
+/// Delta job 20699004. BND was not a separable category from INV at all.
+///
+/// The spec's own worked examples give each reciprocal pair:
+///   `t[p[` <-> `]p]t`   (direct)
+///   `t]p]` <-> `t]p]`   (head-to-head)
+///   `[p[t` <-> `[p[t`   (tail-to-tail)
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum BndGeometry {
+    /// `t[p[` — piece right of the mate joined after this base. Deletion-like.
+    DeletionLike,
+    /// `]p]t` — piece left of the mate joined before this base. Duplication-like.
+    DuplicationLike,
+    /// `t]p]` — reverse-complemented piece left of the mate, joined after. Inversion.
+    HeadToHead,
+    /// `[p[t` — reverse-complemented piece right of the mate, joined before. Inversion.
+    TailToTail,
+}
+
+impl BndGeometry {
+    pub const ALL: [BndGeometry; 4] = [
+        BndGeometry::DeletionLike,
+        BndGeometry::DuplicationLike,
+        BndGeometry::HeadToHead,
+        BndGeometry::TailToTail,
+    ];
+
+    /// `(bnd_join_after, bnd_mate_extends_right)` — the pair the chimeric read
+    /// generator dispatches on. These MUST agree with the ALT string this geometry
+    /// emits; a mismatch between them is the defect fixed in v3.1.0.
+    pub fn flags(self) -> (bool, bool) {
+        match self {
+            BndGeometry::DeletionLike => (true, true),
+            BndGeometry::DuplicationLike => (false, false),
+            BndGeometry::HeadToHead => (true, false),
+            BndGeometry::TailToTail => (false, true),
+        }
+    }
+
+    /// Classify from the flags `parse_bnd_alt` returns, so fitting and emission cannot
+    /// drift apart: both go through this one mapping.
+    pub fn from_flags(join_after: bool, mate_extends_right: bool) -> BndGeometry {
+        match (join_after, mate_extends_right) {
+            (true, true) => BndGeometry::DeletionLike,
+            (false, false) => BndGeometry::DuplicationLike,
+            (true, false) => BndGeometry::HeadToHead,
+            (false, true) => BndGeometry::TailToTail,
+        }
+    }
+
+    /// The geometry the MATE record of this junction must carry.
+    ///
+    /// Only the two inversion orientations are self-reciprocal. A direct junction pairs
+    /// `t[p[` with `]p]t`, so the mate's geometry differs from the anchor's — which is
+    /// why "anchor and mate share a geometry" is the wrong invariant to assert, true
+    /// only while head-to-head was the sole form emitted.
+    pub fn reciprocal(self) -> BndGeometry {
+        match self {
+            BndGeometry::DeletionLike => BndGeometry::DuplicationLike,
+            BndGeometry::DuplicationLike => BndGeometry::DeletionLike,
+            BndGeometry::HeadToHead => BndGeometry::HeadToHead,
+            BndGeometry::TailToTail => BndGeometry::TailToTail,
+        }
+    }
+
+    /// The ALT string for a breakend of this geometry at `base`, mating to
+    /// `contig:pos` (1-based). The reference base is embedded per VCF 4.2 §5.4.
+    pub fn alt_string(self, base: char, contig: &str, pos: usize) -> String {
+        match self {
+            BndGeometry::DeletionLike => format!("{base}[{contig}:{pos}["),
+            BndGeometry::DuplicationLike => format!("]{contig}:{pos}]{base}"),
+            BndGeometry::HeadToHead => format!("{base}]{contig}:{pos}]"),
+            BndGeometry::TailToTail => format!("[{contig}:{pos}[{base}"),
+        }
+    }
+}
+
 /// Learned statistical model for symbolic-SV generation.
 ///
 /// The five fields together specify everything a sampler needs: how
@@ -62,7 +203,7 @@ const FALLBACK_CN_DISTRIBUTION: &[(u32, f64)] =
 /// by type), what copy number a `<CNV>` carries
 /// (`cnv_copy_number_distribution`), and whether it's homozygous
 /// (`homozygous_frequency`).
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SvModel {
     /// Per-base SV rate across the training corpus
     /// (= count of fit-eligible SVs / sum of training contig lengths
@@ -92,10 +233,46 @@ pub struct SvModel {
     /// CNVs in the training corpus carried `INFO/CN`; empty otherwise.
     pub cnv_copy_number_distribution: HashMap<u32, f64>,
 
+    /// Observed distribution over the four breakend geometries (§5.4), fitted from the
+    /// training corpus' own BND ALT strings.
+    ///
+    /// Model files predating this field must still load, and they fall back to
+    /// [`default_bnd_geometry_weights`] — NOT to an empty map.
+    ///
+    /// That distinction matters operationally. A bare `#[serde(default)]` would give an
+    /// empty `HashMap`, the sampler would fall back to head-to-head, and every existing
+    /// model — including the COSMIC pan-cancer model the Delta campaign runs — would
+    /// keep emitting the single orientation this change exists to remove, until someone
+    /// remembered to rebuild it. Defaulting to uniform means the fix takes effect on
+    /// models already on disk.
+    #[serde(default = "default_bnd_geometry_weights")]
+    pub bnd_geometry_weights: HashMap<BndGeometry, f64>,
+
     /// Probability that a generated SV is homozygous (vs heterozygous),
     /// estimated as the homozygous fraction across all fit-eligible
     /// observations of all types.
     pub homozygous_frequency: f64,
+}
+
+/// Hand-written so `SvModel::default()` agrees with serde.
+///
+/// `#[derive(Default)]` left `bnd_geometry_weights` EMPTY, while a deserialized model
+/// gets `default_bnd_geometry_weights()` via `#[serde(default = ...)]`. Since
+/// `sample_bnd_geometry` falls back to head-to-head on an empty map, the same struct
+/// emitted different geometry depending on how it was constructed — the two-paths-
+/// disagree shape that has bitten this file before. Every other field keeps its
+/// zero/empty default.
+impl Default for SvModel {
+    fn default() -> Self {
+        SvModel {
+            per_base_rate: 0.0,
+            type_probabilities: HashMap::new(),
+            length_log_normal: HashMap::new(),
+            cnv_copy_number_distribution: HashMap::new(),
+            bnd_geometry_weights: default_bnd_geometry_weights(),
+            homozygous_frequency: 0.0,
+        }
+    }
 }
 
 impl SvModel {
@@ -146,6 +323,10 @@ impl SvModel {
         // Per-type accumulators of (span, &Variant) so we can pull CN
         // and genotype back out without re-walking the source.
         let mut by_type: HashMap<SvType, Vec<(usize, &Variant)>> = HashMap::new();
+        // Breakend geometry counts, taken from the corpus' own ALT strings. Classified
+        // through the SAME parser the read generator's flags come from, so a fitted
+        // model and the emitter cannot disagree about what a given ALT means.
+        let mut geometry_counts: HashMap<BndGeometry, usize> = HashMap::new();
 
         for v in observations {
             let sv = match v.alternate.as_symbolic() {
@@ -155,6 +336,18 @@ impl SvModel {
                     continue;
                 }
             };
+            if sv.sv_type == SvType::Bnd {
+                let (_c, _p, join_after, mate_right) =
+                    crate::structs::variants::parse_bnd_alt(&sv.raw_alt);
+                // A single breakend with no parseable mate locus yields (false, false)
+                // from the parser, which would masquerade as DuplicationLike. Only count
+                // records whose ALT actually resolved to a mate.
+                if _c.is_some() && _p.is_some() {
+                    *geometry_counts
+                        .entry(BndGeometry::from_flags(join_after, mate_right))
+                        .or_insert(0) += 1;
+                }
+            }
             match sv.sv_type {
                 SvType::Del
                 | SvType::Dup
@@ -299,11 +492,30 @@ impl SvModel {
             homozygous_frequency
         );
 
+        // Fitted geometry weights, or the uniform non-claim if the corpus had no
+        // parseable breakends. Reported so a model built from a BND-free corpus does not
+        // silently look like one that measured a uniform spectrum.
+        let total_geom: usize = geometry_counts.values().sum();
+        let bnd_geometry_weights = if total_geom == 0 {
+            info!(
+                "SvModel: no parseable breakends in the corpus — BND geometry defaults \
+                 to uniform (an explicit non-claim, not a measurement)"
+            );
+            default_bnd_geometry_weights()
+        } else {
+            info!("SvModel: fitted BND geometry from {total_geom} breakend record(s)");
+            geometry_counts
+                .into_iter()
+                .map(|(g, n)| (g, n as f64 / total_geom as f64))
+                .collect()
+        };
+
         Some(SvModel {
             per_base_rate,
             type_probabilities,
             length_log_normal,
             cnv_copy_number_distribution,
+            bnd_geometry_weights,
             homozygous_frequency,
         })
     }
@@ -351,6 +563,9 @@ impl SvModel {
         max_length_fraction: f64,
         rng: &mut NeatRng,
     ) -> Vec<Variant> {
+        // Dedicated sub-stream for geometry draws, so adding them leaves every other
+        // sampling decision — position, length, genotype — bit-for-bit unchanged.
+        let mut geom_rng = rng.derive_child(BND_GEOMETRY_STREAM);
         if rate_scale <= 0.0 || !rate_scale.is_finite() {
             return Vec::new();
         }
@@ -361,7 +576,16 @@ impl SvModel {
             return Vec::new();
         }
 
-        let lambda = self.per_base_rate * contig_len as f64 * rate_scale;
+        // BND's share of the per-base rate belongs to the genome-wide translocation
+        // pass, so this contig's budget covers only the span types. Total SV yield across
+        // the run is unchanged; it is split between the two samplers rather than reduced.
+        let p_bnd = self
+            .type_probabilities
+            .get(&SvType::Bnd)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let lambda = self.per_base_rate * contig_len as f64 * rate_scale * (1.0 - p_bnd);
         if !lambda.is_finite() || lambda <= 0.0 {
             return Vec::new();
         }
@@ -379,7 +603,25 @@ impl SvModel {
         // Sorted type list + cumulative weights for repeatable picking
         // via NeatRng::random() (avoids depending on rand::WeightedIndex's
         // RNG trait shape).
-        let mut types: Vec<SvType> = self.type_probabilities.keys().copied().collect();
+        //
+        // BND is EXCLUDED here and sampled genome-wide by `sample_translocations`
+        // instead. A breakend's two ends live on different contigs, which a per-contig
+        // sampler cannot express — it used to hardcode the mate to the anchor's own
+        // contig, so every "translocation" was same-contig (466 of 466 in job 20719077).
+        // PCAWG's TRA class, the source of the BND share, is 100% inter-chromosomal
+        // (docs/pcawg_sv_measurement.md M1), and a same-contig junction is a DEL, DUP or
+        // INV by its orientation — all of which are already sampled here at their own
+        // measured rates. Emitting one under a BND label double-counted those classes.
+        //
+        // The BND share is SUBTRACTED from this contig's budget (below) rather than
+        // dropped from the type list alone: renormalising over the remaining types would
+        // hand BND's ~23% to DEL/DUP/INV and silently inflate them.
+        let mut types: Vec<SvType> = self
+            .type_probabilities
+            .keys()
+            .copied()
+            .filter(|t| *t != SvType::Bnd)
+            .collect();
         types.sort_by_key(|t| *t as u8);
         let type_weights: Vec<f64> = types
             .iter()
@@ -501,7 +743,6 @@ impl SvModel {
             // alignable since the right chimeric piece anchors there;
             // we check `sv_end_1based - 1` (= 0-based last affected base)
             // for those types.
-            const ALIGNABLE_WINDOW: usize = 200;
             if !anchor_window_alignable(sequence, anchor_0based, ALIGNABLE_WINDOW) {
                 continue;
             }
@@ -562,9 +803,23 @@ impl SvModel {
                     id: None,
                     quality_score: None,
                     filter: None,
-                    // No symbolic INFO needed — the SVLEN is implicit in
-                    // the REF/ALT length difference.
-                    info: None,
+                    // SVTYPE/SVLEN are what make this identifiable as a STRUCTURAL
+                    // insertion, and omitting them is not cosmetic. The SVLEN is indeed
+                    // implicit in the REF/ALT length difference — but so is a 60 bp
+                    // insertion from the small-indel model, so an untagged record is
+                    // indistinguishable from one, by any means. Every SV validation run
+                    // to date reported `truth INS: 0` while planting insertions, because
+                    // the harness selects SVs on a symbolic ALT or an SVTYPE tag and
+                    // these had neither: job 20885875 planted 3 (296/1057/1492 bp) and
+                    // scored none of them. Below MIN_SV_LENGTH_BP-ish sizes the record
+                    // was not merely unscored but unattributable.
+                    //
+                    // END == POS because an insertion spans no reference bases; place_sv
+                    // already returns anchor+1 for Ins, which is that. The literal ALT is
+                    // KEPT — it routes the novel bases through gen-reads' insertion
+                    // machinery so the reads actually carry them, and SVTYPE=INS beside a
+                    // literal ALT is exactly what Manta emits for a resolved insertion.
+                    info: Some(build_info_field(SvType::Ins, sv_end_1based, length, None)),
                     format: vec!["GT".to_string()],
                     sample: vec![genotype_str],
                     provenance: Provenance::Denovo,
@@ -572,6 +827,9 @@ impl SvModel {
                 continue;
             }
 
+            // Set inside the BND arm and consumed twice afterwards — once for the
+            // anchor's flags, once to give the mate the RECIPROCAL geometry.
+            let mut bnd_geometry: Option<BndGeometry> = None;
             let (raw_alt, m_contig, m_pos) = match sv_type {
                 SvType::Del => ("<DEL>".to_string(), None, None),
                 SvType::Dup => ("<DUP>".to_string(), None, None),
@@ -607,8 +865,14 @@ impl SvModel {
                     // (VCF 4.2 §5.4). A literal "N" contradicts the REF column,
                     // which carries the real base — see #451.
                     let anchor_char: char = anchor_base.into();
+                    // Geometry is SAMPLED now rather than hardcoded head-to-head.
+                    // Emitting one orientation made every planted BND geometrically an
+                    // inversion breakpoint, which is why BND was not separable from INV
+                    // in scoring at all (#458 item 2).
+                    let geom = sample_bnd_geometry(&self.bnd_geometry_weights, &mut geom_rng);
+                    bnd_geometry = Some(geom);
                     (
-                        format!("{anchor_char}]{contig_name}:{mp_candidate}]"),
+                        geom.alt_string(anchor_char, contig_name, mp_candidate),
                         Some(contig_name.to_string()),
                         Some(mp_candidate),
                     )
@@ -617,6 +881,19 @@ impl SvModel {
                 // others were excluded from type_probabilities at fit
                 // time. The match is exhaustive for the compiler.
                 _ => continue,
+            };
+            // VCF 4.2 §5.4: a breakend is a POINT. END must equal POS and there is no
+            // SVLEN, whatever length the model happened to sample. An anchor reporting
+            // END = POS + length claims a multi-kb span for a 1bp event, and tools that
+            // size records off END (truvari, bcftools) act on it — while the record's own
+            // mate correctly carries END = POS, so one junction would ship two
+            // conventions. `fit_from_observations` pins BND length to 1, so a trained
+            // model never exposed this; `SvModel` is plain serde JSON and hand-edited or
+            // grafted models are not covered by that.
+            let sv_end_1based = if sv_type == SvType::Bnd {
+                anchor_0based + 1
+            } else {
+                sv_end_1based
             };
             let mut sv_data = SvData::new(raw_alt, sv_type);
             sv_data.end = Some(sv_end_1based);
@@ -629,6 +906,21 @@ impl SvModel {
                 None
             };
             sv_data.copy_number = copy_number;
+            // The chimeric read generator dispatches on these flags, NOT on the ALT
+            // string, and they are otherwise only ever set by the input-VCF parser. A de
+            // novo BND left them at their false/false defaults, which is case 4 (`]p]t`)
+            // — a DIRECT join — while the ALT above says `t]p]`, case 2, head-to-head
+            // with the mate piece reverse-complemented. The truth VCF therefore described
+            // a different rearrangement than the reads carried, and a direct intra-contig
+            // join is just a deletion or duplication: on Delta, Manta placed DEL/DUP
+            // candidates within 1-2bp of all 7 planted junctions and emitted no breakend
+            // at any of them, so BND recall read 0.000 for a caller that had found every
+            // one. Keep these in step with the ALT emitted above.
+            if let Some(geom) = bnd_geometry {
+                let (ja, mer) = geom.flags();
+                sv_data.bnd_join_after = ja;
+                sv_data.bnd_mate_extends_right = mer;
+            }
             sv_data.mate_contig = m_contig;
             sv_data.mate_pos = m_pos;
 
@@ -691,13 +983,22 @@ impl SvModel {
             // builds is unchanged; only the record representation is fixed.
             if let Some((id1, id2, anchor_1based, mate_1based, mate_base)) = bnd_pair {
                 let mate_char: char = mate_base.into();
+                // The mate carries the RECIPROCAL geometry, not the same one. Only the
+                // two inversion orientations are self-reciprocal; a direct junction
+                // pairs `t[p[` with `]p]t`, per the spec's own worked example.
+                let mate_geom = bnd_geometry.unwrap_or(BndGeometry::HeadToHead).reciprocal();
                 let mut mate_sv = SvData::new(
-                    format!("{mate_char}]{contig_name}:{anchor_1based}]"),
+                    mate_geom.alt_string(mate_char, contig_name, anchor_1based),
                     SvType::Bnd,
                 );
                 mate_sv.end = Some(mate_1based);
                 mate_sv.svlen = None;
                 mate_sv.copy_number = None;
+                // Same form as the anchor (`t]p]`), so the same geometry — a reciprocal
+                // `t]p]` <-> `t]p]` pair is the spec's own worked example.
+                let (m_ja, m_mer) = mate_geom.flags();
+                mate_sv.bnd_join_after = m_ja;
+                mate_sv.bnd_mate_extends_right = m_mer;
                 mate_sv.mate_contig = Some(contig_name.to_string());
                 mate_sv.mate_pos = Some(anchor_1based);
                 let mate_info = format!(
@@ -745,6 +1046,237 @@ impl SvModel {
 
         out
     }
+
+    /// Sample **inter-chromosomal translocations** across the whole genome.
+    ///
+    /// This exists because a translocation cannot be produced by a per-contig sampler:
+    /// its two breakends live on different contigs and each one generates reads from its
+    /// own contig, so both records must reach both contigs' variant lists. `sample_variants`
+    /// sees one contig and structurally cannot emit one — which is why eidolon shipped a
+    /// "translocation" feature that had never produced a translocation (see the retraction
+    /// in `docs/cancer_simulator.md`).
+    ///
+    /// **Why BND means inter-chromosomal here.** The BND share in every shipped model is
+    /// the PCAWG per-donor mean of `svclass == "TRA"` rows, and `TRA` was measured to be
+    /// **100% inter-chromosomal — 68,547 of 68,547 rows, zero exceptions**
+    /// (`docs/pcawg_sv_measurement.md` M1). There is no intra-chromosomal TRA in the
+    /// source at all: a same-contig junction is a DEL, DUP or INV by its orientation, and
+    /// those are sampled separately at their own measured rates.
+    ///
+    /// **Partner contig is length-weighted, deliberately.** PCAWG's chromosome pairing is
+    /// non-uniform (chr1-chr12 at ~7x uniform, M3) but that structure is *human-specific*
+    /// and meaningless on any other reference, so it is not a defensible general default.
+    /// Length-weighting is the honest general choice; a human-specific pair distribution
+    /// would be a per-model refinement, not a built-in.
+    ///
+    /// **Geometry stays uniform, and that is now a measurement rather than a non-claim.**
+    /// TRA orientation was measured at 24.6 / 25.4 / 25.3 / 24.7 across the four forms
+    /// (M2) — indistinguishable from uniform.
+    ///
+    /// # Correctness criterion
+    ///
+    /// Stated before implementing, with how each part is falsified:
+    ///
+    /// 1. **Every junction spans two different contigs.** Falsified by any emitted pair
+    ///    whose anchor contig equals its mate contig.
+    /// 2. **The two records are a spec-valid reciprocal pair**, each naming the other's
+    ///    contig and position. Falsified by a mate whose ALT does not point back.
+    /// 3. **Count scales with total genome length**, not with any one contig. Falsified
+    ///    by doubling the genome and not roughly doubling the yield.
+    /// 4. **MUST NOT FIRE on a single-contig reference** — zero translocations, rather
+    ///    than silently falling back to a same-contig junction.
+    ///
+    /// Returns per-contig records, keyed by contig name.
+    pub fn sample_translocations(
+        &self,
+        contig_order: &[String],
+        reference: &HashMap<String, Vec<Nucleotide>>,
+        ploidy: usize,
+        rate_scale: f64,
+        rng: &mut NeatRng,
+    ) -> HashMap<String, Vec<Variant>> {
+        let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
+        if !self.is_usable() || rate_scale <= 0.0 || !rate_scale.is_finite() {
+            return out;
+        }
+
+        // Deterministic order: iterate the caller's contig list, never a HashMap.
+        let usable: Vec<(&str, usize)> = contig_order
+            .iter()
+            .filter_map(|n| reference.get(n).map(|s| (n.as_str(), s.len())))
+            .filter(|(_, len)| *len >= MIN_SV_LENGTH_BP.saturating_mul(2))
+            .collect();
+        // Criterion 4: a translocation needs two distinct contigs. On a single-contig
+        // reference the correct yield is zero, NOT a same-contig junction.
+        if usable.len() < 2 {
+            return out;
+        }
+
+        let p_bnd = self
+            .type_probabilities
+            .get(&SvType::Bnd)
+            .copied()
+            .unwrap_or(0.0);
+        if p_bnd <= 0.0 {
+            return out;
+        }
+
+        // Criterion 3: the rate is over the whole genome, so the BND budget no longer
+        // depends on which contig happens to be processed.
+        let total_len: usize = usable.iter().map(|(_, l)| *l).sum();
+        let lambda = self.per_base_rate * total_len as f64 * rate_scale * p_bnd;
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return out;
+        }
+        let n_tra = match sample_poisson(lambda, rng) {
+            Ok(n) => n as usize,
+            Err(e) => {
+                warn!("SvModel: translocation Poisson error (λ={lambda}): {e}; none emitted");
+                return out;
+            }
+        };
+        if n_tra == 0 {
+            return out;
+        }
+
+        // Cumulative length weights for partner selection.
+        let mut cum: Vec<f64> = Vec::with_capacity(usable.len());
+        let mut acc = 0.0f64;
+        for (_, len) in &usable {
+            acc += *len as f64;
+            cum.push(acc);
+        }
+        let pick = |r: f64| -> usize {
+            let target = r * acc;
+            cum.partition_point(|&c| c < target).min(usable.len() - 1)
+        };
+
+        // Dedicated sub-streams so adding translocations leaves every other sampling
+        // decision bit-for-bit unchanged.
+        let mut geom_rng = rng.derive_child(BND_GEOMETRY_STREAM);
+        let mut placed = 0usize;
+        let max_retries = (n_tra * 20).max(40);
+
+        for _ in 0..max_retries {
+            if placed >= n_tra {
+                break;
+            }
+            let (Ok(ra), Ok(rb)) = (rng.random(), rng.random()) else {
+                break;
+            };
+            let ia = pick(ra);
+            let mut ib = pick(rb);
+            if ib == ia {
+                // Nudge to a different contig rather than rejecting the draw, which on a
+                // two-contig reference with one dominant contig would reject most tries.
+                ib = (ia + 1) % usable.len();
+            }
+            let (name_a, len_a) = usable[ia];
+            let (name_b, len_b) = usable[ib];
+            debug_assert_ne!(
+                name_a, name_b,
+                "criterion 1: junction must span two contigs"
+            );
+
+            let (Some(seq_a), Some(seq_b)) = (reference.get(name_a), reference.get(name_b)) else {
+                continue;
+            };
+            let Some(pos_a) = pick_alignable_pos(seq_a, len_a, rng) else {
+                continue;
+            };
+            let Some(pos_b) = pick_alignable_pos(seq_b, len_b, rng) else {
+                continue;
+            };
+            let (Some(&base_a), Some(&base_b)) = (seq_a.get(pos_a - 1), seq_b.get(pos_b - 1))
+            else {
+                continue;
+            };
+            if base_a == Nucleotide::N || base_b == Nucleotide::N {
+                continue;
+            }
+
+            let geom = sample_bnd_geometry(&self.bnd_geometry_weights, &mut geom_rng);
+            let mate_geom = geom.reciprocal();
+            let genotype = match rng.gen_bool(self.homozygous_frequency.clamp(0.0, 1.0)) {
+                Ok(true) => Genotype::Homozygous,
+                Ok(false) => Genotype::Heterozygous,
+                Err(_) => Genotype::Heterozygous,
+            };
+            let genotype_str = genotype_string(&genotype, ploidy);
+            let id1 = format!("eidolon_tra_{name_a}_{pos_a}_{name_b}_{pos_b}_1");
+            let id2 = format!("eidolon_tra_{name_a}_{pos_a}_{name_b}_{pos_b}_2");
+
+            // Criterion 2: each record names the OTHER contig and position.
+            let mut sv_a = SvData::new(geom.alt_string(base_a.into(), name_b, pos_b), SvType::Bnd);
+            sv_a.end = Some(pos_a);
+            sv_a.svlen = None;
+            let (ja, mer) = geom.flags();
+            sv_a.bnd_join_after = ja;
+            sv_a.bnd_mate_extends_right = mer;
+            sv_a.mate_contig = Some(name_b.to_string());
+            sv_a.mate_pos = Some(pos_b);
+
+            let mut sv_b = SvData::new(
+                mate_geom.alt_string(base_b.into(), name_a, pos_a),
+                SvType::Bnd,
+            );
+            sv_b.end = Some(pos_b);
+            sv_b.svlen = None;
+            let (m_ja, m_mer) = mate_geom.flags();
+            sv_b.bnd_join_after = m_ja;
+            sv_b.bnd_mate_extends_right = m_mer;
+            sv_b.mate_contig = Some(name_a.to_string());
+            sv_b.mate_pos = Some(pos_a);
+
+            let mk = |sv: SvData, pos: usize, base: Nucleotide, id: &str, mate_id: &str| Variant {
+                variant_type: VariantType::Complex,
+                location: pos.saturating_sub(1),
+                reference: vec![base],
+                alternate: AlternateType::Symbolic(sv),
+                genotype_str: genotype_str.clone(),
+                genotype: genotype.clone(),
+                allele_fraction: None,
+                id: Some(id.to_string()),
+                quality_score: None,
+                filter: None,
+                info: Some(format!(
+                    "{};MATEID={mate_id}",
+                    build_info_field(SvType::Bnd, pos, 1, None)
+                )),
+                format: vec!["GT".to_string()],
+                sample: vec![genotype_str.clone()],
+                provenance: Provenance::Denovo,
+            };
+
+            out.entry(name_a.to_string())
+                .or_default()
+                .push(mk(sv_a, pos_a, base_a, &id1, &id2));
+            out.entry(name_b.to_string())
+                .or_default()
+                .push(mk(sv_b, pos_b, base_b, &id2, &id1));
+            placed += 1;
+        }
+
+        if placed < n_tra {
+            warn!(
+                "SvModel: placed {placed} of {n_tra} translocation(s); \
+                 the reference may be mostly N or have few usable contigs"
+            );
+        }
+        out
+    }
+}
+
+/// Draw a 1-based position whose surrounding window is alignable (not an N-tract).
+/// Returns `None` after 32 tries, which means the contig is effectively unusable.
+fn pick_alignable_pos(seq: &[Nucleotide], len: usize, rng: &mut NeatRng) -> Option<usize> {
+    for _ in 0..32 {
+        let c = rng.range_i64(1, len.saturating_sub(1) as i64).ok()? as usize;
+        if anchor_window_alignable(seq, c, ALIGNABLE_WINDOW) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 /// Hybrid Poisson sampler:
@@ -869,11 +1401,14 @@ fn weighted_pick_with<'a, T>(
 /// anchor_0based, sv_end_1based)` or `None` if the contig is too small
 /// for the chosen length.
 ///
-/// For `<DEL>`, the anchor (1-based POS) is the base immediately before
-/// the deletion and is NOT itself deleted — the affected range is
-/// `[POS+1, END]` 1-based inclusive, i.e. `[anchor_0based + 1,
-/// anchor_0based + 1 + length)` 0-based half-open. For `<DUP>` / `<CNV>`
-/// POS is the first affected base.
+/// INVARIANT, for every symbolic SPAN type: `anchor_0based` is the base
+/// immediately BEFORE the event and is NOT itself affected. The affected range
+/// is always `[anchor_0based + 1, anchor_0based + 1 + length)` 0-based
+/// half-open, i.e. 1-based `[POS+1, END]`, so `END - POS == |SVLEN|` holds
+/// uniformly (VCF 4.2 symbolic-allele convention).
+///
+/// `<INS>` and `<BND>` are point events, not spans: nothing in the reference is
+/// consumed, POS marks the position, and END == POS.
 fn place_sv(
     sv_type: SvType,
     length: usize,
@@ -894,28 +1429,48 @@ fn place_sv(
         return None;
     }
     let anchor = rng.range_i64(0, max_anchor_inclusive as i64).ok()?.max(0) as usize;
-    let (start, end, sv_end_1based) = match sv_type {
+    let (start, end, vcf_anchor_0based, sv_end_1based) = match sv_type {
         SvType::Del => {
             let s = anchor + 1;
             let e = s + length;
             // 1-based END for SvData: span includes the anchor + deleted
             // bases, so END_1based = anchor_1based + length = anchor + 1 + length.
-            (s, e, anchor + 1 + length)
+            (s, e, anchor, anchor + 1 + length)
         }
         SvType::Ins => {
-            // Insertions are point events in the reference.
+            // Insertions are point events in the reference: POS carries the base
+            // before the inserted sequence and END == POS.
             let s = anchor;
             let e = s + 1;
-            (s, e, anchor + 1)
+            (s, e, anchor, anchor + 1)
+        }
+        SvType::Bnd => {
+            // A breakend is a point and POS IS the breakend base — the
+            // anchor-before convention does not apply, and END is forced to POS
+            // by the caller (VCF 4.2 5.4).
+            let s = anchor;
+            let e = s + 1;
+            (s, e, anchor, anchor + 1)
         }
         _ => {
+            // DUP/CNV/INV. `anchor` is the FIRST AFFECTED base, but VCF 4.2 puts
+            // POS on the base BEFORE a symbolic event, so the record's anchor is
+            // `anchor - 1` while the affected range stays [anchor, anchor+length).
+            // Emitting `anchor` directly is what made POS mean "last unaffected"
+            // for DEL and "first affected" for everything else, so END-POS equalled
+            // |SVLEN| for DEL and |SVLEN|-1 for the rest in the same file. It also
+            // put the first duplicated base in REF, where the preceding base belongs.
+            // There is no base before position 0.
+            if anchor == 0 {
+                return None;
+            }
             let s = anchor;
             let e = s + length;
-            // 1-based END = POS_1based + length - 1 = (anchor + 1) + length - 1 = anchor + length.
-            (s, e, anchor + length)
+            // 1-based END = last affected base = anchor + length.
+            (s, e, anchor - 1, anchor + length)
         }
     };
-    Some((start, end, anchor, sv_end_1based))
+    Some((start, end, vcf_anchor_0based, sv_end_1based))
 }
 
 /// Compute the 0-based half-open affected range of an existing symbolic
@@ -932,8 +1487,13 @@ fn affected_range_for_existing(v: &Variant, block_end: usize) -> Option<(usize, 
     }
     let raw_end = v.location.saturating_add(span).min(block_end);
     let start = match sv.sv_type {
-        SvType::Del => v.location.saturating_add(1).min(block_end),
-        _ => v.location.min(block_end),
+        // Point events consume no reference bases, so the anchor itself marks the
+        // position for overlap purposes — there is no POS+1..END to speak of.
+        SvType::Ins | SvType::Bnd => v.location.min(block_end),
+        // Span events: POS is the base BEFORE the event (VCF 4.2), so the affected
+        // range starts at POS+1. This used to be DEL-only, which is what let a DUP
+        // and a DEL in the same file mean different things by POS.
+        _ => v.location.saturating_add(1).min(block_end),
     };
     if start >= raw_end {
         return None;
@@ -1080,7 +1640,7 @@ fn genotype_string(genotype: &Genotype, ploidy: usize) -> String {
 mod tests {
     use super::*;
     use crate::structs::nucleotides::Nucleotide;
-    use crate::structs::variants::{AlternateType, SvData, VariantType};
+    use crate::structs::variants::{AlternateType, SvData, VariantType, parse_bnd_alt};
 
     #[test]
     fn default_sv_model_is_not_usable() {
@@ -1406,111 +1966,6 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// A BND is a two-sided event: VCF 4.2 §5.4 wants a mate PAIR, cross-linked by
-    /// MATEID, with each record's ALT embedding the reference base at *its own*
-    /// breakend. Before #451 the sampler emitted a single record with `id: None`,
-    /// no MATEID, and a hardcoded `N` in the ALT — unmatchable by any comparison
-    /// tool, and `sample_variants_emits_all_supported_types` passed anyway because
-    /// it only asserts the BND *type appears*.
-    #[test]
-    fn denovo_bnd_emits_a_cross_linked_mate_pair() {
-        let mut m = SvModel::default();
-        m.per_base_rate = 5e-3;
-        m.homozygous_frequency = 0.5;
-        m.type_probabilities.clear();
-        m.type_probabilities.insert(SvType::Bnd, 1.0);
-        m.length_log_normal.insert(SvType::Bnd, (7.0, 0.3));
-        let seq = acgt_sequence(50_000);
-        let mut rng = deterministic_rng();
-        let out = m.sample_variants("chr1", 50_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
-
-        let bnds: Vec<&Variant> = out
-            .iter()
-            .filter(|v| {
-                v.alternate
-                    .as_symbolic()
-                    .map(|s| s.sv_type == SvType::Bnd)
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(!bnds.is_empty(), "expected at least one de novo BND");
-        assert_eq!(
-            bnds.len() % 2,
-            0,
-            "BND records must come in pairs: {bnds:?}"
-        );
-
-        // Every record has an ID, and MATEID resolves to a record that points back.
-        let by_id: std::collections::HashMap<&str, &Variant> = bnds
-            .iter()
-            .map(|v| (v.id.as_deref().expect("BND must carry an ID"), *v))
-            .collect();
-        assert_eq!(by_id.len(), bnds.len(), "BND IDs must be unique");
-
-        for v in &bnds {
-            let info = v.info.as_deref().unwrap_or("");
-            let mateid = info
-                .split(';')
-                .find_map(|f| f.strip_prefix("MATEID="))
-                .unwrap_or_else(|| panic!("BND record has no MATEID: {info}"));
-            let mate = by_id
-                .get(mateid)
-                .unwrap_or_else(|| panic!("MATEID={mateid} does not resolve to a record"));
-            let back = mate
-                .info
-                .as_deref()
-                .unwrap_or("")
-                .split(';')
-                .find_map(|f| f.strip_prefix("MATEID="))
-                .unwrap_or("");
-            assert_eq!(
-                back,
-                v.id.as_deref().unwrap(),
-                "MATEID linkage is not reciprocal"
-            );
-
-            // The ALT's embedded breakend base must equal this record's REF.
-            let alt = v.alternate.as_symbolic().unwrap().raw_alt.clone();
-            let ref_char: char = v.reference[0].into();
-            assert_eq!(
-                alt.chars().next().unwrap(),
-                ref_char,
-                "BND ALT must embed its own REF base (not a literal N): REF={ref_char} ALT={alt}"
-            );
-
-            // And the mate's position must be the mate record's own location.
-            let mate_pos_1based = v.alternate.as_symbolic().unwrap().mate_pos.unwrap();
-            assert_eq!(
-                mate_pos_1based.saturating_sub(1),
-                mate.location,
-                "mate_pos must point at the mate record's location"
-            );
-        }
-    }
-
-    /// The sampling loop is gated on placed *events*, not emitted records — a BND
-    /// emits two records, so gating on `out.len()` would halve the SV count.
-    #[test]
-    fn bnd_pair_counts_as_one_event_toward_n_sv() {
-        let mut m = SvModel::default();
-        m.per_base_rate = 5e-3;
-        m.homozygous_frequency = 0.5;
-        m.type_probabilities.clear();
-        m.type_probabilities.insert(SvType::Bnd, 1.0);
-        m.length_log_normal.insert(SvType::Bnd, (7.0, 0.3));
-        let seq = acgt_sequence(50_000);
-        let mut rng = deterministic_rng();
-        let out = m.sample_variants("chr1", 50_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
-        // Junctions, not records.
-        let junctions = out.len() / 2;
-        assert!(
-            junctions >= 2,
-            "an all-BND model should place multiple junctions, got {junctions} \
-             ({} records) — a loop gated on out.len() would halve this",
-            out.len()
-        );
-    }
-
     #[test]
     fn sample_variants_emits_all_supported_types() {
         // The sampler must emit DEL/DUP/CNV/INS/BND/INV if they are in the model.
@@ -1560,15 +2015,24 @@ mod tests {
                 }
             }
         }
-        // At this rate and probability we expect to see all six types,
-        // with INS landing on the literal path.
+        // At this rate and probability we expect every SPAN type, with INS landing on
+        // the literal path.
         assert!(seen_types.contains(&SvType::Del));
         assert!(seen_types.contains(&SvType::Dup));
         assert!(seen_types.contains(&SvType::Cnv));
         assert!(seen_types.contains(&SvType::Ins));
-        assert!(seen_types.contains(&SvType::Bnd));
         assert!(seen_types.contains(&SvType::Inv));
         assert!(seen_literal_ins, "expected at least one literal-ALT INS");
+        // MUST NOT FIRE: BND is in this model's type_probabilities (0.17) and must still
+        // not be emitted here. A breakend spans two contigs, so it is sampled genome-wide
+        // by `sample_translocations`; the per-contig sampler used to fake one by pointing
+        // the mate at its own contig, which is a DEL/DUP/INV by orientation and
+        // double-counted classes this same loop already emits.
+        assert!(
+            !seen_types.contains(&SvType::Bnd),
+            "per-contig sampling must not emit BND — it cannot place the mate on another \
+             contig, and a same-contig junction is a DEL/DUP/INV"
+        );
     }
 
     #[test]
@@ -1714,6 +2178,148 @@ mod tests {
         }
     }
 
+    /// A de novo INS must be identifiable as a STRUCTURAL insertion, not just as an
+    /// insertion. It is emitted with a literal ALT (so the reads carry the bases), which
+    /// makes it byte-identical in form to a small-indel-model insertion — SVTYPE is the
+    /// only thing that separates them. Without it the SV harness selects on
+    /// `ALT[0]~"<" || INFO/SVTYPE!="."`, matches neither, and reports `truth INS: 0`
+    /// while insertions were planted (jobs 20885875 / 20892075, 4 planted, 0 scored).
+    ///
+    /// KNOWN ANSWER, independent of the implementation: for `REF=<1 anchor base>` and
+    /// `ALT=<anchor><n novel bases>`, SVLEN must be exactly `n` = `ALT.len() - REF.len()`,
+    /// positive, and END must equal POS because an insertion consumes no reference span.
+    #[test]
+    fn sampled_ins_carry_svtype_and_svlen_so_they_are_separable_from_indels() {
+        use crate::structs::variants::parse_sv_info;
+        let m = model_with_single_type(SvType::Ins, 5e-3);
+        let seq = acgt_sequence(100_000);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+        assert!(!out.is_empty(), "fixture must plant at least one INS");
+        for v in &out {
+            let info = v
+                .info
+                .as_deref()
+                .expect("de novo INS must carry INFO or it cannot be told from an indel");
+            let parsed = parse_sv_info(info);
+            assert_eq!(
+                parsed.svtype.as_deref(),
+                Some("INS"),
+                "INS must be tagged SVTYPE=INS; got {info}"
+            );
+
+            // SVLEN computed from the record itself, not from the sampler's internals.
+            let alt = v.alternate.as_literal().expect("INS must be literal-ALT");
+            let inserted = (alt.len() - v.reference.len()) as i64;
+            assert!(inserted > 0);
+            assert_eq!(
+                parsed.svlen,
+                Some(inserted),
+                "SVLEN must equal ALT.len()-REF.len() = {inserted}; got {info}"
+            );
+
+            // MUST NOT FIRE: END must be POS, never POS+SVLEN. Claiming a reference span
+            // an insertion does not occupy is the same defect the BND arm carries a long
+            // comment about, and truvari sizes records off END.
+            let pos_1based = v.location + 1;
+            assert_eq!(
+                parsed.end,
+                Some(pos_1based),
+                "END must equal POS ({pos_1based}) for an insertion; got {info}"
+            );
+            assert_ne!(
+                parsed.end,
+                Some(pos_1based + inserted as usize),
+                "END must not span the inserted sequence"
+            );
+        }
+    }
+
+    /// CROSS-COMPONENT INVARIANT (sv_model -> vcf_tools). The sampler tagging the record
+    /// and the writer emitting the tag are separate components, and each can be correct
+    /// while the pair is not — which is the shape of most defects found in this repo. The
+    /// writer routes literal records down a *different* INFO branch than symbolic ones
+    /// (`vcf_tools.rs`, on `is_symbolic`), and that branch is documented as carrying only
+    /// simulator tags like EIDOLON_CCF/EIDOLON_VAF. A literal INS carrying SVTYPE could be
+    /// dropped there and every unit test above would still pass, because none of them
+    /// touch a file. Drive the real sampler through the real writer.
+    #[test]
+    fn sampled_ins_svtype_survives_the_vcf_writer() {
+        use crate::file_tools::vcf_tools::write_vcf;
+        use crate::structs::mutated_map::MutatedMap;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let contig_len = 100_000usize;
+        let m = model_with_single_type(SvType::Ins, 5e-3);
+        let seq = acgt_sequence(contig_len);
+        let mut rng = deterministic_rng();
+        let out = m.sample_variants("chr1", contig_len, &[], &seq, 2, 1.0, 0.25, &mut rng);
+        assert!(!out.is_empty(), "fixture must plant at least one INS");
+        let n_ins = out.len();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = temp_dir.path().join("ins.vcf");
+        let map = MutatedMap::from_interval(0, contig_len, out).unwrap();
+        let maps = HashMap::from([("chr1".to_string(), vec![map])]);
+        write_vcf(
+            &maps,
+            &vec!["chr1".to_string()],
+            &HashMap::from([("chr1".to_string(), contig_len)]),
+            &PathBuf::from("ref.fa"),
+            false,
+            &output,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let body: Vec<String> = crate::file_tools::file_io::read_gzip_lines(&output)
+            .unwrap()
+            .map(|l| l.unwrap())
+            .filter(|l| !l.starts_with('#'))
+            .collect();
+        let tagged = body.iter().filter(|l| l.contains("SVTYPE=INS")).count();
+        assert_eq!(
+            tagged,
+            n_ins,
+            "all {n_ins} sampled INS must reach the VCF carrying SVTYPE=INS; \
+             got {tagged} of {} record(s): {body:?}",
+            body.len()
+        );
+        // The SV tags must be appended BESIDE provenance, not instead of it — the writer
+        // builds that INFO column by concatenation and either side could win.
+        assert!(
+            body.iter().all(|l| l.contains("EIDOLON_PROVENANCE=denovo")),
+            "provenance must survive beside SVTYPE: {body:?}"
+        );
+    }
+
+    /// MUST NOT FIRE, the other direction: tagging INS must not have leaked SVTYPE onto
+    /// the *other* literal variants, or small indels would be promoted to structural
+    /// variants and every future INS denominator would be inflated. Only the SV sampler's
+    /// insertions are in scope here, so assert the converse invariant that holds within
+    /// this sampler: nothing it emits with a non-INS type claims to be an INS.
+    #[test]
+    fn no_non_ins_sampled_variant_claims_svtype_ins() {
+        use crate::structs::variants::parse_sv_info;
+        for t in [SvType::Del, SvType::Dup, SvType::Cnv, SvType::Inv] {
+            let m = model_with_single_type(t, 5e-3);
+            let seq = acgt_sequence(100_000);
+            let mut rng = deterministic_rng();
+            let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+            assert!(!out.is_empty(), "fixture must plant at least one {t:?}");
+            for v in &out {
+                if let Some(info) = v.info.as_deref() {
+                    assert_ne!(
+                        parse_sv_info(info).svtype.as_deref(),
+                        Some("INS"),
+                        "{t:?} must not be tagged SVTYPE=INS; got {info}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn sampled_cnvs_carry_info_cn_from_distribution() {
         let m = model_with_single_type(SvType::Cnv, 5e-3);
@@ -1772,24 +2378,434 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sampled_bnds_have_fixed_1bp_length() {
-        // BNDs currently use a nominal fixed length of 1bp.
-        let m = model_with_single_type(SvType::Bnd, 5e-3);
-        let seq = acgt_sequence(100_000);
-        let mut rng = deterministic_rng();
-        let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
-        assert!(!out.is_empty());
-        for v in &out {
-            let sv = v.alternate.as_symbolic().expect("must be symbolic");
-            assert_eq!(sv.sv_type, SvType::Bnd);
-            assert!(sv.raw_alt.contains("chr1:"));
-            assert_eq!(sv.mate_contig.as_deref(), Some("chr1"));
-            assert!(sv.mate_pos.is_some());
-            let end = sv.end.expect("END must be populated");
-            // For BND, length = 1, so end = location + 1.
-            assert_eq!(end, v.location + 1);
+    /// Sample BNDs with a NON-degenerate length distribution. `model_with_single_type`
+    /// special-cases BND to `(0.0, 0.0)`, so every existing BND test runs at length 1 and
+    /// cannot see a length-dependent bug.
+    // ── Inter-chromosomal translocations ────────────────────────────────────────
+    // Each test below maps to one numbered clause of `sample_translocations`'
+    // correctness criterion, which was written before the implementation.
+
+    /// A multi-contig reference of ACGT, with the given per-contig lengths.
+    fn tra_reference(lens: &[(&str, usize)]) -> (Vec<String>, HashMap<String, Vec<Nucleotide>>) {
+        let order: Vec<String> = lens.iter().map(|(n, _)| n.to_string()).collect();
+        let map = lens
+            .iter()
+            .map(|(n, l)| (n.to_string(), acgt_sequence(*l)))
+            .collect();
+        (order, map)
+    }
+
+    fn tra_model() -> SvModel {
+        let mut m = SvModel::default();
+        m.per_base_rate = 5e-4;
+        m.homozygous_frequency = 0.5;
+        m.type_probabilities.clear();
+        m.type_probabilities.insert(SvType::Bnd, 1.0);
+        m.length_log_normal.insert(SvType::Bnd, (1.0, 0.1));
+        m
+    }
+
+    /// Flatten the per-contig map into (contig, pos, mate_contig, mate_pos, ALT).
+    fn tra_records(
+        out: &HashMap<String, Vec<Variant>>,
+    ) -> Vec<(String, usize, String, usize, String)> {
+        let mut v = Vec::new();
+        for (contig, vars) in out {
+            for var in vars {
+                let sv = var.alternate.as_symbolic().expect("symbolic");
+                v.push((
+                    contig.clone(),
+                    var.location + 1,
+                    sv.mate_contig.clone().expect("mate contig"),
+                    sv.mate_pos.expect("mate pos"),
+                    sv.raw_alt.clone(),
+                ));
+            }
         }
+        v.sort();
+        v
+    }
+
+    /// Record shape: a breakend is a POINT. END == POS, no SVLEN, whatever length the
+    /// model sampled. Migrated from `bnd_end_equals_pos_regardless_of_length_distribution`
+    /// and `sampled_bnds_have_fixed_1bp_length`, which drove the per-contig sampler that
+    /// no longer emits BND. The invariant is unchanged; only its source moved.
+    #[test]
+    fn translocation_records_are_points_with_no_svlen() {
+        let mut m = tra_model();
+        // A length distribution that would produce multi-kb spans if it were consulted.
+        m.length_log_normal.insert(SvType::Bnd, (7.0, 0.3));
+        let (order, refmap) = tra_reference(&[("c1", 60_000), ("c2", 60_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+        let mut n = 0usize;
+        for (_, vars) in &out {
+            for v in vars {
+                let sv = v.alternate.as_symbolic().expect("symbolic");
+                assert_eq!(sv.sv_type, SvType::Bnd);
+                assert_eq!(
+                    sv.end,
+                    Some(v.location + 1),
+                    "END must equal POS for a breakend; a span here would make truvari and \
+                     bcftools size a 1bp event as multi-kb"
+                );
+                assert_eq!(sv.svlen, None, "a breakend has no SVLEN");
+                assert_eq!(v.reference.len(), 1, "REF is the single anchor base");
+                n += 1;
+            }
+        }
+        assert!(n >= 20, "only {n} record(s) checked");
+    }
+
+    /// One translocation event emits EXACTLY two records, cross-linked by MATEID.
+    /// Migrated from `bnd_pair_counts_as_one_event_toward_n_sv` and
+    /// `denovo_bnd_emits_a_cross_linked_mate_pair`.
+    #[test]
+    fn each_translocation_emits_exactly_two_cross_linked_records() {
+        let m = tra_model();
+        let (order, refmap) = tra_reference(&[("c1", 60_000), ("c2", 60_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+
+        let mut by_id: HashMap<String, String> = HashMap::new(); // id -> MATEID
+        for (_, vars) in &out {
+            for v in vars {
+                let id = v.id.clone().expect("every BND record needs an ID");
+                let info = v.info.clone().unwrap_or_default();
+                let mate = info
+                    .split(';')
+                    .find_map(|f| f.strip_prefix("MATEID="))
+                    .expect("every BND record needs MATEID")
+                    .to_string();
+                assert!(by_id.insert(id, mate).is_none(), "duplicate BND ID");
+            }
+        }
+        assert!(!by_id.is_empty(), "no records — test would be vacuous");
+        assert_eq!(by_id.len() % 2, 0, "records must come in pairs");
+        for (id, mate) in &by_id {
+            let back = by_id
+                .get(mate)
+                .unwrap_or_else(|| panic!("MATEID {mate} names no emitted record"));
+            assert_eq!(
+                back, id,
+                "MATEID linkage is not reciprocal: {id} -> {mate} -> {back}"
+            );
+        }
+    }
+
+    /// Criterion 1: every junction spans two DIFFERENT contigs.
+    ///
+    /// This is the whole point of the feature. eidolon shipped `<BND>` "translocations"
+    /// that were 100% same-contig — job 20719077 emitted 466 junctions, 466 of them
+    /// intra-chromosomal, because the mate contig was hardcoded to the anchor's own.
+    #[test]
+    fn every_translocation_spans_two_different_contigs() {
+        let m = tra_model();
+        let (order, refmap) =
+            tra_reference(&[("chr1", 60_000), ("chr2", 40_000), ("chr3", 20_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+        let recs = tra_records(&out);
+        assert!(
+            !recs.is_empty(),
+            "no translocations — test would be vacuous"
+        );
+        for (contig, _, mate_contig, _, _) in &recs {
+            assert_ne!(
+                contig, mate_contig,
+                "a translocation must join two different contigs; got {contig} -> {mate_contig}"
+            );
+        }
+    }
+
+    /// Criterion 2: the two records of a junction are reciprocal — each names the
+    /// other's contig and position, and the ALT embeds the mate's coordinates.
+    #[test]
+    fn translocation_records_point_back_at_each_other() {
+        let m = tra_model();
+        let (order, refmap) = tra_reference(&[("chrA", 50_000), ("chrB", 50_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+        let recs = tra_records(&out);
+        assert!(
+            !recs.is_empty(),
+            "no translocations — test would be vacuous"
+        );
+        assert_eq!(recs.len() % 2, 0, "records must come in pairs");
+
+        for (contig, pos, mate_contig, mate_pos, alt) in &recs {
+            // The partner record must exist, and must point back here.
+            let back = recs
+                .iter()
+                .find(|(c, p, _, _, _)| c == mate_contig && p == mate_pos)
+                .unwrap_or_else(|| panic!("no record at the mate {mate_contig}:{mate_pos}"));
+            assert_eq!(
+                (&back.2, back.3),
+                (contig, *pos),
+                "mate at {mate_contig}:{mate_pos} does not point back to {contig}:{pos}"
+            );
+            // Content, not just bookkeeping: the ALT must name the mate locus.
+            assert!(
+                alt.contains(&format!("{mate_contig}:{mate_pos}")),
+                "ALT {alt} does not embed the mate locus {mate_contig}:{mate_pos}"
+            );
+        }
+    }
+
+    /// The mate must carry the RECIPROCAL geometry, not the same one — only the two
+    /// inversion orientations are self-reciprocal, so a direct junction pairs `t[p[`
+    /// with `]p]t`. Coordinates pointing back is not enough: a mate with the wrong
+    /// geometry still points back correctly, and the truth VCF would then describe a
+    /// different rearrangement than the reads carry (#451). Found by mutation — the
+    /// coordinate check alone did NOT catch `mate_geom = geom`.
+    #[test]
+    fn translocation_mate_carries_the_reciprocal_geometry() {
+        let m = tra_model();
+        let (order, refmap) = tra_reference(&[("cA", 60_000), ("cB", 60_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+
+        // Index every emitted record by (contig, pos) so each anchor can find its mate.
+        let mut by_locus: HashMap<(String, usize), SvData> = HashMap::new();
+        for (contig, vars) in &out {
+            for v in vars {
+                let sv = v.alternate.as_symbolic().expect("symbolic").clone();
+                by_locus.insert((contig.clone(), v.location + 1), sv);
+            }
+        }
+        assert!(!by_locus.is_empty(), "no records — test would be vacuous");
+
+        let mut checked = 0usize;
+        let mut saw_non_self_reciprocal = false;
+        for ((contig, pos), sv) in &by_locus {
+            let mate_key = (
+                sv.mate_contig.clone().expect("mate contig"),
+                sv.mate_pos.expect("mate pos"),
+            );
+            let mate = by_locus
+                .get(&mate_key)
+                .unwrap_or_else(|| panic!("no mate record for {contig}:{pos}"));
+
+            let anchor_geom = BndGeometry::from_flags(sv.bnd_join_after, sv.bnd_mate_extends_right);
+            let mate_geom =
+                BndGeometry::from_flags(mate.bnd_join_after, mate.bnd_mate_extends_right);
+            assert_eq!(
+                mate_geom,
+                anchor_geom.reciprocal(),
+                "{contig}:{pos} is {anchor_geom:?} so its mate must be {:?}, got {mate_geom:?}",
+                anchor_geom.reciprocal()
+            );
+            // Flags must also agree with each record's OWN ALT, or the reads and the
+            // truth disagree even when the pair is internally consistent.
+            assert_eq!(
+                (sv.bnd_join_after, sv.bnd_mate_extends_right),
+                anchor_geom.flags(),
+                "flags disagree with ALT {}",
+                sv.raw_alt
+            );
+            if anchor_geom != anchor_geom.reciprocal() {
+                saw_non_self_reciprocal = true;
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20, "only {checked} record(s) checked");
+        // Non-vacuity: head-to-head and tail-to-tail are self-reciprocal, so a sample
+        // containing only those would satisfy the assertion no matter what the code did.
+        assert!(
+            saw_non_self_reciprocal,
+            "sample contained only self-reciprocal geometries — the reciprocity \
+             assertion above is vacuous on this sample"
+        );
+    }
+
+    /// Criterion 3: the budget follows total genome length, not any single contig.
+    /// Doubling the genome (same per-contig size, twice as many contigs) should roughly
+    /// double the yield.
+    #[test]
+    fn translocation_count_scales_with_genome_length() {
+        let m = tra_model();
+        let small = tra_reference(&[("c1", 50_000), ("c2", 50_000)]);
+        let big = tra_reference(&[
+            ("c1", 50_000),
+            ("c2", 50_000),
+            ("c3", 50_000),
+            ("c4", 50_000),
+        ]);
+        let mut r1 = deterministic_rng();
+        let mut r2 = deterministic_rng();
+        let n_small =
+            tra_records(&m.sample_translocations(&small.0, &small.1, 2, 1.0, &mut r1)).len();
+        let n_big = tra_records(&m.sample_translocations(&big.0, &big.1, 2, 1.0, &mut r2)).len();
+        assert!(n_small > 0 && n_big > 0, "both arms must emit something");
+        let ratio = n_big as f64 / n_small as f64;
+        assert!(
+            (1.4..=2.8).contains(&ratio),
+            "doubling the genome should roughly double the yield; got {n_small} -> {n_big} (x{ratio:.2})"
+        );
+    }
+
+    /// Criterion 4, the MUST-NOT-FIRE case: one contig means no translocation is
+    /// possible, and the correct answer is zero — not a same-contig junction, which is
+    /// exactly the defect this feature replaces.
+    #[test]
+    fn a_single_contig_reference_yields_no_translocations() {
+        let m = tra_model();
+        let (order, refmap) = tra_reference(&[("only", 100_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+        assert!(
+            out.is_empty(),
+            "a single-contig reference must yield zero translocations, got {:?}",
+            tra_records(&out)
+        );
+    }
+
+    /// Partner contigs are length-weighted: a contig 9x longer should take part in far
+    /// more junctions than a short one. Guards against picking the first contig, or
+    /// picking uniformly over contigs regardless of size.
+    #[test]
+    fn partner_contig_selection_is_length_weighted() {
+        let m = tra_model();
+        let (order, refmap) = tra_reference(&[("big", 90_000), ("small", 10_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+        let recs = tra_records(&out);
+        assert!(
+            recs.len() >= 20,
+            "need a sample to test a distribution; got {}",
+            recs.len()
+        );
+        let big = recs.iter().filter(|(c, ..)| c == "big").count();
+        let frac = big as f64 / recs.len() as f64;
+        // Every junction contributes one endpoint to each of the two contigs here (only
+        // two exist), so the split is 50/50 by construction — what length-weighting
+        // must NOT do is starve the short contig entirely or invert the relationship.
+        assert!(
+            (0.3..=0.7).contains(&frac),
+            "with two contigs each junction touches both; got big={frac:.2}"
+        );
+    }
+
+    /// Geometry stays uniform across the four breakend forms — now a MEASURED claim,
+    /// not a non-claim: PCAWG TRA orientation is 24.6/25.4/25.3/24.7
+    /// (docs/pcawg_sv_measurement.md M2).
+    #[test]
+    fn translocation_geometry_covers_all_four_forms() {
+        let m = tra_model();
+        let (order, refmap) = tra_reference(&[("c1", 80_000), ("c2", 80_000)]);
+        let mut rng = deterministic_rng();
+        let out = m.sample_translocations(&order, &refmap, 2, 1.0, &mut rng);
+        let recs = tra_records(&out);
+        assert!(recs.len() >= 40, "need a sample; got {}", recs.len());
+        let mut forms = std::collections::HashSet::new();
+        for (_, _, _, _, alt) in &recs {
+            let b = alt.as_bytes();
+            forms.insert(match (b[0], b.iter().any(|&c| c == b'[')) {
+                (b'[', _) => "[p[t",
+                (b']', _) => "]p]t",
+                (_, true) => "t[p[",
+                (_, false) => "t]p]",
+            });
+        }
+        assert_eq!(
+            forms.len(),
+            4,
+            "all four VCF 4.2 breakend forms should appear; saw {forms:?}"
+        );
+    }
+
+    /// VCF 4.2 puts POS on the base BEFORE a symbolic event, so `END - POS` must
+    /// equal `|SVLEN|` for every span type — one rule, not one per type.
+    ///
+    /// `place_sv` used to return the FIRST AFFECTED base as the anchor for
+    /// DUP/CNV/INV while returning the preceding base for DEL, so a single output
+    /// file carried two meanings of POS: `END-POS == |SVLEN|` for DEL and
+    /// `|SVLEN|-1` for the rest. It also put the first duplicated base in REF where
+    /// the preceding base belongs.
+    #[test]
+    fn denovo_symbolic_svs_put_pos_on_the_base_before_the_event() {
+        for sv_type in [SvType::Del, SvType::Dup, SvType::Cnv, SvType::Inv] {
+            let m = model_with_single_type(sv_type, 5e-3);
+            let seq = acgt_sequence(100_000);
+            let mut rng = deterministic_rng();
+            let out = m.sample_variants("chr1", 100_000, &[], &seq, 2, 1.0, 0.25, &mut rng);
+            let mut checked = 0;
+            for v in &out {
+                let Some(sv) = v.alternate.as_symbolic() else {
+                    continue;
+                };
+                if sv.sv_type != sv_type {
+                    continue;
+                }
+                let pos = (v.location + 1) as i64; // 1-based POS
+                let end = sv.end.expect("symbolic SV must carry END") as i64;
+                let svlen = sv.svlen.expect("span SV must carry SVLEN");
+                assert_eq!(
+                    end - pos,
+                    svlen.abs(),
+                    "{sv_type:?} at POS {pos}: END-POS ({}) != |SVLEN| ({}) — POS is \
+                     not on the base before the event",
+                    end - pos,
+                    svlen.abs()
+                );
+                checked += 1;
+            }
+            assert!(
+                checked > 0,
+                "{sv_type:?}: nothing sampled — test proves nothing"
+            );
+        }
+    }
+
+    /// Geometry is fitted from the corpus' own ALT strings, not assumed.
+    #[test]
+    fn fit_learns_bnd_geometry_from_the_corpus() {
+        // Three head-to-head breakends and one deletion-like: 0.75 / 0.25.
+        let alts = ["A]chr1:500]", "A]chr1:600]", "A]chr1:700]", "A[chr1:800["];
+        let obs: Vec<Variant> = alts
+            .iter()
+            .enumerate()
+            .map(|(i, alt)| {
+                let mut sd = SvData::new(*alt, SvType::Bnd);
+                sd.end = Some(100 + i);
+                let (c, p, ja, mr) = parse_bnd_alt(alt);
+                sd.mate_contig = c;
+                sd.mate_pos = p;
+                sd.bnd_join_after = ja;
+                sd.bnd_mate_extends_right = mr;
+                Variant {
+                    variant_type: VariantType::BND,
+                    location: 100 + i,
+                    reference: vec![Nucleotide::A],
+                    alternate: AlternateType::Symbolic(sd),
+                    genotype_str: "0/1".to_string(),
+                    genotype: Genotype::Heterozygous,
+                    allele_fraction: None,
+                    id: None,
+                    quality_score: None,
+                    filter: None,
+                    info: None,
+                    format: vec!["GT".to_string()],
+                    sample: vec!["0/1".to_string()],
+                    provenance: Provenance::InputVcf,
+                }
+            })
+            .collect();
+        let m = SvModel::fit_from_observations(&obs, 100_000).expect("should fit");
+        let w = &m.bnd_geometry_weights;
+        assert!(
+            (w.get(&BndGeometry::HeadToHead).copied().unwrap_or(0.0) - 0.75).abs() < 1e-9,
+            "head-to-head should be 3/4, got {:?}",
+            w.get(&BndGeometry::HeadToHead)
+        );
+        assert!(
+            (w.get(&BndGeometry::DeletionLike).copied().unwrap_or(0.0) - 0.25).abs() < 1e-9,
+            "deletion-like should be 1/4, got {:?}",
+            w.get(&BndGeometry::DeletionLike)
+        );
+        // ...and the orientations the corpus never showed must carry no weight, rather
+        // than being smoothed in.
+        assert_eq!(w.get(&BndGeometry::TailToTail).copied().unwrap_or(0.0), 0.0);
     }
 
     #[test]

@@ -44,23 +44,51 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 
 |                                            | **NEAT 2.x** (genReads)        | **NEAT 4.x**                              | **`eidolon`**                                              |
 | ------------------------------------------ | ------------------------------ | ----------------------------------------- | -------------------------------------------------------- |
-| Latest version                             | 2.1                            | 4.5.3                                      | 3.0.0                                                    |
+| Latest version                             | 2.1                            | 4.6.1                                      | 3.0.0                                                    |
 | Language                                   | Python 2                       | Python 3                                  | Rust                                                     |
 | FASTQ reads (single / paired)              | ✅                             | ✅                                        | ✅                                                       |
 | Golden BAM + VCF truth set                 | ✅                             | ✅                                        | ✅                                                       |
 | SNPs + indels                              | ✅                             | ✅                                        | ✅                                                       |
-| Structural variants                        | Input VCF only (no native SV)  | Native: inversions, translocations, duplications | Native: BND, INV, INS, **CNV**                    |
-| Native tumor / normal cancer workflow      | ❌                             | ❌                                        | ✅ `gen-cancer-reads` (purity mix + origin-tagged truth) |
+| Structural variants                        | ❌ none                        | ❌ placeholder classes only, not wired in (see note) | ✅ Native: BND, INV, INS, **CNV**              |
+| Native tumor / normal cancer workflow      | ❌ (tutorial script only)      | ❌ (stated roadmap)                       | ✅ `gen-cancer-reads` (purity mix + origin-tagged truth) |
 | Cancer / per-tissue models                 | ❌                             | ❌                                        | ✅ pan-cancer + BRCA / skin / lung (COSMIC / PCAWG)      |
-| Empirical mutation model (trinucleotide)   | ✅                             | ✅                                        | ✅                                                       |
+| Intra-tumor heterogeneity (subclones)      | ❌                             | ❌                                        | ✅ CCF mixtures; `purity × dosage × CCF`; PyClone-VI / DPClust ingest; `EIDOLON_CCF` / `EIDOLON_VAF` truth |
+| Empirical mutation model (trinucleotide)   | ✅                             | ✅                                        | ✅ (incl. positional trinucleotide bias — SBS-96 cosine 0.99) |
 | Sequencing error model                     | ✅                             | ✅                                        | ✅                                                       |
+| SNP transition matrix source               | fit from VCF                   | fit from VCF                              | ✅ VCF, **or inferred from a BAM's MD tags**, or a custom 4×4 TSV |
+| Quality-score binning                      | ❌                             | ✅ + named instrument presets (`--quality-preset novaseq`) | ✅ explicit bin list (`binned_quality_bins`); no named presets |
+| Default het/hom ratio (bundled model)      | ~99 (`homozygous_frequency` 0.010) | ~999 (0.001)                          | ✅ ~2.0 (0.333) — human-realistic, locked by a test      |
 | Fragment-length + GC-bias models           | ✅                             | ✅                                        | ✅ (incl. one-pass `gen-bam-models`)                     |
 | BED targeting / VCF variant insertion      | ✅                             | ✅                                        | ✅                                                       |
 | Continuous per-variant allele fraction     | ❌ (genotype `{0.5, 1.0}`)     | ❌ (genotype `{0.5, 1.0}`)                | ✅ input-VCF `AF`/`AD` → matched AF spectrum (pooled / somatic) |
+| Long reads (ONT / PacBio)                  | ❌                             | ⚠️ PacBio-like single-end "given a model" | ⚠️ `long_reads:` fragment mode; no long-read error model yet (#319) |
 | Parallelism                                | Manual job sharding (`--job`)  | Multiprocessing (`--threads`): genome split into ~8 chunks/thread, then stitched | Multithreading (rayon) |
+| Deterministic output                       | Not guaranteed                 | Not guaranteed across thread counts       | ✅ byte-identical for a given seed, **any** thread count  |
+| Speed (single thread, vs NEAT 4.6.1)       | —                              | 1× (baseline)                             | **~10–13× faster** (E. coli 10.4× · yeast 11.2× · chr22 13.3×) |
+| Peak memory (same runs)                    | —                              | 1× (baseline)                             | **3–7× less**, and flatter (chr22 227 MB vs 1525 MB)      |
 | VCF comparison tooling                      | Bundled scripts                | ✅ `compare-vcfs`                          | ✅ `compare-vcfs`                                        |
 | I/O / memory                               | Temp files                     | Temp files                                | Streaming writes, low-memory focus                       |
+| Versioning policy                          | ad hoc                         | ad hoc                                    | SemVer 2.0.0 with a declared public API (as of v3.0.0)   |
 | Distribution                               | GitHub source                  | GitHub / PyPI                             | GitHub + binaries; Bioconda (`conda install -c bioconda eidolon`) |
+
+Speed and memory are single-thread medians (n=3, 10× coverage) on one exclusive
+Delta node against NEAT 4.6.1; see `docs/access_report_draft.md` §3.2. Germline
+fidelity is statistically equivalent between the two tools through an identical
+GATK pipeline (§3.3), which is the intended result for a port.
+
+**On NEAT 4 and structural variants.** NEAT 4.6.1 ships `Inversion`, `Duplication`,
+`Translocation`, `Transposition` and `CopyNumberVariant` classes under
+`neat/variants/`, but none is reachable: none is exported from that package's
+`__init__.py`, none is referenced anywhere outside its own file, and
+`VariantTypes.types` lists only `Insertion`, `Deletion`, `SingleNucleotideVariant`
+and `UnknownVariant`. The mutation model can emit only SNVs, insertions and
+deletions. The input-VCF path classifies records by REF/ALT length arithmetic, so a
+symbolic `<INV>`/`<DUP>` or a breakend ALT becomes an `UnknownVariant` — whose
+`get_alt()` and `get_ref_len()` both raise, since its `__init__` sets no `alt` and
+its metadata is nested one level deeper than those accessors expect. NEAT 4 does not
+generate structural variants and does not render them from an input VCF either.
+NEAT 2.1 has no structural-variant code at all. Verified against tags `2.1` and
+`4.6.1` on 12 Aug 2026.
 
 **Citations.** NEAT: Stephens et al. (2016), *PLOS ONE* 11(11):e0167047,
 [doi:10.1371/journal.pone.0167047](https://doi.org/10.1371/journal.pone.0167047);
@@ -75,6 +103,11 @@ when you want:
 - **Cancer simulation** — a native tumor/normal workflow (`gen-cancer-reads`)
   with configurable purity and an origin-tagged truth VCF, plus CNVs and
   per-tissue cancer models. This is `eidolon`-only.
+- **Intra-tumor heterogeneity** — a tumor as a mixture of subclones at distinct
+  cancer-cell fractions, either specified inline, fitted from PyClone-VI /
+  DPClust output, or replayed from a real tumor's observed VAF. Validated on
+  SEQC2 HCC1395 at r = 0.99 against the intended per-site VAF. Also
+  `eidolon`-only — the axis the NEAT lineage cannot represent at all.
 - **Low, flat memory** — streaming FASTQ writes keep peak RSS small and roughly
   constant across genome size and thread count, which matters on shared HPC
   allocations.
@@ -222,13 +255,21 @@ SUB-COMMANDS:
   gen-bam-models         Builds multiple models (frag-length, GC bias) from one BAM in a single pass
   compare-vcfs           Compares a NEAT-simulated golden VCF against a downstream variant-caller VCF
   gen-cancer-reads       Simulates a tumor/normal mixture (two gen-reads passes + merge)
+  validate               Checks an emitted FASTQ/VCF/BAM against what its consumers accept
+  compare-af             Per-allele AF correlation between a truth VCF and a simulated one
   help                   Print this message or the help of the given subcommand(s)
 
 Options:
-      --log-level [<log_level>]  Sets the log level for the display log. [default: trace] [possible values: trace, debug, info, warn, error, off]
+      --log-level [<log_level>]  Verbosity of the written .neat.log. The on-screen log is always
+                                 info. [default: info] [possible values: trace, debug, info,
+                                 warn, error, off]
       --log-dest <log_dest>      Sets the log destination (full path with full filename) for the written log
   -h, --help                     Print help
 ```
+
+`validate` and `compare-af` take file paths and flags directly rather than a
+configuration YAML — both are diagnostic/measurement runs invoked ad hoc and from
+harness scripts, where writing a YAML per check is friction.
 
 To check options for a subcommand:
 
@@ -773,6 +814,8 @@ qual_offset: 33
 # The BAM must have MD tags. If your aligner did not add them, run:
 #   samtools calmd -b aligned.bam reference.fa > aligned_with_md.bam
 # Ignored if transition_matrix_file is also set.
+# If the BAM yields no mismatches at all, eidolon errors out rather than quietly using the
+# default matrix. To use the default deliberately, omit this key.
 bam_file: /path/to/aligned.bam
 
 # optional: custom 4x4 SNP transition matrix TSV (rows/columns: A C G T).
@@ -784,14 +827,22 @@ transition_matrix_file: /path/to/matrix.tsv
 **SNP transition matrix priority:**
 1. `transition_matrix_file` (explicit TSV) — highest priority
 2. `bam_file` (inferred from MD-tagged BAM mismatches)
-3. Default matrix from Python `eidolon` — used when neither is provided
+3. Built-in default matrix (inherited from Python NEAT) — used when neither is provided
+
+Supplying `bam_file` is a request to *fit* the matrix from data, so if the BAM yields no
+read-vs-reference mismatches, eidolon **errors out** instead of falling back to the default. A
+model that looks trained and is actually the default is indistinguishable from a trained one
+downstream. **Omitting `bam_file` is how you ask for the default matrix.**
 
 **BAM MD tag requirement:**
-The BAM path requires MD tags to identify reference bases at mismatch positions. Most aligners (BWA-MEM, STAR with `--outSAMattributes MD`) add them automatically. If yours does not, generate them with:
+The BAM path requires MD tags to identify reference bases at mismatch positions. MD is an
+*optional* SAM tag, so check your aligner: BWA-MEM writes it, `minimap2` needs `--MD`, and STAR
+needs `--outSAMattributes MD`. If your BAM lacks them, generate them with:
 ```bash
 samtools calmd -b aligned.bam reference.fa > aligned_with_md.bam
 samtools index aligned_with_md.bam
 ```
+Without MD tags the inference finds nothing, which is an error rather than a silent fallback.
 
 **TSV format:**
 The transition matrix TSV has 4 data rows (one per reference base: A, C, G, T) and 4 whitespace-separated columns (one per read base: A, C, G, T). The first row is skipped if it is non-numeric (treated as a header). Diagonal values are zeroed automatically. Rows are re-normalized to sum to 1.

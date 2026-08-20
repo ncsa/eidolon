@@ -69,6 +69,16 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
     // mostly samples DEL/DUP/CNV at typical rates; we just want a guaranteed
     // de novo INS record to verify the literal-Insertion path.
     config.sv_rate_scale = Some(50.0);
+    // #516: de novo insertions longer than `read_len - 1` are now REFUSED rather than planted,
+    // because reads can carry at most that much of an insertion's novel sequence and emitting
+    // the record would put a length in the truth VCF the reads do not support. The default SV
+    // model puts Ins at log-normal (5.7, 1.0) — median ~299 bp — so at a default read length
+    // essentially every de novo insertion is correctly dropped and this test found none.
+    //
+    // A longer read makes more of the model's own distribution realizable instead of weakening
+    // the assertion — the record this test wants to see should be one the engine can actually
+    // render. 150 is the largest that still fits the helper's hardcoded 200bp fragment.
+    config.read_len = 150;
     config.rng_seed = "v1.12.0-multi-sv".to_string();
 
     let yaml = config.write_yaml();
@@ -149,6 +159,31 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
     assert!(
         de_novo_ins_count > 0,
         "expected ≥1 de novo literal Insertion record (per #190); got 0 in: {body:?}"
+    );
+
+    // #516 END-TO-END: no de novo insertion may declare more novel bases than a read can
+    // carry. This is the assertion the cap exists for — the unit tests pin the filter, this
+    // pins that the filter is actually WIRED INTO the de novo path and reaches the truth VCF.
+    // Without it, deleting the call site would leave every other assertion here green.
+    let max_novel = config.read_len - 1;
+    let oversized: Vec<(usize, &&String)> = body
+        .iter()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() < 5
+                || f[3].len() != 1
+                || !f[4].chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T'))
+            {
+                return None;
+            }
+            let novel = f[4].len().saturating_sub(f[3].len());
+            (novel > max_novel).then_some((novel, l))
+        })
+        .collect();
+    assert!(
+        oversized.is_empty(),
+        "de novo insertion(s) declare more novel bases than read_len-1={max_novel}, which the \
+         reads cannot carry (#516): {oversized:?}"
     );
 
     // ── FASTQ assertions ───────────────────────────────────────────────────

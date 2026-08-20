@@ -53,8 +53,62 @@ export CARGO_TARGET_DIR
 mkdir -p "$CARGO_TARGET_DIR"
 echo "[1/4] Building eidolon release binary (artifacts → \$SCRATCH)..."
 cd "$REPO_ROOT"
+# Say what is about to be built, and refuse to build a checkout that is behind its
+# remote. A partial or interrupted `git pull` leaves the tree on older code and setup
+# happily builds it: job 20682989 ran a 3.0.1 binary against a 3.1.0 checkout, spent
+# 25 core-hours, and produced a complete set of plausible numbers that tested none of
+# the fix it was submitted to verify. Nothing in the old output could have revealed
+# that, because setup never reported what it built.
+echo "      checkout: $(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}')"
+    if git fetch -q origin 2>/dev/null; then
+        behind="$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)"
+        if [[ "${behind:-0}" -gt 0 ]]; then
+            echo "      ERROR: checkout is ${behind} commit(s) behind ${upstream}." >&2
+            echo "      Pull before building, or the binary will not contain the code you" >&2
+            echo "      think it does. Set ALLOW_BEHIND=1 to build anyway." >&2
+            [[ "${ALLOW_BEHIND:-0}" == "1" ]] || exit 1
+        fi
+    else
+        echo "      WARNING: could not fetch ${upstream} — cannot confirm this checkout" >&2
+        echo "      is current. If a pull failed earlier, you may be building stale code." >&2
+    fi
+fi
+# LINK WITH gcc, NOT the Cray `cc` wrapper.
+#
+# Delta's site-wide `default` module set loads PrgEnv-gnu together with
+# craype-accel-nvidia80, which tells the Cray compiler driver to target NVIDIA A100s. `cc`
+# then composes its link line from pkg-config's `virtual:world`, which pulls in a CUDA
+# runtime plus cray-mpich, cray-libsci, cray-dsmml and libfabric. eidolon uses NONE of
+# those — it is pure Rust plus zlib-ng/libdeflate via cmake.
+#
+# After the RHEL/PE upgrade that world referenced cray-sdk-cudatoolkit-25.3_11.8, whose .pc
+# file is absent, so `cc` refused to link ANYTHING — including a hello-world, and including
+# every dependency build script. Every build failed with "Package 'cray-sdk-cudatoolkit...',
+# required by 'virtual:world', not found" (2026-08-12).
+#
+# Confirmed working 2026-08-12. Unloading cudatoolkit ALONE was measured and still fails — it
+# removes the package while leaving craype-accel-nvidia80, which is what demands it. Unloading
+# craype-accel-nvidia80 instead is untested, and would not persist regardless: `default`
+# reloads at every login. This export is immune to that. rustc already does the real linking
+# with its own bundled lld (-fuse-ld=lld); `cc` was only ever supplying a driver front-end
+# that insisted on resolving a GPU stack we do not use. gcc-native/13.2 is in the default
+# set, so `gcc` is present.
+#
+# Override CARGO_LINKER=cc to go back to the wrapper if a future PE actually needs it.
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_LINKER:-gcc}"
+echo "      Linker: $CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER (see the comment above; Cray cc pulls in CUDA)"
 cargo build --release 2>&1 | tail -5
 echo "      Binary: $CARGO_TARGET_DIR/release/eidolon"
+# Report the version actually produced. This is the line whose absence cost a run.
+built_ver="$("$CARGO_TARGET_DIR/release/eidolon" --version 2>/dev/null || echo unknown)"
+repo_ver="$(awk -F\' '/^version = /{print $2; exit}' Cargo.toml 2>/dev/null || echo unknown)"
+echo "      Built:  ${built_ver}   (Cargo.toml says ${repo_ver})"
+if [[ "$built_ver" != *"$repo_ver"* ]]; then
+    echo "      ERROR: built binary reports '${built_ver}' but Cargo.toml says ${repo_ver}." >&2
+    exit 1
+fi
 
 # ── 2. NEAT 4 conda env ─────────────────────────────────────────────────
 setup_conda   # load the conda module + bootstrap `conda` (Delta: miniforge3-python)

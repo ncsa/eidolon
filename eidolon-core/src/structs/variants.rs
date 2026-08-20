@@ -766,7 +766,13 @@ fn sv_type_matches_svtype(sv_type: SvType, svtype_str: &str) -> bool {
     svtype_str.eq_ignore_ascii_case(expected)
 }
 
-fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
+/// Test-only re-export: lets the read generator's tests assert that the geometry an ALT
+/// declares is the geometry the reads are built from, without duplicating the parser.
+pub fn parse_bnd_alt_for_test(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
+    parse_bnd_alt(alt)
+}
+
+pub(crate) fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
     // VCF 4.2 breakend notation (Section 1.4.2)
     // 4 possible forms involving brackets:
     // 1. t[p[  2. t]p]  3. ]p]t  4. [p[t
@@ -1088,6 +1094,66 @@ mod tests {
             // Check if VariantType is also BND when fully parsed
             let (vt, _, _) = parse_alt_payload(100, ".", ref_base, alt).expect(desc);
             assert_eq!(vt, VariantType::BND, "form {} VariantType mismatch", desc);
+        }
+    }
+
+    /// The BND payload must actually REACH `SvData`. `parse_bnd_alt_extracts_mate_info`
+    /// tests the helper in isolation and
+    /// `parse_alternate_breakend_alt_classifies_as_bnd` throws the `AlternateType` away
+    /// (`let (vt, _, _)`) to assert only the type tag — so deleting the two flag
+    /// assignments, or shifting the mate coordinate, left the whole suite green while
+    /// every parsed breakend silently became a direct join.
+    ///
+    /// This is the input-VCF side of the defect that shipped on the de novo side: the
+    /// ALT said one rearrangement and the reads carried another.
+    #[test]
+    fn parsing_a_bnd_record_carries_geometry_and_mate_into_svdata() {
+        // ref, ALT, mate contig, mate pos, join_after, mate_extends_right, form
+        let cases = [
+            (
+                "G",
+                "G]17:198982]",
+                "17",
+                198982usize,
+                true,
+                false,
+                "case 2 t]p]",
+            ),
+            ("G", "G[17:198982[", "17", 198982, true, true, "case 1 t[p["),
+            (
+                "A",
+                "]13:123456]A",
+                "13",
+                123456,
+                false,
+                false,
+                "case 4 ]p]t",
+            ),
+            (
+                "A",
+                "[13:123456[A",
+                "13",
+                123456,
+                false,
+                true,
+                "case 3 [p[t",
+            ),
+        ];
+        for (ref_base, alt, contig, pos, join_after, mate_right, form) in cases {
+            let (_vt, alternate, _r) = parse_alt_payload(100, ".", ref_base, alt).expect(form);
+            let sv = alternate
+                .as_symbolic()
+                .unwrap_or_else(|| panic!("{form}: expected a symbolic BND"));
+            assert_eq!(
+                (
+                    sv.mate_contig.as_deref(),
+                    sv.mate_pos,
+                    sv.bnd_join_after,
+                    sv.bnd_mate_extends_right
+                ),
+                (Some(contig), Some(pos), join_after, mate_right),
+                "{form}: ALT {alt} did not reach SvData as the junction it declares"
+            );
         }
     }
 

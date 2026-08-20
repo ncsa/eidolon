@@ -42,6 +42,52 @@ pub fn default_sv_model() -> SvModel {
 
     // Type breakdown: fitted from the full gnomAD-SV v4.1 run.
     // Deletions dominate; BNDs are included at ~19%.
+    //
+    // ⚠ UNVERIFIED PREMISE (2026-08-02). This 0.1943 is a HEURISTIC, not a gnomAD
+    // measurement: `tools/validate_with_gnomad.sh:11` drops INV/CPX/CTX/BND before
+    // fitting, so no BND ever reached this number. Two consequences worth checking
+    // before it is trusted:
+    //
+    //   1. gnomAD-SV lists CTX (translocation) SEPARATELY from BND, so in that
+    //      taxonomy "BND" means an unresolved junction — many of them
+    //      intra-chromosomal — and NOT a translocation. eidolon now emits every BND
+    //      as an inter-chromosomal translocation, a convention taken from PCAWG,
+    //      where `svclass == "TRA"` is 100% inter-chromosomal
+    //      (docs/pcawg_sv_measurement.md M1). That measurement is about the CANCER
+    //      corpus and does not license the same reading of this germline share.
+    //   2. MEASURED 2026-08-02, streaming gnomAD-SV v4.1 sites (2,154,486 records):
+    //        CTX               99  (0.0046%)  — 99/99 inter-chromosomal
+    //        BND          356,035  (16.5%)    — 210,397 inter (59%), 145,638 intra (41%)
+    //        DEL 56.0%  INS 14.1%  DUP 12.5%  CPX 0.7%  INV 0.10%  CNV 0.03%
+    //      So gnomAD's BND is genuinely mixed and is NOT a translocation class; CTX is,
+    //      and it is vanishingly rare. Depending on which eidolon means:
+    //        BND == resolved translocation (CTX)          -> 0.005%, this is ~4,000x high
+    //        BND == any inter-chromosomal junction        -> 9.8%,   this is ~2x high
+    //      Either way 0.1943 is not supportable, and 41% of germline breakends are
+    //      intra-chromosomal — a class eidolon now emits none of.
+    //
+    //   3. DECISION (2026-08-02): de novo SVs are not recommended for human germline
+    //      simulation at all. Constitutional balanced translocations occur in roughly
+    //      1 in 500 live births, so a normal human genome carries ~zero — any nonzero
+    //      Bnd share here models something that essentially does not happen. Note also
+    //      that gnomAD BNDs reach AF > 0.1 (one record: AC=8474, AN=74246,
+    //      AF=0.114134); a translocation carried by 11% of humans would be a landmark
+    //      cytogenetic finding, so that class is dominated by mapping artifacts in
+    //      repetitive regions rather than real rearrangements.
+    //
+    //      This costs little in practice because `sv_rate_scale` DEFAULTS TO 0.0 —
+    //      de novo SVs are opt-in, and the shipped default emits none. A researcher
+    //      wanting a specific rearrangement should supply it via `input_vcf`, which
+    //      preserves the record verbatim (IDs, POS, ALT) and generates junction reads;
+    //      that path is verified and is the right one when you need to KNOW your
+    //      variant reached the output.
+    //
+    //      The de novo machinery stays for CANCER (somatic rates are real and
+    //      PCAWG-derived) and is expected to matter for PLANTS, where SV burden is far
+    //      higher. It is human GERMLINE where the rate is the problem.
+    //
+    // Flagged rather than silently corrected: guessing a replacement number here
+    // would repeat the exact defect (see docs/claude_engineering_audit.md §5.1).
     // Inversions and Insertions are added here at nominal rates (heuristic) since they
     // were filtered in the original validation fit.
     let mut type_probabilities: HashMap<SvType, f64> = HashMap::new();
@@ -100,11 +146,18 @@ pub fn default_sv_model() -> SvModel {
     // refit this; for now the literature value is the best estimate.
     let homozygous_frequency = 0.20;
 
+    // Breakend geometry: uniform, and deliberately not a literature value. Unlike the
+    // homozygous fraction above there is no figure here I can cite and defend, and this
+    // repo has already been burned by an unexamined inherited number. Uniform states
+    // "no information"; a model fitted from a corpus containing breakends replaces it.
+    let bnd_geometry_weights = crate::structs::sv_model::default_bnd_geometry_weights();
+
     SvModel {
         per_base_rate,
         type_probabilities,
         length_log_normal,
         cnv_copy_number_distribution,
+        bnd_geometry_weights,
         homozygous_frequency,
     }
 }

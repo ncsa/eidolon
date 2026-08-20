@@ -185,10 +185,36 @@ fn all_qualities_are_valid_phred33() {
     ))
     .expect("FASTQ failed strict parse");
 
+    // `q <= 93` cannot fail: parse_fastq_strict already rejects any byte outside
+    // 33..=126, so `b - 33` is <= 93 BY CONSTRUCTION. The assertion was unfalsifiable
+    // given its own precondition — switching the encoder to Phred+64, the classic
+    // offset bug, passed it. Assert on the DISTRIBUTION instead, which is what actually
+    // pins the offset: the same bytes decode to a mean near 65 under Phred+64.
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    let mut above_45 = 0u64;
     for r in &records {
         for &b in r.quality.as_bytes() {
-            let q = b.saturating_sub(33);
-            assert!(q <= 93, "quality byte {b} maps to invalid Phred score {q}");
+            let q = b.saturating_sub(33) as u64;
+            sum += q;
+            n += 1;
+            if q > 45 {
+                above_45 += 1;
+            }
         }
     }
+    assert!(n > 0, "no quality bytes to check");
+    let mean = sum as f64 / n as f64;
+    assert!(
+        (25.0..=42.0).contains(&mean),
+        "mean decoded quality {mean:.1} is outside the plausible Phred+33 range \
+         [25, 42] — check the encoding offset (Phred+64 would land near 65)"
+    );
+    // Phred+33 tops out at 41-42 for real instruments; a systematic excess above 45
+    // means the offset is wrong even if the mean happens to land in range.
+    let pct_above = 100.0 * above_45 as f64 / n as f64;
+    assert!(
+        pct_above <= 1.0,
+        "{pct_above:.1}% of bases decode above Phred 45 — implausible for Phred+33"
+    );
 }

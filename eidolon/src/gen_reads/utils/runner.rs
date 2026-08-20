@@ -4,7 +4,7 @@ use eidolon_core::rng::NeatRng;
 use eidolon_core::structs::variants::{Genotype, Provenance, SvType, VariantType};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,11 +42,17 @@ use crate::{
             config::RunConfiguration,
             generate_fragments::{generate_fragments, generate_weighted_fragments},
             generate_variants::generate_variants,
+            subclone::SubcloneModel,
         },
     },
 };
 use eidolon_core::models::gc_bias_model::GcBiasModel;
 use flate2::{Compression, write::GzEncoder};
+
+/// Dedicated RNG sub-stream for the genome-wide translocation pass, so adding it leaves
+/// every per-contig sampling decision bit-for-bit unchanged.
+const TRANSLOCATION_STREAM: u64 = 9_100_000;
+const TRANSLOCATION_CCF_STREAM: u64 = TRANSLOCATION_STREAM + 1;
 
 struct ContigContext<'a> {
     config: &'a RunConfiguration,
@@ -253,6 +259,50 @@ pub fn run_neat(
         None
     };
 
+    // Phase 0: place inter-chromosomal translocations across the WHOLE genome.
+    //
+    // A breakend's two ends live on different contigs and each generates reads from its
+    // own contig, so both records must exist before either contig is processed. The
+    // per-contig sampler cannot do this and used to hardcode the mate to the anchor's own
+    // contig, which made every "translocation" same-contig (466 of 466, job 20719077).
+    // BND's share of the per-base rate is subtracted from the per-contig budget inside
+    // `sample_variants`, so total SV yield is unchanged — it is split, not duplicated.
+    let mut translocations: HashMap<String, Vec<Variant>> = if config.sv_rate_scale > 0.0
+        && let Some(sv_model) = mutation_model.sv_model.as_ref()
+        && sv_model.is_usable()
+    {
+        let mut tra_rng = rng.derive_child(TRANSLOCATION_STREAM);
+        let t = sv_model.sample_translocations(
+            &contig_order_in_file,
+            reference.as_ref(),
+            config.ploidy,
+            config.sv_rate_scale,
+            &mut tra_rng,
+        );
+        let n: usize = t.values().map(|v| v.len()).sum();
+        if n > 0 {
+            info!(
+                "Placed {} inter-chromosomal translocation(s) ({} breakend records) across {} contig(s)",
+                n / 2,
+                n,
+                t.len()
+            );
+        }
+        t
+    } else {
+        HashMap::new()
+    };
+    if config.subclone_model.is_some() && !translocations.is_empty() {
+        let mut ccf_rng = rng.derive_child(TRANSLOCATION_CCF_STREAM);
+        apply_translocation_subclone_model(
+            &mut translocations,
+            config.subclone_model.as_ref(),
+            config.ploidy,
+            config.merged_vaf_purity,
+            &mut ccf_rng,
+        )?;
+    }
+
     // Phase 1: Generate MutatedMaps for all contigs
     info!("Generating mutations for all contigs");
     let mut all_mutated_maps = HashMap::new();
@@ -272,6 +322,7 @@ pub fn run_neat(
             &target_bed,
             &mutation_regions,
             &input_variants,
+            translocations.get(name),
             &mutation_model,
             default_run_mutation_rate,
             m_rng,
@@ -501,6 +552,14 @@ pub fn run_neat(
                 bodies.sort_by_key(|(start, _)| *start);
                 ordered_bodies.extend(bodies.into_iter().map(|(_, path)| path));
             }
+        }
+        // Chimeric reads are staged under a pseudo-contig so they do not appear in the BAM
+        // header's reference dictionary. Their records still carry real contig coordinates and
+        // must be appended after the regular per-contig bodies, just as their FASTQs are appended
+        // in the chimeric pass above.
+        if let Some(mut bodies) = bam_body_files.remove("chimeric") {
+            bodies.sort_by_key(|(start, _)| *start);
+            ordered_bodies.extend(bodies.into_iter().map(|(_, path)| path));
         }
         concat_temp_bams(bam_ctx, &ordered_bodies, bam_path)?;
         info!("Successfully wrote BAM file: {:?}", bam_path);
@@ -750,8 +809,12 @@ fn process_chunk(
         // SV coverage multipliers are needed here to scale fragment counts.
         // Even though they are also in MutatedMap, we need them as intervals.
         let sv_variants: Vec<Variant> = mutated_map.sv_records.iter().cloned().collect();
-        let coverage_multipliers =
-            build_coverage_multipliers(&sv_variants, ctx.config.ploidy, contig_len);
+        let coverage_multipliers = build_coverage_multipliers(
+            &sv_variants,
+            ctx.config.ploidy,
+            contig_len,
+            ctx.config.subclone_model.is_some(),
+        );
 
         for (region_start, region_end) in regions_of_interest.into_iter().map(|r| (r.start, r.end))
         {
@@ -816,6 +879,7 @@ fn process_chunk(
         ctx.config.ploidy,
         ctx.config.read_len,
         ctx.config.paired_ended,
+        ctx.config.subclone_model.is_some(),
         &mut rng,
     )?;
 
@@ -985,6 +1049,113 @@ fn process_chunk(
     })
 }
 
+/// Return the fraction of cellular copies carrying an SV. For CNVs this is the
+/// magnitude of the copy-number deviation; for other SVs it is the genotype
+/// dosage. This is the quantity that CCF scales for the tumor pass.
+fn sv_dosage_fraction(v: &Variant, ploidy: usize) -> f64 {
+    if let Some(cn) = v.alternate.as_symbolic().and_then(|sv| sv.copy_number) {
+        let p = ploidy.max(1) as f64;
+        return (cn as f64 - p).abs() / p;
+    }
+    v.dosage_fraction()
+}
+
+/// Apply the existing subclone model to de-novo SVs only. Input/germline SVs
+/// remain unchanged, and the no-model path consumes no additional RNG draws.
+fn apply_sv_subclone_model(
+    variants: &mut [Variant],
+    model: Option<&SubcloneModel>,
+    ploidy: usize,
+    merged_vaf_purity: Option<f64>,
+    rng: &mut NeatRng,
+) -> Result<(), GenerateReadsError> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+    for variant in variants {
+        let ccf = model.sample_ccf(rng).map_err(GenerateReadsError::from)?;
+        stamp_sv_subclone(variant, ccf, ploidy, merged_vaf_purity);
+    }
+    Ok(())
+}
+
+fn stamp_sv_subclone(
+    variant: &mut Variant,
+    ccf: f64,
+    ploidy: usize,
+    merged_vaf_purity: Option<f64>,
+) {
+    let af = sv_dosage_fraction(variant, ploidy) * ccf;
+    variant.allele_fraction = Some(af);
+    append_info_tag(&mut variant.info, format!("EIDOLON_CCF={ccf:.4}"));
+    if let Some(purity) = merged_vaf_purity {
+        append_info_tag(&mut variant.info, format!("EIDOLON_VAF={:.4}", purity * af));
+    }
+}
+
+/// Stamp both ends of each genome-wide translocation with one shared CCF. A
+/// translocation is one biological event even though it has two VCF records;
+/// sampling the ends independently would create an impossible allele balance.
+fn apply_translocation_subclone_model(
+    translocations: &mut HashMap<String, Vec<Variant>>,
+    model: Option<&SubcloneModel>,
+    ploidy: usize,
+    merged_vaf_purity: Option<f64>,
+    rng: &mut NeatRng,
+) -> Result<(), GenerateReadsError> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+    // Keep pair traversal ordered so CCF assignment remains reproducible across
+    // processes (HashSet iteration order is intentionally randomized).
+    let mut pairs = BTreeSet::new();
+    for variants in translocations.values() {
+        for variant in variants {
+            let Some(id) = variant.id.as_ref() else {
+                continue;
+            };
+            let mate = variant.info.as_deref().and_then(|info| {
+                info.split(';')
+                    .find_map(|field| field.strip_prefix("MATEID="))
+            });
+            let Some(mate) = mate else { continue };
+            let key = if id.as_str() <= mate {
+                (id.clone(), mate.to_string())
+            } else {
+                (mate.to_string(), id.clone())
+            };
+            pairs.insert(key);
+        }
+    }
+    for (id, mate) in pairs {
+        let ccf = model.sample_ccf(rng).map_err(GenerateReadsError::from)?;
+        for variants in translocations.values_mut() {
+            for variant in variants {
+                if variant.id.as_deref() == Some(id.as_str())
+                    || variant.id.as_deref() == Some(mate.as_str())
+                {
+                    stamp_sv_subclone(variant, ccf, ploidy, merged_vaf_purity);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Effective alternate fraction for SV read evidence. With no subclone model,
+/// this deliberately returns the historical genotype-based value.
+fn sv_effective_fraction(v: &Variant, ploidy: usize, use_subclone: bool) -> f64 {
+    if use_subclone {
+        v.allele_fraction
+            .unwrap_or_else(|| sv_dosage_fraction(v, ploidy))
+    } else {
+        match v.genotype {
+            Genotype::Homozygous => 1.0,
+            Genotype::Heterozygous => 1.0 / (ploidy.max(1) as f64),
+        }
+    }
+}
+
 fn generate_mutated_map(
     contig_name: &str,
     sequence: &[Nucleotide],
@@ -992,6 +1163,10 @@ fn generate_mutated_map(
     target_bed: &Option<HashMap<String, Vec<BedRecord>>>,
     mutation_regions: &Option<HashMap<String, Vec<BedRecord>>>,
     input_variants: &Option<HashMap<String, Vec<Variant>>>,
+    // Breakend records already placed for this contig by the genome-wide translocation
+    // pass. Seeded into `sv_variants` before de novo sampling so overlap rejection sees
+    // them, exactly like input-VCF SVs.
+    preplaced_svs: Option<&Vec<Variant>>,
     mutation_model: &MutationModel,
     default_run_mutation_rate: f64,
     mut rng: NeatRng,
@@ -1050,6 +1225,11 @@ fn generate_mutated_map(
 
     let mut block_variants: Vec<Variant> = Vec::new();
     let mut sv_variants: Vec<Variant> = Vec::new();
+    // Genome-wide translocations land here first: they are already placed, and seeding
+    // them before de novo sampling makes overlap rejection treat them as occupied.
+    if let Some(pre) = preplaced_svs {
+        sv_variants.extend(pre.iter().cloned());
+    }
     if let Some(iv) = input_variants
         && let Some(vs) = iv.get(contig_name)
     {
@@ -1096,10 +1276,44 @@ fn generate_mutated_map(
             config.sv_max_length_fraction,
             &mut rng,
         );
+        // #516: refuse to PLANT an insertion the engine cannot render. Reads carry at most
+        // `read_len - 1` of an insertion's novel bases (fragments are placed in reference
+        // offsets, so none can begin inside a zero-reference-width event), while the truth VCF
+        // declares the full SVLEN — a benchmark built from that asserts insertions the reads
+        // cannot support. Until the fragment sampler can place reads in haplotype coordinates,
+        // not emitting the record is strictly better than emitting a false one.
+        //
+        // De novo ONLY. An `input_vcf` insertion is kept regardless, because input fidelity is
+        // the stronger contract ("what you put in comes out") and silently discarding a
+        // user-supplied variant would be worse than rendering it partially; that case stays
+        // documented in docs/sv_support_matrix.md.
+        let (mut de_novo, dropped) =
+            drop_unrealizable_insertions(de_novo, config.read_len.saturating_sub(1));
+        if dropped > 0 {
+            warn!(
+                "{contig_name}: dropped {dropped} de novo insertion(s) longer than {} bp — \
+                 reads cannot carry more than that of an insertion's novel sequence (#516), so \
+                 planting them would put a length in the truth VCF that the reads do not \
+                 support. The realized INS rate is therefore below the model's Ins probability.",
+                config.read_len.saturating_sub(1)
+            );
+        }
+        apply_sv_subclone_model(
+            &mut de_novo,
+            config.subclone_model.as_ref(),
+            config.ploidy,
+            config.merged_vaf_purity,
+            &mut rng,
+        )?;
         sv_variants.extend(de_novo);
     }
 
-    let coverage_multipliers = build_coverage_multipliers(&sv_variants, config.ploidy, contig_len);
+    let coverage_multipliers = build_coverage_multipliers(
+        &sv_variants,
+        config.ploidy,
+        contig_len,
+        config.subclone_model.is_some(),
+    );
     let mut zeroed = false;
     for &(s, e, mult) in &coverage_multipliers {
         if mult == 0.0 && s < e {
@@ -1255,10 +1469,11 @@ fn process_chimeric_variants(
                 // reads). A proper fix would teach the regular pass to skip
                 // the broken-allele fraction of reads at BND positions;
                 // tracked as a v2 follow-up.
-                let mult = match sv_rec.genotype {
-                    Genotype::Homozygous => 1.0,
-                    Genotype::Heterozygous => 1.0 / (ctx.config.ploidy as f64),
-                };
+                let mult = sv_effective_fraction(
+                    sv_rec,
+                    ctx.config.ploidy,
+                    ctx.config.subclone_model.is_some(),
+                );
 
                 let num_frags = scale_coverage(ctx.config.coverage, mult);
                 if num_frags == 0 {
@@ -1348,10 +1563,11 @@ fn process_chimeric_variants(
                 // breakpoints (it reads from the unbroken forward reference),
                 // so a homozygous inversion ends up with regular + junction
                 // coverage at each breakpoint.
-                let mult = match sv_rec.genotype {
-                    Genotype::Homozygous => 1.0,
-                    Genotype::Heterozygous => 1.0 / (ctx.config.ploidy as f64),
-                };
+                let mult = sv_effective_fraction(
+                    sv_rec,
+                    ctx.config.ploidy,
+                    ctx.config.subclone_model.is_some(),
+                );
 
                 let num_frags = scale_coverage(ctx.config.coverage, mult);
                 if num_frags == 0 {
@@ -1469,7 +1685,9 @@ fn process_chimeric_variants(
                 // ref haplotype, so two tandem junctions). This mirrors
                 // how coverage_multiplier_for treats CNVs as cn/ploidy
                 // for depth.
-                let mult = if cn < ploidy {
+                let mult = if ctx.config.subclone_model.is_some() {
+                    sv_effective_fraction(sv_rec, ctx.config.ploidy, true)
+                } else if cn < ploidy {
                     (ploidy - cn) as f64 / ploidy as f64
                 } else {
                     (cn - ploidy) as f64 / ploidy as f64
@@ -1579,10 +1797,11 @@ fn process_chimeric_variants(
                     continue;
                 }
 
-                let mult = match sv_rec.genotype {
-                    Genotype::Homozygous => 1.0,
-                    Genotype::Heterozygous => 1.0 / (ctx.config.ploidy as f64),
-                };
+                let mult = sv_effective_fraction(
+                    sv_rec,
+                    ctx.config.ploidy,
+                    ctx.config.subclone_model.is_some(),
+                );
 
                 let num_frags = scale_coverage(ctx.config.coverage, mult);
                 if num_frags == 0 {
@@ -1850,7 +2069,7 @@ fn generate_chimeric_pair(
     // L2 = frag_len - offset
 
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
-        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, ctx)?;
+        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, &ctx.reference)?;
 
     let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
 
@@ -2278,8 +2497,9 @@ fn get_dup_pieces(
     // pre-dup context — see fn doc for the implication).
     let e1 = end.min(c_len);
     let s1 = e1.saturating_sub(len1);
-    // Right piece: first len2 bases of the duplicated region.
-    let s2 = location;
+    // Right piece: first len2 bases of the duplicated region. POS is the base
+    // BEFORE the event (VCF 4.2), so the region begins at location+1.
+    let s2 = location + 1;
     let e2 = (s2 + len2).min(c_len);
     Ok((
         (contig.to_string(), s1, e1, false),
@@ -2305,21 +2525,22 @@ fn get_inv_pieces(
         ))
     })?;
     Ok(if junction == 1 {
-        // Junction 1: REF[..POS-1] | RC(REF[POS..END])
-        // Left piece ends at index location-1. Right piece starts at RC(index end-1).
-        let e1 = location;
+        // Junction 1: REF[..POS] | RC(REF[POS+1..END])
+        // POS is the base BEFORE the inverted block (VCF 4.2), so the block begins
+        // at location+1 and the left piece ends there.
+        let e1 = location + 1;
         let s1 = e1.saturating_sub(len1);
 
         let e2 = end.min(c_len);
-        let s2 = e2.saturating_sub(len2).max(location);
+        let s2 = e2.saturating_sub(len2).max(location + 1);
         (
             (contig.to_string(), s1, e1, false),
             (contig.to_string(), s2, e2, true),
         )
     } else {
-        // Junction 2: RC(REF[POS..END]) | REF[END+1..]
-        // Left piece ends at RC(index location). Right piece starts at index end.
-        let s1 = location;
+        // Junction 2: RC(REF[POS+1..END]) | REF[END+1..]
+        // Same convention as junction 1: the inverted block begins at location+1.
+        let s1 = location + 1;
         let e1 = (s1 + len1).min(end).min(c_len);
 
         let s2 = end.min(c_len);
@@ -2331,13 +2552,18 @@ fn get_inv_pieces(
     })
 }
 
+/// Split a BND into the two reference pieces a chimeric fragment is stitched from.
+///
+/// Takes the reference map rather than the whole `ContigContext` because contig lengths
+/// are all it needs — and because the geometry it selects is the thing most worth
+/// testing directly. The `bool` in each tuple is "reverse-complement this piece".
 fn get_bnd_pieces(
     contig: &str,
     pos: usize, // 0-based
     sv: &SvData,
     len1: usize,
     len2: usize,
-    ctx: &ContigContext,
+    reference: &HashMap<String, Vec<Nucleotide>>,
 ) -> Result<((String, usize, usize, bool), (String, usize, usize, bool)), GenerateReadsError> {
     let mate_contig = sv.mate_contig.as_ref().unwrap().clone();
     let mate_pos = sv.mate_pos.unwrap().saturating_sub(1);
@@ -2345,12 +2571,12 @@ fn get_bnd_pieces(
     // BNDs can legitimately point at a contig outside the reference (a real
     // VCF data quality issue). Surface that as an error rather than silently
     // producing zero-length sequences via `unwrap_or(0)`.
-    let c1_len = ctx.reference.get(contig).map(|s| s.len()).ok_or_else(|| {
+    let c1_len = reference.get(contig).map(|s| s.len()).ok_or_else(|| {
         GenerateReadsError::CliError(format!(
             "BND at {contig}:{pos} references its own contig {contig} but that contig is not in the reference"
         ))
     })?;
-    let c2_len = ctx.reference.get(&mate_contig).map(|s| s.len()).ok_or_else(|| {
+    let c2_len = reference.get(&mate_contig).map(|s| s.len()).ok_or_else(|| {
         GenerateReadsError::CliError(format!(
             "BND at {contig}:{pos} has mate on contig {mate_contig} but that contig is not in the reference"
         ))
@@ -2591,6 +2817,39 @@ fn rate_at(segments: &[(usize, usize, f64)], pos: usize) -> f64 {
 
 /// Splits segments to remove individual excluded positions (e.g. positions already
 /// occupied by input variants). `excluded` must be sorted.
+/// Novel-base count of a LITERAL insertion, or `None` for anything else.
+///
+/// A literal insertion is `REF=<anchor>`, `ALT=<anchor><novel…>`, so the novel length is
+/// `ALT.len() - REF.len()`. Returns `None` for symbolic SVs (whose length lives in INFO, not in
+/// the ALT) and for deletions (where the subtraction underflows) — both must be left alone.
+fn literal_insertion_novel_len(v: &Variant) -> Option<usize> {
+    if v.variant_type != VariantType::Insertion {
+        return None;
+    }
+    let alt = v.alternate.as_literal()?;
+    alt.len().checked_sub(v.reference.len()).filter(|&n| n > 0)
+}
+
+/// Drop de novo insertions longer than `max_novel_bp`; returns the survivors and the count
+/// dropped. See the call site for why (#516).
+///
+/// REJECTS rather than clamps. Clamping the upper tail to exactly `max_novel_bp` would pile
+/// every large draw at one length and produce a spike that reads as a real size distribution.
+/// Rejection just thins the tail, which is the honest statement: eidolon does not currently
+/// simulate insertions longer than a read.
+fn drop_unrealizable_insertions(vars: Vec<Variant>, max_novel_bp: usize) -> (Vec<Variant>, usize) {
+    let before = vars.len();
+    let kept: Vec<Variant> = vars
+        .into_iter()
+        .filter(|v| match literal_insertion_novel_len(v) {
+            Some(n) => n <= max_novel_bp,
+            None => true,
+        })
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
 fn exclude_positions(
     segments: Vec<(usize, usize, f64)>,
     excluded: &[usize],
@@ -2630,12 +2889,13 @@ fn exclude_positions(
 /// END for an INV is computed exactly as the chimeric INV branch does
 /// (`sv.end`, else POS + span − 1 via `SvData::span`) so the suppression window
 /// references the same base the chimeric reads were placed against.
-fn collect_suppressible_junctions(sv_records: &[Variant], ploidy: usize) -> Vec<(usize, f64)> {
+fn collect_suppressible_junctions(
+    sv_records: &[Variant],
+    ploidy: usize,
+    use_subclone: bool,
+) -> Vec<(usize, f64)> {
     let ploidy_f = (ploidy.max(1)) as f64;
-    let genotype_fraction = |g: &Genotype| match g {
-        Genotype::Homozygous => 1.0,
-        Genotype::Heterozygous => 1.0 / ploidy_f,
-    };
+    let fraction = |v: &Variant| sv_effective_fraction(v, ploidy, use_subclone);
     let mut junctions: Vec<(usize, f64)> = Vec::new();
     for v in sv_records {
         let sv = match v.alternate.as_symbolic() {
@@ -2648,12 +2908,10 @@ fn collect_suppressible_junctions(sv_records: &[Variant], ploidy: usize) -> Vec<
             // unbroken reference (BND is coverage-neutral, DEL's coverage
             // multiplier only zeros the *interior* — flank reads crossing POS
             // still leak). broken_fraction = the chimeric pass's genotype mult.
-            SvType::Bnd | SvType::Del => {
-                junctions.push((v.location, genotype_fraction(&v.genotype)))
-            }
+            SvType::Bnd | SvType::Del => junctions.push((v.location, fraction(v))),
             // Two junctions (POS and END) — both breakpoints get junction reads.
             SvType::Inv => {
-                let bf = genotype_fraction(&v.genotype);
+                let bf = fraction(v);
                 junctions.push((v.location, bf));
                 let end = match sv.end {
                     Some(e) => e,
@@ -2674,7 +2932,11 @@ fn collect_suppressible_junctions(sv_records: &[Variant], ploidy: usize) -> Vec<
                 if let Some(cn) = sv.copy_number {
                     let cn = cn as usize;
                     if cn < ploidy {
-                        let bf = (ploidy - cn) as f64 / ploidy_f;
+                        let bf = if use_subclone {
+                            fraction(v)
+                        } else {
+                            (ploidy - cn) as f64 / ploidy_f
+                        };
                         junctions.push((v.location, bf));
                     }
                 }
@@ -2724,9 +2986,10 @@ fn suppress_junction_double_count(
     ploidy: usize,
     read_len: usize,
     paired_ended: bool,
+    use_subclone: bool,
     rng: &mut NeatRng,
 ) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
-    let junctions = collect_suppressible_junctions(sv_records, ploidy);
+    let junctions = collect_suppressible_junctions(sv_records, ploidy, use_subclone);
     if junctions.is_empty() {
         return Ok(fragments);
     }
@@ -2763,6 +3026,7 @@ fn build_coverage_multipliers(
     sv_variants: &[Variant],
     ploidy: usize,
     block_end: usize,
+    use_subclone: bool,
 ) -> Vec<(usize, usize, f64)> {
     let mut segments: Vec<(usize, usize, f64)> = if block_end > 0 {
         vec![(0, block_end, 1.0)]
@@ -2787,16 +3051,28 @@ fn build_coverage_multipliers(
                 continue;
             }
         };
-        let mult = match coverage_multiplier_for(sv.sv_type, sv.copy_number, &v.genotype, ploidy) {
-            Some(m) => m,
-            None => {
-                warn!(
-                    "CNV at 1-based POS {} has no INFO/CN — cannot determine copy number; \
+        let base_mult =
+            match coverage_multiplier_for(sv.sv_type, sv.copy_number, &v.genotype, ploidy) {
+                Some(m) => m,
+                None => {
+                    warn!(
+                        "CNV at 1-based POS {} has no INFO/CN — cannot determine copy number; \
                      skipping coverage modulation",
-                    pos_1based
-                );
-                continue;
-            }
+                        pos_1based
+                    );
+                    continue;
+                }
+            };
+        let mult = if use_subclone {
+            let dosage = sv_dosage_fraction(v, ploidy);
+            let ccf = if dosage > 0.0 {
+                (v.allele_fraction.unwrap_or(dosage) / dosage).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            1.0 + (base_mult - 1.0) * ccf
+        } else {
+            base_mult
         };
         if (mult - 1.0).abs() < f64::EPSILON {
             continue;
@@ -2815,15 +3091,15 @@ fn build_coverage_multipliers(
 /// modulates coverage, given the variant's 0-based stored `location` (= VCF
 /// POS − 1) and the `span_bases` reported by [`SvData::span`].
 ///
-/// VCF convention for `<DEL>`: POS is the anchor base immediately *before*
-/// the deletion (still present in the reference), and the deleted bases run
-/// from POS+1 to END (1-based, inclusive). So a DEL modulates `[POS, END)`
-/// in 0-based half-open coords, which is `[location + 1, location + span)`.
+/// One convention for every symbolic type (VCF 4.2): POS is the anchor base
+/// immediately *before* the event and is not itself affected, so the affected
+/// bases run from POS+1 to END (1-based, inclusive) and the modulated range is
+/// `[location + 1, location + span)` in 0-based half-open coords.
 ///
-/// `<DUP>`, `<CNV>`, `<INV>`: POS is conventionally *inside* the affected
-/// region (the duplicated / inverted block starts at POS itself). Those
-/// modulate `[POS − 1, END)` in 0-based half-open coords, i.e.
-/// `[location, location + span)`.
+/// This used to differ by type — DUP/CNV/INV modulated `[location, location + span)`
+/// on the basis that "POS is conventionally *inside* the affected region". That is
+/// not the VCF convention, and it meant an input `<DUP>` was modulated one base
+/// early while a `<DEL>` in the same file was not.
 fn sv_modulation_range(
     location_0based: usize,
     sv_type: SvType,
@@ -2833,8 +3109,12 @@ fn sv_modulation_range(
     let raw_end = location_0based.saturating_add(span_bases);
     let end = raw_end.min(block_end);
     let start = match sv_type {
-        SvType::Del => location_0based.saturating_add(1).min(block_end),
-        _ => location_0based.min(block_end),
+        // Point events never modulate coverage today (their multiplier is 1.0, so
+        // build_coverage_multipliers skips them before reaching here), but they have
+        // no POS+1..END range, so don't let a future multiplier change silently shift
+        // them by one.
+        SvType::Ins | SvType::Bnd => location_0based.min(block_end),
+        _ => location_0based.saturating_add(1).min(block_end),
     };
     (start, end)
 }
@@ -3002,6 +3282,138 @@ mod tests {
     use eidolon_core::structs::sequence_block::{RegionType, SequenceMap};
     use eidolon_core::structs::variants::AlternateType;
 
+    /// The four VCF 4.2 §5.4 breakend forms, and specifically WHICH PIECE gets reverse-
+    /// complemented. This is the property nothing tested: `bnd_fastq.rs` drives the input
+    /// path (where the parser sets the flags) and only asserts that some read is named
+    /// "EIDOLON_chimeric", so a direct join and a head-to-head join were indistinguishable
+    /// to the whole suite.
+    ///
+    /// That gap let de novo BNDs ship a truth VCF saying `t]p]` (reverse-complemented)
+    /// while the reads were built as case 4 (a direct join) — which is simply a deletion
+    /// or duplication, and is what Manta correctly called them on Delta.
+    fn bnd_sv(join_after: bool, mate_extends_right: bool) -> SvData {
+        let mut sv = SvData::new("N]chr1:5001]", SvType::Bnd);
+        sv.mate_contig = Some("chr1".to_string());
+        sv.mate_pos = Some(5001); // 1-based, so 5000 0-based
+        sv.bnd_join_after = join_after;
+        sv.bnd_mate_extends_right = mate_extends_right;
+        sv
+    }
+
+    fn bnd_reference() -> HashMap<String, Vec<Nucleotide>> {
+        let mut r = HashMap::new();
+        r.insert("chr1".to_string(), vec![Nucleotide::A; 10_000]);
+        r
+    }
+
+    /// #224: a chimeric fragment whose junction sits too close to either end produces a
+    /// read with an anchor too short for BWA to split-align — the regression that shipped
+    /// in v1.13.0 and was fixed by the `read_len / 4` floor. Nothing tested that floor,
+    /// so replacing it with `1` was silently safe.
+    #[test]
+    fn balanced_chimeric_offset_keeps_a_split_alignable_anchor_either_side() {
+        let mut rng = NeatRng::new_from_seed(&vec!["chimeric offset".to_string()]).unwrap();
+        let (read_len, frag_len) = (151usize, 400usize);
+        let floor = read_len / 4; // 37
+        for _ in 0..1000 {
+            let off = balanced_chimeric_offset(frag_len, read_len, &mut rng).unwrap();
+            assert!(
+                off >= floor,
+                "offset {off} leaves a {off}bp anchor before the junction, below the \
+                 read_len/4 floor of {floor} (#224)"
+            );
+            assert!(
+                frag_len - off >= floor,
+                "offset {off} leaves a {}bp anchor after the junction, below {floor} (#224)",
+                frag_len - off
+            );
+        }
+    }
+
+    /// Degenerate case: a fragment no longer than the read cannot honour the floor on both
+    /// sides. It must still return a usable offset rather than panic or return 0.
+    #[test]
+    fn balanced_chimeric_offset_survives_a_fragment_no_longer_than_the_read() {
+        let mut rng = NeatRng::new_from_seed(&vec!["degenerate".to_string()]).unwrap();
+        for _ in 0..100 {
+            let off = balanced_chimeric_offset(151, 151, &mut rng).unwrap();
+            assert!(off >= 1, "offset must be at least 1, got {off}");
+        }
+    }
+
+    #[test]
+    fn bnd_pieces_reverse_complement_exactly_the_spec_cases() {
+        let reference = bnd_reference();
+        let (pos, len1, len2) = (1000usize, 100usize, 50usize);
+
+        // Case 1, t[p[ : REF[..=pos] + MATE[mate_pos..]. Direct, nothing reversed.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(true, true), len1, len2, &reference).unwrap();
+        assert_eq!((a.1, a.2, a.3), (901, 1001, false), "case 1 anchor piece");
+        assert_eq!(
+            (b.1, b.2, b.3),
+            (5000, 5050, false),
+            "case 1 mate piece must NOT be reversed"
+        );
+
+        // Case 2, t]p] : REF[..=pos] + revcomp(MATE[..=mate_pos]). This is the form de
+        // novo BNDs declare, so the mate piece MUST be reverse-complemented.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(true, false), len1, len2, &reference).unwrap();
+        assert_eq!((a.1, a.2, a.3), (901, 1001, false), "case 2 anchor piece");
+        assert_eq!(
+            (b.1, b.2, b.3),
+            (4951, 5001, true),
+            "case 2 mate piece MUST be reverse-complemented"
+        );
+
+        // Case 3, [p[t : revcomp(MATE[mate_pos..]) + REF[pos..]. Mate piece comes first.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(false, true), len1, len2, &reference).unwrap();
+        assert_eq!(
+            (a.1, a.2, a.3),
+            (5000, 5100, true),
+            "case 3 mate piece leads, reversed"
+        );
+        assert_eq!((b.1, b.2, b.3), (1000, 1050, false), "case 3 anchor piece");
+
+        // Case 4, ]p]t : MATE[..=mate_pos] + REF[pos..]. Direct, nothing reversed — the
+        // layout a de novo BND was silently getting from the false/false defaults.
+        let (a, b) =
+            get_bnd_pieces("chr1", pos, &bnd_sv(false, false), len1, len2, &reference).unwrap();
+        assert_eq!(
+            (a.1, a.2, a.3),
+            (4901, 5001, false),
+            "case 4 mate piece leads, NOT reversed"
+        );
+        assert_eq!((b.1, b.2, b.3), (1000, 1050, false), "case 4 anchor piece");
+    }
+
+    /// The regression proper: the geometry a de novo BND's ALT declares must be the
+    /// geometry its reads are built from. Distinct from the case table above, which pins
+    /// the generator; this pins the two ends AGREEING.
+    #[test]
+    fn denovo_bnd_alt_form_produces_a_reverse_complemented_junction() {
+        let reference = bnd_reference();
+        // `t]p]` is what sv_model.rs emits for every de novo BND.
+        let (_mc, _mp, join_after, mate_right) =
+            eidolon_core::structs::variants::parse_bnd_alt_for_test("N]chr1:5001]");
+        let (_a, b) = get_bnd_pieces(
+            "chr1",
+            1000,
+            &bnd_sv(join_after, mate_right),
+            100,
+            50,
+            &reference,
+        )
+        .unwrap();
+        assert!(
+            b.3,
+            "a `t]p]` breakend joins a REVERSE-COMPLEMENTED piece (VCF 4.2 §5.4); a \
+             direct join here is a deletion or duplication, not a breakend"
+        );
+    }
+
     #[test]
     fn test_split_contig_into_chunks_covers_contig_without_gaps_or_overlap() {
         // 1 Mbp chunks over a 2.5 Mbp contig → 3 even chunks, contiguous, covering [0, len).
@@ -3139,6 +3551,88 @@ mod tests {
         assert!(locs.contains(&500));
     }
 
+    /// Build a LITERAL insertion of `novel` novel bases: REF=A, ALT=A + novel*'C'.
+    fn literal_ins(novel: usize) -> Variant {
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let mut alt = vec![Nucleotide::A];
+        alt.extend(std::iter::repeat_n(Nucleotide::C, novel));
+        Variant {
+            variant_type: VariantType::Insertion,
+            location: 1000,
+            reference: vec![Nucleotide::A],
+            alternate: AlternateType::Literal(alt),
+            genotype_str: "0/1".to_string(),
+            genotype: Genotype::Heterozygous,
+            allele_fraction: None,
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: vec!["GT".to_string()],
+            sample: vec!["0/1".to_string()],
+            provenance: Provenance::Denovo,
+        }
+    }
+
+    /// #516: an insertion longer than a read is only partially realized, so it must not be
+    /// planted. KNOWN ANSWER: the boundary is exactly `max_novel_bp` — kept at the boundary,
+    /// dropped one past it.
+    #[test]
+    fn unrealizable_insertions_are_dropped_at_exactly_the_boundary() {
+        let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(99)], 99);
+        assert_eq!((kept.len(), dropped), (1, 0), "99bp must be KEPT at max=99");
+
+        let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(100)], 99);
+        assert_eq!(
+            (kept.len(), dropped),
+            (0, 1),
+            "100bp must be DROPPED at max=99"
+        );
+
+        // Count is over the whole batch, not just the first offender.
+        let batch = vec![
+            literal_ins(50),
+            literal_ins(500),
+            literal_ins(99),
+            literal_ins(2155),
+        ];
+        let (kept, dropped) = drop_unrealizable_insertions(batch, 99);
+        assert_eq!((kept.len(), dropped), (2, 2));
+        for v in &kept {
+            assert!(literal_insertion_novel_len(v).unwrap() <= 99);
+        }
+    }
+
+    /// MUST NOT FIRE. The cap is about insertions only: a symbolic SV carries its length in
+    /// INFO rather than the ALT, and a literal DELETION has a longer REF than ALT. Dropping
+    /// either would silently delete large DELs/DUPs/INVs from every de novo run — a far worse
+    /// bug than the one being worked around.
+    #[test]
+    fn the_insertion_cap_does_not_touch_other_variant_types() {
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let huge_dup =
+            sv_variant_with_span(1000, 900_000, SvType::Dup, Genotype::Heterozygous, None);
+        let huge_del =
+            sv_variant_with_span(1000, 900_000, SvType::Del, Genotype::Heterozygous, None);
+        let mut literal_del = literal_ins(0);
+        // REF spans the deleted bases, ALT is the anchor alone — the reverse of an insertion.
+        literal_del.variant_type = VariantType::Deletion;
+        literal_del.reference = std::iter::repeat_n(Nucleotide::T, 400).collect();
+        literal_del.alternate = AlternateType::Literal(vec![Nucleotide::T]);
+
+        assert_eq!(literal_insertion_novel_len(&huge_dup), None);
+        assert_eq!(literal_insertion_novel_len(&huge_del), None);
+        assert_eq!(literal_insertion_novel_len(&literal_del), None);
+
+        let (kept, dropped) =
+            drop_unrealizable_insertions(vec![huge_dup, huge_del, literal_del], 99);
+        assert_eq!(
+            (kept.len(), dropped),
+            (3, 0),
+            "no non-insertion may be dropped by the insertion cap"
+        );
+    }
+
     fn sv_variant_with_span(
         location_0based: usize,
         end_1based: usize,
@@ -3184,12 +3678,64 @@ mod tests {
     }
 
     #[test]
+    fn sv_subclone_ccf_scales_depth_and_junction_fraction() {
+        let mut del = sv_variant_with_span(100, 200, SvType::Del, Genotype::Heterozygous, None);
+        del.allele_fraction = Some(0.25); // 0.5 dosage × 0.5 CCF
+
+        let historical = build_coverage_multipliers(&[del.clone()], 2, 300, false);
+        assert!(historical.iter().any(|&(_, _, m)| (m - 0.5).abs() < 1e-9));
+
+        let subclonal = build_coverage_multipliers(&[del.clone()], 2, 300, true);
+        assert!(subclonal.iter().any(|&(_, _, m)| (m - 0.75).abs() < 1e-9));
+
+        let junctions = collect_suppressible_junctions(&[del], 2, true);
+        assert_eq!(junctions, vec![(100, 0.25)]);
+    }
+
+    #[test]
+    fn applying_sv_subclone_model_stamps_ccf_and_vaf() {
+        use crate::gen_reads::utils::subclone::Subclone;
+
+        let model = SubcloneModel::new(vec![Subclone {
+            ccf: 0.5,
+            weight: 1.0,
+        }])
+        .unwrap();
+        let mut variants = vec![sv_variant_with_span(
+            100,
+            200,
+            SvType::Bnd,
+            Genotype::Heterozygous,
+            None,
+        )];
+        let mut rng = NeatRng::new_from_seed(&vec!["sv-ccf".to_string()]).unwrap();
+
+        apply_sv_subclone_model(&mut variants, Some(&model), 2, Some(0.6), &mut rng).unwrap();
+
+        assert!((variants[0].allele_fraction.unwrap() - 0.25).abs() < 1e-9);
+        let info = variants[0].info.as_deref().unwrap();
+        assert!(info.contains("EIDOLON_CCF=0.5000"));
+        assert!(info.contains("EIDOLON_VAF=0.1500"));
+    }
+
+    #[test]
+    fn no_sv_subclone_model_preserves_variant_and_rng_path() {
+        let original = sv_variant_with_span(100, 200, SvType::Bnd, Genotype::Heterozygous, None);
+        let mut variants = vec![original.clone()];
+        let mut rng = NeatRng::new_from_seed(&vec!["sv-no-ccf".to_string()]).unwrap();
+
+        apply_sv_subclone_model(&mut variants, None, 2, Some(0.6), &mut rng).unwrap();
+
+        assert_eq!(variants[0], original);
+    }
+
+    #[test]
     fn test_collect_suppressible_junctions() {
         // BND (homozygous) at 100 → one junction (100, 1.0).
         // INV (heterozygous, ploidy 2) over [200, 300] → (200, 0.5) and (300, 0.5).
         let bnd = sv_variant_with_span(100, 0, SvType::Bnd, Genotype::Homozygous, None);
         let inv = sv_variant_with_span(200, 300, SvType::Inv, Genotype::Heterozygous, None);
-        let j = collect_suppressible_junctions(&[inv, bnd], 2);
+        let j = collect_suppressible_junctions(&[inv, bnd], 2, false);
         assert_eq!(j.len(), 3, "BND→1 junction, INV→2");
         // sorted by position
         assert_eq!(j[0].0, 100);
@@ -3215,7 +3761,7 @@ mod tests {
         let dup = sv_variant_with_span(300, 400, SvType::Dup, Genotype::Homozygous, None);
         let cnv_loss = sv_variant_with_span(500, 600, SvType::Cnv, Genotype::Homozygous, Some(1));
         let cnv_gain = sv_variant_with_span(700, 800, SvType::Cnv, Genotype::Homozygous, Some(4));
-        let j = collect_suppressible_junctions(&[del, dup, cnv_loss, cnv_gain], 2);
+        let j = collect_suppressible_junctions(&[del, dup, cnv_loss, cnv_gain], 2, false);
         // Only DEL (100) and CNV-loss (500) contribute.
         assert_eq!(
             j.len(),
@@ -3236,7 +3782,7 @@ mod tests {
     fn test_collect_cnv_full_loss_is_one() {
         // CN=0 (full loss) → broken_fraction (ploidy−0)/ploidy = 1.0.
         let cnv0 = sv_variant_with_span(500, 600, SvType::Cnv, Genotype::Homozygous, Some(0));
-        let j = collect_suppressible_junctions(&[cnv0], 2);
+        let j = collect_suppressible_junctions(&[cnv0], 2, false);
         assert_eq!(j.len(), 1);
         assert!((j[0].1 - 1.0).abs() < 1e-9);
     }
@@ -3251,7 +3797,8 @@ mod tests {
             (600, 700), // flank-right → keep
         ];
         let mut rng = NeatRng::new_from_seed(&vec!["bp".to_string()]).unwrap();
-        let kept = suppress_junction_double_count(frags, &[bnd], 2, 100, false, &mut rng).unwrap();
+        let kept =
+            suppress_junction_double_count(frags, &[bnd], 2, 100, false, false, &mut rng).unwrap();
         assert_eq!(kept, vec![(300, 400), (600, 700)]);
     }
 
@@ -3261,7 +3808,8 @@ mod tests {
         let frags = vec![(0, 100), (200, 300)];
         let mut rng = NeatRng::new_from_seed(&vec!["bp".to_string()]).unwrap();
         let kept =
-            suppress_junction_double_count(frags.clone(), &[], 2, 100, false, &mut rng).unwrap();
+            suppress_junction_double_count(frags.clone(), &[], 2, 100, false, false, &mut rng)
+                .unwrap();
         assert_eq!(kept, frags);
     }
 
@@ -3271,15 +3819,29 @@ mod tests {
         // A junction at 550 sits in the unsequenced gap [500,600) → NOT crossed.
         let in_gap = sv_variant_with_span(550, 0, SvType::Bnd, Genotype::Homozygous, None);
         let mut rng = NeatRng::new_from_seed(&vec!["bp".to_string()]).unwrap();
-        let kept =
-            suppress_junction_double_count(vec![(400, 700)], &[in_gap], 2, 100, true, &mut rng)
-                .unwrap();
+        let kept = suppress_junction_double_count(
+            vec![(400, 700)],
+            &[in_gap],
+            2,
+            100,
+            true,
+            false,
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(kept, vec![(400, 700)], "gap junction must not suppress");
         // A junction at 450 sits in R1 → crossed → dropped.
         let in_r1 = sv_variant_with_span(450, 0, SvType::Bnd, Genotype::Homozygous, None);
-        let kept2 =
-            suppress_junction_double_count(vec![(400, 700)], &[in_r1], 2, 100, true, &mut rng)
-                .unwrap();
+        let kept2 = suppress_junction_double_count(
+            vec![(400, 700)],
+            &[in_r1],
+            2,
+            100,
+            true,
+            false,
+            &mut rng,
+        )
+        .unwrap();
         assert!(kept2.is_empty(), "R1-crossing pair must be suppressed");
     }
 
@@ -3290,7 +3852,8 @@ mod tests {
         let het = sv_variant_with_span(500, 0, SvType::Bnd, Genotype::Heterozygous, None);
         let frags: Vec<(usize, usize)> = vec![(450usize, 550usize); 1000];
         let mut rng = NeatRng::new_from_seed(&vec!["bp het".to_string()]).unwrap();
-        let kept = suppress_junction_double_count(frags, &[het], 2, 100, false, &mut rng).unwrap();
+        let kept =
+            suppress_junction_double_count(frags, &[het], 2, 100, false, false, &mut rng).unwrap();
         assert!(
             (300..700).contains(&kept.len()),
             "expected ~50% of 1000 het-crossing pairs kept, got {}",
@@ -3314,19 +3877,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sv_modulation_range_dup_cnv_inv_include_anchor() {
-        // For DUP / CNV / INV, POS is conventionally inside the affected
-        // region — range starts at the anchor.
-        assert_eq!(sv_modulation_range(100, SvType::Dup, 100, 1000), (100, 200));
-        assert_eq!(sv_modulation_range(100, SvType::Cnv, 100, 1000), (100, 200));
-        assert_eq!(sv_modulation_range(100, SvType::Inv, 100, 1000), (100, 200));
+    fn test_sv_modulation_range_excludes_the_anchor_for_every_type() {
+        // location=100 -> POS=101 (1-based); span=100 -> END = 101+100-1 = 200.
+        // VCF 4.2: the anchor at POS is NOT affected, so the affected bases are
+        // 1-based 102..200, i.e. 0-based [101, 200) — identical to DEL.
+        //
+        // These used to be (100, 200): DUP/CNV/INV modulated one base early, so an
+        // input <DUP> and an input <DEL> in the same file used different conventions.
+        assert_eq!(sv_modulation_range(100, SvType::Dup, 100, 1000), (101, 200));
+        assert_eq!(sv_modulation_range(100, SvType::Cnv, 100, 1000), (101, 200));
+        assert_eq!(sv_modulation_range(100, SvType::Inv, 100, 1000), (101, 200));
+        // Same input, same answer as DEL — that equality is the property that was
+        // missing, not an incidental detail.
+        assert_eq!(
+            sv_modulation_range(100, SvType::Dup, 100, 1000),
+            sv_modulation_range(100, SvType::Del, 100, 1000)
+        );
     }
 
     #[test]
     fn test_sv_modulation_range_clipped_to_block_end() {
         // SV running past block_end gets clipped on both ends.
         assert_eq!(sv_modulation_range(95, SvType::Del, 100, 110), (96, 110));
-        assert_eq!(sv_modulation_range(95, SvType::Dup, 100, 110), (95, 110));
+        // Was (95, 110): DUP now excludes its anchor like every other type.
+        assert_eq!(sv_modulation_range(95, SvType::Dup, 100, 110), (96, 110));
         // Start clipped above block_end → empty range.
         let (s, e) = sv_modulation_range(150, SvType::Del, 50, 100);
         assert!(s >= e);
@@ -3416,7 +3990,7 @@ mod tests {
             Genotype::Homozygous,
             None,
         )];
-        let segs = build_coverage_multipliers(&svs, 2, 500);
+        let segs = build_coverage_multipliers(&svs, 2, 500, false);
         assert_eq!(segs, vec![(0, 101, 1.0), (101, 200, 0.0), (200, 500, 1.0)]);
     }
 
@@ -3430,9 +4004,11 @@ mod tests {
             Genotype::Heterozygous,
             None,
         )];
-        // span = 149 - 51 + 1 = 99; range = [50, 50 + 99) = [50, 149).
-        let segs = build_coverage_multipliers(&svs, 2, 300);
-        assert_eq!(segs, vec![(0, 50, 1.0), (50, 149, 1.5), (149, 300, 1.0)]);
+        // POS = 51 (1-based); span = 149 - 51 + 1 = 99. The anchor at POS is not
+        // duplicated, so the affected range is [51, 50 + 99) = [51, 149).
+        // Was [50, 149) — one base early.
+        let segs = build_coverage_multipliers(&svs, 2, 300, false);
+        assert_eq!(segs, vec![(0, 51, 1.0), (51, 149, 1.5), (149, 300, 1.0)]);
     }
 
     #[test]
@@ -3445,9 +4021,10 @@ mod tests {
             Genotype::Homozygous,
             Some(4),
         )];
-        // span = 99 - 1 + 1 = 99; range = [0, 99).
-        let segs = build_coverage_multipliers(&svs, 2, 200);
-        assert_eq!(segs, vec![(0, 99, 2.0), (99, 200, 1.0)]);
+        // POS = 1 (1-based); span = 99 - 1 + 1 = 99. Anchor excluded, so the
+        // affected range is [1, 0 + 99) = [1, 99). Was [0, 99).
+        let segs = build_coverage_multipliers(&svs, 2, 200, false);
+        assert_eq!(segs, vec![(0, 1, 1.0), (1, 99, 2.0), (99, 200, 1.0)]);
     }
 
     #[test]
@@ -3459,7 +4036,7 @@ mod tests {
             Genotype::Homozygous,
             None,
         )];
-        let segs = build_coverage_multipliers(&svs, 2, 200);
+        let segs = build_coverage_multipliers(&svs, 2, 200, false);
         assert_eq!(segs, vec![(0, 200, 1.0)]);
     }
 
@@ -3469,7 +4046,7 @@ mod tests {
             sv_variant_with_span(10, 19, SvType::Ins, Genotype::Heterozygous, None),
             sv_variant_with_span(50, 99, SvType::Inv, Genotype::Homozygous, None),
         ];
-        let segs = build_coverage_multipliers(&svs, 2, 200);
+        let segs = build_coverage_multipliers(&svs, 2, 200, false);
         // Both should be skipped (multiplier == 1.0), leaving the default segment.
         assert_eq!(segs, vec![(0, 200, 1.0)]);
     }

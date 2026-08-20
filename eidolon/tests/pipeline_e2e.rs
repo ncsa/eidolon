@@ -392,9 +392,28 @@ fn gen_reads_treats_n_tract_as_gap_no_variants_inside() {
                 .unwrap_or(false)
         })
         .collect();
+    // POSITIVE CONTROL FIRST. Without it, "zero variants anywhere" satisfies this test:
+    // making non_n_regions return an empty vec whenever the sequence contains any N —
+    // the natural over-broad form of the fix this guards — passed the whole
+    // pipeline_e2e suite. A denominator is required before an exclusion means anything.
+    let variants_in_flanks = vcf_lines
+        .iter()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split('\t').nth(1).and_then(|p| p.parse::<usize>().ok()))
+        .filter(|p| (1..=240).contains(p) || (481..=720).contains(p))
+        .count();
+    assert!(
+        variants_in_flanks >= 10,
+        "only {variants_in_flanks} variant(s) placed in the non-N flanks [1,240] and \
+         [481,720] — too few for the N-tract exclusion below to mean anything. Either \
+         mutation placement is broken or the gap exclusion is over-broad."
+    );
+
     assert!(
         variants_in_gap.is_empty(),
-        "variants were placed inside the N tract [241, 480]; N regions must be excluded: {variants_in_gap:?}"
+        "variants were placed inside the N tract [241, 480] ({} in the flanks, so \
+         placement is working); N regions must be excluded: {variants_in_gap:?}",
+        variants_in_flanks
     );
 }
 
@@ -510,6 +529,39 @@ fn gen_reads_with_trained_sv_model_emits_de_novo_symbolic_svs() {
         !symbolic_records.is_empty(),
         "expected at least one de novo symbolic SV in output; got VCF lines: {vcf_lines:#?}"
     );
+    // Presence is not enough: `contains("END=")` is satisfied by ANY value, and shifting
+    // every emitted END by +1000 passed the entire workspace. END is what downstream
+    // consumers size the event from (depth modulation, compare-vcfs, truvari), so assert
+    // it is INTERNALLY CONSISTENT with the record's own SVLEN and POS.
+    let info_int = |line: &str, key: &str| -> Option<i64> {
+        line.split('\t')
+            .nth(7)?
+            .split(';')
+            .find_map(|f| f.strip_prefix(key).and_then(|v| v.parse::<i64>().ok()))
+    };
+    for line in &symbolic_records {
+        let pos: i64 = line.split('\t').nth(1).unwrap().parse().unwrap();
+        let end = info_int(line, "END=")
+            .unwrap_or_else(|| panic!("symbolic record has no parseable INFO/END: {line}"));
+        let svlen = info_int(line, "SVLEN=")
+            .unwrap_or_else(|| panic!("symbolic record has no parseable INFO/SVLEN: {line}"));
+        assert!(end > pos, "INFO/END={end} is not after POS={pos}: {line}");
+        // VCF 4.2, one rule for every symbolic type: POS is the base BEFORE the
+        // event, so the affected bases are 1-based [POS+1, END] and
+        // END - POS == |SVLEN|. This used to need a per-type branch — DEL followed
+        // the convention while DUP/CNV/INV put POS on the first affected base, so
+        // the same file carried two meanings of POS. Collapsing this assertion to a
+        // single rule is the observable half of that fix.
+        assert_eq!(
+            end - pos,
+            svlen.abs(),
+            "INFO/END - POS ({}) disagrees with |SVLEN| ({}) — a consumer sizing \
+             this event off END sees a different variant than one sizing it off \
+             SVLEN: {line}",
+            end - pos,
+            svlen.abs()
+        );
+    }
     for line in &symbolic_records {
         assert!(
             line.contains("SVTYPE="),

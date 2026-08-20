@@ -19,7 +19,7 @@
 # WHY EIDOLON_VAF, NOT FORMAT/AF: FORMAT/AF in the truth is measured per-pass
 # (tumor-only) = dosage x CCF; the observed sample VAF after tumor/normal mixing is
 # purity x that = EIDOLON_VAF. We map EIDOLON_VAF -> INFO/AF on the truth side so the
-# existing scn_af_compare.py (truth INFO/AF vs sim FORMAT/AD) does the comparison.
+# `eidolon compare-af` (truth INFO/AF vs sim FORMAT/AD) does the comparison.
 #
 # PREREQS
 #   * eidolon built from develop (>= #405 merged) via setup.sh -> $EIDOLON_BIN
@@ -44,7 +44,14 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+# 96G, sized from measurement rather than guessed. Two runs of this script:
+#   job 20553463  --mem=48G  -> OUT_OF_MEMORY, killed at 47.99 GB after 2h49m
+#   job 20556912  --mem=96G  -> COMPLETED, peak 60.33 GB (62.85% of 96)
+# The 48G failure was bumped to 64G, but 64 was a guess and sits BELOW the 60.33 GB
+# the only successful run actually consumed — under 4 GB of margin, i.e. one unlucky
+# draw from another OOM. bwa-mem2 + samtools sort on chr1 is the peak.
+# Check `seff <jobid>` before lowering this.
+#SBATCH --mem=96G
 #SBATCH --time=8:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
@@ -72,6 +79,9 @@ PURITY="${PURITY:-0.7}"
 COV="${COV:-150}"                              # total (merged) depth; high so low-CCF sites
                                                # don't drop out and per-site VAF noise is tight
 MIN_DEPTH="${MIN_DEPTH:-25}"                   # gate low-depth sites in the comparison
+# mpileup's max per-site depth. Its default of 250 would silently downsample a
+# 200x+ run; set explicitly so any cap is deliberate and visible.
+MPILEUP_MAX_DEPTH="${MPILEUP_MAX_DEPTH:-2000}"
 # PASS is gated on FIDELITY metrics that hold for a discrete subclonal architecture:
 #   |mean(observed-intended)| = bias (systematic composition error) and MAE (per-site
 #   accuracy vs the binomial noise floor). Pearson r is ADVISORY only — for tight,
@@ -154,7 +164,7 @@ R2="$OUTDIR/subvaf_merged_r2.fastq.gz"
 for f in "$TRUTH" "$R1" "$R2"; do [[ -s "$f" ]] || { echo "missing output: $f" >&2; exit 1; }; done
 
 # ── Step 2: somatic sites, with EIDOLON_VAF surfaced as INFO/AF (the truth) ──────
-# scn_af_compare.py reads INFO/AF; EIDOLON_VAF is the intended OBSERVED VAF.
+# `eidolon compare-af` reads INFO/AF; EIDOLON_VAF is the intended OBSERVED VAF.
 SITES="$OUTDIR/somatic_sites.vcf.gz"
 {
   echo '##fileformat=VCFv4.2'
@@ -168,15 +178,16 @@ bcftools index -t "$SITES"
 nsom=$(bcftools view -H "$SITES" | wc -l)
 echo "somatic sites carrying EIDOLON_VAF: $nsom"
 [[ "$nsom" -gt 0 ]] || { echo "ABORT: 0 somatic EIDOLON_VAF sites — is this build >= #405?" >&2; exit 1; }
+# The record count above is necessary but not sufficient, and this is the exact site
+# where that bit: it passed while every value was the malformed string `AF=AF=0.3000`,
+# because counting records says nothing about their content. bcftools would not have
+# complained either — it silently converts a type-mismatched value to `.`.
+validate_artifacts "$EIDOLON_BIN" "somatic sites" "$SITES" || exit 1
 # Read-the-artifact guard: EIDOLON_VAF must span a spectrum, not pile at one value.
 echo "EIDOLON_VAF spread (should span deciles for a subclonal architecture):"
 bcftools query -f '%INFO/AF\n' "$SITES" \
   | awk '{b=int($1*10); if(b>9)b=9; c[b]++} END{for(i=0;i<10;i++)printf "  [%.1f,%.1f) %d\n",i/10,(i+1)/10,c[i]+0}'
 
-# Tab-delimited allele list for forced genotyping (-C alleles): CHROM POS REF,ALT.
-ALLELES="$OUTDIR/alleles.tsv.gz"
-bcftools query -f '%CHROM\t%POS\t%REF,%ALT\n' "$SITES" | bgzip > "$ALLELES"
-tabix -s1 -b2 -e2 "$ALLELES"
 
 # ── Step 3: align the MERGED (mixed) reads — the sample a caller sees ─────────
 if [[ ! -s "${REF}.bwt.2bit.64" ]]; then
@@ -203,18 +214,42 @@ if ! bwa-mem2 mem -t "$THREADS" -R '@RG\tID:subvaf\tSM:merged\tPL:ILLUMINA' "$RE
 fi
 samtools index "$MERGED_BAM"
 
-# ── Step 4: OBSERVED VAF at the somatic sites (forced genotyping) ─────────────
-# -C alleles -T $ALLELES forces the KNOWN alt allele so AD is measured even for
-# low-VAF subclonal sites that a de-novo caller's LoD would drop — exactly the
-# sites #405 is about. FORMAT/AD then carries the observed alt fraction.
+# ── Step 4: OBSERVED VAF at the somatic sites (mpileup AD, no genotype call) ──
+# Read FORMAT/AD straight from mpileup. NO `bcftools call` (#450).
+#
+# The previous version piped mpileup into `bcftools call -m -C alleles`, on the
+# reasoning that -C alleles "forces the KNOWN alt allele so AD is measured even for
+# low-VAF subclonal sites that a de-novo caller's LoD would drop". -C alleles does
+# constrain which alleles are considered, but `call -m` still makes a diploid ML
+# GENOTYPE call — and a hom-ref call discards the uncalled allele together with its
+# read count. Measured in isolation at 7% VAF:
+#
+#   mpileup alone          REF=G ALT=T,<*>   AD=93,7,0     <- 7/100 = 0.07, correct
+#   mpileup | call -m      REF=G ALT=.       AD=93         <- allele and count gone
+#
+# Coverage cannot rescue it: identical at 100x, 300x and 600x, because the decision
+# is driven by the allele FRACTION against a diploid model — no diploid genotype
+# predicts 7%. So the step meant to preserve low-VAF sites was destroying exactly
+# them, and 160 of 567 planted sites (the entire lowest CCF cluster) never reached
+# the comparison. Measuring an allele fraction needs no genotype call at all.
+#
+# `eidolon compare-af` selects this allele's own AD element from the ALT list, so
+# mpileup's `<*>` non-ref placeholder beside the real base is handled.
 SIM="$OUTDIR/observed.vcf.gz"
-echo "=== mpileup + forced-allele genotyping at the somatic sites ==="
-bcftools mpileup -a FORMAT/AD -f "$REF" -R "$SITES" "$MERGED_BAM" -Ou 2>/dev/null \
-  | bcftools call -m -C alleles -T "$ALLELES" -Oz -o "$SIM" 2>/dev/null
+echo "=== mpileup at the somatic sites (AD only, no genotype calling) ==="
+# -d: mpileup's default max depth is 250, which would silently downsample a 200x+
+# run. Set it explicitly so the cap is visible and generous.
+bcftools mpileup -a FORMAT/AD -d "$MPILEUP_MAX_DEPTH" -f "$REF" -R "$SITES" \
+    "$MERGED_BAM" -Oz -o "$SIM" 2>/dev/null
 bcftools index -t "$SIM"
 nsim=$(bcftools view -H "$SIM" | wc -l)
-echo "sites genotyped in merged BAM: $nsim"
-[[ "$nsim" -gt 0 ]] || { echo "ABORT: 0 sites genotyped — check alignment / -C alleles." >&2; exit 1; }
+echo "sites piled up in merged BAM: $nsim"
+[[ "$nsim" -gt 0 ]] || { echo "ABORT: 0 sites piled up — check alignment / -R sites." >&2; exit 1; }
+# Read-the-artifact guard: a site with coverage must carry a per-allele AD. If AD is
+# absent the comparison would silently find nothing to join.
+nad=$(bcftools query -f '%CHROM\t%POS\t[%AD]\n' "$SIM" 2>/dev/null | awk -F'\t' '$3!="" && $3!="."' | wc -l)
+echo "sites carrying FORMAT/AD: $nad"
+[[ "$nad" -gt 0 ]] || { echo "ABORT: no site carries FORMAT/AD — mpileup -a FORMAT/AD failed." >&2; exit 1; }
 
 # ── Step 5: compare intended EIDOLON_VAF (truth) vs observed merged-BAM VAF ──────
 echo
@@ -222,8 +257,14 @@ echo "════════════════════════�
 echo "#405 subclonal VAF reproduction — intended EIDOLON_VAF vs observed merged VAF"
 echo "════════════════════════════════════════════════════════════════"
 CMP="$OUTDIR/compare.txt"
-python3 "$REPO_ROOT/scripts/delta/scn_af_compare.py" \
-    --truth "$SITES" --sim "$SIM" --min-depth "$MIN_DEPTH" | tee "$CMP"
+# `eidolon compare-af` exits non-zero when too much of the planted set went unscored.
+# Capture that instead of letting `set -e` + pipefail abort here, which would skip both
+# the verdict and archive_run — the artifacts are most worth keeping when it fails.
+# `$(cmd; echo $?)` cannot be used for this: the inherited `set -e` kills the subshell
+# before echo runs. `|| rc=$?` is the form that works.
+CMP_RC=0
+"$EIDOLON_BIN" compare-af \
+    --truth "$SITES" --sim "$SIM" --min-depth "$MIN_DEPTH" | tee "$CMP" || CMP_RC=$?
 echo "════════════════════════════════════════════════════════════════"
 
 # ── PASS/FAIL gate (don't trust a green run — parse the actual numbers) ───────
@@ -242,7 +283,14 @@ if [[ -n "$r" ]] && awk -v r="$r" -v rm="$R_MIN" 'BEGIN{exit !(r<rm)}'; then
   echo "        this depth; raise COV and/or widen SUBCLONES for a Pearson-meaningful run." >&2
 fi
 verdict=FAIL
-if [[ -n "$bias" && -n "$mae" ]] \
+# Coverage first: bias and MAE computed over a subset that dropped a whole VAF stratum
+# look BETTER than an honest full-coverage run, so they can never be the only gate.
+# That is #450 exactly — it reported clean numbers and PASS while excluding the sites
+# it existed to test.
+if [[ "$CMP_RC" -ne 0 ]]; then
+  echo "  coverage gate FAILED (eidolon compare-af rc=$CMP_RC) — see the per-decile" >&2
+  echo "  planted/scored table above. bias and MAE are not usable." >&2
+elif [[ -n "$bias" && -n "$mae" ]] \
    && awk -v b="$absbias" -v bm="$BIAS_MAX" 'BEGIN{exit !(b<=bm)}' \
    && awk -v m="$mae" -v mm="$MAE_MAX" 'BEGIN{exit !(m<=mm)}'; then
   verdict=PASS

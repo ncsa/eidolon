@@ -5,6 +5,8 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::file_tools::fastq_tools::reverse_complement;
+use crate::structs::nucleotides::Nucleotide;
 use noodles::bam;
 use noodles::bgzf;
 use noodles::core::Position;
@@ -370,11 +372,33 @@ fn rle_to_cigar(char_ops: &[char]) -> Cigar {
     ops.into_iter().collect()
 }
 
+/// Map a `ReadRecord::cigar_ops` character to its SAM CIGAR operation.
+///
+/// The read pipeline emits exactly four: `M` (aligned base), `I` (insertion error),
+/// `D` (deletion error), and `S` (adapter read-through, `fastq_tools.rs:657`).
+///
+/// `S` was previously absent, so it fell through to `Match` and every adapter base was
+/// written to the BAM as aligned sequence — a soft clip does not consume reference, and
+/// claiming it does tells every downstream aligner and caller that adapter aligned to
+/// the genome. `fastq_tools` pinned the `'S'` in its own unit test and nothing checked
+/// the BAM honoured it, which is the two-components-in-agreement invariant that needs
+/// its own test (see `every_op_the_read_pipeline_emits_round_trips_through_a_bam`).
 fn char_to_cigar_kind(c: char) -> CigarKind {
     match c {
+        'M' => CigarKind::Match,
         'I' => CigarKind::Insertion,
         'D' => CigarKind::Deletion,
-        _ => CigarKind::Match,
+        'S' => CigarKind::SoftClip,
+        // `cigar_ops` is an untyped Vec<char>, so an unknown op is possible. Fall back
+        // to Match rather than panicking mid-write, but fail loudly in tests so a newly
+        // added op cannot repeat the silent-Match bug above.
+        other => {
+            debug_assert!(
+                false,
+                "unhandled CIGAR op {other:?} — add it to char_to_cigar_kind"
+            );
+            CigarKind::Match
+        }
     }
 }
 
@@ -419,18 +443,62 @@ pub fn build_bam_record(
 ) -> RecordBuf {
     let mut record = RecordBuf::default();
 
-    *record.name_mut() = Some(name.as_bytes().to_vec().into());
+    // SAM v1 §1.4 field 1: segments of one template share a QNAME, and mate identity is carried
+    // by FLAG 0x40/0x80. The `/1` and `/2` suffixes are a FASTQ convention; carried into a BAM
+    // they give mates DIFFERENT names, so nothing can pair them -- MarkDuplicates and fixmate
+    // silently see singletons (#551). The FASTQ writer keeps its suffixes, correctly.
+    let qname = name
+        .strip_suffix("/1")
+        .or_else(|| name.strip_suffix("/2"))
+        .unwrap_or(name);
+
+    // SAM v1 §1.4 fields 10-11: when 0x10 is set, SEQ holds the REVERSE COMPLEMENT of the read as
+    // sequenced and QUAL is reversed, so that POS + CIGAR + SEQ are one consistent statement.
+    //
+    // The `ReadRecord` reaching us is in READ orientation: `fastq_tools` flips R2 via
+    // `reverse_complement_record` because a FASTQ must contain the read as sequenced. Both writers
+    // consume that same record, and only this one needs reference orientation -- so undo the flip
+    // here, keyed off the very flag this function was handed, which is what keeps the two from
+    // disagreeing (#550). Reuses `fastq_tools::reverse_complement` rather than reimplementing the
+    // complement table, so the two paths cannot drift.
+    // The CIGAR needs the same treatment, and this is the part that is easy to miss: it too
+    // arrives in read orientation, so `60M1I39M` on a reverse read describes an insertion 60
+    // bases into the READ. Reference-oriented, that is `39M1I60M`. Measured on 66 reverse records
+    // carrying an indel: identity to the reference is 0.607 with the CIGAR as written and 0.995
+    // with the op order reversed. Fixing SEQ alone leaves SEQ and CIGAR disagreeing with each
+    // other, which is worse than the original bug -- before, the two were at least mutually
+    // consistent in read orientation.
+    let reverse = flags.is_reverse_complemented();
+    let cigar_out: Cigar = if reverse {
+        cigar.as_ref().iter().rev().copied().collect()
+    } else {
+        cigar
+    };
+    let seq_out: String = if reverse {
+        reverse_complement(sequence.chars().map(Nucleotide::from).collect())
+            .into_iter()
+            .map(char::from)
+            .collect()
+    } else {
+        sequence.to_string()
+    };
+
+    *record.name_mut() = Some(qname.as_bytes().to_vec().into());
     *record.flags_mut() = flags;
     *record.reference_sequence_id_mut() = Some(ref_id);
     *record.alignment_start_mut() = Position::new(pos + 1);
     *record.mapping_quality_mut() = MappingQuality::try_from(mapq).ok();
-    *record.cigar_mut() = cigar;
+    *record.cigar_mut() = cigar_out;
     *record.mate_reference_sequence_id_mut() = Some(mate_ref_id);
     *record.mate_alignment_start_mut() = Position::new(mate_pos + 1);
     *record.template_length_mut() = template_length;
-    *record.sequence_mut() = Sequence::from(sequence.as_bytes());
+    *record.sequence_mut() = Sequence::from(seq_out.as_bytes());
 
-    let qual_u8: Vec<u8> = qual_scores.iter().map(|&q| q as u8).collect();
+    let qual_u8: Vec<u8> = if reverse {
+        qual_scores.iter().rev().map(|&q| q as u8).collect()
+    } else {
+        qual_scores.iter().map(|&q| q as u8).collect()
+    };
     *record.quality_scores_mut() = QualityScores::from(qual_u8);
 
     record
@@ -458,6 +526,81 @@ mod tests {
             mate_position: 0,
             template_length: 0,
         }
+    }
+
+    /// Flatten a built `Cigar` into (kind, len) pairs for exact comparison.
+    fn cigar_ops_of(cigar: &Cigar) -> Vec<(CigarKind, usize)> {
+        cigar.as_ref().iter().map(|o| (o.kind(), o.len())).collect()
+    }
+
+    /// Read every record's CIGAR back out of a written BAM, as a SAM-style string.
+    ///
+    /// Nothing in this repo read a CIGAR out of a produced BAM before this. That gap is
+    /// exactly why adapter soft clips could be emitted as `M` for as long as they were:
+    /// the FASTQ side pinned `'S'` and the BAM side silently turned it into `M`, and no
+    /// test spanned the two.
+    fn read_bam_cigars(path: &PathBuf) -> Vec<String> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut reader = bam::io::Reader::new(file);
+        reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|r| {
+                let rec = r.unwrap();
+                rec.cigar()
+                    .iter()
+                    .map(|o| {
+                        let o = o.unwrap();
+                        format!(
+                            "{}{}",
+                            o.len(),
+                            match o.kind() {
+                                CigarKind::Match => 'M',
+                                CigarKind::Insertion => 'I',
+                                CigarKind::Deletion => 'D',
+                                CigarKind::SoftClip => 'S',
+                                CigarKind::HardClip => 'H',
+                                _ => '?',
+                            }
+                        )
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn soft_clips_are_not_silently_converted_to_matches() {
+        // Known answer, independent of the implementation: four aligned bases followed
+        // by two adapter bases is 4M2S. A soft clip does NOT consume reference, so
+        // emitting it as M asserts that adapter sequence aligned to the genome.
+        assert_eq!(
+            cigar_ops_of(&rle_to_cigar(&['M', 'M', 'M', 'M', 'S', 'S'])),
+            vec![(CigarKind::Match, 4), (CigarKind::SoftClip, 2)],
+        );
+    }
+
+    #[test]
+    fn every_op_the_read_pipeline_emits_round_trips_through_a_bam() {
+        // fastq_tools produces exactly four ops: M (match), I (insert error),
+        // D (delete error), S (adapter read-through). Each must survive to the BAM.
+        // Asserting the whole alphabet at once means a future op added on the FASTQ
+        // side and forgotten here shows up as a failure rather than as silent Ms.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ops.bam");
+        let contigs = vec![("chr1".to_string(), 1000usize)];
+        {
+            let mut w = BamWriter::new(&path, &contigs).unwrap();
+            let mut rec = make_read("ops", 10);
+            // SEQ length must equal the query-consuming ops (M + I + S = 7); 'D'
+            // marks a deleted reference base and consumes no query base.
+            rec.sequence = "ACGTACG".to_string();
+            rec.quality_scores = vec![30; 7];
+            //              2M        1I   1D    2M        2S
+            rec.cigar_ops = vec!['M', 'M', 'I', 'D', 'M', 'M', 'S', 'S'];
+            w.write_read_record(&rec).unwrap();
+        }
+        assert_eq!(read_bam_cigars(&path), vec!["2M1I1D2M2S".to_string()]);
     }
 
     fn read_bam_positions(path: &PathBuf) -> Vec<usize> {

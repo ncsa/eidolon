@@ -272,11 +272,24 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             let counts = read_bam_transitions(path)?;
             let total_mismatches: usize = counts.iter().flatten().sum();
             if total_mismatches == 0 {
-                warn!(
-                    "BAM file {:?} had no MD-tagged records; using default transition matrix",
-                    path
-                );
-                None
+                // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
+                // fitting the transition matrix -- so a BAM that yields no evidence cannot be
+                // honoured at all. Silently substituting the default produces a model that is
+                // indistinguishable from a trained one downstream. MD is a *predefined* SAM tag
+                // rather than a required one, so this is easy to hit unintentionally.
+                //
+                // Omitting `bam_file:` is how a user asks for the default matrix, so there is
+                // nothing to fall back to here: a config that names a BAM it does not use would
+                // be a lie about provenance.
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
+                     transition matrix cannot be inferred from it. Most likely the BAM has no \
+                     MD tags, which are optional in SAM and not written by every aligner. \
+                     Either add them with `samtools calmd -b {} reference.fa > with_md.bam`, \
+                     or remove `bam_file:` from the config to use the built-in default matrix.",
+                    path,
+                    path.display()
+                )));
             } else {
                 info!(
                     "Observed {} SNP mismatches across all records",
@@ -653,10 +666,64 @@ mod tests {
         assert!(output_path.exists());
     }
 
+    /// The cumulative weights of one transition-matrix row, as `[A, C, G, T]`.
+    ///
+    /// `DiscreteDistribution` stores a CDF rather than per-value probabilities, so a row
+    /// whose whole weight sits on C reads `[0.0, 1.0, 1.0, 1.0]`, and one split
+    /// 0.5/0/0.25/0.25 reads `[0.5, 0.5, 0.75, 1.0]`.
+    fn row_cdf(
+        tm: &eidolon_core::structs::transition_matrix::TransitionMatrix,
+        base: eidolon_core::structs::nucleotides::Nucleotide,
+    ) -> Vec<f64> {
+        tm[&base].weights().unwrap()
+    }
+
+    fn assert_row_cdf_eq(actual: &[f64], expected: &[f64; 4], what: &str) {
+        assert_eq!(actual.len(), 4, "{what}: expected a 4-wide row");
+        for (i, exp) in expected.iter().enumerate() {
+            assert!(
+                (actual[i] - exp).abs() < 1e-9,
+                "{what}: position {i} was {}, expected {exp} (full row {actual:?})",
+                actual[i]
+            );
+        }
+    }
+
+    /// The default SEQUENCING-ERROR matrix's A row as a CDF, derived rather than transcribed.
+    ///
+    /// A hardcoded copy would be a vacuity hazard precisely here: the assertions below use
+    /// this to prove a built matrix is *not* the default. If the default changed and a
+    /// transcribed constant did not, the check would compare against a value that is no
+    /// longer the default — and could pass while the built matrix IS the new default.
+    ///
+    /// DO NOT reach for `TransitionMatrix::default()`. Two differently-valued defaults share
+    /// that name: `TransitionMatrix::default()` is NEAT 2.0's *mutation* matrix (A row
+    /// 0.0/0.1695/0.6878/0.1427), while the sequencing-error default is a separate literal
+    /// inside `SequencingErrorModel` (A row 0.0/0.4918/0.3377/0.1705). Deriving from the
+    /// wrong one makes this test fail against correct code, which is how the distinction was
+    /// found.
+    ///
+    /// Residual, pre-existing: that literal appears TWICE in `sequencing_error_model.rs`
+    /// (`default()` and `from_raw_data`'s `None` arm). This reads the former while the
+    /// runner's fallback path uses the latter, so a drift between the two copies would slip
+    /// past. They are identical today.
+    fn default_a_row_cdf() -> [f64; 4] {
+        let m = SequencingErrorModel::default()
+            .expect("the default sequencing error model must be constructible");
+        let row = row_cdf(
+            m.transition_distros(),
+            eidolon_core::structs::nucleotides::Nucleotide::A,
+        );
+        [row[0], row[1], row[2], row[3]]
+    }
+
     #[test]
-    fn test_runner_with_bam_md_tags() {
-        // ref=AAAA, read=CCCC → every base is an A→C mismatch.
-        // Verifies that runner accepts a bam_file and completes successfully.
+    fn test_runner_with_bam_md_tags_puts_all_a_weight_on_c() {
+        // ref=AAAA, read=CCCC → every mismatch is A→C, so the built model's A row must
+        // place its entire weight on C. Asserting the artifact's content, not that a file
+        // appeared: the previous version of this test passed with any matrix at all,
+        // including the default, which is precisely the failure it needed to catch.
+        use eidolon_core::structs::nucleotides::Nucleotide;
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);
@@ -675,13 +742,158 @@ mod tests {
             transition_matrix_file: None,
         };
         runner(&config).unwrap();
-        assert!(output_path.exists());
-        SequencingErrorModel::from_file(&output_path).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let tm = model.transition_distros();
+
+        // A → C with probability 1: CDF steps to 1.0 at C and stays there.
+        assert_row_cdf_eq(
+            &row_cdf(tm, Nucleotide::A),
+            &[0.0, 1.0, 1.0, 1.0],
+            "A row inferred from an all-A→C BAM",
+        );
+
+        // And it must not simply be the default matrix wearing a disguise.
+        let a_row = row_cdf(tm, Nucleotide::A);
+        assert!(
+            (a_row[1] - default_a_row_cdf()[1]).abs() > 1e-6,
+            "A row matched the default matrix, so the BAM was not consulted: {a_row:?}"
+        );
+
+        // Rows the BAM said nothing about fall back to uniform off-diagonal (1/3 each):
+        // C row CDF = [1/3, 1/3, 2/3, 1.0].
+        assert_row_cdf_eq(
+            &row_cdf(tm, Nucleotide::C),
+            &[1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+            "C row, unobserved in the BAM",
+        );
     }
 
     #[test]
-    fn test_runner_bam_no_md_tags_falls_back() {
-        // BAM records without MD tags → runner succeeds and uses the default matrix.
+    fn test_runner_bam_transitions_track_a_mixed_mismatch_pattern() {
+        // The fixture must be ASYMMETRIC, and each row must spread over more than one
+        // target base. A reciprocal pattern (ref=ACGT / read=CATG, giving A→C and C→A in
+        // equal number) produces a count matrix equal to its own transpose, so swapping
+        // the ref/read axes cannot be detected — the first version of this test had that
+        // flaw and a transpose mutation passed it. Single-entry rows are no good either:
+        // the distribution is normalized, so one nonzero cell lands on probability 1.0
+        // wherever it sits.
+        //
+        // ref=AAAACCCC vs read=CCGTAAAG gives
+        //   A row: A→C ×2, A→G ×1, A→T ×1  → 0.50 / 0.25 / 0.25
+        //   C row: C→A ×3, C→G ×1          → 0.75 / 0.25
+        // counts[A][C]=2 against counts[C][A]=3, so the matrix is not symmetric.
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let bam_path = temp.path().join("mixed.bam");
+        write_test_bam(&bam_path, 8, b"AAAACCCC", b"CCGTAAAG", true);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            output_file: output_path.clone(),
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+        };
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let tm = model.transition_distros();
+
+        // A: 0.50 C, 0.25 G, 0.25 T → CDF [0.0, 0.50, 0.75, 1.0].
+        assert_row_cdf_eq(
+            &row_cdf(tm, Nucleotide::A),
+            &[0.0, 0.5, 0.75, 1.0],
+            "A row (2 C, 1 G, 1 T)",
+        );
+        // C: 0.75 A, 0.25 G → CDF [0.75, 0.75, 1.0, 1.0].
+        assert_row_cdf_eq(
+            &row_cdf(tm, Nucleotide::C),
+            &[0.75, 0.75, 1.0, 1.0],
+            "C row (3 A, 1 G)",
+        );
+        // G and T were never the reference base here, so both fall back to uniform.
+        assert_row_cdf_eq(
+            &row_cdf(tm, Nucleotide::G),
+            &[1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 1.0],
+            "G row, unobserved",
+        );
+    }
+
+    #[test]
+    fn test_build_transition_matrix_from_counts_is_not_transposed() {
+        // Guards the ref/read axis directly on the pure function, where the fixture can be
+        // made maximally asymmetric without having to express it as a BAM. Transposing
+        // `counts[i][j]` changes every row here.
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let mut counts = [[0usize; 4]; 4];
+        // A row: 6 C, 3 G, 1 T  → 0.6 / 0.3 / 0.1
+        counts[0][1] = 6;
+        counts[0][2] = 3;
+        counts[0][3] = 1;
+        // C row: 1 A, 1 G, 8 T  → 0.1 / 0.1 / 0.8
+        counts[1][0] = 1;
+        counts[1][2] = 1;
+        counts[1][3] = 8;
+        let tm = build_transition_matrix_from_counts(counts).unwrap();
+
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::A),
+            &[0.0, 0.6, 0.9, 1.0],
+            "A row 0.6/0.3/0.1",
+        );
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::C),
+            &[0.1, 0.1, 0.2, 1.0],
+            "C row 0.1/0.1/0.8",
+        );
+    }
+
+    #[test]
+    fn test_runner_no_bam_file_uses_the_default_matrix() {
+        // MUST-NOT-FIRE: with no `bam_file:` at all, nothing was requested and nothing errors --
+        // the model carries the default matrix. This is the supported way to ask for it.
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = make_config(fastq_path, output_path.clone());
+        assert!(
+            config.bam_file.is_none(),
+            "this test's premise is no bam_file"
+        );
+        runner(&config).unwrap();
+
+        // The case where inference must NOT fire: nothing was requested,
+        // so the model has to carry the default matrix. Asserting only "a file appeared"
+        // could not tell that apart from silently inventing a matrix from zero evidence.
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_row_cdf_eq(
+            &row_cdf(
+                model.transition_distros(),
+                eidolon_core::structs::nucleotides::Nucleotide::A,
+            ),
+            &default_a_row_cdf(),
+            "A row with no bam_file at all",
+        );
+    }
+
+    /// MUST-FAIL: `bam_file:` that yields no mismatch evidence is an error, not a warning.
+    ///
+    /// The defect this pins (#529): the runner used to `warn!` and substitute the built-in
+    /// default, producing a model that is byte-identical to an untrained one while the config
+    /// says it was fitted from a BAM. Nothing downstream can distinguish those, which is the
+    /// same shape as every other quiet failure in this repo — a value produced by a path that
+    /// never ran.
+    #[test]
+    fn test_runner_bam_no_md_tags_is_an_error() {
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);
@@ -699,16 +911,133 @@ mod tests {
             bam_file: Some(bam_path),
             transition_matrix_file: None,
         };
+        let err = runner(&config).expect_err("an MD-less bam_file must not silently default");
+        let msg = err.to_string();
+
+        // Assert the message names BOTH remedies. A bare "cannot infer" would leave the user
+        // with no route forward, and the whole point of the flag is that it be discoverable
+        // from the error rather than from the source.
+        assert!(
+            msg.contains("samtools calmd"),
+            "error must name the MD remedy: {msg}"
+        );
+        assert!(
+            msg.contains("remove `bam_file:`"),
+            "error must name the other remedy -- dropping the key: {msg}"
+        );
+
+        // And it must fail BEFORE writing anything. A model on disk next to an error is worse
+        // than either outcome alone, because a rerunning pipeline would pick it up.
+        assert!(
+            !output_path.exists(),
+            "no model file may be written when inference fails"
+        );
+    }
+
+    /// A BAM that HAS MD tags but records zero mismatches is the same failure with a different
+    /// cause — a perfectly-matching alignment carries no transition evidence either. Included
+    /// because the guard keys on the mismatch total, not on tag presence, and a reader could
+    /// reasonably assume otherwise from the error text.
+    #[test]
+    fn test_runner_bam_with_md_but_no_mismatches_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let bam_path = temp.path().join("md_no_mismatch.bam");
+        // ref == read, so the MD tag is written but encodes only matches.
+        write_test_bam(&bam_path, 5, b"ACGT", b"ACGT", true);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            output_file: output_path,
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+        };
+        let err = runner(&config).expect_err("zero mismatches is no evidence, MD tags or not");
+        assert!(
+            err.to_string().contains("no read-vs-reference mismatches"),
+            "{err}"
+        );
+    }
+
+    /// End-to-end `runner` over a **real** aligned BAM — the gap #529 left open.
+    ///
+    /// Every other BAM in these tests is written by `write_test_bam` a few records at a time.
+    /// This one is 1000 Genomes HG00096, GRCh37 `20:1000000-1050000`, aligned with bwa 0.5.9 in
+    /// 2012 and left unmodified: soft clips, indels, duplicate-marked reads, unmapped mates,
+    /// `N` bases, and MD strings emitted by an aligner rather than by us. Provenance in
+    /// `eidolon-core/test_data/HG00096.chr20_1Mb.README.md`.
+    ///
+    /// KNOWN ANSWER, computed outside eidolon by an awk walk over MD+CIGAR and corroborated by
+    /// `sum(NM) - sum(indel bases)` from the aligner's own tags: the A row of the raw count
+    /// matrix is `[0, 97, 100, 53]`, 250 substitutions from a reference A. Normalized that is
+    /// C 97/250, G 100/250, T 53/250, which as a CDF is `[0, 0.388, 0.788, 1.0]`.
+    ///
+    /// The assertion is on the fitted row, not merely on "a model was produced": the whole
+    /// failure mode this file keeps guarding against is a model that looks trained and is not.
+    #[test]
+    fn test_runner_infers_from_a_real_aligner_bam() {
+        let bam_path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../eidolon-core/test_data/HG00096.chr20_1Mb.bam"
+        ));
+        assert!(
+            bam_path.is_file(),
+            "real-data fixture missing: {bam_path:?}"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let output_path = temp.path().join("model.json.gz");
+
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            output_file: output_path.clone(),
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+        };
         runner(&config).unwrap();
-        assert!(output_path.exists());
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let a_row = row_cdf(
+            model.transition_distros(),
+            eidolon_core::structs::nucleotides::Nucleotide::A,
+        );
+        assert_row_cdf_eq(
+            &a_row,
+            &[0.0, 97.0 / 250.0, 197.0 / 250.0, 1.0],
+            "A row fitted from the real HG00096 BAM",
+        );
+
+        // MUST DIFFER from the default. Without this the test would pass just as happily if
+        // inference had silently fallen back -- which is exactly the #529 defect, and exactly
+        // the kind of pass this repo has been fooled by before.
+        let default_row = default_a_row_cdf();
+        assert!(
+            (a_row[1] - default_row[1]).abs() > 1e-6,
+            "fitted A row {a_row:?} is indistinguishable from the default {default_row:?}; \
+             inference did not actually fire"
+        );
     }
 
     #[test]
     fn test_tsv_takes_precedence_over_bam() {
-        // When both transition_matrix_file and bam_file are set, the TSV wins.
-        // The BAM has A→C biased mismatches; the TSV has a uniform matrix.
-        // We can't easily inspect the matrix after serialization, so just verify
-        // that the runner completes and writes a valid model.
+        // When both transition_matrix_file and bam_file are set, the TSV wins. The BAM is
+        // all A→C; the TSV's A row is 0.5/0.3/0.2 across C/G/T. Those are distinguishable,
+        // so the assertion can actually establish precedence — the earlier version only
+        // checked that the runner completed, and would have passed with precedence
+        // inverted, which is the single thing it existed to rule out.
+        use eidolon_core::structs::nucleotides::Nucleotide;
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
         make_test_fastq(&fastq_path, 20, 4);
@@ -737,8 +1066,18 @@ mod tests {
             transition_matrix_file: Some(tsv_path),
         };
         runner(&config).unwrap();
-        assert!(output_path.exists());
-        SequencingErrorModel::from_file(&output_path).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let a_row = row_cdf(model.transition_distros(), Nucleotide::A);
+
+        // TSV A row 0.0/0.5/0.3/0.2 → CDF [0.0, 0.5, 0.8, 1.0].
+        assert_row_cdf_eq(&a_row, &[0.0, 0.5, 0.8, 1.0], "A row taken from the TSV");
+
+        // The BAM would have produced [0.0, 1.0, 1.0, 1.0]. State the negative directly.
+        assert!(
+            (a_row[2] - 1.0).abs() > 1e-6,
+            "A row looks BAM-derived, so the TSV did not take precedence: {a_row:?}"
+        );
     }
 
     #[test]
@@ -752,6 +1091,16 @@ mod tests {
         counts[1][2] = 5; // C→G
         counts[1][3] = 5; // C→T
         let tm = build_transition_matrix_from_counts(counts).unwrap();
+
+        // The observed row is the point of the function and went unasserted: 10/5/5 out of
+        // 20 is 0.5 / 0.25 / 0.25 across A / G / T, so the C row's CDF is
+        // [0.5, 0.5, 0.75, 1.0]. Without this, the counts could have been ignored entirely
+        // and only the untouched A row was ever checked.
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::C),
+            &[0.5, 0.5, 0.75, 1.0],
+            "C row fitted from 10/5/5 counts",
+        );
 
         // Sample the A row at several evenly-spaced random values
         let a_dist = &tm[&Nucleotide::A];

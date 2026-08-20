@@ -411,6 +411,53 @@ fn golden_vcf_with_svs_is_well_formed() {
 
 /// Every BND must be a reciprocal mate pair whose two ALTs name each other's
 /// position. Before #451 the de-novo path emitted a single ID-less breakend.
+/// Every de novo breakend must join TWO DIFFERENT contigs.
+///
+/// This is the end-to-end proof of the whole chain, and the thing that was false for
+/// eidolon's entire BND history: the per-contig sampler hardcoded the mate to the
+/// anchor's own contig, so 466 of 466 junctions in job 20719077 were same-contig while
+/// the docs advertised BCR-ABL-style translocations. PCAWG's TRA class — the source of
+/// the BND rate — is 100% inter-chromosomal (docs/pcawg_sv_measurement.md M1).
+///
+/// A unit test on the sampler is not enough here: the records have to survive placement,
+/// the mutated-map merge, and VCF writing, on two different contigs, to reach this file.
+#[test]
+fn every_denovo_bnd_joins_two_different_contigs() {
+    let (v, _r) = golden_vcf("vcfval_bnd_interchrom", Some(8.0));
+    let bnds: Vec<&Record> = v.records.iter().filter(|r| r.is_bnd()).collect();
+    assert!(
+        !bnds.is_empty(),
+        "no BND records emitted — test would vacuously pass"
+    );
+    for r in &bnds {
+        // The ALT embeds the mate locus as `contig:pos` inside [] or ][.
+        let mate_locus = r
+            .alt
+            .split(|c| c == '[' || c == ']')
+            .find(|piece| piece.contains(':'))
+            .unwrap_or_else(|| panic!("BND ALT has no mate locus: {}", r.raw));
+        let mate_contig = mate_locus
+            .rsplit_once(':')
+            .map(|(c, _)| c)
+            .unwrap_or_else(|| panic!("unparsable mate locus {mate_locus}"));
+        assert_ne!(
+            mate_contig, r.chrom,
+            "de novo BND at {}:{} points at its OWN contig — that is a deletion or \
+             duplication by orientation, not a translocation: {}",
+            r.chrom, r.pos, r.raw
+        );
+    }
+    // Coverage of the input, not just the metric: at least two distinct contigs must
+    // actually carry breakends, or a single-contig run could satisfy the loop above by
+    // emitting nothing on the others.
+    let contigs: std::collections::HashSet<&str> = bnds.iter().map(|r| r.chrom.as_str()).collect();
+    assert!(
+        contigs.len() >= 2,
+        "breakends landed on only {} contig(s): {contigs:?}",
+        contigs.len()
+    );
+}
+
 #[test]
 fn every_bnd_is_a_reciprocal_mate_pair() {
     let (v, _r) = golden_vcf("vcfval_bnd", Some(8.0));
@@ -451,4 +498,164 @@ fn golden_vcf_declares_contigs() {
     let (v, _r) = golden_vcf("vcfval_contig", None);
     let p = report("contigs", check_contigs(&v));
     assert!(p.is_empty(), "contig declarations missing: {}", p[0]);
+}
+
+// ── compare-vcfs artifacts (#444) ────────────────────────────────────────────
+// FN_with_reasons.vcf / FP.vcf pass each record's INFO through verbatim from the
+// VCF it came from, so they must declare those tags. A fixed minimal header left
+// them undeclared, which streams fine VCF->VCF but hard-fails BCF translation.
+// Validate them as whole artifacts, the same way the golden VCF is validated
+// above — the missing check is what let the defect ship.
+
+fn write_fasta(path: &Path, contig: &str, seq: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(path).unwrap();
+    writeln!(f, ">{contig}").unwrap();
+    writeln!(f, "{seq}").unwrap();
+}
+
+/// Write a VCF whose header declares `extra_info` lines, so we can check they are
+/// inherited rather than dropped.
+fn write_src_vcf(path: &Path, contig: &str, len: usize, extra_info: &[&str], body: &[&str]) {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(path).unwrap();
+    writeln!(f, "##fileformat=VCFv4.2").unwrap();
+    writeln!(f, "##contig=<ID={contig},length={len}>").unwrap();
+    writeln!(
+        f,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+    )
+    .unwrap();
+    for l in extra_info {
+        writeln!(f, "{l}").unwrap();
+    }
+    writeln!(
+        f,
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE"
+    )
+    .unwrap();
+    for l in body {
+        writeln!(f, "{l}").unwrap();
+    }
+}
+
+/// Both compare-vcfs artifacts must be well formed — every INFO tag their records
+/// carry declared, contigs declared, columns consistent.
+#[test]
+fn compare_vcfs_artifacts_are_well_formed() {
+    let (_dir, work) = fresh_workdir();
+    let contig = "chr1";
+    let seq: String = std::iter::repeat('A').take(2000).collect();
+    let fa = work.join("ref.fa");
+    write_fasta(&fa, contig, &seq);
+
+    // Golden carries DP; called carries a caller-specific TLOD. Neither could be
+    // enumerated in a fixed header, and they must land in different artifacts.
+    let golden = work.join("golden.vcf");
+    write_src_vcf(
+        &golden,
+        contig,
+        2000,
+        &[
+            "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"depth\">",
+            "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"type\">",
+            "##INFO=<ID=END,Number=1,Type=Integer,Description=\"end\">",
+            "##ALT=<ID=DEL,Description=\"Deletion\">",
+        ],
+        &[
+            "chr1\t100\t.\tA\tG\t50\tPASS\tDP=30\tGT\t0/1",
+            "chr1\t200\t.\tA\tT\t50\tPASS\tDP=25\tGT\t0/1",
+            // Symbolic SV: exercises ##ALT / SVTYPE / END inheritance, the case a
+            // real cancer truth VCF hits.
+            "chr1\t500\t.\tA\t<DEL>\t50\tPASS\tSVTYPE=DEL;END=600\tGT\t0/1",
+        ],
+    );
+    let called = work.join("called.vcf");
+    write_src_vcf(
+        &called,
+        contig,
+        2000,
+        &["##INFO=<ID=TLOD,Number=1,Type=Float,Description=\"mutect\">"],
+        &["chr1\t900\t.\tA\tC\t50\tPASS\tTLOD=12.5\tGT\t0/1"],
+    );
+
+    let out = work.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = work.join("cfg.yml");
+    std::fs::write(
+        &yaml,
+        format!(
+            "golden_vcf: {}\ncalled_vcf: {}\nreference: {}\noutput_dir: {}\n\
+             overwrite_output: true\nwrite_fp_vcf: true\n",
+            golden.display(),
+            called.display(),
+            fa.display(),
+            out.display(),
+        ),
+    )
+    .unwrap();
+
+    eidolon()
+        .args(["compare-vcfs", "-c"])
+        .arg(&yaml)
+        .assert()
+        .success();
+
+    let reference = load_reference(&fa);
+    for name in ["FN_with_reasons.vcf", "FP.vcf"] {
+        let path = out.join(name);
+        assert!(path.is_file(), "{name} was not written");
+        let parsed = parse_vcf(&path);
+        assert!(
+            !parsed.records.is_empty(),
+            "{name} has no records — validating an empty file proves nothing"
+        );
+        let mut problems = Vec::new();
+        problems.extend(report(
+            &format!("{name} INFO declared"),
+            check_info_declared(&parsed),
+        ));
+        problems.extend(report(
+            &format!("{name} REF"),
+            check_ref(&parsed, &reference),
+        ));
+        problems.extend(report(&format!("{name} sorted"), check_sorted(&parsed)));
+        problems.extend(report(&format!("{name} columns"), check_columns(&parsed)));
+        // No check_alt_declared here: compare-vcfs deliberately excludes symbolic
+        // ALTs before comparison (runner.rs skips them so nothing calls
+        // .as_literal() on a <DEL>) and reports the count it dropped, so these
+        // artifacts never carry one. Asserting it would pass vacuously — the
+        // golden-VCF tests above cover ALT declarations where they can occur.
+        problems.extend(report(&format!("{name} contigs"), check_contigs(&parsed)));
+        assert!(
+            problems.is_empty(),
+            "{name} is not well formed ({} problem(s)); first: {}",
+            problems.len(),
+            problems[0]
+        );
+    }
+
+    // The golden's symbolic <DEL> must be excluded cleanly, not crash and not leak
+    // into the artifact — compare-vcfs is an SNV/indel comparator by design.
+    let fn_body = std::fs::read_to_string(out.join("FN_with_reasons.vcf")).unwrap();
+    assert!(
+        !fn_body.contains("<DEL>"),
+        "symbolic ALT leaked into FN artifact:\n{fn_body}"
+    );
+    assert_eq!(
+        fn_body.lines().filter(|l| !l.starts_with('#')).count(),
+        2,
+        "expected exactly the 2 literal FNs (symbolic excluded):\n{fn_body}"
+    );
+
+    // Each artifact inherited from ITS OWN source, not a shared fixed header.
+    let fp_body = std::fs::read_to_string(out.join("FP.vcf")).unwrap();
+    assert!(
+        fn_body.contains("##INFO=<ID=DP,"),
+        "FN lost golden's DP decl"
+    );
+    assert!(
+        fp_body.contains("##INFO=<ID=TLOD,"),
+        "FP lost the caller's TLOD decl"
+    );
 }

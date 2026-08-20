@@ -208,6 +208,53 @@ check_outdir_version() {
     return 0
 }
 
+# Gate emitted artifacts through `eidolon validate` before anything consumes them.
+#
+# This replaces accreting more ad-hoc greps. The reason it exists: the malformed
+# `AF=AF=0.3000` INFO value sailed past an `nsom > 0` guard because that guard counted
+# RECORDS, not content — and bcftools would never have complained either, since it
+# silently converts a type-mismatched value to `.`. A record count cannot see that; a
+# validator that knows the declared type can.
+#
+# ERROR findings are fatal: producing numbers from an artifact a downstream tool will
+# reject, or has silently emptied, is precisely the failure this whole harness keeps
+# hitting. WARNINGs are printed and do not stop the run, because by construction nothing
+# downstream rejects them.
+#
+# Skips (loudly) if the binary predates the subcommand, so an older checkout still runs.
+validate_artifacts() {  # <eidolon-bin> <label> <file>...
+    local bin="$1" label="$2"; shift 2
+    [[ $# -gt 0 ]] || return 0
+    if [[ ! -x "$bin" ]]; then
+        echo "  WARNING: $bin is not executable — skipping $label validation." >&2
+        return 0
+    fi
+    if ! "$bin" validate --help >/dev/null 2>&1; then
+        echo "  WARNING: this eidolon build has no \`validate\` subcommand — skipping" >&2
+        echo "    $label validation. Rebuild to enable the artifact gate." >&2
+        return 0
+    fi
+    local present=()
+    local f
+    for f in "$@"; do
+        [[ -f "$f" ]] && present+=("$f")
+    done
+    if [[ ${#present[@]} -eq 0 ]]; then
+        echo "  WARNING: none of the $label artifacts exist yet — nothing validated." >&2
+        return 0
+    fi
+    echo "  Validating $label (${#present[@]} artifact(s))..."
+    local rc=0
+    "$bin" validate "${present[@]}" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        echo "ERROR: $label failed validation (see the findings above). Each one names the" >&2
+        echo "  tool and operation that will reject it. Refusing to compute results from an" >&2
+        echo "  artifact a consumer will not accept." >&2
+        return 1
+    fi
+    return 0
+}
+
 stamp_outdir_version() {
     printf '%s\n' "$EIDOLON_VERSION" > "$1/.eidolon_version"
 }

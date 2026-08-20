@@ -41,7 +41,11 @@ cd "$WORK"
 # the smoke-friendly small slices. Full gnomAD-SV is large (~3.5GB) and
 # GRCh38 is ~900MB — script will refuse to download those without an
 # explicit ALLOW_LARGE_DOWNLOADS=1.
-GNOMAD_VCF_URL="${GNOMAD_VCF_URL:-https://storage.googleapis.com/gcp-public-data--gnomad/release/4/sv/gnomad_v4_sv.sites.vcf.gz}"
+# Verified live 2026-08-02 (1.74 GB). The previous path — release/4/sv/gnomad_v4_sv.sites.vcf.gz
+# — now 404s; gnomAD reorganised to release/<ver>/genome_sv/ with a dotted filename.
+# A rotted URL makes this script fail at step 1, so check it before assuming the
+# validation "has not been run lately" for any other reason.
+GNOMAD_VCF_URL="${GNOMAD_VCF_URL:-https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/genome_sv/gnomad.v4.1.sv.sites.vcf.gz}"
 GRCH38_URL="${GRCH38_URL:-https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz}"
 
 ensure_vcf() {

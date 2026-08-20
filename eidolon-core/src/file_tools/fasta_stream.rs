@@ -17,6 +17,18 @@ use thiserror::Error;
 pub enum FastaStreamError {
     #[error("I/O error reading FASTA: {0}")]
     IoError(#[from] io::Error),
+    /// The file has content but no `>` header line, or has data before the first one.
+    ///
+    /// Silently skipping pre-header content let a gzipped FASTQ be read as a reference:
+    /// `>` is ASCII 62, an ordinary Phred+33 quality character (Q29), so the reader
+    /// walked past the reads until a QUALITY line happened to start with `>` and then
+    /// used that quality string as a contig name. The run produced contigs named
+    /// `=D2DFGGGCGGG...` and completed without complaint.
+    #[error(
+        "{path}: not a FASTA — {detail}. The first non-blank line of a FASTA must be a \
+         '>' header. (If this is a FASTQ, pass the reference FASTA instead.)"
+    )]
+    NotFasta { path: String, detail: String },
 }
 
 /// Streaming FASTA reader that yields `(contig_name, raw_sequence)` one contig at a time.
@@ -48,15 +60,46 @@ impl FastaStream {
         };
 
         // Advance to the first header line.
+        //
+        // Anything other than blank lines before it is a hard error. This used to skip
+        // silently, which meant a file that is not a FASTA at all could still "open":
+        // a gzipped FASTQ got walked past its reads until a QUALITY line beginning with
+        // '>' (ASCII 62 = Q29 in Phred+33) was mistaken for a header, and the run
+        // proceeded with quality strings as contig names.
+        let display = path.display().to_string();
+        let mut skipped_nonblank: Option<String> = None;
         loop {
             match stream.lines.next() {
-                None => return Ok(stream),
+                None => {
+                    return match skipped_nonblank {
+                        Some(first) => Err(FastaStreamError::NotFasta {
+                            path: display,
+                            detail: format!(
+                                "no '>' header line anywhere in the file; first content \
+                                 line was {first:?}"
+                            ),
+                        }),
+                        // A genuinely empty (or blank-only) file yields no contigs, which
+                        // downstream code already handles; that is not a format error.
+                        None => Ok(stream),
+                    };
+                }
                 Some(Err(e)) => return Err(e.into()),
                 Some(Ok(line)) if line.starts_with('>') => {
+                    if let Some(first) = skipped_nonblank {
+                        return Err(FastaStreamError::NotFasta {
+                            path: display,
+                            detail: format!("content appears before the first header: {first:?}"),
+                        });
+                    }
                     stream.pending_name = Some(parse_contig_name(&line));
                     break;
                 }
-                Some(Ok(_)) => {}
+                Some(Ok(line)) => {
+                    if !line.trim().is_empty() && skipped_nonblank.is_none() {
+                        skipped_nonblank = Some(line.chars().take(60).collect::<String>());
+                    }
+                }
             }
         }
 
@@ -296,6 +339,71 @@ pub fn scan_fasta_lengths(path: &PathBuf) -> Result<Vec<(String, usize)>, FastaS
 
 #[cfg(test)]
 mod tests {
+
+    /// A FASTQ must be rejected, not silently parsed as a reference.
+    ///
+    /// This is the real defect, reproduced: `>` is ASCII 62, an ordinary Phred+33
+    /// quality character (Q29), so a quality line CAN begin with it. The old reader
+    /// skipped everything before the first `>` without comment, walked past the reads,
+    /// and adopted a quality string as a contig name. A whole gen-reads run then
+    /// completed with contigs called `=D2DFGGGCGGGBFBGG...` and nothing flagged it.
+    #[test]
+    fn a_fastq_is_rejected_rather_than_parsed_as_a_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reads.fq");
+        // Quality line deliberately begins with '>' — the character that made this work.
+        std::fs::write(
+            &path,
+            "@read1\nACGTACGTAC\n+\n>GGFGGFGGFG\n@read2\nTTTTGGGGCC\n+\nIIIIIIIIII\n",
+        )
+        .unwrap();
+        let err = match FastaStream::open(&path) {
+            Ok(_) => panic!("a FASTQ must not open as a FASTA"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a FASTA"),
+            "error should say the file is not a FASTA; got: {msg}"
+        );
+        assert!(
+            msg.contains("@read1"),
+            "error should quote the offending first content line; got: {msg}"
+        );
+    }
+
+    /// No header anywhere is also a hard error, not an empty contig set.
+    #[test]
+    fn a_headerless_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, "ACGTACGT\nACGTACGT\n").unwrap();
+        let err = match FastaStream::open(&path) {
+            Ok(_) => panic!("a headerless file must not open"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no '>' header"), "{err}");
+    }
+
+    /// MUST NOT FIRE: a well-formed FASTA still opens, including one that starts with
+    /// blank lines. Rejecting those would break real files.
+    #[test]
+    fn a_wellformed_fasta_still_opens_even_with_leading_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref.fa");
+        std::fs::write(&path, "\n\n>chr1 desc here\nACGT\nACGT\n>chr2\nTTTT\n").unwrap();
+        let got: Vec<(String, String)> = FastaStream::open(&path)
+            .expect("a valid FASTA must open")
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("chr1".to_string(), "ACGTACGT".to_string()),
+                ("chr2".to_string(), "TTTT".to_string()),
+            ]
+        );
+    }
     use super::*;
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
@@ -488,6 +596,58 @@ mod tests {
                 "unexpected nucleotide {:?}",
                 nuc
             );
+        }
+    }
+
+    /// Every IUPAC code must resolve to EXACTLY its own constituents.
+    ///
+    /// `test_resolve_iupac_all_codes_yield_only_acgtn` asserts membership in
+    /// {A,C,G,T,N}, which ANY wrong mapping satisfies — resolving Y (pyrimidine, C/T)
+    /// to purines passed it and every other test in the workspace. Only R and H had
+    /// distribution tests, leaving Y, M, K, S, W, B, V and D unconstrained.
+    #[test]
+    fn resolve_iupac_yields_exactly_each_code_constituents() {
+        // IUPAC nucleotide codes, per the IUBMB/IUPAC-IUB definition.
+        let codes: [(char, &[Nucleotide]); 10] = [
+            ('R', &[Nucleotide::A, Nucleotide::G]), // puRine
+            ('Y', &[Nucleotide::C, Nucleotide::T]), // pYrimidine
+            ('M', &[Nucleotide::A, Nucleotide::C]), // aMino
+            ('K', &[Nucleotide::G, Nucleotide::T]), // Keto
+            ('S', &[Nucleotide::C, Nucleotide::G]), // Strong (3 H-bonds)
+            ('W', &[Nucleotide::A, Nucleotide::T]), // Weak (2 H-bonds)
+            ('B', &[Nucleotide::C, Nucleotide::G, Nucleotide::T]), // not A
+            ('D', &[Nucleotide::A, Nucleotide::G, Nucleotide::T]), // not C
+            ('H', &[Nucleotide::A, Nucleotide::C, Nucleotide::T]), // not G
+            ('V', &[Nucleotide::A, Nucleotide::C, Nucleotide::G]), // not T
+        ];
+        let mut rng = NeatRng::new_from_seed(&vec!["iupac constituents".to_string()]).unwrap();
+        for (code, expected) in codes {
+            let input: String = std::iter::repeat(code).take(600).collect();
+            let (seq, count) = resolve_iupac_bases(&input, &mut rng).unwrap();
+            assert_eq!(count, 600, "{code}: wrong ambiguity count");
+
+            let mut seen: Vec<Nucleotide> = Vec::new();
+            for n in &seq {
+                if !seen.contains(n) {
+                    seen.push(*n);
+                }
+            }
+            // Nothing outside the code's constituents...
+            for n in &seen {
+                assert!(
+                    expected.contains(n),
+                    "{code} resolved to {n:?}, which is not one of its constituents \
+                     {expected:?}"
+                );
+            }
+            // ...and every constituent actually appears, so a mapping that collapses a
+            // code onto a strict subset (e.g. always picking the first base) fails too.
+            for n in expected {
+                assert!(
+                    seen.contains(n),
+                    "{code} never resolved to {n:?} in 600 draws; observed only {seen:?}"
+                );
+            }
         }
     }
 

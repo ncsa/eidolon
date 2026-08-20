@@ -1,0 +1,11 @@
+truth sites=567  sim sites=463  shared=463  (only-truth=104, only-sim=0)
+min-depth 25: 0 shared sites gated, 463 compared
+n=463  Pearson r=0.9803  Spearman rho=0.8479
+MAE=0.0227  RMSE=0.0295  mean(sim-truth)=+0.0011
+  target: r>=0.95 and per-bin MAE within AF-estimation noise at that coverage
+per-AF-decile coverage and MAE (truth bin):
+  bin           planted   scored  unscored   MAE
+  [0.0,0.1)        104        0       104   n/a — NOTHING SCORED  <-- incomplete
+  [0.1,0.2)        183      183         0   0.0222
+  [0.4,0.5)        280      280         0   0.0231
+  total planted=567  scored=463  unscored=104 (18.3%)

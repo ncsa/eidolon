@@ -107,12 +107,53 @@ The cancer MVP's credibility depends on eidolon being able to generate the SVs t
 
 | Tier | Ticket | Gap | Cancer relevance | Status |
 |---|---|---|---|---|
-| **1** | **#187** | `<BND>` translocations with junction reads | **Critical** — BCR-ABL, PML-RARA, EWSR1-FLI1, MYC-IGH, TMPRSS2-ERG, etc. | ✅ Shipped in v1.12.0 |
+| **1** | **#187** | `<BND>` translocations with junction reads | **Critical** — BCR-ABL, PML-RARA, EWSR1-FLI1, MYC-IGH, TMPRSS2-ERG, etc. | ⚠️ **Partial — junction machinery shipped in v1.12.0; translocations were never generated. See retraction below.** |
 | **1** | **#188** | `<INV>` inversions with read-strand flipping | Moderate — inv(16) AML, inv(3) MDS, focal inversions in solid tumors | ✅ Shipped in v1.12.0 |
 | **2** | **#189** | Verify whole-arm / whole-chromosome aneuploidy via existing DEL/DUP | **High** (universal in cancer) but mostly verification, not new code | ✅ Resolved in v1.10.3 |
 | **2** | **#190** | De novo `<INS>` with novel-sequence generation | Moderate — L1 retrotransposition (lung, colorectal, HCC); viral integrations (HPV, HBV, EBV) | ✅ Shipped in v1.12.0 (random-novel-sequence MVP) |
 | **3** | **#191** | Complex rearrangement patterns (chromothripsis, chromoplexy, BFB) | **High in specific cancers** (sarcoma, GBM, prostate) — but requires correlated multi-event sampler | Design pending |
 | **3** | **#192** | ecDNA / double minutes | **High in some aggressive cancers** (~25–50% of GBM) but needs first-class extrachromosomal data-model concept | Design pending |
+
+> ### ⚠️ Retraction (2026-08-01): #187 was marked shipped; translocations were never generated
+>
+> **The de novo SV sampler cannot place a breakend mate on another contig.** Both
+> `sv_model.rs:810` and `:936` hardcode the mate contig to `Some(contig_name.to_string())`,
+> and `sample_variants` (`sv_model.rs:529-539`) receives one contig's name, length and
+> sequence — it has no view of any other contig. Every BND eidolon has ever generated
+> from a model is intra-chromosomal, by construction rather than by chance. Job 20719077
+> emitted 466 junctions and **466 of 466** were same-contig.
+>
+> Four of the five exemplars in the row above (BCR-ABL, PML-RARA, EWSR1-FLI1, MYC-IGH)
+> are inter-chromosomal fusions. None of them is reachable by the shipped generator.
+>
+> **What did ship, and is correct:** chimeric junction-read generation and all four
+> VCF 4.2 breakend orientation forms. The read path even supports off-contig mates —
+> `runner.rs:2360` resolves `reference.get(&mate_contig)` — so an inter-chromosomal BND
+> supplied via `input_vcf` works today. Only the **de novo sampler**, which is what
+> produces every cancer benchmark, cannot emit one.
+>
+> **How the mislabel arose.** The BND share (23.2%) is the PCAWG per-donor mean of
+> `svclass == "TRA"` rows (`normalize_pcawg_sv_model.py:108-114`) — TRA being precisely
+> the inter-chromosomal class. But `build_pcawg_sv_vcf.py:127-128` reads only
+> `f[0],f[1],f[3],f[4],f[10]`, and its BND branch (`:155-159`) emits a bare `<BND>`
+> anchor and `continue`s — discarding the mate chromosome, and never reading
+> `strand1`/`strand2` (fields 8, 9) at all. So we inherited the *count* of
+> translocations while dropping the two facts that make one a translocation.
+>
+> Consequently the shipped model carries no chromosome-pair, strand, or geometry field,
+> and geometry falls back to a uniform 25% per form (`sv_model.rs:101-103`). About a
+> quarter of emitted BNDs are therefore *deletion-like direct joins on one contig* — the
+> reads carry a plain deletion while the truth VCF types it `SVTYPE=BND`.
+>
+> A further conflation worth stating: **`BND` in a VCF is a notation for an adjacency a
+> caller did not resolve, not an event class.** Manta buckets inversion-oriented
+> junctions as BND; Delly types the same junction `<INV>`; both were observed on
+> identical data in job 20745149. Treating BND as an event type with its own 23.2% share
+> encodes which caller and chemistry produced the source calls, not tumour biology.
+>
+> Remediation is planned as a measurement pass over PCAWG first (intra/inter split,
+> strand spectrum, partner-distance distribution) with the implementation scope decided
+> by what that finds, rather than assumed now.
 
 ## Roadmap
 
@@ -131,11 +172,29 @@ The cancer MVP's credibility depends on eidolon being able to generate the SVs t
 **Exit criterion:** running the orchestration script with reasonable defaults produces a merged FASTQ that a current somatic SNV caller (Mutect2 or Strelka) calls into a VCF that scores reasonably well against the origin-tagged truth.
 
 ### Stage 2 — cancer SV credibility (shipped in v1.12.0)
-6. ✅ **#187** — `<BND>` translocations with junction reads. Chimeric-pair generation via `process_chimeric_variants` → `generate_chimeric_pair` → `get_bnd_pieces` + `get_stitched_sequence`, correctly handling the four VCF 4.2 breakend orientation forms (`t[p[`, `t]p]`, `[p[t`, `]p]t`). Paired-BND deduplication via canonical-ID HashSet.
+6. ⚠️ **#187** — `<BND>` junction reads (**not** translocations; see the retraction above). Chimeric-pair generation via `process_chimeric_variants` → `generate_chimeric_pair` → `get_bnd_pieces` + `get_stitched_sequence`, correctly handling the four VCF 4.2 breakend orientation forms (`t[p[`, `t]p]`, `[p[t`, `]p]t`). Paired-BND deduplication via canonical-ID HashSet. All of that is real and verified — but orientation is not translocation, and the de novo sampler emits only same-contig junctions.
 7. ✅ **#188** — `<INV>` inversions with strand flipping. Two-junction model (start of inversion + end of inversion), each independently sampling reads. `generate_inv_pair` + `get_inv_pieces` handle orientation flipping per junction. Smarter fragment-length sampling + graceful `TruncatedRead` handling shipped alongside, applied to BND too.
 8. ✅ **#190** — de novo `<INS>` with novel sequence. Emitted as LITERAL Insertion records (`REF="A"`, `ALT="A<novel-bases>"`) — same shape Manta / DELLY produce when they resolve the inserted sequence. Routes through the existing literal-insertion machinery. Novel sequence drawn from single-base composition of a ±250 bp window around the anchor.
 
-**Exit criterion:** a current somatic SV caller (GRIDSS or Manta) calls translocation breakpoints from the simulated data with high enough recall that the simulator could plausibly be used as a benchmark fixture. **Status:** validated — functionally against a synthetic 5 kb fixture (v1.12.0 CHANGELOG), and against real callers on Delta (Manta + Delly per-type SV recall, ACCESS report §3.7; cross-caller coverage #317, closed).
+**Exit criterion:** a current somatic SV caller (GRIDSS or Manta) calls translocation breakpoints from the simulated data with high enough recall that the simulator could plausibly be used as a benchmark fixture.
+
+**Status: ⚠️ NOT MET — previously recorded as "validated" (retracted 2026-08-01).** The
+criterion names *translocation* breakpoints, and no run could have tested it: the de novo
+sampler cannot place a mate off-contig, so no translocation was ever present in the data
+the callers were scored against. The evidence cited for "validated" measured something
+else — same-contig junction recall — and was accurate about that.
+
+What the cited evidence does support: callers recover same-contig breakend junctions at a
+measurable rate. Job 20745149 puts Manta at **0.738** over the 480 inversion-oriented
+records it can represent as breakends (the aggregate 0.380 is floored by our own SVTYPE
+choice, since direct junctions are correctly called `<DEL>`/`<DUP:TANDEM>` and cannot
+match a BND record). Delly emits no BND records at all — it types the same junctions
+`<INV>` — which is itself evidence that BND is a representation convention rather than an
+event class.
+
+Re-stating this criterion honestly requires either generating real translocations or
+narrowing the criterion to what is actually produced. That decision is deferred to the
+PCAWG measurement pass.
 
 #### Known limitations carried into v1.12.0
 - **Breakpoint double-counting — resolved in v1.14.1 (#236).** The regular per-contig pass used to also generate reads across BND / INV breakpoint positions (from the unbroken reference), leaving those loci with regular + junction reads — ~2× coverage for homozygous variants. Fixed: the regular pass now suppresses the broken-allele fraction of junction-crossing read-pairs (`collect_suppressible_junctions` / `suppress_junction_double_count`; DEL/BND/INV/CNV-loss, with DUP/CNV-gain intentionally excluded).
@@ -155,6 +214,7 @@ These are documented here so future work has a record of what's been decided vs 
 
 - **Subclonal heterogeneity.** The v1 orchestration modelled two populations (a single global purity), collapsing every somatic variant to ~one effective VAF. **Shipped via #405 (native sampler).** A tumor is now a mixture of subclones at distinct cancer-cell fractions (CCF): each somatic variant's observed alt fraction composes as `purity × dosage × CCF`. The architecture is authored inline (`subclones:`), **fitted from real data** (`subclones_file:` — PyClone-VI / PCAWG cluster tables), or **replayed** from a real somatic VCF (`somatic_vcf:`, honored at its observed VAF). Ground truth is emitted per somatic record as `INFO/EIDOLON_CCF` (intended CCF) and `INFO/EIDOLON_VAF` (intended observed VAF). Real-data validated on Delta two ways: **generative** (soybean scaffold, 200×) reproduces a synthetic 3-cluster spectrum unbiased (mean err −0.003, MAE 0.026); **reproductive** replay of a real tumor (SEQC2 HCC1395 somatic SNVs, GRCh38 chr1, 200×) reproduces its full empirical VAF distribution (2,948 sites, all deciles) at Pearson r 0.99, unbiased (−0.004), MAE 0.024 — see report §3.12 and `scripts/delta/{run_subclonal_vaf_validation,run_hcc1395_reproductive}.sh`.
 - **Mutation signatures (COSMIC SBS).** Cancer mutation patterns are dominated by tissue- and exposure-specific signatures (UV → SBS7 in melanoma, tobacco → SBS4 in lung, MMR deficiency → SBS6/15 in colorectal, etc.). eidolon's trinucleotide-frequency model captures these per-corpus, and **context-weighted SNP placement (#372, v1.20.0) now reproduces context-specific signatures** — validated on HCC1395 (SBS-96 cosine 0.72 → 0.99) and via signature extraction on chr1–3 (SBS1 + APOBEC recovered; #320 closed). What remains optional is explicit signature *authoring* (load a named COSMIC SBS profile and mix signatures at chosen proportions), a separate enhancement.
+- **Subclonal structural variants.** **Shipped via #537.** De-novo SVs now receive the configured CCF, reciprocal translocation BND mates share one CCF, and `INFO/EIDOLON_CCF` / `INFO/EIDOLON_VAF` are emitted in the somatic truth. CCF scales supported SV depth and junction evidence as `dosage × CCF`; the no-subclone path is unchanged. Delta multi-contig validation exercised CCF 0.2/0.5/1.0 and retained 199 chimeric alignments. The remaining SV caveats are #516 (large literal insertions are capped by read length), #498 (input BND inserted sequence), #500 (symbolic INS), and #499 (small non-binary depth over-delivery bias).
 - **Variant allele fraction (VAF) annotation in the truth VCF.** **Shipped via #176.** Golden VCFs now carry `FORMAT/GT:AD:DP:AF` on every literal SNP/indel record, populated from a per-variant allelic-depth counter incremented by the gen-reads fragment loop at the existing per-read coin-flip site (`fastq_tools.rs::generate_read`). Symbolic SVs emit `.` placeholders for AD/DP/AF since their depth semantics are span-based, not point-based — that's tracked in #411. Realistic `FILTER` values (`LowQual` etc.) were left out of v1; everything is still `PASS`.
 - **Cancer-specific SvModel defaults.** First shipped in v1.12.1 (#217) as a *literature-derived* `sv_model` injection (`tools/inject_cancer_sv_model.py`, now deprecated). **Replaced in v1.14.0 (#218) with a data-derived refit**: the bundled tumor model's `sv_model` is counted from the PCAWG consensus SV/CNV callsets (Li et al. 2020, n=2,748 donors) with gnomAD-SV supplying INS length, via `tools/fetch_pcawg_sv_corpus.sh` → `tools/build_pcawg_sv_vcf.py` → `gen-mut-model` → `tools/normalize_pcawg_sv_model.py`. The refit corrected the heuristic type mix (notably INV 0.08→0.134, BND 0.35→0.232) to match the published PCAWG ranking (DEL>DUP>BND>INV); the fitted per-base rate 3.46e-8 confirmed the prior 3.8e-8 estimate. INS and focal-CNV *rates* remain literature estimates (PCAWG MEI calls are controlled-access; focal-CNA segment counts are segmentation, not discrete events). The germline-side `default_sv_model()` stays gnomAD-derived. See CHANGELOG v1.14.0.
 - **Per-tissue tumor models (#202).** **Shipped — both halves now tissue-specific.**

@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=1000>
+##INFO=<ID=DP,Number=1,Type=Integer,Description="d">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="g">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	S
+chr9	100	.	A	C	60	PASS	DP=10	GT	0/1

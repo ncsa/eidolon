@@ -230,6 +230,23 @@ scaffold at 200× with three subclones spanning 4–40% VAF, the aligned reads r
 the planted spectrum **unbiased** (mean err −0.003) and **to the sampling-noise floor**
 (MAE 0.026, Pearson r 0.95) — see report §3.12.
 
+Structural variants use the same CCF composition. De-novo DEL/DUP/INV/INS/CNV records
+receive `dosage × CCF`; reciprocal translocation BND mates receive one shared CCF so
+the two ends of one event remain balanced. The CCF-adjusted fraction drives interval
+depth, chimeric/junction reads, and breakpoint double-count suppression. This was
+validated on Delta with a multi-contig yeast smoke (12 SV records spanning CCF 0.2,
+0.5, and 1.0; all records carried `EIDOLON_CCF`/`EIDOLON_VAF`; 199 chimeric alignments
+survived alignment with 100% mapping). The full-GRCh38 stress run then produced 140 tagged
+SVs across CCF 0.2/0.5/1.0, 2,837 chimeric alignments, 100% mapping, and a 71 GB BAM.
+The no-subclone path remains unchanged.
+
+SV limitations remain explicit: literal insertions longer than `read_len - 1` are
+partially realized (#516), inserted novel sequence in input BND ALT alleles is not yet
+carried through junction reads (#498), symbolic `<INS>` is not a supported read-level
+path (#500), and non-binary SV depth multipliers have a measured small over-delivery
+bias (#499). These limitations affect specific SV representations; they do not remove
+the CCF tags or the CCF scaling of the supported paths.
+
 ### Reproductive replay (from a real somatic VCF)
 
 The subclonal options above are *generative* — they invent somatic variants matching

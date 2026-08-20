@@ -111,6 +111,12 @@ impl MdWalker {
     }
 
     /// Advance past the next Deletion token (called once per D/N CIGAR operation).
+    ///
+    /// Redundant by construction: `next_alignment_base` also consumes `MdToken::Deletion`, so
+    /// removing this call alone changes no output (verified by mutation — see
+    /// `transition_observer_matches_samtools_generated_md_including_indels`). Kept as the explicit
+    /// path so a D/N op has a visible handler; be aware that a defect introduced in either site
+    /// alone is masked by the other.
     fn skip_deletion(&mut self) {
         while self.idx < self.tokens.len() {
             match &self.tokens[self.idx] {
@@ -542,6 +548,76 @@ mod tests {
     // (reference_sequence_id, alignment_start_1based, cigar_ops)
     type TestCoverageRecord<'a> = (usize, usize, &'a [TestCigarOp]);
 
+    /// `read_bam_transitions` against a **real** aligner's output, with a known answer computed
+    /// outside eidolon.
+    ///
+    /// Everything else that tests this path — including the samtools-calmd oracle above — feeds
+    /// the reader a BAM written by the test itself: a handful of records, hand-chosen CIGARs, no
+    /// surprises. Real alignments are not like that. This fixture has soft clips, indels,
+    /// duplicate-marked and unmapped records, `N` bases, and MD strings emitted by bwa 0.5.9
+    /// rather than by us.
+    ///
+    /// Fixture: 1000 Genomes HG00096 low-coverage alignment, GRCh37 `20:1000000-1050000`,
+    /// unmodified. Full provenance and redistribution terms in
+    /// `test_data/HG00096.chr20_1Mb.README.md`.
+    ///
+    /// KNOWN ANSWER. Derived two independent ways, neither of them this code:
+    ///
+    /// 1. An awk walk over `MD` + `CIGAR` (`samtools view -F 0x904`, matching `SKIP_FLAGS`),
+    ///    tallying `counts[ref][read]` — 2548 usable records, **804** substitutions.
+    /// 2. The aligner's own tags: `sum(NM) - sum(inserted + deleted bases)` = **804**.
+    ///
+    /// bwa computed those NM values at alignment time in 2012, knowing nothing about this
+    /// codebase, so (2) is about as independent as an oracle gets. The two agreeing to the
+    /// record is what licenses the per-cell literals below.
+    #[test]
+    fn transition_counts_match_an_independent_oracle_on_a_real_bam() {
+        let path = PathBuf::from("test_data/HG00096.chr20_1Mb.bam");
+        assert!(path.is_file(), "real-data fixture missing: {path:?}");
+
+        let counts = read_bam_transitions(&path).unwrap();
+
+        // ALLOWED_NUCS order: A=0, C=1, G=2, T=3.
+        let expected: [[usize; 4]; 4] = [
+            [0, 97, 100, 53],
+            [62, 0, 15, 75],
+            [91, 21, 0, 39],
+            [46, 120, 85, 0],
+        ];
+        assert_eq!(
+            counts, expected,
+            "real-BAM substitution counts disagree with the awk + NM oracle"
+        );
+
+        // The total is the figure both oracles agree on, asserted separately: a per-cell
+        // regression and a wholesale miscount are different failures, and the total is the one
+        // an outside reader can re-derive with samtools alone.
+        let total: usize = counts.iter().flatten().sum();
+        assert_eq!(
+            total, 804,
+            "total substitutions must match sum(NM) - indels"
+        );
+
+        // The diagonal is not a substitution and must never be counted, whatever the MD says.
+        for (i, row) in counts.iter().enumerate() {
+            assert_eq!(row[i], 0, "diagonal cell [{i}][{i}] must be zero");
+        }
+
+        // Every off-diagonal cell is populated, which is what makes the equality assertion
+        // above meaningful: a parser that silently dropped a whole class of substitution would
+        // leave a zero here rather than failing some aggregate.
+        for (i, row) in counts.iter().enumerate() {
+            for (j, &c) in row.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        c > 0,
+                        "cell [{i}][{j}] is zero; the fixture should populate all 12"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_md_simple() {
         // "10A5G3": 10 matches, mismatch ref=A, 5 matches, mismatch ref=G, 3 matches
@@ -638,6 +714,147 @@ mod tests {
             *record.template_length_mut() = tlen;
             writer.write_alignment_record(&header, &record).unwrap();
         }
+    }
+
+    /// Build a BAM with arbitrary CIGAR + sequence + MD per record.
+    ///
+    /// Records are `(cigar_ops, sequence, md)`. Unlike the `write_test_bam` above — which is
+    /// fixed at `4M` with no MD — this exists to exercise `TransitionObserver`'s CIGAR
+    /// handling, which the transition tests otherwise never reach.
+    fn write_md_cigar_bam(
+        path: &std::path::PathBuf,
+        records: &[(&[(CigarOpKind, usize)], &str, &str)],
+    ) {
+        use noodles::sam::{
+            self as sam,
+            alignment::{
+                RecordBuf,
+                io::Write as _,
+                record::{cigar::Op, data::field::Tag},
+                record_buf::{Cigar, Sequence, data::field::Value as BufValue},
+            },
+            header::record::value::{Map, map::ReferenceSequence},
+        };
+        let header = sam::Header::builder()
+            .add_reference_sequence(
+                b"H1N1_HA".to_vec(),
+                Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(1_701).unwrap()),
+            )
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = bam::io::Writer::new(file);
+        writer.write_header(&header).unwrap();
+        for (ops, seq, md) in records {
+            let cigar: Cigar = ops.iter().map(|&(k, n)| Op::new(k, n)).collect();
+            let mut record = RecordBuf::default();
+            // RecordBuf::default() is UNMAPPED, which SKIP_FLAGS drops before any observer sees it.
+            *record.flags_mut() = Flags::empty();
+            *record.cigar_mut() = cigar;
+            *record.sequence_mut() = Sequence::from(seq.as_bytes());
+            *record.reference_sequence_id_mut() = Some(0);
+            *record.alignment_start_mut() = noodles::core::Position::new(501);
+            record
+                .data_mut()
+                .insert(Tag::MISMATCHED_POSITIONS, BufValue::from(*md));
+            writer.write_alignment_record(&header, &record).unwrap();
+        }
+    }
+
+    /// `TransitionObserver` against MD strings produced by **samtools**, not by us.
+    ///
+    /// WHY THIS EXISTS. Every other transition test builds its MD with
+    /// `gen_seq_error_model::utils::runner::write_test_bam`, which *generates the MD string
+    /// itself* by zipping equal-length ref/read slices. That encoder and this parser share one
+    /// understanding of MD encoding, so if the understanding is wrong both are wrong identically
+    /// and the tests pass regardless. It also cannot emit `^` at all, so the deletion branch of
+    /// `observe` — and the insertion branch — were never reached by any test.
+    ///
+    /// The MD strings below were generated by **samtools 1.19.2** against the in-repo fixture
+    /// `eidolon-core/test_data/H1N1.fa`, all three reads at `H1N1_HA:501`. To regenerate:
+    ///
+    /// ```text
+    /// tr -d '\r' < eidolon-core/test_data/H1N1.fa > ref.fa   # the fixture is CRLF
+    /// samtools faidx ref.fa H1N1_HA:501-530                  # GCTAGTTAAAAAAGGAAATTCATACCCAAA
+    /// # a SAM with the three (CIGAR, sequence) rows below, POS 501, MAPQ 60, FLAG 0
+    /// samtools view -b in.sam | samtools calmd -b - ref.fa > out.bam
+    /// ```
+    ///
+    ///   read  CIGAR      sequence        samtools MD    NM
+    ///   r1    12M        GCGAGTTCAAAA    2T4A4          2
+    ///   r2    5M2D5M     GCTAGAACAA      5^TT2A2        3
+    ///   r3    5M2I5M     GCTAGTTTGAAA    6T3            3
+    ///
+    /// Baked in as literals rather than computed at test time because CI has no samtools.
+    ///
+    /// KNOWN ANSWER, computed by hand from the reference window rather than from this code:
+    /// r1 contributes T→G and A→C; r2 contributes A→C (its `^TT` is *deleted reference*, not a
+    /// substitution); r3 contributes T→G (its two inserted bases are invisible to MD, and the
+    /// mismatch sits AFTER them — a parser that ignored the `I` op would attribute the wrong
+    /// read base). Total: **A→C ×2, T→G ×2, everything else zero.**
+    ///
+    /// NON-VACUITY, by mutation of `TransitionObserver::observe`:
+    ///
+    ///   mutation                                              result
+    ///   `Insertion | SoftClip` arm made a no-op               CAUGHT (T row became G×1, T×1)
+    ///   `Deletion` arm also advances `read_pos += len`         CAUGHT (A row became A×1, C×1)
+    ///   `Deletion` arm made a no-op                           SURVIVED — see below
+    ///   that no-op **plus** `MdToken::Deletion` no longer      CAUGHT (A→C fell to 1)
+    ///   skipped inside `next_alignment_base`
+    ///
+    /// The lone survivor is an equivalent mutant, not a coverage hole: `MdToken::Deletion` is a
+    /// zero-width marker that `next_alignment_base` also consumes, so no MD/CIGAR pair can
+    /// distinguish `skip_deletion()` running from it not running. The last row proves the
+    /// deletion *semantics* are covered — remove both copies and the count is wrong.
+    #[test]
+    fn transition_observer_matches_samtools_generated_md_including_indels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samtools_md.bam");
+        write_md_cigar_bam(
+            &path,
+            &[
+                (&[(CigarOpKind::Match, 12)], "GCGAGTTCAAAA", "2T4A4"),
+                (
+                    &[
+                        (CigarOpKind::Match, 5),
+                        (CigarOpKind::Deletion, 2),
+                        (CigarOpKind::Match, 5),
+                    ],
+                    "GCTAGAACAA",
+                    "5^TT2A2",
+                ),
+                (
+                    &[
+                        (CigarOpKind::Match, 5),
+                        (CigarOpKind::Insertion, 2),
+                        (CigarOpKind::Match, 5),
+                    ],
+                    "GCTAGTTTGAAA",
+                    "6T3",
+                ),
+            ],
+        );
+
+        let counts = read_bam_transitions(&path).unwrap();
+
+        // ALLOWED_NUCS order: A=0, C=1, G=2, T=3.
+        let mut expected = [[0usize; 4]; 4];
+        expected[0][1] = 2; // A -> C
+        expected[3][2] = 2; // T -> G
+        assert_eq!(
+            counts, expected,
+            "counts disagree with the hand-computed answer for samtools' MD.\n  got:      {counts:?}\n  expected: {expected:?}"
+        );
+
+        // MUST NOT FIRE: the deleted reference bases in r2's `^TT` are not substitutions. If the
+        // Deletion arm stopped calling skip_deletion, the walker would desynchronise and T rows
+        // would pick up spurious counts.
+        assert_eq!(counts[3][3], 0, "T->T is not a substitution");
+        assert_eq!(
+            counts[3].iter().sum::<usize>(),
+            2,
+            "the T row must total exactly the two real T->G events; \
+             extra counts mean deleted or inserted bases leaked in"
+        );
     }
 
     #[test]
