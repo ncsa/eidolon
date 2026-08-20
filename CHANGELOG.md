@@ -1,11 +1,11 @@
-Unreleased
-==========
+8/19/2026
+=========
+## eidolon v3.1.0 — correctness and validation release
 
-## Release-candidate validation and SV follow-up
-
-The current `develop` line is release-candidate ready after the full-GRCh38 Delta
-stress run. Gate 2b BAM correctness is now covered by focused orientation, QNAME, TLEN,
-and planted-SV checks, with a full-GRCh38 BAM timing baseline recorded separately.
+This release is primarily a correctness and validation release: it hardens BAM and
+artifact measurements, corrects SV truth/read mismatches, and records Delta validation
+at primary-assembly scale. It also extends the existing subclone model to structural
+variants. The insertion limitations listed below remain known and documented.
 
 ### Subclonal structural variants (#537)
 
