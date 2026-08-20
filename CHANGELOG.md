@@ -3,7 +3,7 @@ Unreleased
 
 ## Release-candidate validation and SV follow-up
 
-The current `develop` line is release-candidate ready pending the full-GRCh38 Delta
+The current `develop` line is release-candidate ready after the full-GRCh38 Delta
 stress run. Gate 2b BAM correctness is now covered by focused orientation, QNAME, TLEN,
 and planted-SV checks, with a full-GRCh38 BAM timing baseline recorded separately.
 
@@ -18,6 +18,9 @@ and planted-SV checks, with a full-GRCh38 BAM timing baseline recorded separatel
 - The no-subclone path remains backward-compatible; focused tests, the full Rust suite,
   and Delta yeast multi-contig runs passed. The larger Delta smoke produced 12 tagged
   SVs (CCF 0.2/0.5/1.0), 199 chimeric alignments, 100% mapping, and 99.99% proper pairing.
+- The full-GRCh38 Delta run produced 140 tagged SVs (31 at CCF 0.2, 43 at CCF 0.5,
+  66 clonal), 2,837 chimeric alignments, 588,995,182 mapped reads, and a 71 GB BAM;
+  99.99% of reads were properly paired.
 
 ### Known SV limitations
 

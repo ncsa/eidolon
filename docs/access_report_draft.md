@@ -1007,7 +1007,9 @@ bwa-mem2 alignment, 199 chimeric alignments survived; all 2,426,389 reads mapped
 69 were supplementary, and 99.99% were properly paired.
 
 This is read-level and representation validation, not a caller recall estimate. The
-full-GRCh38 stress run is the remaining release-candidate check. Known SV limitations
+full-GRCh38 stress run completed successfully as the release-candidate check: job
+`21282504` produced 140 tagged SVs (31 at CCF 0.2, 43 at CCF 0.5, 66 at CCF 1.0),
+2,837 chimeric alignments, 588,995,182 mapped reads, and a 71 GB BAM. Known SV limitations
 remain: literal insertions beyond `read_len - 1` are only partially realized (#516),
 inserted sequence in input BND alleles is not yet carried through junction reads (#498),
 symbolic `<INS>` is not a supported read-level path (#500), non-binary SV depth has a

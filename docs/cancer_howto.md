@@ -236,8 +236,9 @@ the two ends of one event remain balanced. The CCF-adjusted fraction drives inte
 depth, chimeric/junction reads, and breakpoint double-count suppression. This was
 validated on Delta with a multi-contig yeast smoke (12 SV records spanning CCF 0.2,
 0.5, and 1.0; all records carried `EIDOLON_CCF`/`EIDOLON_VAF`; 199 chimeric alignments
-survived alignment with 100% mapping). A full-GRCh38 stress run is the release-candidate
-follow-up. The no-subclone path remains unchanged.
+survived alignment with 100% mapping). The full-GRCh38 stress run then produced 140 tagged
+SVs across CCF 0.2/0.5/1.0, 2,837 chimeric alignments, 100% mapping, and a 71 GB BAM.
+The no-subclone path remains unchanged.
 
 SV limitations remain explicit: literal insertions longer than `read_len - 1` are
 partially realized (#516), inserted novel sequence in input BND ALT alleles is not yet

@@ -29,7 +29,14 @@ multi-contig *S. cerevisiae*. The higher-rate run produced 12 SV records (7 at C
 After bwa-mem2 alignment, 199 chimeric alignments were retained, 100% of 2,426,389 reads
 mapped, 69 were supplementary, and 99.99% were properly paired. This validates CCF
 stamping, reciprocal-BND pairing, and read-level junction survival; it is not a caller
-recall estimate. A full-GRCh38 run is in progress as the release-candidate stress test.
+recall estimate.
+
+The full-GRCh38 post-merge stress run (job `21282504`, 30×, purity 0.6, nominal
+`SV_RATE_SCALE=1.0`) produced 140 tagged SV records: 31 at CCF 0.2, 43 at CCF 0.5,
+and 66 at CCF 1.0. Its merged BAM contained 588,995,182 reads, all mapped, with
+2,837 chimeric alignments, 2,216 supplementary records, 99.99% proper pairing, and
+71 GB compressed size. This confirms the subclonal SV path at primary-assembly scale;
+it is still a simulation/read-level result rather than a pooled caller-recall estimate.
 
 ### Local performance and BAM baseline
 
@@ -464,8 +471,8 @@ planted insertions, so an INS-enriched model is likely the only route to a usabl
   records now carry `EIDOLON_CCF`/`EIDOLON_VAF` and use CCF-adjusted depth and junction
   evidence; reciprocal translocation BND mates share one CCF. Delta yeast validation
   exercised CCF 0.2/0.5/1.0 and retained 199 chimeric alignments. This section's older
-  nominal-rate campaign predates that fix; the full-GRCh38 post-fix run is the current
-  release-candidate stress test.
+  nominal-rate campaign predates that fix; the full-GRCh38 post-fix run above is the
+  current release-candidate stress test.
 - **Small events.** The planted set skews very large (DUP 3.4 Mb, DEL 9.1 Mb, INV 2.0 Mb).
   Multi-megabase events are easy to detect by depth; these recall figures say little about the
   1–50 kb range where callers actually struggle.
