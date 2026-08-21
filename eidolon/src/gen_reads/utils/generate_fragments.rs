@@ -451,6 +451,114 @@ pub(crate) fn prototype_insertion_read_windows(
     Ok(windows)
 }
 
+/// Coordinate map for one literal insertion in an altered haplotype.
+///
+/// `anchor` is the zero-based reference base represented by the VCF REF allele;
+/// novel bases are inserted immediately after it. Reference coordinates are
+/// therefore unchanged through `anchor`, and shift by `insertion_len` after
+/// that point. This map is the foundation for emitting insertion-interior reads
+/// while retaining reference coordinates for BAM records.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InsertionCoordinateMap {
+    reference_len: usize,
+    anchor: usize,
+    insertion_len: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HaplotypeSegment {
+    Reference {
+        hap_start: usize,
+        hap_end: usize,
+        ref_start: usize,
+    },
+    Insertion {
+        hap_start: usize,
+        hap_end: usize,
+        insertion_start: usize,
+    },
+}
+
+#[cfg(test)]
+impl InsertionCoordinateMap {
+    pub(crate) fn new(reference_len: usize, anchor: usize, insertion_len: usize) -> Option<Self> {
+        (reference_len > 0 && anchor < reference_len && insertion_len > 0).then_some(Self {
+            reference_len,
+            anchor,
+            insertion_len,
+        })
+    }
+
+    pub(crate) fn haplotype_len(self) -> usize {
+        self.reference_len + self.insertion_len
+    }
+
+    pub(crate) fn reference_base_to_haplotype(self, reference_pos: usize) -> Option<usize> {
+        if reference_pos >= self.reference_len {
+            return None;
+        }
+        Some(if reference_pos <= self.anchor {
+            reference_pos
+        } else {
+            reference_pos + self.insertion_len
+        })
+    }
+
+    pub(crate) fn haplotype_base_to_reference(self, haplotype_pos: usize) -> Option<usize> {
+        if haplotype_pos >= self.haplotype_len() {
+            return None;
+        }
+        let insertion_start = self.anchor + 1;
+        let insertion_end = insertion_start + self.insertion_len;
+        if haplotype_pos >= insertion_start && haplotype_pos < insertion_end {
+            return None;
+        }
+        Some(if haplotype_pos < insertion_start {
+            haplotype_pos
+        } else {
+            haplotype_pos - self.insertion_len
+        })
+    }
+
+    pub(crate) fn segments_for(self, start: usize, end: usize) -> Option<Vec<HaplotypeSegment>> {
+        if start >= end || end > self.haplotype_len() {
+            return None;
+        }
+        let insertion_start = self.anchor + 1;
+        let insertion_end = insertion_start + self.insertion_len;
+        let mut segments = Vec::with_capacity(3);
+
+        if start < insertion_start {
+            let ref_end = end.min(insertion_start);
+            segments.push(HaplotypeSegment::Reference {
+                hap_start: start,
+                hap_end: ref_end,
+                ref_start: start,
+            });
+        }
+        if end > insertion_start && start < insertion_end {
+            let hap_start = start.max(insertion_start);
+            let hap_end = end.min(insertion_end);
+            segments.push(HaplotypeSegment::Insertion {
+                hap_start,
+                hap_end,
+                insertion_start: hap_start - insertion_start,
+            });
+        }
+        if end > insertion_end {
+            let hap_start = start.max(insertion_end);
+            segments.push(HaplotypeSegment::Reference {
+                hap_start,
+                hap_end: end,
+                ref_start: hap_start - self.insertion_len,
+            });
+        }
+        Some(segments)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,6 +1167,48 @@ mod tests {
             windows
                 .iter()
                 .all(|&(start, end)| { end > start && end - start <= 100 && end <= 600 })
+        );
+    }
+
+    #[test]
+    fn insertion_coordinate_map_tracks_anchor_interior_and_tail() {
+        let map = InsertionCoordinateMap::new(1_000, 500, 600).unwrap();
+        assert_eq!(map.haplotype_len(), 1_600);
+        assert_eq!(map.reference_base_to_haplotype(500), Some(500));
+        assert_eq!(map.reference_base_to_haplotype(501), Some(1_101));
+        assert_eq!(map.haplotype_base_to_reference(500), Some(500));
+        assert_eq!(map.haplotype_base_to_reference(501), None);
+        assert_eq!(map.haplotype_base_to_reference(1_101), Some(501));
+
+        assert_eq!(
+            map.segments_for(490, 520),
+            Some(vec![
+                HaplotypeSegment::Reference {
+                    hap_start: 490,
+                    hap_end: 501,
+                    ref_start: 490,
+                },
+                HaplotypeSegment::Insertion {
+                    hap_start: 501,
+                    hap_end: 520,
+                    insertion_start: 0,
+                },
+            ])
+        );
+        assert_eq!(
+            map.segments_for(1_090, 1_120),
+            Some(vec![
+                HaplotypeSegment::Insertion {
+                    hap_start: 1_090,
+                    hap_end: 1_101,
+                    insertion_start: 589,
+                },
+                HaplotypeSegment::Reference {
+                    hap_start: 1_101,
+                    hap_end: 1_120,
+                    ref_start: 501,
+                },
+            ])
         );
     }
 
