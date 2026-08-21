@@ -408,6 +408,49 @@ fn cover_dataset(
     Ok(fragment_set)
 }
 
+/// Prototype helper for #516: produce read windows whose coordinate system is
+/// the inserted haplotype sequence rather than the reference contig.
+///
+/// This is deliberately not wired into production read generation yet. The
+/// current writer still needs a mapping from these haplotype coordinates back
+/// to reference/BAM coordinates. Keeping that mapping separate lets us test
+/// the geometric requirement first: long insertions must have fragments whose
+/// R1/R2 windows begin in the insertion interior, not only at its anchor.
+#[cfg(test)]
+pub(crate) fn prototype_insertion_read_windows(
+    insertion_len: usize,
+    read_length: usize,
+    target_count: usize,
+    fragment_pool: Vec<usize>,
+    rng: &mut NeatRng,
+) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
+    if insertion_len == 0 || read_length == 0 || target_count == 0 {
+        return Ok(Vec::new());
+    }
+    let fragments = cover_dataset(
+        insertion_len,
+        read_length,
+        target_count,
+        0,
+        fragment_pool,
+        rng,
+    )?;
+    let mut windows = Vec::with_capacity(fragments.len() * 2);
+    for (start, end) in fragments {
+        let r1_end = (start + read_length).min(end);
+        if r1_end > start {
+            windows.push((start, r1_end));
+        }
+        let r2_start = end.saturating_sub(read_length).max(start);
+        if end > r2_start {
+            windows.push((r2_start, end));
+        }
+    }
+    windows.sort_unstable();
+    windows.dedup();
+    Ok(windows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1037,28 @@ mod tests {
         assert!(
             result.is_empty(),
             "No fragments should be placed when all exceed span"
+        );
+    }
+
+    #[test]
+    fn prototype_insertion_windows_cover_interior_and_tail() {
+        let mut rng = make_rng();
+        let windows =
+            prototype_insertion_read_windows(600, 100, 12, vec![250; 12], &mut rng).unwrap();
+
+        assert!(!windows.is_empty());
+        assert!(
+            windows.iter().any(|&(start, _)| start >= 200),
+            "prototype must place a read window inside a long insertion"
+        );
+        assert!(
+            windows.iter().any(|&(_, end)| end >= 570),
+            "prototype must reach the far end of a long insertion"
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|&(start, end)| { end > start && end - start <= 100 && end <= 600 })
         );
     }
 
