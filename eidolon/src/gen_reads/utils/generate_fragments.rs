@@ -592,6 +592,26 @@ impl InsertionCoordinateMap {
         }
         Some((sequence, segments))
     }
+
+    /// Return the baseline CIGAR operation for every materialized base. This
+    /// intentionally excludes sequencing-error operations; the read generator
+    /// can layer those onto the baseline while retaining the insertion `I`
+    /// operations supplied by the haplotype map.
+    pub(crate) fn cigar_ops_for_segments(segments: &[HaplotypeSegment]) -> Vec<char> {
+        let mut cigar = Vec::new();
+        for segment in segments {
+            let (len, op) = match *segment {
+                HaplotypeSegment::Reference {
+                    hap_start, hap_end, ..
+                } => (hap_end - hap_start, 'M'),
+                HaplotypeSegment::Insertion {
+                    hap_start, hap_end, ..
+                } => (hap_end - hap_start, 'I'),
+            };
+            cigar.extend(std::iter::repeat_n(op, len));
+        }
+        cigar
+    }
 }
 
 #[cfg(test)]
@@ -1259,6 +1279,13 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(segments.len(), 2);
+        assert_eq!(
+            InsertionCoordinateMap::cigar_ops_for_segments(&segments),
+            vec!['I'; 11]
+                .into_iter()
+                .chain(vec!['M'; 19])
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
