@@ -458,16 +458,16 @@ pub(crate) fn prototype_insertion_read_windows(
 /// therefore unchanged through `anchor`, and shift by `insertion_len` after
 /// that point. This map is the foundation for emitting insertion-interior reads
 /// while retaining reference coordinates for BAM records.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct InsertionCoordinateMap {
     reference_len: usize,
     anchor: usize,
     insertion_len: usize,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum HaplotypeSegment {
     Reference {
         hap_start: usize,
@@ -481,7 +481,7 @@ pub(crate) enum HaplotypeSegment {
     },
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 impl InsertionCoordinateMap {
     pub(crate) fn new(reference_len: usize, anchor: usize, insertion_len: usize) -> Option<Self> {
         (reference_len > 0 && anchor < reference_len && insertion_len > 0).then_some(Self {
@@ -556,6 +556,41 @@ impl InsertionCoordinateMap {
             });
         }
         Some(segments)
+    }
+
+    /// Materialize a haplotype interval from reference and inserted bases.
+    /// The returned segments retain enough provenance for the caller to build
+    /// reference-anchored BAM CIGAR operations.
+    pub(crate) fn materialize_interval(
+        self,
+        reference: &[Nucleotide],
+        inserted: &[Nucleotide],
+        start: usize,
+        end: usize,
+    ) -> Option<(Vec<Nucleotide>, Vec<HaplotypeSegment>)> {
+        if reference.len() != self.reference_len || inserted.len() != self.insertion_len {
+            return None;
+        }
+        let segments = self.segments_for(start, end)?;
+        let mut sequence = Vec::with_capacity(end - start);
+        for segment in &segments {
+            match *segment {
+                HaplotypeSegment::Reference {
+                    ref_start,
+                    hap_start,
+                    hap_end,
+                } => sequence
+                    .extend_from_slice(&reference[ref_start..ref_start + (hap_end - hap_start)]),
+                HaplotypeSegment::Insertion {
+                    insertion_start,
+                    hap_start,
+                    hap_end,
+                } => sequence.extend_from_slice(
+                    &inserted[insertion_start..insertion_start + (hap_end - hap_start)],
+                ),
+            }
+        }
+        Some((sequence, segments))
     }
 }
 
@@ -1210,6 +1245,20 @@ mod tests {
                 },
             ])
         );
+
+        let reference = vec![A; 1_000];
+        let inserted = vec![C; 600];
+        let (sequence, segments) = map
+            .materialize_interval(&reference, &inserted, 1_090, 1_120)
+            .unwrap();
+        assert_eq!(
+            sequence,
+            vec![C; 11]
+                .into_iter()
+                .chain(vec![A; 19])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(segments.len(), 2);
     }
 
     #[test]
