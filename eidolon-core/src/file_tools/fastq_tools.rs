@@ -390,6 +390,52 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     Ok(())
 }
 
+/// Write single-ended reads whose sequence was materialized in haplotype
+/// coordinates. Each item contains the read sequence, one baseline CIGAR
+/// operation per sequence base, and its reference-anchored position. This
+/// opt-in path is intentionally separate from `write_block_fastq` until the
+/// paired-end fragment ownership and mate-coordinate rules are finalized.
+pub fn write_haplotype_fragments<W: Write>(
+    fragments: impl IntoIterator<Item = (Vec<Nucleotide>, Vec<char>, usize)>,
+    buffer: &mut W,
+    read_length: usize,
+    read_name_prefix: &str,
+    quality_score_model: &QualityScoreModel,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+) -> Result<usize, FastqToolsError> {
+    let mut written = 0;
+    for (sequence, baseline_ops, position) in fragments {
+        if sequence.len() != read_length || baseline_ops.len() != read_length {
+            return Err(FastqToolsError::HaplotypeCigarMismatch);
+        }
+        let quality_scores = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let mut ad_counter = AdCounter::new();
+        let mut record = generate_read(
+            &sequence,
+            &[],
+            &HashMap::new(),
+            read_length,
+            format!("{}_{}", read_name_prefix, written),
+            Strand::Forward,
+            quality_scores,
+            sequencing_error_model,
+            rng,
+            "".to_string(),
+            position,
+            "".to_string(),
+            0,
+            0,
+            false,
+            &mut ad_counter,
+        )?;
+        apply_haplotype_baseline_cigar(&mut record, &baseline_ops)?;
+        write_read_to_fastq(&record, buffer)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 pub fn combine_temp_fastqs(
     files_r1: Vec<PathBuf>,
     files_r2: Vec<PathBuf>,
@@ -847,6 +893,37 @@ mod tests {
         apply_haplotype_baseline_cigar(&mut record, &baseline).unwrap();
         assert_eq!(record.sequence.len(), sequence.len());
         assert!(record.cigar_ops[1..6].iter().all(|&op| op == 'I'));
+    }
+
+    #[test]
+    fn test_write_haplotype_fragments_emits_single_ended_records() {
+        let sequence = vec![A, C, C, C, C, C]
+            .into_iter()
+            .chain(vec![A; 19])
+            .collect::<Vec<_>>();
+        let baseline = vec!['M'; 1]
+            .into_iter()
+            .chain(vec!['I'; 5])
+            .chain(vec!['M'; 19])
+            .collect::<Vec<_>>();
+        let quality_model = QualityScoreModel::default().unwrap();
+        let error_model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["haplotype-writer".to_string()]).unwrap();
+        let mut output = Vec::new();
+        let written = write_haplotype_fragments(
+            vec![(sequence, baseline, 100)],
+            &mut output,
+            25,
+            "hap",
+            &quality_model,
+            &error_model,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(written, 1);
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.starts_with("@hap_0\n"));
     }
 
     #[test]
