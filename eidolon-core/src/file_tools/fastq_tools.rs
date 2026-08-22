@@ -816,6 +816,40 @@ mod tests {
     }
 
     #[test]
+    fn test_generated_read_accepts_haplotype_baseline_cigar() {
+        let sequence = vec![A, C, C, C, C, C]
+            .into_iter()
+            .chain(vec![A; 19])
+            .collect::<Vec<_>>();
+        let model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["haplotype-read".to_string()]).unwrap();
+        let mut record = generate_read(
+            &sequence,
+            &[],
+            &HashMap::new(),
+            sequence.len(),
+            "hap/1".to_string(),
+            Strand::Forward,
+            vec![40; sequence.len()],
+            &model,
+            &mut rng,
+            "chr1".to_string(),
+            100,
+            "chr1".to_string(),
+            0,
+            0,
+            false,
+            &mut AdCounter::new(),
+        )
+        .unwrap();
+        let mut baseline = vec!['M'; sequence.len()];
+        baseline[1..6].fill('I');
+        apply_haplotype_baseline_cigar(&mut record, &baseline).unwrap();
+        assert_eq!(record.sequence.len(), sequence.len());
+        assert!(record.cigar_ops[1..6].iter().all(|&op| op == 'I'));
+    }
+
+    #[test]
     fn test_write_reverse() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut temp_file = PathBuf::from(temp_dir.path());
