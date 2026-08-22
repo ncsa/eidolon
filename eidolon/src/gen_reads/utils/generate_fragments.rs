@@ -1244,6 +1244,56 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────────────
+    // RESOLVED DESIGN (supersedes the "two bounds" framing in the previous
+    // commit's message). Simulated in Python, not yet implemented here:
+    // https://github.com/ncsa/eidolon (see release/fragment-placement history
+    // for the full simulation). Summary of what was checked and why it
+    // matters, since the two prior candidates both produce a measurable
+    // ARTIFICIAL dead zone at an ownership boundary where none should exist:
+    //
+    //   Draw LENGTH first, then constrain the START range based on whether
+    //   real sequence continues past the far boundary:
+    //     - EXTENDABLE boundary (an arbitrary line: BED target edge, SV
+    //       sub-region edge, chunk boundary -- real sequence continues past
+    //       it) -> start drawn uniformly over the FULL ownership interval,
+    //       independent of the drawn length; the end may run past the
+    //       boundary into that real flanking sequence. Never rejected.
+    //     - TRUE boundary (the actual start/end of the contig/molecule --
+    //       no sequence exists past it) -> start is drawn uniformly over
+    //       [region_start, region_end - length); if length > region length,
+    //       this candidate is discarded WITHOUT a replacement draw (fewer
+    //       fragments are realized near that end, not zero, and not clipped).
+    //
+    // This is NOT "reject-and-redraw" (which retries until something fits,
+    // discussed and rejected two commits back) and NOT "clip" (which
+    // truncates the sampled fragment to the boundary). Both of those apply the
+    // TRUE-boundary rule to EVERY boundary, which is what manufactures a dead
+    // zone at ownership lines that real, continuous DNA does not have.
+    //
+    // MEASURED (Python simulation, two adjacent 1500bp regions inside a
+    // 3000bp molecule, region A's right edge marked extendable into B, B's
+    // right edge marked as the true molecule end; seam/interior depth ratio,
+    // 1.0 = no artifact):
+    //   reject-and-redraw:    seam/interior = 0.12  (an 88% dead zone)
+    //   clip-at-boundary:     seam/interior = 0.77  (a 23% dead zone)
+    //   length-first/extend:  seam/interior = 1.08  (no dead zone, noise-level)
+    // At the TRUE end, length-first/extend reproduced the textbook
+    // Lander-Waterman ramp-to-zero of a direct single-molecule ground-truth
+    // simulation (no region split at all), rather than eliminating it --
+    // that ramp is real shotgun-sampling physics, not a bug, and only
+    // belongs at an actual molecule terminus, never at an arbitrary line.
+    //
+    // BONUS: this requires no rejection loop at all, which resolves the
+    // "reject-and-redraw can be slow or loop near a boundary" concern
+    // structurally rather than by bounding attempts. It is also very likely
+    // the same fix needed for cover_dataset's own length-fidelity and depth-
+    // VMR failures below -- both call for exactly this: draw from the real
+    // model every time (no pool cycling), position independently (no sweep).
+    // Confirming that on the actual Rust implementation, against the criteria
+    // already committed here, is the next piece of work, not yet done.
+    // ───────────────────────────────────────────────────────────────────────
+
+    // ───────────────────────────────────────────────────────────────────────
     // FRAGMENT PLACEMENT CRITERIA (#TBD).
     //
     // `cover_dataset` cycles `fragment_pool` and silently drops any draw that
