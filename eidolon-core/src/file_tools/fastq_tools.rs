@@ -456,6 +456,7 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
     buffer2: &mut B2,
     read_length: usize,
     read_name_prefix: &str,
+    contig_name: &str,
     quality_score_model: &QualityScoreModel,
     sequencing_error_model: &SequencingErrorModel,
     rng: &mut NeatRng,
@@ -473,7 +474,7 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         let name = format!("{}_{}", read_name_prefix, written);
         let mut ad_counter = AdCounter::new();
         let r1_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
-        let mut r1 = generate_read(
+        let mut r1 = match generate_read(
             &fragment.r1_sequence,
             &[],
             &HashMap::new(),
@@ -483,18 +484,22 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
             r1_quality,
             sequencing_error_model,
             rng,
-            "".to_string(),
+            contig_name.to_string(),
             fragment.r1_position,
-            "".to_string(),
+            contig_name.to_string(),
             fragment.r2_position,
             fragment.template_length,
             true,
             &mut ad_counter,
-        )?;
+        ) {
+            Ok(record) => record,
+            Err(FastqToolsError::TruncatedRead(_)) => continue,
+            Err(error) => return Err(error),
+        };
         apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
 
         let r2_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
-        let mut r2 = generate_read(
+        let mut r2 = match generate_read(
             &fragment.r2_sequence,
             &[],
             &HashMap::new(),
@@ -504,14 +509,18 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
             r2_quality,
             sequencing_error_model,
             rng,
-            "".to_string(),
+            contig_name.to_string(),
             fragment.r2_position,
-            "".to_string(),
+            contig_name.to_string(),
             fragment.r1_position,
             -fragment.template_length,
             true,
             &mut ad_counter,
-        )?;
+        ) {
+            Ok(record) => record,
+            Err(FastqToolsError::TruncatedRead(_)) => continue,
+            Err(error) => return Err(error),
+        };
         apply_haplotype_baseline_cigar(&mut r2, &fragment.r2_baseline_ops)?;
         r2 = reverse_complement_record(r2);
 
@@ -1048,6 +1057,7 @@ mod tests {
             &mut r2_output,
             25,
             "hap",
+            "chr1",
             &quality_model,
             &error_model,
             &mut rng,

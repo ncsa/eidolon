@@ -470,23 +470,16 @@ fn large_literal_insertions_reach_the_reads() {
         }
     }
 
-    // CHARACTERIZATION of the open bug. Beyond ~a read length, an insertion's interior and
-    // far end are never sequenced while the truth VCF keeps declaring the full SVLEN — so a
-    // benchmark built from this data asserts insertions the reads cannot support. Filed as
-    // #516. Same family as #498 (BND insert dropped) and #474 (a fragment spanning a whole
-    // DUP needs a stitch the fragment builder cannot express). It is why campaign 20925151
-    // measured Manta INS recall at 1/22: only the 61bp event had evidence for its declared
-    // length, and Manta called only that one.
-    //
-    // If any of these starts finding reads, the bug is FIXED: promote the size into the
-    // guards above and delete it from here.
+    // Production runner coverage: long literal insertions must reach both their
+    // interior and their far end. The paired haplotype writer now replaces
+    // regular reads touching these anchors and carries insertion-aware baseline
+    // CIGAR operations into the BAM.
     for &(size, _, m, t) in &carried {
         if size >= 200 {
-            assert_eq!(
-                (m, t),
-                (0, 0),
-                "{size}bp insertion now reaches the reads mid-sequence or at its tail \
-                 (middle={m}, tail={t}) — #516 may be FIXED."
+            assert!(
+                m > 0 && t > 0,
+                "{size}bp insertion does not reach both the interior and tail \
+                 (middle={m}, tail={t})"
             );
         }
     }
