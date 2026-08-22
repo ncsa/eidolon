@@ -436,6 +436,98 @@ pub fn write_haplotype_fragments<W: Write>(
     Ok(written)
 }
 
+pub struct HaplotypePairedFragment {
+    pub r1_sequence: Vec<Nucleotide>,
+    pub r1_baseline_ops: Vec<char>,
+    pub r1_position: usize,
+    pub r2_sequence: Vec<Nucleotide>,
+    pub r2_baseline_ops: Vec<char>,
+    pub r2_position: usize,
+    pub template_length: i32,
+}
+
+/// Write paired-end reads from expanded-coordinate haplotype windows. R2 is
+/// generated in forward orientation, annotated with its baseline operations,
+/// then reverse-complemented so the two records share the same construction
+/// path as the existing paired-end writer.
+pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
+    fragments: impl IntoIterator<Item = HaplotypePairedFragment>,
+    buffer1: &mut B1,
+    buffer2: &mut B2,
+    read_length: usize,
+    read_name_prefix: &str,
+    quality_score_model: &QualityScoreModel,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+    mut bam_writer: Option<&mut dyn BamRecordStager>,
+) -> Result<usize, FastqToolsError> {
+    let mut written = 0;
+    for fragment in fragments {
+        if fragment.r1_sequence.len() != read_length
+            || fragment.r2_sequence.len() != read_length
+            || fragment.r1_baseline_ops.len() != read_length
+            || fragment.r2_baseline_ops.len() != read_length
+        {
+            return Err(FastqToolsError::HaplotypeCigarMismatch);
+        }
+        let name = format!("{}_{}", read_name_prefix, written);
+        let mut ad_counter = AdCounter::new();
+        let r1_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let mut r1 = generate_read(
+            &fragment.r1_sequence,
+            &[],
+            &HashMap::new(),
+            read_length,
+            format!("{name}/1"),
+            Strand::Forward,
+            r1_quality,
+            sequencing_error_model,
+            rng,
+            "".to_string(),
+            fragment.r1_position,
+            "".to_string(),
+            fragment.r2_position,
+            fragment.template_length,
+            true,
+            &mut ad_counter,
+        )?;
+        apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
+
+        let r2_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let mut r2 = generate_read(
+            &fragment.r2_sequence,
+            &[],
+            &HashMap::new(),
+            read_length,
+            format!("{name}/2"),
+            Strand::Forward,
+            r2_quality,
+            sequencing_error_model,
+            rng,
+            "".to_string(),
+            fragment.r2_position,
+            "".to_string(),
+            fragment.r1_position,
+            -fragment.template_length,
+            true,
+            &mut ad_counter,
+        )?;
+        apply_haplotype_baseline_cigar(&mut r2, &fragment.r2_baseline_ops)?;
+        r2 = reverse_complement_record(r2);
+
+        write_read_to_fastq(&r1, buffer1)?;
+        write_read_to_fastq(&r2, buffer2)?;
+        if let Some(bam) = bam_writer.as_deref_mut() {
+            bam.stage_read_record(&r1)
+                .map_err(|e| FastqToolsError::BamError(e.to_string()))?;
+            bam.stage_read_record(&r2)
+                .map_err(|e| FastqToolsError::BamError(e.to_string()))?;
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
 pub fn combine_temp_fastqs(
     files_r1: Vec<PathBuf>,
     files_r2: Vec<PathBuf>,
@@ -924,6 +1016,55 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert_eq!(text.lines().count(), 4);
         assert!(text.starts_with("@hap_0\n"));
+    }
+
+    #[test]
+    fn test_write_haplotype_paired_fragments_emits_mates() {
+        let sequence = vec![A, C, C, C, C, C]
+            .into_iter()
+            .chain(vec![A; 19])
+            .collect::<Vec<_>>();
+        let baseline = vec!['M'; 1]
+            .into_iter()
+            .chain(vec!['I'; 5])
+            .chain(vec!['M'; 19])
+            .collect::<Vec<_>>();
+        let quality_model = QualityScoreModel::default().unwrap();
+        let error_model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["haplotype-paired-writer".to_string()]).unwrap();
+        let mut r1_output = Vec::new();
+        let mut r2_output = Vec::new();
+        let written = write_haplotype_paired_fragments(
+            vec![HaplotypePairedFragment {
+                r1_sequence: sequence.clone(),
+                r1_baseline_ops: baseline.clone(),
+                r1_position: 100,
+                r2_sequence: sequence,
+                r2_baseline_ops: baseline,
+                r2_position: 250,
+                template_length: 175,
+            }],
+            &mut r1_output,
+            &mut r2_output,
+            25,
+            "hap",
+            &quality_model,
+            &error_model,
+            &mut rng,
+            None,
+        )
+        .unwrap();
+        assert_eq!(written, 1);
+        assert!(
+            String::from_utf8(r1_output)
+                .unwrap()
+                .starts_with("@hap_0/1\n")
+        );
+        assert!(
+            String::from_utf8(r2_output)
+                .unwrap()
+                .starts_with("@hap_0/2\n")
+        );
     }
 
     #[test]
