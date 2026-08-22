@@ -1450,4 +1450,167 @@ mod tests {
         let none = cover_dataset(5_000, 1_000, 250, 0, vec![30_000; 10], &mut rng).unwrap();
         assert!(none.is_empty(), "unplaceable pool must yield no fragments");
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Same three criteria against `generate_weighted_fragments` (the GC-bias
+    // path), under a UNIFORM GcBiasModel so any failure is attributable to
+    // placement, not to bias weighting. This path does not call
+    // `cover_dataset` — it samples a start from a GC-weighted prefix sum and
+    // draws each fragment's length independently from the model — so a priori
+    // it need not share the sweep placer's defect. Measuring it, not assuming
+    // it, per the same rule that governs the sweep placer's own criteria.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Deterministic non-periodic sequence so every GC window differs, ruling
+    /// out a periodic sequence silently making every window's weight identical.
+    fn make_gc_test_sequence(len: usize) -> Vec<eidolon_core::structs::nucleotides::Nucleotide> {
+        let bases = [A, C, G, T];
+        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                bases[((x >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// CRITERION 1 (weighted path). Same known answer as the sweep-placer
+    /// version: realized lengths must be a fair sample of the fragment model,
+    /// even on a span not much longer than the mean fragment.
+    #[test]
+    fn weighted_fragments_preserve_the_length_distribution_on_a_short_span() {
+        let span = 400usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap(); // mean=300, sd=30
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            60, // coverage
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true, // paired_ended
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert!(!frags.is_empty(), "must place at least some fragments");
+
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        let distinct = lens.iter().collect::<std::collections::HashSet<_>>().len();
+
+        assert!(
+            distinct >= lens.len() / 3,
+            "realized lengths collapsed to {distinct} distinct value(s) out of {} \
+             fragments — clipping at the region edge is truncating the model",
+            lens.len()
+        );
+        assert!(
+            (mean - 300.0).abs() < 0.15 * 300.0,
+            "realized mean fragment length {mean:.1} is far from the model mean 300.0 \
+             — edge clipping is biasing the length distribution"
+        );
+    }
+
+    /// CRITERION 2 (weighted path). Starts must reach the whole span.
+    #[test]
+    fn weighted_fragments_spread_starts_across_the_span() {
+        let span = 1_000usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            60,
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert!(!frags.is_empty());
+
+        for q in 0..4 {
+            let (lo, hi) = (q * span / 4, (q + 1) * span / 4);
+            let n = frags.iter().filter(|&&(s, _)| s >= lo && s < hi).count();
+            assert!(n > 0, "no fragment starts in span quarter [{lo}, {hi})");
+        }
+    }
+
+    /// CRITERION 3 (weighted path). Per-base depth must not be far less
+    /// variable than uniform-random placement (VMR ~= 1 is the floor a random
+    /// placer gives; real sequencing is overdispersed, VMR > 1).
+    #[test]
+    fn weighted_fragments_depth_is_not_underdispersed() {
+        let span = 200_000usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            30,
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+
+        let mut diff = vec![0i32; span + 1];
+        for &(s, e) in &frags {
+            for (a, b) in [
+                (s, (s + read_length).min(span)),
+                (e.saturating_sub(read_length), e.min(span)),
+            ] {
+                if a < b {
+                    diff[a] += 1;
+                    diff[b] -= 1;
+                }
+            }
+        }
+        let mut depth = Vec::with_capacity(span);
+        let mut acc = 0i32;
+        for d in &diff[..span] {
+            acc += d;
+            depth.push(acc as f64);
+        }
+        let interior = &depth[2_000..span - 2_000];
+        let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+        let var = interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+        let vmr = var / mean;
+
+        assert!(
+            vmr >= 0.9,
+            "per-base depth VMR is {vmr:.3} (mean {mean:.2}, var {var:.2}) under the \
+             GC-weighted path — unexpectedly underdispersed"
+        );
+    }
 }
