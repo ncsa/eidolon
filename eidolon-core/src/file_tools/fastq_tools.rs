@@ -58,6 +58,8 @@ pub enum FastqToolsError {
     MalformedReverseRead,
     #[error("BAM write error: {0}")]
     BamError(String),
+    #[error("Haplotype baseline CIGAR does not match read sequence length")]
+    HaplotypeCigarMismatch,
 }
 
 pub enum Strand {
@@ -625,6 +627,33 @@ pub fn generate_read(
     })
 }
 
+/// Apply baseline alignment operations from a materialized haplotype interval
+/// to a generated read. Deletion operations do not consume query sequence and
+/// are left untouched; reference `M` operations can be relabeled as insertion
+/// `I` operations. Existing sequencing-error insertions remain `I`.
+pub fn apply_haplotype_baseline_cigar(
+    record: &mut ReadRecord,
+    baseline_ops: &[char],
+) -> Result<(), FastqToolsError> {
+    let mut query_index = 0;
+    for op in &mut record.cigar_ops {
+        if matches!(*op, 'D' | 'N') {
+            continue;
+        }
+        let baseline = baseline_ops
+            .get(query_index)
+            .ok_or(FastqToolsError::HaplotypeCigarMismatch)?;
+        if matches!(*op, 'M' | '=' | 'X') {
+            *op = *baseline;
+        }
+        query_index += 1;
+    }
+    if query_index != baseline_ops.len() || query_index != record.sequence.len() {
+        return Err(FastqToolsError::HaplotypeCigarMismatch);
+    }
+    Ok(())
+}
+
 /// Turn a forward-generated read into its reverse-strand mate: reverse-complement
 /// the sequence and reverse the per-base CIGAR ops and qualities. R2 is generated
 /// forward over the fragment's right-end window (so SNP/insertion/deletion handling
@@ -761,6 +790,29 @@ mod tests {
         );
         assert_eq!(lines[0], "@read1");
         assert_eq!(lines[4], "@read2");
+    }
+
+    #[test]
+    fn test_apply_haplotype_baseline_cigar_marks_inserted_bases() {
+        let mut record = ReadRecord {
+            name: "read".to_string(),
+            sequence: "ACCCCCAAAAAAAAAAAAAAAAAAA".to_string(),
+            quality_scores: vec![30; 25],
+            cigar_ops: vec!['M'; 25],
+            is_paired: false,
+            is_reverse: false,
+            contig: "chr1".to_string(),
+            position: 100,
+            mate_contig: "chr1".to_string(),
+            mate_position: 0,
+            template_length: 0,
+        };
+        let mut baseline = vec!['M'; 25];
+        baseline[1..6].fill('I');
+        apply_haplotype_baseline_cigar(&mut record, &baseline).unwrap();
+        assert_eq!(record.cigar_ops[0], 'M');
+        assert_eq!(&record.cigar_ops[1..6], &['I'; 5]);
+        assert_eq!(&record.cigar_ops[6..], &['M'; 19]);
     }
 
     #[test]
