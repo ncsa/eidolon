@@ -898,7 +898,7 @@ pub fn quality_scores_to_char_vec(array: &[usize]) -> Result<Vec<u8>, FastqTools
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_tools::bam_writer::{BamRecordStager, BamWriter};
+    use crate::file_tools::bam_writer::{BamRecordStager, BamWriter, BamWriterError};
     use crate::file_tools::file_io::{VectorBuffer, create_output_file, read_gzip_lines};
     use crate::structs::nucleotides::Nucleotide::*;
     use crate::structs::sequence_block::{RegionType, SequenceMap};
@@ -906,6 +906,32 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
+
+    #[derive(Default)]
+    struct CapturedPairedReads(Vec<ReadRecord>);
+
+    impl BamRecordStager for CapturedPairedReads {
+        fn stage_read_record(&mut self, record: &ReadRecord) -> Result<(), BamWriterError> {
+            self.0.push(ReadRecord {
+                name: record.name.clone(),
+                sequence: record.sequence.clone(),
+                quality_scores: record.quality_scores.clone(),
+                cigar_ops: record.cigar_ops.clone(),
+                is_paired: record.is_paired,
+                is_reverse: record.is_reverse,
+                contig: record.contig.clone(),
+                position: record.position,
+                mate_contig: record.mate_contig.clone(),
+                mate_position: record.mate_position,
+                template_length: record.template_length,
+            });
+            Ok(())
+        }
+
+        fn flush_up_to(&mut self, _flush_pos: usize) -> Result<(), BamWriterError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_combine_temp_fastqs() {
@@ -1075,6 +1101,58 @@ mod tests {
                 .unwrap()
                 .starts_with("@hap_0/2\n")
         );
+    }
+
+    #[test]
+    fn test_write_haplotype_paired_fragments_preserves_orientation_and_mates() {
+        let r1_sequence = vec![A, C, G, T].into_iter().chain(vec![A; 21]).collect();
+        let r2_sequence = vec![T, G, C, A].into_iter().chain(vec![C; 21]).collect();
+        let mut r2_baseline = vec!['M'; 25];
+        r2_baseline[..4].fill('I');
+        let quality_model = QualityScoreModel::default().unwrap();
+        let error_model =
+            SequencingErrorModel::from_raw_data(0.0, quality_model.clone(), None).unwrap();
+        let mut rng =
+            NeatRng::new_from_seed(&vec!["haplotype-paired-orientation".to_string()]).unwrap();
+        let mut r1_output = Vec::new();
+        let mut r2_output = Vec::new();
+        let mut captured = CapturedPairedReads::default();
+        assert_eq!(
+            write_haplotype_paired_fragments(
+                vec![HaplotypePairedFragment {
+                    r1_sequence,
+                    r1_baseline_ops: vec!['M'; 25],
+                    r1_position: 100,
+                    r2_sequence,
+                    r2_baseline_ops: r2_baseline,
+                    r2_position: 250,
+                    template_length: 175,
+                }],
+                &mut r1_output,
+                &mut r2_output,
+                25,
+                "hap",
+                "chr1",
+                &quality_model,
+                &error_model,
+                &mut rng,
+                Some(&mut captured),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(captured.0.len(), 2);
+        let r1 = &captured.0[0];
+        let r2 = &captured.0[1];
+        assert!(r1.is_paired && !r1.is_reverse);
+        assert!(r2.is_paired && r2.is_reverse);
+        assert_eq!((r1.name.as_str(), r2.name.as_str()), ("hap_0/1", "hap_0/2"));
+        assert_eq!((r1.position, r2.position), (100, 250));
+        assert_eq!((r1.mate_position, r2.mate_position), (250, 100));
+        assert_eq!((r1.template_length, r2.template_length), (175, -175));
+        assert_eq!(&r2.cigar_ops[21..], &['I'; 4]);
+        assert_eq!(r1.contig, "chr1");
+        assert_eq!(r2.mate_contig, "chr1");
     }
 
     #[test]
