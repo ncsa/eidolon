@@ -1613,4 +1613,206 @@ mod tests {
              GC-weighted path — unexpectedly underdispersed"
         );
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // MEDIUM-SPAN tier, completing the span-size x placer matrix. Every span
+    // used by a pre-existing test in this file (before this session) was
+    // either ~1 fragment length or >=5_000bp -- nothing at the scale of a
+    // realistic BED target or SV event a few fragment-lengths wide. These
+    // measure, rather than assume, where each defect actually fades.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// MEDIUM tier, length fidelity. A span several fragment-lengths wide --
+    /// a realistic exon panel target or a mid-size SV -- not the read-length-
+    /// scale extreme already covered above.
+    #[test]
+    fn cover_dataset_length_fidelity_at_medium_span() {
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let pool = spread_pool(200, 180, 320);
+        let pool_mean = pool.iter().sum::<usize>() as f64 / pool.len() as f64;
+        let target_count = span * 60 / (2 * read_length);
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(span, read_length, target_count, 0, pool, &mut rng).unwrap();
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        let distinct = lens.iter().collect::<std::collections::HashSet<_>>().len();
+        eprintln!(
+            "[medium-span cover_dataset] n={} mean={:.1} (pool mean {:.1}) distinct={}",
+            lens.len(),
+            mean,
+            pool_mean,
+            distinct
+        );
+        assert!(
+            (mean - pool_mean).abs() < 0.15 * pool_mean,
+            "medium-span mean {mean:.1} drifted from pool mean {pool_mean:.1}"
+        );
+    }
+
+    /// MEDIUM tier, depth VMR. Does the sweep's underdispersion fade smoothly
+    /// with span, or is it still present at a realistic target/SV scale?
+    #[test]
+    fn cover_dataset_depth_vmr_at_medium_span() {
+        // Same multi-replicate averaging as the weighted-path version of this
+        // test, and for the same reason: a single medium-span draw has too few
+        // independent autocorrelation blocks for a stable point estimate.
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let target_count = span * 60 / (2 * read_length);
+
+        let mut vmrs = Vec::new();
+        for seed in 0..12u32 {
+            let pool = spread_pool(200, 180, 320);
+            let mut rng =
+                NeatRng::new_from_seed(&vec![format!("cover-dataset-medium-span-{seed}")])
+                    .unwrap();
+            let frags = cover_dataset(span, read_length, target_count, 0, pool, &mut rng).unwrap();
+            let mut diff = vec![0i32; span + 1];
+            for &(s, e) in &frags {
+                for (a, b) in [
+                    (s, (s + read_length).min(span)),
+                    (e.saturating_sub(read_length), e.min(span)),
+                ] {
+                    if a < b {
+                        diff[a] += 1;
+                        diff[b] -= 1;
+                    }
+                }
+            }
+            let mut depth = Vec::with_capacity(span);
+            let mut acc = 0i32;
+            for d in &diff[..span] {
+                acc += d;
+                depth.push(acc as f64);
+            }
+            let interior = &depth[300..span - 300];
+            let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+            let var =
+                interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+            vmrs.push(var / mean);
+        }
+        let avg_vmr = vmrs.iter().sum::<f64>() / vmrs.len() as f64;
+        eprintln!(
+            "[medium-span cover_dataset, {} replicates] per-replicate VMR={:?} avg={avg_vmr:.3}",
+            vmrs.len(),
+            vmrs.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>()
+        );
+        assert!(
+            avg_vmr >= 0.9,
+            "medium-span (3000bp, ~10x mean fragment length) depth VMR averaged over {} \
+             independent replicates is {avg_vmr:.3} -- underdispersion has not faded by \
+             this scale",
+            vmrs.len()
+        );
+    }
+
+    /// MEDIUM tier, weighted path, length fidelity.
+    #[test]
+    fn weighted_fragments_length_fidelity_at_medium_span() {
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            60,
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        eprintln!("[medium-span weighted] n={} mean={:.1}", lens.len(), mean);
+        assert!(
+            (mean - 300.0).abs() < 0.15 * 300.0,
+            "medium-span weighted-path mean {mean:.1} drifted from model mean 300.0"
+        );
+    }
+
+    /// MEDIUM tier, weighted path, depth VMR.
+    #[test]
+    fn weighted_fragments_depth_vmr_at_medium_span() {
+        // Depth autocorrelates over roughly one fragment length, so a single
+        // medium-span draw has only ~span/fragment_length independent blocks to
+        // estimate variance from -- too few for a stable point estimate (a
+        // single-seed run here swung 0.845-0.90 across different edge trims
+        // with no consistent trend, which is the signature of estimator noise,
+        // not a real effect: the whole-contig version of this test measures
+        // VMR=0.984 with ~30x more independent blocks). Average across
+        // independent replicates instead of trusting one draw.
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+
+        let mut vmrs = Vec::new();
+        for seed in 0..12u32 {
+            let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+            let mut rng =
+                NeatRng::new_from_seed(&vec![format!("gc-bias-medium-span-{seed}")]).unwrap();
+            let frags = generate_weighted_fragments(
+                &sequence_block,
+                0,
+                span,
+                read_length,
+                0,
+                60,
+                &GcBiasModel::default(),
+                &fragment_model,
+                false,
+                true,
+                false,
+                false,
+                &mut rng,
+            )
+            .unwrap();
+            let mut diff = vec![0i32; span + 1];
+            for &(s, e) in &frags {
+                for (a, b) in [
+                    (s, (s + read_length).min(span)),
+                    (e.saturating_sub(read_length), e.min(span)),
+                ] {
+                    if a < b {
+                        diff[a] += 1;
+                        diff[b] -= 1;
+                    }
+                }
+            }
+            let mut depth = Vec::with_capacity(span);
+            let mut acc = 0i32;
+            for d in &diff[..span] {
+                acc += d;
+                depth.push(acc as f64);
+            }
+            let interior = &depth[300..span - 300];
+            let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+            let var =
+                interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+            vmrs.push(var / mean);
+        }
+        let avg_vmr = vmrs.iter().sum::<f64>() / vmrs.len() as f64;
+        eprintln!(
+            "[medium-span weighted, {} replicates] per-replicate VMR={:?} avg={avg_vmr:.3}",
+            vmrs.len(),
+            vmrs.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>()
+        );
+        assert!(
+            avg_vmr >= 0.9,
+            "medium-span weighted-path depth VMR averaged over {} independent replicates \
+             is {avg_vmr:.3} -- underdispersion has not faded by this scale",
+            vmrs.len()
+        );
+    }
 }
