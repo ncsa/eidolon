@@ -1242,4 +1242,212 @@ mod tests {
             avg_depth
         );
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // FRAGMENT PLACEMENT CRITERIA (#TBD).
+    //
+    // `cover_dataset` cycles `fragment_pool` and silently drops any draw that
+    // does not fit the span, substituting one that does. `non_placing_streak`
+    // only trips on CONSECUTIVE oversized draws, so when most of the pool is
+    // too large it never fires: the loop grinds out `target_count` from the
+    // placeable tail. Sweep origins are additionally pinned within
+    // `read_length / 4` of a span edge, so those few lengths are laid down from
+    // the same place every pass.
+    //
+    // The count comes out exact, which is why every pre-existing test here
+    // passes. What collapses is the DISTRIBUTION, in three ways, each asserted
+    // below against a known answer that is independent of the implementation:
+    //
+    //   1. realized fragment lengths must be a fair sample of `fragment_pool`
+    //   2. starts must reach the whole span, not pile at its 5' edge
+    //   3. per-base depth must not be far less variable than a random placer
+    //
+    // MEASURED before the fix (eidolon output, not these unit tests):
+    //   200 bp BED target, model N(250,30) -> realized mean 186.0, sd 0.4,
+    //     3 distinct lengths in 60 fragments; all 60 starts inside 15 bp.
+    //   200 bp <DUP> sub-region -> 91 of 120 starts in an 8 bp window.
+    //   2 Mb contig at 30x -> per-base depth VMR 0.226, against 1.007/1.025/
+    //     1.016 for uniform-random placement with identical N and identical
+    //     length pool.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Deterministic stand-in for a fragment-length model: `n` lengths spread
+    /// evenly over [lo, hi]. Using an explicit pool (rather than sampling a
+    /// model) makes the known answer exact — the realized lengths must be a
+    /// fair sample of THIS list.
+    fn spread_pool(n: usize, lo: usize, hi: usize) -> Vec<usize> {
+        (0..n).map(|i| lo + (hi - lo) * i / (n - 1).max(1)).collect()
+    }
+
+    /// CRITERION 1. A span barely longer than the mean fragment must still
+    /// realize the pool's spread. KNOWN ANSWER: the pool IS the input, so its
+    /// mean and spread are computable without reference to the placer.
+    ///
+    /// Currently FAILS: only pool entries <= span are placeable, so the
+    /// realized library collapses onto the extreme left tail.
+    #[test]
+    fn cover_dataset_preserves_the_fragment_length_distribution_on_a_short_span() {
+        let span = 200usize;
+        let read_length = 100usize;
+        let pool = spread_pool(60, 180, 320);
+        let pool_mean = pool.iter().sum::<usize>() as f64 / pool.len() as f64;
+        let target_count = 60;
+        let mut rng = make_rng();
+
+        let frags =
+            cover_dataset(span, read_length, target_count, 0, pool.clone(), &mut rng).unwrap();
+        assert_eq!(frags.len(), target_count, "count must still be exact");
+
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        let distinct = lens.iter().collect::<std::collections::HashSet<_>>().len();
+
+        assert!(
+            distinct >= pool.len() / 4,
+            "realized lengths collapsed to {distinct} distinct value(s) from a \
+             {}-entry pool — the placer is resampling only the entries that fit \
+             the span, so the library is monodisperse",
+            pool.len()
+        );
+        assert!(
+            (mean - pool_mean).abs() < 0.15 * pool_mean,
+            "realized mean fragment length {mean:.1} is far from the pool mean \
+             {pool_mean:.1} — the length distribution is truncated, not sampled"
+        );
+    }
+
+    /// CRITERION 2. Fragment starts must reach the whole span. The failure is
+    /// specific to the sweep-origin window: origins are drawn as
+    /// `rand % (read_length / 4)` from a span edge, so on a span only a few
+    /// fragments wide every pass restarts inside the same narrow band.
+    ///
+    /// KNOWN ANSWER: with starts spread over the span, the share landing in any
+    /// `read_length / 4` window is about `(read_length / 4) / span`.
+    ///
+    /// Currently FAILS. MEASURED end-to-end: a 400 bp BED target put ~55 of 120
+    /// starts inside 25 bp; a 200 bp target put all 60 inside 15 bp.
+    #[test]
+    fn cover_dataset_spreads_starts_across_the_span() {
+        let span = 400usize;
+        let read_length = 100usize;
+        let origin_window = read_length / 4;
+        let pool = spread_pool(120, 180, 320);
+        let target_count = 120;
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(span, read_length, target_count, 0, pool, &mut rng).unwrap();
+        assert_eq!(frags.len(), target_count);
+
+        let head = frags.iter().filter(|&&(s, _)| s < origin_window).count();
+        let expected = (target_count * origin_window).div_ceil(span);
+        assert!(
+            head <= 3 * expected,
+            "{head} of {target_count} fragments start in the first {origin_window} bp \
+             of a {span} bp span (spread placement gives about {expected}) — \
+             placement is anchored to the sweep origin at the span edge"
+        );
+
+        // Every quarter of the span must receive starts; a stalled sweep leaves
+        // whole quarters empty.
+        for q in 0..4 {
+            let (lo, hi) = (q * span / 4, (q + 1) * span / 4);
+            let n = frags.iter().filter(|&&(s, _)| s >= lo && s < hi).count();
+            assert!(n > 0, "no fragment starts in span quarter [{lo}, {hi})");
+        }
+    }
+
+    /// CRITERION 3. Per-base depth must not be dramatically LESS variable than
+    /// a random placer. KNOWN ANSWER: uniform-random placement of the same
+    /// fragment count gives Poisson-like depth, VMR ~= 1. Real sequencing is
+    /// overdispersed (VMR > 1) from GC and mappability, so a random placer is
+    /// the floor, not the target.
+    ///
+    /// Currently FAILS at roughly VMR 0.23: depth is ~4x too clean, which makes
+    /// depth-based CNV/DUP/DEL calling look far better than it will on real data.
+    #[test]
+    fn cover_dataset_depth_is_not_underdispersed() {
+        let span = 200_000usize;
+        let read_length = 100usize;
+        let pool = spread_pool(400, 180, 320);
+        let coverage = 30usize;
+        let target_count = span * coverage / (2 * read_length);
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(span, read_length, target_count, 0, pool, &mut rng).unwrap();
+
+        // Difference array over both read windows of each pair.
+        let mut diff = vec![0i32; span + 1];
+        for &(s, e) in &frags {
+            for (a, b) in [
+                (s, (s + read_length).min(span)),
+                (e.saturating_sub(read_length), e.min(span)),
+            ] {
+                if a < b {
+                    diff[a] += 1;
+                    diff[b] -= 1;
+                }
+            }
+        }
+        let mut depth = Vec::with_capacity(span);
+        let mut acc = 0i32;
+        for d in &diff[..span] {
+            acc += d;
+            depth.push(acc as f64);
+        }
+        // Trim the edges, where any placer legitimately ramps.
+        let interior = &depth[2_000..span - 2_000];
+        let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+        let var = interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+        let vmr = var / mean;
+
+        assert!(
+            vmr >= 0.9,
+            "per-base depth VMR is {vmr:.3} (mean {mean:.2}, var {var:.2}); \
+             uniform-random placement of the same fragments gives ~1.0. Depth is \
+             far too uniform to exercise a depth-based caller honestly."
+        );
+    }
+
+    /// MUST NOT FIRE. The properties the sweep placer got right have to survive
+    /// any replacement: exact fragment count (so mean coverage stays exact),
+    /// fragments inside the span, and termination when nothing can be placed.
+    #[test]
+    fn placement_preserves_count_bounds_and_termination() {
+        let mut rng = make_rng();
+
+        let span = 50_000usize;
+        let read_length = 100usize;
+        let target_count = span * 20 / (2 * read_length);
+        let frags = cover_dataset(
+            span,
+            read_length,
+            target_count,
+            0,
+            spread_pool(200, 180, 320),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(frags.len(), target_count, "exact fragment count");
+        assert!(
+            frags.iter().all(|&(s, e)| s < e && e <= span),
+            "every fragment must lie inside the span"
+        );
+
+        // read_start must offset the output, not the bounds logic.
+        let offset = cover_dataset(
+            span,
+            read_length,
+            100,
+            7_000,
+            spread_pool(200, 180, 320),
+            &mut rng,
+        )
+        .unwrap();
+        assert!(offset.iter().all(|&(s, _)| s >= 7_000));
+
+        // A whole contig genuinely shorter than every fragment cannot be
+        // covered — that must still return empty rather than loop or clip.
+        let none = cover_dataset(5_000, 1_000, 250, 0, vec![30_000; 10], &mut rng).unwrap();
+        assert!(none.is_empty(), "unplaceable pool must yield no fragments");
+    }
 }
