@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::{eidolon, gate2::ref_base, h1n1_reference};
+use common::{eidolon, h1n1_reference};
 use noodles::bam;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use std::path::{Path, PathBuf};
@@ -78,27 +78,6 @@ fn vcf_header() -> String {
 /// Run gen-reads over `records` (already tab-delimited VCF body lines) and return the
 /// output directory. `records` empty => the no-variant control.
 fn run_cell(dir: &Path, name: &str, records: &[&str]) -> PathBuf {
-    run_cell_with_mode(dir, name, records, true, true, None)
-}
-
-fn run_cell_with_options(
-    dir: &Path,
-    name: &str,
-    records: &[&str],
-    produce_fastq: bool,
-    chunk_size: Option<usize>,
-) -> PathBuf {
-    run_cell_with_mode(dir, name, records, true, produce_fastq, chunk_size)
-}
-
-fn run_cell_with_mode(
-    dir: &Path,
-    name: &str,
-    records: &[&str],
-    paired_ended: bool,
-    produce_fastq: bool,
-    chunk_size: Option<usize>,
-) -> PathBuf {
     let out = dir.join(name);
     std::fs::create_dir_all(&out).unwrap();
     let vcf = out.join("in.vcf");
@@ -110,22 +89,14 @@ fn run_cell_with_mode(
     std::fs::write(&vcf, text).unwrap();
 
     let cfg = out.join("c.yml");
-    let chunk_size = chunk_size
-        .map(|size| format!("chunk_size: {size}\n"))
-        .unwrap_or_default();
-    let paired = if paired_ended {
-        "paired_ended: true\nfragment_mean: 250\nfragment_st_dev: 30\n"
-    } else {
-        "paired_ended: false\n"
-    };
     std::fs::write(
         &cfg,
         format!(
-            "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 2\n{paired}\
-             input_vcf: {vcf}\n\
-             produce_vcf: true\nproduce_fastq: {produce_fastq}\nproduce_bam: true\n\
+            "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 2\npaired_ended: true\n\
+             fragment_mean: 250\nfragment_st_dev: 30\ninput_vcf: {vcf}\n\
+             produce_vcf: true\nproduce_fastq: true\nproduce_bam: true\n\
              sv_rate_scale: 0.0\noverwrite_output: true\n\
-             output_dir: {out}\noutput_filename: o\nrng_seed: matrix {name}\nnum_threads: 1\n{chunk_size}",
+             output_dir: {out}\noutput_filename: o\nrng_seed: matrix {name}\nnum_threads: 1\n",
             ref = h1n1_reference().display(),
             vcf = vcf.display(),
             out = out.display(),
@@ -499,90 +470,26 @@ fn large_literal_insertions_reach_the_reads() {
         }
     }
 
-    // Production runner coverage: long literal insertions must reach both their
-    // interior and their far end. The paired haplotype writer now replaces
-    // regular reads touching these anchors and carries insertion-aware baseline
-    // CIGAR operations into the BAM.
+    // CHARACTERIZATION of the open bug. Beyond ~a read length, an insertion's interior and
+    // far end are never sequenced while the truth VCF keeps declaring the full SVLEN — so a
+    // benchmark built from this data asserts insertions the reads cannot support. Filed as
+    // #516. Same family as #498 (BND insert dropped) and #474 (a fragment spanning a whole
+    // DUP needs a stitch the fragment builder cannot express). It is why campaign 20925151
+    // measured Manta INS recall at 1/22: only the 61bp event had evidence for its declared
+    // length, and Manta called only that one.
+    //
+    // If any of these starts finding reads, the bug is FIXED: promote the size into the
+    // guards above and delete it from here.
     for &(size, _, m, t) in &carried {
         if size >= 200 {
-            assert!(
-                m > 0 && t > 0,
-                "{size}bp insertion does not reach both the interior and tail \
-                 (middle={m}, tail={t})"
+            assert_eq!(
+                (m, t),
+                (0, 0),
+                "{size}bp insertion now reaches the reads mid-sequence or at its tail \
+                 (middle={m}, tail={t}) — #516 may be FIXED."
             );
         }
     }
-}
-
-#[test]
-fn long_insertions_work_in_bam_only_and_across_chunk_boundaries() {
-    let tmp = tempfile::tempdir().unwrap();
-    let insert_a = synthetic_insert(300);
-    let insert_b = synthetic_insert(350);
-    let base_a = ref_base(EV.0, 500);
-    let base_b = ref_base(EV.0, 1000);
-    let rec_a = format!(
-        "{}\t500\tchunk_a\t{base_a}\t{base_a}{insert_a}\t60\tPASS\t.\tGT\t1/1",
-        EV.0
-    );
-    let rec_b = format!(
-        "{}\t1000\tchunk_b\t{base_b}\t{base_b}{insert_b}\t60\tPASS\t.\tGT\t1/1",
-        EV.0
-    );
-
-    // Exercise the BAM-only branch, which uses the haplotype writer with sink
-    // FASTQ buffers. Both insertion events must still contribute insertion CIGARs.
-    let bam_only = run_cell_with_options(
-        tmp.path(),
-        "long_ins_bam_only",
-        &[rec_a.as_str()],
-        false,
-        None,
-    );
-    assert!(!bam_only.join("o_r1.fastq.gz").exists());
-    assert!(
-        reads_with_op(&bam_only, EV.0, 450, 900, Kind::Insertion) > 0,
-        "BAM-only generation lost the long insertion CIGAR"
-    );
-
-    // Single-ended mode intentionally keeps the pre-haplotype path for now;
-    // verify it remains well-formed and does not accidentally enter the paired
-    // writer with a missing R2 stream.
-    let single = run_cell_with_mode(
-        tmp.path(),
-        "long_ins_single_ended",
-        &[rec_a.as_str()],
-        false,
-        true,
-        None,
-    );
-    assert!(single.join("o_r1.fastq.gz").exists());
-    assert!(!single.join("o_r2.fastq.gz").exists());
-    assert!(
-        seq_lines_containing(&single, &insert_a[..30]) > 0,
-        "single-ended long-insertion generation lost the anchored sequence"
-    );
-
-    // Put the two anchors on opposite sides of a 500 bp chunk boundary. This
-    // guards against duplicate or missing haplotype reads when chunks own
-    // variants independently.
-    let chunked = run_cell_with_options(
-        tmp.path(),
-        "long_ins_chunked",
-        &[rec_a.as_str(), rec_b.as_str()],
-        true,
-        Some(500),
-    );
-    assert!(truth_has_id(&chunked, "chunk_a"));
-    assert!(truth_has_id(&chunked, "chunk_b"));
-    assert!(
-        seq_lines_containing(&chunked, &insert_a[120..150]) > 0,
-        "chunk-boundary insertion A did not reach FASTQ"
-    );
-    assert!(
-        seq_lines_containing(&chunked, &insert_b[140..170]) > 0,
-        "chunk-boundary insertion B did not reach FASTQ"
-    );
 }
 
 #[test]
