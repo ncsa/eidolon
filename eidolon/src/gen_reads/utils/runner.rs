@@ -17,8 +17,7 @@ use crate::{
             bed_reader::read_bed,
             fasta_stream::{FastaStream, map_buffer, resolve_iupac_bases},
             fastq_tools::{
-                HaplotypePairedFragment, Strand, combine_temp_fastqs, generate_read,
-                reverse_complement, write_block_fastq, write_haplotype_paired_fragments,
+                Strand, combine_temp_fastqs, generate_read, reverse_complement, write_block_fastq,
                 write_read_to_fastq,
             },
             file_io::{VectorBuffer, append_to_file},
@@ -41,9 +40,7 @@ use crate::{
         errors::GenerateReadsError,
         utils::{
             config::RunConfiguration,
-            generate_fragments::{
-                InsertionCoordinateMap, generate_fragments, generate_weighted_fragments,
-            },
+            generate_fragments::{generate_fragments, generate_weighted_fragments},
             generate_variants::generate_variants,
             subclone::SubcloneModel,
         },
@@ -886,44 +883,6 @@ fn process_chunk(
         &mut rng,
     )?;
 
-    // Literal insertions longer than one read need expanded-coordinate reads so
-    // the inserted sequence is represented in both FASTQ mates and in their
-    // baseline BAM CIGARs.  Keep this opt-in to paired short-read generation;
-    // long-read and single-ended paths retain their existing behavior until
-    // they receive the corresponding haplotype writer.
-    let (block_fragments, long_insertion_fragments) =
-        if ctx.config.paired_ended && !ctx.config.long_reads {
-            let long_insertions =
-                long_insertion_anchors(mutated_map, chunk_start, chunk_end, ctx.config.read_len);
-            let filtered = block_fragments
-                .into_iter()
-                .filter(|&(start, end)| {
-                    !long_insertions.iter().any(|&anchor| {
-                        let r1_end = (start + ctx.config.read_len).min(end);
-                        let r2_start = end.saturating_sub(ctx.config.read_len);
-                        (start <= anchor && anchor < r1_end) || (r2_start <= anchor && anchor < end)
-                    })
-                })
-                .collect();
-            let haplotype_fragments = generate_long_insertion_fragments(
-                &current_block.sequence,
-                mutated_map,
-                &long_insertions,
-                contig_len,
-                chunk_start,
-                chunk_end,
-                ctx.config.read_len,
-                ctx.config.coverage,
-                ctx.fragment_length_model,
-                ctx.config.long_reads,
-                keep_short,
-                &mut rng,
-            )?;
-            (filtered, haplotype_fragments)
-        } else {
-            (block_fragments, Vec::new())
-        };
-
     let mut contig_files_r1: Vec<PathBuf> = Vec::new();
     let mut contig_files_r2: Vec<PathBuf> = Vec::new();
 
@@ -1009,23 +968,6 @@ fn process_chunk(
                 &r1_adapter,
                 &r2_adapter,
             )?;
-            if !long_insertion_fragments.is_empty() {
-                let bam_stager: Option<&mut dyn BamRecordStager> = bam_body_writer
-                    .as_mut()
-                    .map(|w| w as &mut dyn BamRecordStager);
-                write_haplotype_paired_fragments(
-                    long_insertion_fragments,
-                    &mut buffer1,
-                    &mut buffer2,
-                    ctx.config.read_len,
-                    &read_name_prefix,
-                    &current_block.contig,
-                    ctx.quality_score_model,
-                    ctx.seq_error_model,
-                    &mut rng,
-                    bam_stager,
-                )?;
-            }
             contig_files_r1.push(file_to_write_1);
             contig_files_r2.push(file_to_write_2);
         } else {
@@ -1083,23 +1025,6 @@ fn process_chunk(
             &r1_adapter,
             &r2_adapter,
         )?;
-        if !long_insertion_fragments.is_empty() {
-            let bam_stager: Option<&mut dyn BamRecordStager> = bam_body_writer
-                .as_mut()
-                .map(|w| w as &mut dyn BamRecordStager);
-            write_haplotype_paired_fragments(
-                long_insertion_fragments,
-                &mut buf1,
-                &mut buf2,
-                ctx.config.read_len,
-                &read_name_prefix,
-                &current_block.contig,
-                ctx.quality_score_model,
-                ctx.seq_error_model,
-                &mut rng,
-                bam_stager,
-            )?;
-        }
     }
 
     // Flush and finalize the BAM body file; the bgzf EOF is written on drop.
@@ -2827,163 +2752,6 @@ fn append_info_tag(info: &mut Option<String>, tag: String) {
         Some(e) if !e.is_empty() && e != "." => format!("{e};{tag}"),
         _ => tag,
     });
-}
-
-/// Return the reference anchors owned by this chunk that carry a literal
-/// insertion longer than a read. Symbolic INS records are deliberately left to
-/// the structural-variant path; only literal inserted bases can be materialized
-/// into read sequences here.
-fn long_insertion_anchors(
-    mutated_map: &MutatedMap,
-    chunk_start: usize,
-    chunk_end: usize,
-    read_length: usize,
-) -> Vec<usize> {
-    let mut anchors: Vec<usize> = mutated_map
-        .variant_map
-        .values()
-        .filter(|variant| {
-            variant.variant_type == VariantType::Insertion
-                && variant.location >= chunk_start
-                && variant.location < chunk_end
-                && variant
-                    .alternate
-                    .as_literal()
-                    .and_then(|alt| alt.len().checked_sub(variant.reference.len()))
-                    .is_some_and(|novel_len| novel_len > read_length.saturating_sub(1))
-        })
-        .map(|variant| variant.location)
-        .collect();
-    anchors.sort_unstable();
-    anchors.dedup();
-    anchors
-}
-
-/// Generate paired reads around long literal insertions in expanded haplotype
-/// coordinates. Each fragment is materialized from the reference plus the
-/// inserted sequence, then carries baseline CIGAR operations for BAM staging.
-fn generate_long_insertion_fragments(
-    reference: &[Nucleotide],
-    mutated_map: &MutatedMap,
-    anchors: &[usize],
-    contig_len: usize,
-    chunk_start: usize,
-    chunk_end: usize,
-    read_length: usize,
-    coverage: usize,
-    fragment_model: &FragmentLengthModel,
-    long_reads: bool,
-    keep_short: bool,
-    rng: &mut NeatRng,
-) -> Result<Vec<HaplotypePairedFragment>, GenerateReadsError> {
-    let mut out = Vec::new();
-    let flank = read_length.saturating_mul(2).max(read_length);
-
-    for &anchor in anchors {
-        let variant = match mutated_map.variant_map.get(&anchor) {
-            Some(variant) => variant,
-            None => continue,
-        };
-        let alt = match variant.alternate.as_literal() {
-            Some(alt) => alt,
-            None => continue,
-        };
-        let inserted_len = match alt.len().checked_sub(variant.reference.len()) {
-            Some(len) if len > read_length.saturating_sub(1) => len,
-            _ => continue,
-        };
-        let inserted = &alt[variant.reference.len()..];
-        let map = match InsertionCoordinateMap::new(contig_len, anchor, inserted_len) {
-            Some(map) => map,
-            None => continue,
-        };
-
-        // The insertion is owned by its anchor chunk. Give the sampler a
-        // bounded reference flank on each side, while allowing the expanded
-        // interval to contain the complete inserted sequence.
-        let ref_start = anchor.saturating_sub(flank);
-        let ref_end = (anchor.saturating_add(1).saturating_add(flank)).min(contig_len);
-        if ref_end <= ref_start || ref_end > reference.len() {
-            continue;
-        }
-        let hap_start = map
-            .reference_base_to_haplotype(ref_start)
-            .unwrap_or(ref_start);
-        let hap_end = map
-            .reference_base_to_haplotype(ref_end - 1)
-            .unwrap_or(ref_end - 1)
-            .saturating_add(1);
-        if hap_end <= hap_start {
-            continue;
-        }
-
-        let fragments = generate_fragments(
-            hap_end - hap_start,
-            read_length,
-            0,
-            hap_start,
-            coverage,
-            true,
-            long_reads,
-            keep_short,
-            fragment_model,
-            rng,
-        )?;
-        let insertion_start = anchor + 1;
-        let insertion_end = insertion_start + inserted_len;
-
-        for (start, end) in fragments {
-            if start < hap_start
-                || end > hap_end
-                || start >= insertion_end
-                || end <= insertion_start
-                || end - start < read_length
-            {
-                continue;
-            }
-            let r1_start = start;
-            let r1_end = start + read_length;
-            let r2_start = end - read_length;
-            let r2_end = end;
-            let (r1_sequence, r1_segments) =
-                match map.materialize_interval(reference, inserted, r1_start, r1_end) {
-                    Some(value) => value,
-                    None => continue,
-                };
-            let (r2_sequence, r2_segments) =
-                match map.materialize_interval(reference, inserted, r2_start, r2_end) {
-                    Some(value) => value,
-                    None => continue,
-                };
-            if r1_sequence.len() != read_length || r2_sequence.len() != read_length {
-                continue;
-            }
-            let r1_position = map.haplotype_base_to_reference(r1_start).unwrap_or(anchor);
-            let r2_position = map.haplotype_base_to_reference(r2_start).unwrap_or(anchor);
-            let template_end = r2_position.saturating_add(read_length);
-            let template_length = template_end
-                .saturating_sub(r1_position)
-                .min(i32::MAX as usize) as i32;
-            out.push(HaplotypePairedFragment {
-                r1_sequence,
-                r1_baseline_ops: InsertionCoordinateMap::cigar_ops_for_segments(&r1_segments),
-                r1_position,
-                r2_sequence,
-                r2_baseline_ops: InsertionCoordinateMap::cigar_ops_for_segments(&r2_segments),
-                r2_position,
-                template_length,
-            });
-        }
-    }
-
-    // A chunk should never emit an anchor outside its ownership interval, but
-    // retain this guard as a cheap defence against future chunking changes.
-    debug_assert!(
-        anchors
-            .iter()
-            .all(|&anchor| anchor >= chunk_start && anchor < chunk_end)
-    );
-    Ok(out)
 }
 
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
