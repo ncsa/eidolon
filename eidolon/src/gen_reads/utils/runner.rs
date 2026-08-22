@@ -825,8 +825,16 @@ fn process_chunk(
                 if scaled == 0 {
                     continue;
                 }
+                // TODO(fragment-placement step 2): this is 0 (a true terminus) at every
+                // call site today, which is safe but not yet correct -- most of these
+                // sub-regions (SV coverage-multiplier intervals, BED targets) have real
+                // sequence continuing past them and should pass a real extension budget
+                // (e.g. contig_len - sub_end) instead. See generate_fragments's doc
+                // comment and docs/claude_engineering_audit.md SS5.6 (2026-08-22 addendum).
+                let extension_budget = 0;
                 let frags = if ctx.gc_bias_model.is_uniform() {
                     generate_fragments(
+                        extension_budget,
                         sub_end - sub_start,
                         ctx.config.read_len,
                         max_del_len,
@@ -840,6 +848,7 @@ fn process_chunk(
                     )?
                 } else {
                     generate_weighted_fragments(
+                        extension_budget,
                         current_block,
                         sub_start,
                         sub_end,
