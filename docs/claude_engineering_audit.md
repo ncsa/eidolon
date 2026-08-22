@@ -438,6 +438,40 @@ invented constant.**
 > direction it was wrong in. The guess was half wrong. The taxonomy entry stands; the
 > editorializing inside it did not survive contact with the data.
 
+> **⚠️ New finding, same taxonomy class (2026-08-22), from a live #516 fragment-placement
+> investigation** — the fragment placer's implicit depth-uniformity target had never been
+> checked against real aligned data either, in either direction: neither "is it worse than
+> a naive random placer" nor "how much worse than real sequencing should we expect."
+>
+> `cover_dataset` (`eidolon/src/gen_reads/utils/generate_fragments.rs`) sweeps fragments end
+> to end rather than sampling positions independently — never validated against anything.
+> Per-base depth variance-to-mean ratio (VMR; 1.0 = Poisson/uniform-random, real sequencing
+> is *higher* from GC/mappability/library-prep bias) measured on a synthetic 2Mb uniform-GC
+> reference at 30×: **0.226**, against 1.007–1.025 for a matched-N, matched-length uniform-
+> random control. A real aligned BAM already present on this workstation —
+> `/home/joshfactorial/code/data/na12878_chr22.bam`, GIAB NA12878/HG001, novoalign against
+> GRCh38 (`chr22 LN:50818468`, confirmed matching the local `chr22.fa`) — had never been used
+> for this comparison. It was, for the first time, across four independent 200kb windows:
+>
+> | | VMR | autocorrelation |
+> |---|---|---|
+> | eidolon (current `cover_dataset`, chr22:20.0–20.2Mb, 60×) | 0.282 | ACF<0.5 at lag 36bp; **goes negative** (−0.06 to −0.33) at lag 100–300bp |
+> | NA12878 chr22:20.0–20.2Mb | 8.983 | ACF<0.5 at lag ~600bp; still 0.56 at lag 500bp |
+> | NA12878 chr22:30.0–30.2Mb | 7.959 | — |
+> | NA12878 chr22:40.0–40.2Mb | 7.336 | — |
+> | NA12878 chr22:25.0–25.2Mb | 5.373 | — |
+>
+> Two distinct, independently-confirmed defects, not one: eidolon is **~20–30× less variable
+> than real data** in total, and its autocorrelation **goes negative** at 100–300bp lag — an
+> anti-clustering, comb-like regularity from the sweep's fixed spacing — where real data is
+> strongly *positively* correlated out past 500bp. The 1.0 "uniform-random" floor used
+> throughout the #516 placement-criteria tests (`release/fragment-placement`) is therefore a
+> correctness *floor*, confirmed here to be necessary (current output is 20–30× under even
+> that), but it is nowhere near the realism *target* real data implies (~5–9× that floor,
+> with kilobase-scale structure) — closing the second gap needs the GC-bias model
+> (`generate_weighted_fragments`, off by default, #576) and possibly more, not just the
+> placement fix. Filed as its own follow-on rather than assumed solved by the bug fix.
+
 ---
 
 ## 6. Case study: BND
