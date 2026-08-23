@@ -84,6 +84,25 @@ impl InsertionCoordinateMap {
         })
     }
 
+    /// Reference position at or after `haplotype_pos`.
+    ///
+    /// Unlike [`Self::haplotype_base_to_reference`] this is **total**: a position
+    /// inside the inserted sequence has no reference coordinate of its own, so it
+    /// yields the first reference base following the insertion. That makes it
+    /// usable for projecting a half-open *window* back to reference coordinates,
+    /// where a `None` would force the caller to give up and scan everything.
+    pub fn reference_floor(self, haplotype_pos: usize) -> usize {
+        let insertion_start = self.anchor + 1;
+        let insertion_end = insertion_start + self.insertion_len;
+        if haplotype_pos < insertion_start {
+            haplotype_pos
+        } else if haplotype_pos < insertion_end {
+            insertion_start
+        } else {
+            haplotype_pos - self.insertion_len
+        }
+    }
+
     pub fn segments_for(self, start: usize, end: usize) -> Option<Vec<HaplotypeSegment>> {
         if start >= end || end > self.haplotype_len() {
             return None;

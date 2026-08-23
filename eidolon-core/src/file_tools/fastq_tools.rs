@@ -201,7 +201,19 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     let frag_pad = if paired_ended { read_length } else { 32 };
     for (frag_idx, placed) in block_fragments.into_iter().enumerate() {
         let (start, end) = (placed.start, placed.end);
-        let hap = placed.haplotype.map(|i| &haplotypes[i]);
+        // An index the caller supplied but did not provide a context for is a
+        // programming error, not data-dependent: say which, rather than panicking
+        // with a bare out-of-bounds. (Hit exactly once while wiring this up, when
+        // the runner built its contexts but still passed an empty slice.)
+        let hap = match placed.haplotype {
+            None => None,
+            Some(i) => Some(haplotypes.get(i).ok_or_else(|| {
+                FastqToolsError::BamError(format!(
+                    "fragment references haplotype {i} but only {} were supplied",
+                    haplotypes.len()
+                ))
+            })?),
+        };
         // The span a fragment may be materialized over. For a reference fragment
         // that is the contig; for a haplotype fragment it is the contig plus the
         // inserted bases, which is exactly the extra width the insertion has.
@@ -276,13 +288,50 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // full-map scan made this O(fragments × variants) — pathological with
         // dense models (~220k SNVs on chr22 from the COSMIC tumor rate).
         let flagged = &block_map.flagged_positions;
+        // A variant whose allele is decided by HAPLOTYPE SAMPLING must not also be
+        // applied inline here, or it would be applied twice on the alt haplotype
+        // (once materialized, once by the per-variant coin) and, worse, applied at
+        // all on the reference haplotype — where by construction it is absent.
+        // Deciding it once, per fragment, is the whole point of sampling haplotypes
+        // rather than flipping a coin per read: it is what makes a heterozygous
+        // insertion actually come out at ~half depth.
+        let hap_anchor = |pos: usize| haplotypes.iter().any(|h| h.anchor == pos);
         // R1 window: [start, start + effective_read_len); var offset = pos - start.
-        let r1_lo = flagged.partition_point(|&p| p < start);
-        let r1_hi = flagged.partition_point(|&p| p < start + effective_read_len);
+        // For a haplotype fragment these are HAPLOTYPE offsets, so a reference
+        // variant position has to be projected before it can be located in the read.
+        let project = |pos: usize| -> Option<usize> {
+            match hap {
+                None => Some(pos),
+                Some(h) => h.map.reference_base_to_haplotype(pos),
+            }
+        };
+        // Project the read WINDOW back to reference coordinates rather than
+        // projecting every variant forward. The map is monotonic, so a haplotype
+        // window corresponds to a contiguous reference range -- which keeps the
+        // binary search over the sorted flagged positions. Scanning the whole
+        // variant map per fragment would be O(fragments x variants), the exact
+        // pathology the binary search was introduced to fix (~220k SNVs on chr22
+        // under the COSMIC tumor rate).
+        let ref_window = |lo: usize, hi: usize| -> (usize, usize) {
+            match hap {
+                None => (lo, hi),
+                Some(h) => (h.map.reference_floor(lo), h.map.reference_floor(hi)),
+            }
+        };
+        let (r1_ref_lo, r1_ref_hi) = ref_window(start, start + effective_read_len);
+        let r1_lo = flagged.partition_point(|&p| p < r1_ref_lo);
+        let r1_hi = flagged.partition_point(|&p| p < r1_ref_hi);
         for &pos in &flagged[r1_lo..r1_hi] {
-            let var_pos = pos - start;
-            read1_variants.insert(var_pos, &block_map.variant_map[&pos]);
-            reads1_flagged.push(var_pos);
+            if hap_anchor(pos) {
+                continue;
+            }
+            // Forward-project the handful of hits to locate them within the read.
+            let Some(proj) = project(pos) else { continue };
+            if proj >= start && proj < start + effective_read_len {
+                let var_pos = proj - start;
+                read1_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                reads1_flagged.push(var_pos);
+            }
         }
         // R2 window: [end - effective_read_len, end). R2 is generated in FORWARD
         // orientation over this right-end window (then the whole record is
@@ -291,12 +340,19 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // window start doesn't underflow.
         if paired_ended && end > effective_read_len {
             let w_lo = end - effective_read_len;
-            let r2_lo = flagged.partition_point(|&p| p < w_lo);
-            let r2_hi = flagged.partition_point(|&p| p < end);
+            let (r2_ref_lo, r2_ref_hi) = ref_window(w_lo, end);
+            let r2_lo = flagged.partition_point(|&p| p < r2_ref_lo);
+            let r2_hi = flagged.partition_point(|&p| p < r2_ref_hi);
             for &pos in &flagged[r2_lo..r2_hi] {
-                let var_pos = pos - w_lo;
-                read2_variants.insert(var_pos, &block_map.variant_map[&pos]);
-                reads2_flagged.push(var_pos);
+                if hap_anchor(pos) {
+                    continue;
+                }
+                let Some(proj) = project(pos) else { continue };
+                if proj >= w_lo && proj < end {
+                    let var_pos = proj - w_lo;
+                    read2_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                    reads2_flagged.push(var_pos);
+                }
             }
         }
 
@@ -412,7 +468,12 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // valid alignment. The bases still reach the FASTQ — they are real reads.
         if r1_ref_pos.is_none() {
             r1_record.is_unmapped = true;
-            r1_record.cigar_ops.clear();
+            // Soft-clip the whole read rather than emptying the CIGAR: `S` consumes
+            // query but not reference, which is exactly "these bases exist, none of
+            // them align". An empty CIGAR is what SAM writes as `*`, but this
+            // writer's encoder turns an empty op list into `1M`, and noodles then
+            // rejects the record for a read-length/sequence-length mismatch.
+            r1_record.cigar_ops = vec!['S'; r1_record.sequence.len()];
         }
         // R1 adapter readthrough: pad a short-insert read to read_length at its 3' end.
         if adapters_on {
@@ -477,7 +538,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 Ok(mut record) => {
                     if r2_ref_pos.is_none() {
                         record.is_unmapped = true;
-                        record.cigar_ops.clear();
+                        record.cigar_ops = vec!['S'; record.sequence.len()];
                     }
                     // Flip to the reverse mate FIRST, then append the R2 adapter at
                     // the (now 3') end — so R2 carries the R2 adapter in read
@@ -505,6 +566,35 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         } else {
             None
         };
+
+        // Allelic depth for a haplotype-sampled insertion. `generate_read` no
+        // longer sees these variants (their allele is decided per fragment, not
+        // per read), so nothing else would count them and the golden VCF would
+        // report DP=0 for the event -- which is exactly what the reverted attempt
+        // shipped. Count each fragment once, against the anchor it covers, on
+        // whichever haplotype it was drawn from.
+        for h in haplotypes {
+            let covers_anchor = match hap {
+                // Alt haplotype: the anchor is the base immediately before the
+                // inserted sequence, so a fragment drawn from this haplotype
+                // supports the insertion when its span reaches that anchor.
+                Some(active) if active.anchor == h.anchor => {
+                    let anchor_hap = active.map.reference_base_to_haplotype(h.anchor);
+                    anchor_hap.is_some_and(|a| a >= start && a < end)
+                }
+                // Reference haplotype (or a different insertion's): this fragment
+                // carries the reference allele across the anchor.
+                _ => h.anchor >= start && h.anchor < end,
+            };
+            if !covers_anchor {
+                continue;
+            }
+            let entry = ad_counter.entry(h.anchor + ref_start).or_insert((0, 0));
+            match hap {
+                Some(active) if active.anchor == h.anchor => entry.1 += 1,
+                _ => entry.0 += 1,
+            }
+        }
 
         if let Some(r2_record) = r2_record.as_mut() {
             // Both realized CIGARs are available only here, before either mate

@@ -161,10 +161,22 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
         "expected ≥1 de novo literal Insertion record (per #190); got 0 in: {body:?}"
     );
 
-    // #516 END-TO-END: no de novo insertion may declare more novel bases than a read can
-    // carry. This is the assertion the cap exists for — the unit tests pin the filter, this
-    // pins that the filter is actually WIRED INTO the de novo path and reaches the truth VCF.
-    // Without it, deleting the call site would leave every other assertion here green.
+    // #516 END-TO-END, now INVERTED. This assertion used to pin the opposite — that no
+    // de novo insertion could declare more novel bases than `read_len - 1`, because
+    // fragments were placed in reference offsets and so could never begin inside a
+    // zero-reference-width event. The interim cap that enforced that has been removed:
+    // long insertions are sampled in altered-haplotype coordinates now, where the
+    // inserted sequence has width, so there is no length beyond which the reads cannot
+    // support the declared SVLEN.
+    //
+    // Keeping an assertion here (rather than deleting one) matters for the same reason
+    // the original gave: it pins that the de novo path actually reaches the new
+    // behaviour. If the cap were reinstated — or the sampler stopped being wired in —
+    // every other assertion in this test would stay green while long de novo insertions
+    // silently vanished from the truth VCF again.
+    //
+    // This pins PLANTING only. Whether the inserted sequence reaches the reads is a
+    // separate question, pinned in eidolon/tests/long_insertion_rework.rs.
     let max_novel = config.read_len - 1;
     let oversized: Vec<(usize, &&String)> = body
         .iter()
@@ -181,9 +193,10 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
         })
         .collect();
     assert!(
-        oversized.is_empty(),
-        "de novo insertion(s) declare more novel bases than read_len-1={max_novel}, which the \
-         reads cannot carry (#516): {oversized:?}"
+        !oversized.is_empty(),
+        "no de novo insertion exceeds read_len-1={max_novel}. At this SV rate the model \
+         draws them well past a read length, so seeing none means they are being dropped \
+         — the #516 cap is back, or the de novo path is not reaching haplotype sampling."
     );
 
     // ── FASTQ assertions ───────────────────────────────────────────────────

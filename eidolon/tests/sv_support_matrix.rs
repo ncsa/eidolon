@@ -759,23 +759,27 @@ fn large_literal_insertions_reach_the_reads() {
         }
     }
 
-    // CHARACTERIZATION of the open bug. Beyond ~a read length, an insertion's interior and
-    // far end are never sequenced while the truth VCF keeps declaring the full SVLEN — so a
-    // benchmark built from this data asserts insertions the reads cannot support. Filed as
-    // #516. Same family as #498 (BND insert dropped) and #474 (a fragment spanning a whole
-    // DUP needs a stitch the fragment builder cannot express). It is why campaign 20925151
-    // measured Manta INS recall at 1/22: only the 61bp event had evidence for its declared
-    // length, and Manta called only that one.
+    // FIXED, and now guarded. This block used to be a CHARACTERIZATION of #516,
+    // asserting the inverse — that beyond ~a read length an insertion's interior and
+    // far end were never sequenced while the truth VCF kept declaring the full SVLEN.
+    // It is why campaign 20925151 measured Manta INS recall at 1/22: only the 61bp
+    // event had evidence for its declared length, and Manta called only that one.
     //
-    // If any of these starts finding reads, the bug is FIXED: promote the size into the
-    // guards above and delete it from here.
+    // Long insertions are now sampled in altered-haplotype coordinates, where the
+    // inserted sequence HAS width and a fragment can begin inside it, so the whole
+    // event reaches the reads. Flipped per this block's own former instructions
+    // ("promote the size into the guards above"). The properties that make the fix
+    // CORRECT rather than merely present — zygosity, allelic depth, neighbouring
+    // variants, BAM validity, read-name uniqueness, fragment-length robustness —
+    // are pinned separately in `eidolon/tests/long_insertion_rework.rs`, because the
+    // previous attempt satisfied this cell while breaking all six of them.
     for &(size, _, m, t) in &carried {
         if size >= 200 {
-            assert_eq!(
-                (m, t),
-                (0, 0),
-                "{size}bp insertion now reaches the reads mid-sequence or at its tail \
-                 (middle={m}, tail={t}) — #516 may be FIXED."
+            assert!(
+                m > 0 && t > 0,
+                "{size}bp insertion no longer reaches the reads mid-sequence or at its \
+                 tail (middle={m}, tail={t}) — this is a REGRESSION of #516, not the old \
+                 known gap."
             );
         }
     }
