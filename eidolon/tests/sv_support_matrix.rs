@@ -497,13 +497,18 @@ fn depth_modulation_is_accurate_at_realistic_scale() {
         out
     };
 
-    let dup_record = format!("synth1\t{anchor}\tv\tA\t<DUP>\t60\tPASS\tSVTYPE=DUP;END={end};SVLEN={svlen}\tGT\t0/1");
+    let dup_record = format!(
+        "synth1\t{anchor}\tv\tA\t<DUP>\t60\tPASS\tSVTYPE=DUP;END={end};SVLEN={svlen}\tGT\t0/1"
+    );
     let control = run("control", &[]);
     let dup = run("dup", &[dup_record]);
 
     let a = mean_depth_single_contig(&dup, anchor + margin, end - margin);
     let b = mean_depth_single_contig(&control, anchor + margin, end - margin);
-    assert!(b > 10.0, "control depth {b} implausibly low — fixture broken");
+    assert!(
+        b > 10.0,
+        "control depth {b} implausibly low — fixture broken"
+    );
     let got = a / b;
     eprintln!("[realistic-scale] 100kb het DUP delivered {got:.3} against declared 1.50");
     assert!(
