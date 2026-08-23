@@ -247,6 +247,76 @@ fn long_insertions_reach_interior_and_tail() {
     );
 }
 
+// ── CRITERION 1b: SEVERAL long insertions on one contig ─────────────────────
+// The natural way to test long insertions is to plant a size range at once, and
+// `input_vcf` is the documented path for planting specific events -- so two or
+// more long insertions sharing a contig is the common case, not an edge case.
+// It is also exactly the scenario validated on Delta on 2026-08-22 (200/600/1200bp
+// on one S. cerevisiae contig).
+//
+// This is RED for the first implementation of the rework, which sampled one
+// altered haplotype per sub-region and fell back to the pre-#516 head-only
+// behaviour whenever a sub-region held more than one. Sub-regions are large -- a
+// whole contig, split only by coverage multipliers -- so that fallback caught
+// every multi-insertion case: measured head 10/14/15, middle 0/0/0, tail 0/0/0.
+
+#[test]
+fn several_long_insertions_on_one_contig_are_all_realized() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Distinct novel sequence per event, so a probe cannot be satisfied by the
+    // wrong insertion.
+    let sizes = [200usize, 600, 1200];
+    let inserts: Vec<String> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let mut s = String::with_capacity(n);
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15u64.wrapping_add((i as u64).wrapping_mul(7919));
+            for _ in 0..n {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                s.push(match (x >> 33) & 3 {
+                    0 => 'A',
+                    1 => 'C',
+                    2 => 'G',
+                    _ => 'T',
+                });
+            }
+            s
+        })
+        .collect();
+    // Spaced far apart, but all inside the one non-N region of this contig.
+    let anchors = [400usize, 900, 1500];
+    let records: Vec<String> = anchors
+        .iter()
+        .zip(inserts.iter())
+        .enumerate()
+        .map(|(i, (&pos, ins))| ins_record(pos, ins, "1/1", &format!("ins{i}")))
+        .collect();
+
+    let cell = run(tmp.path(), "multi", &records, "");
+
+    let mut failures = Vec::new();
+    for (i, (&size, ins)) in sizes.iter().zip(inserts.iter()).enumerate() {
+        let head = cell.seq_hits(&ins[..30]);
+        let mid = cell.seq_hits(&ins[size / 2 - 15..size / 2 + 15]);
+        let tail = cell.seq_hits(&ins[size - 30..]);
+        eprintln!("[multi #{i} {size}bp] head={head} middle={mid} tail={tail}");
+        if head == 0 || mid == 0 || tail == 0 {
+            failures.push(format!(
+                "#{i} ({size}bp): head={head} middle={mid} tail={tail}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "insertions sharing a contig are not all fully realized -- a coordinate map \
+         describing only ONE insertion makes the others fall back to head-only:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
 // ── CRITERION 2: zygosity ───────────────────────────────────────────────────
 // The reverted implementation called generate_read with an EMPTY variant map, so the
 // heterozygous coin never ran and 0/1 rendered identically to 1/1. Measured then:

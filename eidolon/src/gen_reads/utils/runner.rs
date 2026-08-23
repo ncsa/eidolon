@@ -900,94 +900,97 @@ fn process_chunk(
                     })
                     .collect();
 
-                let mut alt_plan: Option<(usize, usize, usize)> = None; // (hap_idx, alt_cov, novel_len)
+                // Build ONE alt haplotype carrying every long insertion in this
+                // sub-region. An earlier version handled a single insertion and fell
+                // back to the pre-#516 head-only behaviour for the rest; because
+                // sub-regions are large (a whole contig, split only by coverage
+                // multipliers), that caught the ordinary case of planting a size range
+                // at once via input_vcf -- measured on 200/600/1200bp sharing a contig:
+                // middle and tail both zero for all three.
+                //
+                // Insertions are grouped by their alt fraction. Two insertions at the
+                // same fraction belong on the same molecule; two at different fractions
+                // (a het and a hom, say) do not, and giving each group its own haplotype
+                // keeps each event's dosage independent rather than averaging them.
                 let mut ref_cov = scaled;
-                match long_ins.as_slice() {
-                    [] => {}
-                    [v] => {
-                        let novel_len = v
-                            .alternate
-                            .as_literal()
-                            .and_then(|a| a.len().checked_sub(v.reference.len()))
-                            .unwrap_or(0);
-                        // Mirror the allele semantics generate_read uses for a
-                        // literal variant, so haplotype sampling and inline
-                        // application agree: an explicit allele_fraction wins,
-                        // otherwise homozygous is always alt and heterozygous is a
-                        // half-and-half split.
-                        let f = match v.allele_fraction {
+                let mut alt_plans: Vec<(usize, usize)> = Vec::new(); // (hap_idx, alt_cov)
+                if !long_ins.is_empty() {
+                    // Mirror the allele semantics generate_read uses for a literal
+                    // variant, so haplotype sampling and inline application agree: an
+                    // explicit allele_fraction wins, otherwise homozygous is always alt
+                    // and heterozygous is a half-and-half split.
+                    let fraction_of = |v: &Variant| -> f64 {
+                        match v.allele_fraction {
                             Some(f) => f.clamp(0.0, 1.0),
                             None => match v.genotype {
                                 Genotype::Homozygous => 1.0,
                                 Genotype::Heterozygous => 0.5,
                             },
-                        };
-                        if let Some(map) =
-                            InsertionCoordinateMap::new(contig_len, v.location, novel_len)
-                        {
-                            let alt_cov = scale_coverage(scaled, f);
-                            ref_cov = scaled.saturating_sub(alt_cov);
-                            if alt_cov > 0 {
-                                haplotypes.push(HaplotypeContext {
-                                    map,
-                                    inserted: v.alternate.as_literal().unwrap()
-                                        [v.reference.len()..]
-                                        .to_vec(),
-                                    anchor: v.location,
-                                });
-                                alt_plan = Some((haplotypes.len() - 1, alt_cov, novel_len));
-                            }
                         }
+                    };
+                    // Group by fraction, keyed to the nearest thousandth so ordinary
+                    // float noise does not split a group that is conceptually one.
+                    let mut groups: std::collections::BTreeMap<u64, Vec<&Variant>> =
+                        std::collections::BTreeMap::new();
+                    for v in &long_ins {
+                        let key = (fraction_of(v) * 1000.0).round() as u64;
+                        groups.entry(key).or_default().push(v);
                     }
-                    many => {
-                        // The coordinate map describes ONE insertion. Two in a single
-                        // sub-region would need a composed map; rather than silently
-                        // realizing only one (or corrupting both), fall back to the
-                        // pre-#516 behaviour and say so, so a partially-realized
-                        // insertion is never mistaken for a working one.
-                        // MEASURED frequency, recorded because the first estimate of it
-                        // was wrong by orders of magnitude. This fires only when several
-                        // long insertions pack into ONE sub-region, which needs an SV
-                        // rate far above anything realistic:
-                        //   default germline model, 5Mb, sv_rate_scale=8  -> 10,124 SVs
-                        //     sampled (overlap rejection saturated), 440 long INS, 64 of
-                        //     them in fallback regions
-                        //   COSMIC tumour model, 5Mb, sv_rate_scale=30    -> 3 SVs,
-                        //     ZERO INS, ZERO fallbacks
-                        // The second is what the Delta SV pipeline actually runs
-                        // (TUMOR_MODEL=cosmic_v104_pancancer_model.json.gz); a full-chr22
-                        // smoke run at that setting produced 1 INS in total. So in
-                        // practice this path is near-unreachable, and it is the default
-                        // germline model at high rate_scale that reaches it -- not the
-                        // tumour configuration the validation campaigns use.
-                        warn!(
-                            "{contig_name}: {} long insertions share one sub-region \
-                             [{sub_start},{sub_end}); haplotype sampling handles one at \
-                             a time, so these keep the pre-#516 head-only behaviour \
-                             (#516)",
-                            many.len()
-                        );
+                    let mut spent = 0usize;
+                    for (key, members) in groups {
+                        let f = key as f64 / 1000.0;
+                        let entries: Vec<(usize, Vec<Nucleotide>)> = members
+                            .iter()
+                            .filter_map(|v| {
+                                let alt = v.alternate.as_literal()?;
+                                Some((v.location, alt.get(v.reference.len()..)?.to_vec()))
+                            })
+                            .collect();
+                        let Some(map) = InsertionCoordinateMap::new(contig_len, entries) else {
+                            // Refused only for genuinely ambiguous input (two insertions
+                            // anchored at the same base, an anchor off the contig). Say
+                            // so: these events keep the pre-#516 head-only behaviour and
+                            // must not be mistaken for working ones.
+                            warn!(
+                                "{contig_name}: could not build a haplotype for {} long \
+                                 insertion(s) in [{sub_start},{sub_end}) — they keep the \
+                                 pre-#516 head-only behaviour (#516)",
+                                members.len()
+                            );
+                            continue;
+                        };
+                        let alt_cov = scale_coverage(scaled, f);
+                        if alt_cov == 0 {
+                            continue;
+                        }
+                        spent += alt_cov;
+                        haplotypes.push(HaplotypeContext { map });
+                        alt_plans.push((haplotypes.len() - 1, alt_cov));
                     }
+                    ref_cov = scaled.saturating_sub(spent);
                 }
 
-                if let Some((hap_idx, alt_cov, novel_len)) = alt_plan {
-                    // Same sub-region, expressed on the alt haplotype: every
-                    // coordinate at or past the anchor shifts by the inserted length.
+                for (hap_idx, alt_cov) in alt_plans {
+                    // The same sub-region expressed on the alt haplotype. Ask the map
+                    // to project both boundaries rather than computing the shift by
+                    // hand: with several insertions the span grows by however many of
+                    // them fall inside, and that arithmetic is exactly what the map
+                    // exists to get right. The extra width is what lets a fragment
+                    // BEGIN inside inserted sequence, which reference coordinates
+                    // cannot express at all.
                     let h = &haplotypes[hap_idx];
-                    // The same sub-region on the alt haplotype: coordinates at or
-                    // past the anchor shift by the inserted length, and the span
-                    // itself is longer by that amount exactly when the anchor falls
-                    // inside it. That extra width is what lets a fragment begin in
-                    // the insertion's interior, which reference coordinates cannot
-                    // express at all.
-                    let anchor_inside = h.anchor >= sub_start && h.anchor < sub_end;
-                    let hap_start = if sub_start <= h.anchor {
-                        sub_start
-                    } else {
-                        sub_start + novel_len
-                    };
-                    let hap_span =
-                        (sub_end - sub_start) + if anchor_inside { novel_len } else { 0 };
+                    let hap_start = h
+                        .map
+                        .reference_base_to_haplotype(sub_start)
+                        .unwrap_or(sub_start);
+                    // sub_end is exclusive, so project the last included base and add
+                    // one; projecting sub_end itself would fall off the contig end.
+                    let hap_end = h
+                        .map
+                        .reference_base_to_haplotype(sub_end.saturating_sub(1))
+                        .map(|p| p + 1)
+                        .unwrap_or_else(|| h.map.haplotype_len());
+                    let hap_span = hap_end.saturating_sub(hap_start);
                     let alt_frags = generate_fragments(
                         extension_budget,
                         hap_span,

@@ -148,12 +148,10 @@ impl From<(usize, usize)> for PlacedFragment {
 /// one literal insertion spliced into the reference.
 #[derive(Debug, Clone)]
 pub struct HaplotypeContext {
+    /// Describes every insertion on this haplotype and owns their novel bases, so
+    /// an interval spanning more than one materializes without the caller
+    /// tracking which sequence belongs to which anchor.
     pub map: InsertionCoordinateMap,
-    /// The novel bases only — what the ALT adds beyond the anchor base.
-    pub inserted: Vec<Nucleotide>,
-    /// Block-local reference position of the insertion's anchor, so allelic depth
-    /// is attributed to the right variant.
-    pub anchor: usize,
 }
 
 pub fn write_block_fastq<B1: Write, B2: Write>(
@@ -231,12 +229,10 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let fragment: &[Nucleotide] = match hap {
             None => sequence_block.get_subseq_slice(start, padded_end)?,
             Some(h) => {
-                let Some((bases, segments)) = h.map.materialize_interval(
-                    &sequence_block.sequence,
-                    &h.inserted,
-                    start,
-                    padded_end,
-                ) else {
+                let Some((bases, segments)) =
+                    h.map
+                        .materialize_interval(&sequence_block.sequence, start, padded_end)
+                else {
                     // The map disagrees with the sequence it was built for, or the
                     // interval is degenerate. Skipping is right (the alternative is
                     // emitting reads from a coordinate space that does not exist),
@@ -295,7 +291,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // Deciding it once, per fragment, is the whole point of sampling haplotypes
         // rather than flipping a coin per read: it is what makes a heterozygous
         // insertion actually come out at ~half depth.
-        let hap_anchor = |pos: usize| haplotypes.iter().any(|h| h.anchor == pos);
+        let hap_anchor = |pos: usize| haplotypes.iter().any(|h| h.map.anchors().any(|a| a == pos));
         // R1 window: [start, start + effective_read_len); var offset = pos - start.
         // For a haplotype fragment these are HAPLOTYPE offsets, so a reference
         // variant position has to be projected before it can be located in the read.
@@ -414,7 +410,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // located at the event it came from. Falling back to the insertion anchor
         // covers the (rare) case where BOTH mates lie inside the inserted sequence.
         let anchor_fallback = match hap {
-            Some(h) => h.anchor + ref_start,
+            Some(h) => h.map.anchors().next().unwrap_or(start) + ref_start,
             None => abs_start,
         };
         let r1_pos = r1_ref_pos.or(r2_ref_pos).unwrap_or(anchor_fallback);
@@ -574,25 +570,27 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // shipped. Count each fragment once, against the anchor it covers, on
         // whichever haplotype it was drawn from.
         for h in haplotypes {
-            let covers_anchor = match hap {
-                // Alt haplotype: the anchor is the base immediately before the
-                // inserted sequence, so a fragment drawn from this haplotype
-                // supports the insertion when its span reaches that anchor.
-                Some(active) if active.anchor == h.anchor => {
-                    let anchor_hap = active.map.reference_base_to_haplotype(h.anchor);
-                    anchor_hap.is_some_and(|a| a >= start && a < end)
+            for anchor in h.map.anchors() {
+                // Is this fragment drawn from the very haplotype carrying this
+                // insertion? If so its coordinates are in that haplotype's space
+                // and the anchor has to be projected before it can be located.
+                let on_this_haplotype = hap.is_some_and(|active| std::ptr::eq(active, h));
+                let covers_anchor = if on_this_haplotype {
+                    h.map
+                        .reference_base_to_haplotype(anchor)
+                        .is_some_and(|a| a >= start && a < end)
+                } else {
+                    anchor >= start && anchor < end
+                };
+                if !covers_anchor {
+                    continue;
                 }
-                // Reference haplotype (or a different insertion's): this fragment
-                // carries the reference allele across the anchor.
-                _ => h.anchor >= start && h.anchor < end,
-            };
-            if !covers_anchor {
-                continue;
-            }
-            let entry = ad_counter.entry(h.anchor + ref_start).or_insert((0, 0));
-            match hap {
-                Some(active) if active.anchor == h.anchor => entry.1 += 1,
-                _ => entry.0 += 1,
+                let entry = ad_counter.entry(anchor + ref_start).or_insert((0, 0));
+                if on_this_haplotype {
+                    entry.1 += 1;
+                } else {
+                    entry.0 += 1;
+                }
             }
         }
 
