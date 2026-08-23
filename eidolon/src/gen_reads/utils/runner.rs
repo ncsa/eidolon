@@ -825,13 +825,26 @@ fn process_chunk(
                 if scaled == 0 {
                     continue;
                 }
-                // TODO(fragment-placement step 2): this is 0 (a true terminus) at every
-                // call site today, which is safe but not yet correct -- most of these
-                // sub-regions (SV coverage-multiplier intervals, BED targets) have real
-                // sequence continuing past them and should pass a real extension budget
-                // (e.g. contig_len - sub_end) instead. See generate_fragments's doc
-                // comment and docs/claude_engineering_audit.md SS5.6 (2026-08-22 addendum).
-                let extension_budget = 0;
+                // How far real sequence continues past this sub-region's own
+                // right edge, up to the contig's true end -- including across
+                // a coverage-multiplier boundary (a narrow SV's own edge).
+                // That measurably redistributes some of a narrow segment's
+                // own declared depth to its neighbor (confirmed a real
+                // redistribution, not a bug: total read count and R1/R2
+                // totals are exactly conserved against a Terminal-everywhere
+                // placement; ownership counts and cover_dataset's own
+                // placement are both exact) -- and confirmed to vanish at
+                // realistic scale: a 1200bp event on H1N1's ~400bp flanks
+                // needed a 1.13x correction, the same event on a real chr22
+                // window (megabase flanks) needed 1.07x, a realistic 100kb
+                // event needed 1.003x. No compensation belongs here; a
+                // multiplier-boundary guard was tried and reverted, since it
+                // fixes small-scale depth accuracy at the cost of
+                // reintroducing the zero/near-zero-output cliff for SVs
+                // narrower than the fragment-length scale. See
+                // docs/claude_engineering_audit.md §5.6's 2026-08-22 addendum
+                // and docs/sv_polish_roadmap.md's Phase 1 item 1.
+                let extension_budget = contig_len.saturating_sub(sub_end);
                 let frags = if ctx.gc_bias_model.is_uniform() {
                     generate_fragments(
                         extension_budget,

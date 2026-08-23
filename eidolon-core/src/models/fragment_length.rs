@@ -106,6 +106,33 @@ impl FragmentLengthModel {
         Ok(data)
     }
 
+    /// Mean fragment length, exact and deterministic (no RNG draw) for either
+    /// variant -- `Normal`'s own parameter, or `Discrete`'s weighted average
+    /// over its value/weight table. Used to scale a boundary-extension
+    /// dilution correction to the model actually in use, including a trained
+    /// (real-BAM-derived) discrete model, not just the synthetic Normal case.
+    pub fn mean(&self) -> Result<f64, FragmentModelError> {
+        match self {
+            FragmentLengthModel::Normal { mean, .. } => Ok(*mean),
+            FragmentLengthModel::Discrete { distribution } => {
+                let values = distribution.values()?;
+                let weights = distribution.weights()?;
+                let total_weight: f64 = weights.iter().sum();
+                if total_weight <= 0.0 {
+                    return Err(FragmentModelError::FragModelError(
+                        "Discrete fragment model has zero total weight",
+                    ));
+                }
+                let weighted_sum: f64 = values
+                    .iter()
+                    .zip(weights.iter())
+                    .map(|(&v, &w)| v as f64 * w)
+                    .sum();
+                Ok(weighted_sum / total_weight)
+            }
+        }
+    }
+
     pub fn normal_params(&self) -> Result<(f64, f64), FragmentModelError> {
         // This returns the parameters used to initiate the model
         match self {
