@@ -263,10 +263,26 @@ fn ratio_vs_control(dir: &Path, name: &str, records: &[&str], control: &Path) ->
     a / b
 }
 
+/// Same as `ratio_vs_control`, averaged over `n` independent seeds. A single seed at
+/// this fixture's scale (H1N1, 1200bp event, 400bp margin) is noisy enough to flip a
+/// borderline case: a 3-seed spread of [1.259, 1.347, 1.377] measured for dup_het
+/// during the release/fragment-placement investigation (2026-08-22) means any ONE of
+/// those draws alone could read anywhere from "fine" to "clearly off" depending on
+/// which one the test happens to land on. Averaging is what makes the tolerance below
+/// mean what it says instead of depending on luck.
+fn ratio_vs_control_averaged(dir: &Path, label: &str, record: &str, replicates: usize) -> f64 {
+    let mut ratios = Vec::with_capacity(replicates);
+    for i in 0..replicates {
+        let control = run_cell(dir, &format!("{label}_ctl_{i}"), &[]);
+        let r = ratio_vs_control(dir, &format!("{label}_var_{i}"), &[record], &control);
+        ratios.push(r);
+    }
+    ratios.iter().sum::<f64>() / ratios.len() as f64
+}
+
 #[test]
 fn copy_number_events_scale_depth_as_declared() {
     let tmp = tempfile::tempdir().unwrap();
-    let control = run_cell(tmp.path(), "control", &[]);
 
     // (label, record, expected multiplier)
     let del_het = rec("DEL", "SVTYPE=DEL;END=1700;SVLEN=-1200", "0/1", "v");
@@ -290,13 +306,40 @@ fn copy_number_events_scale_depth_as_declared() {
     let mut report = String::new();
     let mut failures = Vec::new();
     for (label, record, expected) in cases {
-        let got = ratio_vs_control(tmp.path(), label, &[record], &control);
+        let got = if expected == 0.0 {
+            // Degenerate case: a single replicate is enough, the multiplier is 0 either
+            // way and there's no boundary-scale effect to average out.
+            let control = run_cell(tmp.path(), &format!("{label}_ctl"), &[]);
+            ratio_vs_control(tmp.path(), label, &[record], &control)
+        } else {
+            ratio_vs_control_averaged(tmp.path(), label, record, 3)
+        };
         report.push_str(&format!(
             "  {label:9} expected {expected:.2}  got {got:.2}\n"
         ));
-        // Tolerance covers Poisson noise AND the known ~8% over-delivery of #499. The
-        // point of this test is that the multiplier is *applied and roughly right* —
-        // #499 pins the 8% separately, so tightening here would duplicate it.
+        // Tolerance covers Poisson noise plus a real, understood, SCALE-DEPENDENT
+        // boundary effect -- not one mechanism but (at least) two, both vanishing at
+        // realistic event/genome size, both irrelevant to genome-scale campaigns:
+        //
+        //   1. Chimeric junction reads land outside the coverage-multiplied budget
+        //      (#499): excess scales ~1/event_length, ~8% at this fixture's 1200bp,
+        //      confirmed negligible (~0.3%) at 100kb on a real chr22 window.
+        //   2. Fragment placement (release/fragment-placement, 2026-08-22) now lets a
+        //      fragment's end extend past its owning coverage-multiplier segment into
+        //      a differently-multiplied neighbor -- correct and necessary (it is what
+        //      removes an artificial dead zone at every such boundary), but it costs
+        //      some of the segment's own declared depth to redistribution. The size
+        //      the ~20% tolerance needs to cover for THIS fixture specifically: at
+        //      1200bp on H1N1 (narrow ~400bp flanks), correction needed ~1.13; the
+        //      SAME 1200bp event on a real chr22 window with megabase-scale flanks
+        //      needs only ~1.07; at a realistic 100kb event size, ~1.003 (see
+        //      `depth_modulation_is_accurate_at_realistic_scale` below, and
+        //      docs/claude_engineering_audit.md SS5.6's 2026-08-22 addendum).
+        //
+        // H1N1 cannot host an event "much larger than the fragment length" AND leave
+        // wide flanks at the same time -- the contig is 2280bp. This test's job is
+        // "the multiplier is applied and roughly right", fast; it is not, and cannot
+        // be, a precision check at this scale.
         let ok = if expected == 0.0 {
             got < 0.02
         } else {
@@ -314,22 +357,268 @@ fn copy_number_events_scale_depth_as_declared() {
     );
 }
 
+/// Same as `mean_depth`, for a BAM whose reference has exactly one contig -- avoids
+/// depending on the H1N1 fixture's `contigs()` index, which a standalone synthetic
+/// reference (see `depth_modulation_is_accurate_at_realistic_scale`) is not part of.
+fn mean_depth_single_contig(out: &Path, start: usize, end: usize) -> f64 {
+    let file = std::fs::File::open(out.join("o.bam")).expect("bam produced");
+    let mut reader = bam::io::Reader::new(file);
+    reader.read_header().unwrap();
+    let mut depth = vec![0u32; end - start + 1];
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        if rec.reference_sequence_id().is_none() {
+            continue;
+        }
+        let Some(Ok(pos)) = rec.alignment_start() else {
+            continue;
+        };
+        let mut span = 0usize;
+        for op in rec.cigar().iter() {
+            let op = op.unwrap();
+            if matches!(
+                op.kind(),
+                Kind::Match
+                    | Kind::Deletion
+                    | Kind::Skip
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch
+            ) {
+                span += op.len();
+            }
+        }
+        let (s, e) = (pos.get(), pos.get() + span.saturating_sub(1));
+        if e < start || s > end {
+            continue;
+        }
+        for p in s.max(start)..=e.min(end) {
+            depth[p - start] += 1;
+        }
+    }
+    depth.iter().map(|&d| d as f64).sum::<f64>() / depth.len() as f64
+}
+
+/// Deterministic pseudo-random ACGT sequence, same generator as `synthetic_insert`
+/// below, used here to build a whole standalone reference rather than an insert.
+fn synthetic_sequence(n: usize) -> String {
+    let mut s = String::with_capacity(n);
+    let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+    for _ in 0..n {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        s.push(match (x >> 33) & 3 {
+            0 => 'A',
+            1 => 'C',
+            2 => 'G',
+            _ => 'T',
+        });
+    }
+    s
+}
+
+fn write_fasta(path: &Path, contig: &str, seq: &str) {
+    let mut out = String::with_capacity(seq.len() + seq.len() / 60 + 16);
+    out.push('>');
+    out.push_str(contig);
+    out.push('\n');
+    for chunk in seq.as_bytes().chunks(60) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push('\n');
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// REGRESSION GUARD for the assembly-gap boundary. `regions_of_interest` is built
+/// from `get_non_n_regions()`, so N bases are deliberately excluded from read
+/// generation -- but fragment placement is allowed to extend a fragment's END past
+/// its owning region's edge (that is what removes the artificial dead zone at chunk
+/// and coverage-multiplier boundaries). An assembly gap is the one boundary that
+/// extension must treat as a true terminus, or reads carry fabricated gap sequence.
+///
+/// Caught in review of the fragment-placement branch, then measured: 103 of 6000
+/// reads contained `N` on a reference with a 2 kb gap, against 0 both before that
+/// branch and at its step 1 (before extension was wired into runner.rs) -- so it
+/// was introduced by the extension wiring specifically, and is not pre-existing.
+/// Nothing in the suite covered N-gaps at all, which is why it reached a PR;
+/// `docs/sv_polish_roadmap.md`'s Phase 1 item 3 had already flagged that blind spot.
 #[test]
-fn coverage_modulation_over_delivers_by_about_eight_percent() {
-    // CHARACTERIZATION of #499. Only the degenerate multipliers (0 = emit nothing,
-    // 1 = change nothing) are exact; everything requiring real scaling runs ~8% high.
-    // If this test starts FAILING, #499 was probably fixed — verify, then tighten
-    // `copy_number_events_scale_depth_as_declared` and delete this test.
+fn fragments_do_not_extend_across_an_assembly_gap() {
     let tmp = tempfile::tempdir().unwrap();
-    let control = run_cell(tmp.path(), "control", &[]);
-    let cnv4 = rec("CNV", "SVTYPE=CNV;END=1700;SVLEN=1200;CN=4", "0/1", "v");
-    let got = ratio_vs_control(tmp.path(), "cnv4_bias", &[cnv4.as_str()], &control);
-    let bias = got / 2.00;
-    eprintln!("[#499] CN=4 delivered {got:.3} against an expected 2.00 (bias {bias:.3})");
+    let (left, gap, right) = (5_000usize, 2_000usize, 5_000usize);
+    let contig_len = left + gap + right;
+
+    // [0, 5000) real | [5000, 7000) N | [7000, 12000) real
+    let mut seq = synthetic_sequence(left);
+    seq.push_str(&"N".repeat(gap));
+    seq.push_str(&synthetic_sequence(right));
+    let reference = tmp.path().join("ngap.fa");
+    write_fasta(&reference, "ngap1", &seq);
+
+    let out = tmp.path().join("run");
+    std::fs::create_dir_all(&out).unwrap();
+    let cfg = out.join("c.yml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 2\npaired_ended: true\n\
+             fragment_mean: 250\nfragment_st_dev: 30\n\
+             produce_vcf: false\nproduce_fastq: false\nproduce_bam: true\n\
+             sv_rate_scale: 0.0\nmutation_rate: 0.0\noverwrite_output: true\n\
+             output_dir: {out}\noutput_filename: o\nrng_seed: ngap guard\nnum_threads: 1\n",
+            ref = reference.display(),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(&cfg)
+        .assert()
+        .success();
+
+    // Read the BAM directly rather than the FASTQ: a placed read's reference span is
+    // the thing that must not enter the gap, and grepping sequence for 'N' would also
+    // be satisfied by a sequencing-error N, which is a different mechanism.
+    let file = std::fs::File::open(out.join("o.bam")).expect("bam produced");
+    let mut reader = bam::io::Reader::new(file);
+    reader.read_header().unwrap();
+    let (mut total, mut into_gap) = (0usize, 0usize);
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        let Some(Ok(pos)) = rec.alignment_start() else {
+            continue;
+        };
+        let mut span = 0usize;
+        for op in rec.cigar().iter() {
+            let op = op.unwrap();
+            if matches!(
+                op.kind(),
+                Kind::Match
+                    | Kind::Deletion
+                    | Kind::Skip
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch
+            ) {
+                span += op.len();
+            }
+        }
+        total += 1;
+        // 1-based inclusive read span vs the 1-based gap [left+1, left+gap].
+        let (rs, re) = (pos.get(), pos.get() + span.saturating_sub(1));
+        if rs <= left + gap && re > left {
+            into_gap += 1;
+        }
+    }
+
     assert!(
-        bias > 1.03,
-        "CN=4 delivered {got:.3} (bias {bias:.3}) — if this is now ~1.00, #499 is FIXED: \
-         tighten copy_number_events_scale_depth_as_declared and remove this test"
+        total > 100,
+        "fixture produced too few reads ({total}) to be meaningful"
+    );
+    assert_eq!(
+        into_gap,
+        0,
+        "{into_gap} of {total} reads overlap the assembly gap at [{}, {}] -- fragment \
+         extension crossed an N-region boundary, so those reads carry fabricated gap \
+         sequence. Extension must stop at a gap even though it correctly crosses chunk \
+         and coverage-multiplier boundaries.",
+        left + 1,
+        left + gap
+    );
+    // Must-not-fire half: the gap must not have suppressed generation elsewhere.
+    assert!(
+        contig_len > 0 && total >= 4_000,
+        "expected roughly full coverage of the two real intervals, got {total} reads"
+    );
+}
+
+/// CONFIRMS the size-dependence recorded above and in
+/// docs/claude_engineering_audit.md §5.6 (2026-08-22 addendum) at the scale that
+/// actually matters: H1N1 cannot host a "much larger than fragment length" event with
+/// wide flanks at the same time (it is 2280bp total), so `copy_number_events_scale_
+/// depth_as_declared` can only ever be a fast "roughly right" mechanism check, never a
+/// precision one. This test is the precision check, on a standalone 1Mb synthetic
+/// reference (generated here, not checked in) with a 100kb event and wide flanks on
+/// both sides -- matching the `docs/sv_polish_roadmap.md` item 1 size sweep
+/// (1kb/100kb/1Mb) this investigation finally ran. Measured during that investigation:
+/// correction needed was ~1.13 at H1N1 scale (1200bp event, ~400bp flanks), ~1.07 for
+/// the SAME 1200bp event with megabase flanks (a real chr22 window), and ~1.003 at
+/// 100kb with megabase flanks -- confirming the effect is real, understood (chimeric
+/// junction reads outside the coverage-multiplied budget, plus fragments legitimately
+/// extending across a coverage-multiplier boundary), and irrelevant at genome scale.
+#[test]
+fn depth_modulation_is_accurate_at_realistic_scale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let contig_len = 1_000_000usize;
+    let anchor = 400_000usize; // 1-based POS
+    let svlen = 100_000usize;
+    let end = anchor + svlen;
+    let margin = 1_000usize;
+
+    let reference = tmp.path().join("synthetic.fa");
+    write_fasta(&reference, "synth1", &synthetic_sequence(contig_len));
+
+    let run = |name: &str, records: &[String]| -> PathBuf {
+        let out = tmp.path().join(name);
+        std::fs::create_dir_all(&out).unwrap();
+        let vcf = out.join("in.vcf");
+        let mut text = format!(
+            "##fileformat=VCFv4.2\n##contig=<ID=synth1,length={contig_len}>\n\
+             ##ALT=<ID=DUP,Description=\"dup\">\n\
+             ##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"x\">\n\
+             ##INFO=<ID=END,Number=1,Type=Integer,Description=\"x\">\n\
+             ##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"x\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+        );
+        for r in records {
+            text.push_str(r);
+            text.push('\n');
+        }
+        std::fs::write(&vcf, text).unwrap();
+
+        let cfg = out.join("c.yml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 2\npaired_ended: true\n\
+                 fragment_mean: 250\nfragment_st_dev: 30\ninput_vcf: {vcf}\n\
+                 produce_vcf: false\nproduce_fastq: false\nproduce_bam: true\n\
+                 sv_rate_scale: 0.0\noverwrite_output: true\n\
+                 output_dir: {out}\noutput_filename: o\nrng_seed: realistic {name}\n\
+                 num_threads: 4\n",
+                ref = reference.display(),
+                vcf = vcf.display(),
+                out = out.display(),
+            ),
+        )
+        .unwrap();
+        eidolon()
+            .args(["gen-reads", "-c"])
+            .arg(&cfg)
+            .assert()
+            .success();
+        out
+    };
+
+    let dup_record = format!(
+        "synth1\t{anchor}\tv\tA\t<DUP>\t60\tPASS\tSVTYPE=DUP;END={end};SVLEN={svlen}\tGT\t0/1"
+    );
+    let control = run("control", &[]);
+    let dup = run("dup", &[dup_record]);
+
+    let a = mean_depth_single_contig(&dup, anchor + margin, end - margin);
+    let b = mean_depth_single_contig(&control, anchor + margin, end - margin);
+    assert!(
+        b > 10.0,
+        "control depth {b} implausibly low — fixture broken"
+    );
+    let got = a / b;
+    eprintln!("[realistic-scale] 100kb het DUP delivered {got:.3} against declared 1.50");
+    assert!(
+        (got / 1.5 - 1.0).abs() < 0.10,
+        "100kb het DUP with wide flanks delivered {got:.3}, expected ~1.50 within 10% -- \
+         if this is failing, the boundary effect documented above no longer vanishes at \
+         realistic scale, which would be a real regression worth investigating"
     );
 }
 

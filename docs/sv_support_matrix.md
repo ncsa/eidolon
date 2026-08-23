@@ -326,6 +326,50 @@ DEL hom  0.00 vs 0.00   exact        DUP hom  2.17 vs 2.00   (1.084)
 `coverage_multiplier_for` returns the correct values; the gap is between the requested
 multiplier and the depth actually delivered. Mechanism not diagnosed — see #499.
 
+> **Update 2026-08-23 — mechanism diagnosed, and it is size-dependent.** #499 is closed.
+> Two effects contribute, both boundary effects, both shrinking as the event grows
+> relative to the fragment length: chimeric junction reads landing outside the
+> coverage-multiplied budget (#499's own, excess ~`1/event_length`), and fragments
+> legitimately extending across the event's coverage-multiplier boundary into its
+> neighbours (introduced with the fragment-placement rewrite, and the thing that removes
+> an artificial dead zone at every such boundary). See the size guidance below.
+
+### How big does an SV need to be for its declared depth to be accurate?
+
+**Rule of thumb: depth multipliers land within ~1% for events ≳10× the fragment length.
+Below ~5×, expect several percent of under-delivery. On a small contig it is worse,
+because the flanking baseline is narrow too.**
+
+Measured, het `<DUP>` (declared 1.50×), `read_len: 100`, `fragment_mean: 250`,
+3 seeds averaged except where noted:
+
+| event | ÷ fragment_mean | flanks | delivered / declared |
+|---|---|---|---|
+| 1,200 bp (H1N1_PB2, 2,280 bp contig) | 4.8× | ~400 bp | **88%** |
+| 1,200 bp (real chr22 window) | 4.8× | megabases | **93%** |
+| 1,500–4,000 bp (synthetic 2 Mb) | 6–16× | megabases | **99–101%** |
+| 100,000 bp (real chr22 window) | 400× | megabases | **99.7%** |
+
+Read this conservatively: the 1,200 bp (93%) against 1,500 bp (~100%) difference is
+within seed-to-seed noise at that scale, so the useful signal is the trend, not any
+single row. What the table does establish is that both ends are real — a
+fragment-length-scale event genuinely loses several percent, and a realistic event
+genuinely does not.
+
+**Practical guidance:**
+
+- **Validating depth-multiplier accuracy** (DEL/DUP/CNV dosage, copy-ratio callers): use
+  events ≳10× fragment length on a reference with wide flanking sequence. The
+  `depth_modulation_is_accurate_at_realistic_scale` test does exactly this and is the
+  reference measurement.
+- **Small references** (viral genomes, small scaffolds, the H1N1 fixture) cannot host an
+  event much larger than the fragment length *and* leave wide flanks — H1N1 is 2,280 bp
+  total. They remain excellent for fast mechanism checks and are used that way
+  throughout this file, but they should not be used to validate depth *precision*.
+- **Small SVs on any reference** carry the same few-percent under-delivery. If you are
+  simulating sub-kilobase events and depend on their exact dosage, measure it rather
+  than assuming the declared multiplier.
+
 ---
 
 ## Whole-genome tier — de novo, scored by callers

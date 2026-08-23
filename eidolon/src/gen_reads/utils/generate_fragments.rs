@@ -15,6 +15,20 @@ use eidolon_core::structs::sequence_block::SequenceBlock;
 use log::*;
 
 pub fn generate_fragments(
+    // How far past `sequence_length` (local, region-relative) real sequence
+    // continues: 0 means `sequence_length` IS the true end of what can be
+    // materialized (a genuine terminus -- a fragment whose length would run
+    // past it is discarded, not clipped, not redrawn, which reproduces the
+    // real shotgun-sampling depth ramp there); a positive value means real
+    // sequence continues that far past the ownership boundary (ownership
+    // still governs where a fragment's START may fall and how many fragments
+    // this call places -- only the END may run into it). Every current call
+    // site passes 0 -- wiring real per-call values (chunk/BED/SV boundaries
+    // that are NOT termini) is the next step, not yet done here. See
+    // release/fragment-placement (commits ecdebff, e1a1629) for why this
+    // matters: reject-and-redraw and clip both manufacture an artificial dead
+    // zone at any boundary this is 0 for but real sequence continues past.
+    extension_budget: usize,
     sequence_length: usize,
     read_length: usize,
     max_del_len: usize,
@@ -102,6 +116,7 @@ pub fn generate_fragments(
     // Generate a vector of read positions
     debug!("Generating read coordinates.");
     let fragments: Vec<(usize, usize)> = cover_dataset(
+        extension_budget,
         sequence_length,
         read_length,
         num_frags,
@@ -111,7 +126,26 @@ pub fn generate_fragments(
     )?;
 
     if fragments.is_empty() {
-        debug!("No fragments generated!");
+        if num_frags > 0 {
+            // A hard failure, not a WARNING-and-move-on: a region that was
+            // supposed to receive `num_frags` fragments and got zero produces
+            // zero reads, zero depth, silently -- exactly the "denominator"
+            // shape this project has been burned by before (#450, #451).
+            // Most likely cause today: extension_budget=0 (every current
+            // call site) on a region smaller than the fragment-length
+            // distribution's typical scale -- correct for a true terminus
+            // that size, wrong for a BED target or SV sub-region that isn't
+            // one. See generate_fragments's extension_budget doc comment and
+            // docs/claude_engineering_audit.md §5.6's 2026-08-22 addendum.
+            warn!(
+                "Placed 0/{num_frags} fragments in a {sequence_length}bp region \
+                 (extension_budget={extension_budget}) -- this region will carry ZERO \
+                 depth. If this region is not a true sequence terminus, its caller needs \
+                 a real extension_budget, not 0."
+            );
+        } else {
+            debug!("No fragments generated!");
+        }
         Ok(Vec::new())
     } else {
         Ok(fragments)
@@ -185,16 +219,32 @@ fn build_gc_weight_prefix_sum(
     Ok(Some(prefix_sum))
 }
 
-/// Samples a 0-based position offset from the prefix-sum CDF using a single uniform draw.
-fn sample_from_prefix_sum(
+/// Samples a 0-based position offset from a prefix-sum CDF, restricted to
+/// positions `< limit` (a per-draw bound from the length-first sampling
+/// below: a fragment's length is known before its position is chosen, so the
+/// valid position range shrinks with it). `limit` is clamped to the prefix
+/// sum's own length so a caller need not separately intersect the GC-window
+/// bound with the length bound.
+/// Returns `None` if no position is valid at all (`limit == 0` or the
+/// region's total weight in that restricted range is zero).
+fn sample_from_prefix_sum_restricted(
     prefix_sum: &[f64],
-    total_weight: f64,
+    limit: usize,
     rng: &mut NeatRng,
-) -> Result<usize, GenerateReadsError> {
-    let v = rng.random()? * total_weight;
-    // Find the last index k where prefix_sum[k] <= v, i.e. the interval [k, k+1) containing v.
-    let k = prefix_sum.partition_point(|&ps| ps <= v).saturating_sub(1);
-    Ok(k)
+) -> Result<Option<usize>, GenerateReadsError> {
+    let limit = limit.min(prefix_sum.len() - 1);
+    if limit == 0 {
+        return Ok(None);
+    }
+    let restricted_total = prefix_sum[limit];
+    if restricted_total == 0.0 {
+        return Ok(None);
+    }
+    let v = rng.random()? * restricted_total;
+    let k = prefix_sum[..=limit]
+        .partition_point(|&ps| ps <= v)
+        .saturating_sub(1);
+    Ok(Some(k))
 }
 
 /// Generates fragments for a region by sampling start positions directly from a per-position
@@ -209,6 +259,13 @@ fn sample_from_prefix_sum(
 /// regions. When `normalize` is false the fragment count equals what a uniform sequencer
 /// would generate, and coverage will be proportionally lower in low-weight regions.
 pub fn generate_weighted_fragments(
+    // See `generate_fragments`'s `extension_budget` doc for the full design
+    // rationale (release/fragment-placement, commits ecdebff, e1a1629). Same
+    // meaning here: 0 = `region_end` is a true terminus (a fragment that
+    // would run past it is discarded, not clipped, not redrawn); positive =
+    // real sequence continues that far past `region_end`, and a fragment's
+    // end may run freely into it. Every current call site passes 0.
+    extension_budget: usize,
     sequence_block: &SequenceBlock,
     region_start: usize,
     region_end: usize,
@@ -284,35 +341,63 @@ pub fn generate_weighted_fragments(
         return Ok(Vec::new());
     }
 
-    // Keep sampling until num_frags fragments are placed so that fragment model
-    // rejection and edge clamping don't silently reduce coverage.
-    let max_attempts = num_frags.saturating_mul(10);
-    let mut attempts = 0;
+    // LENGTH FIRST, then position -- draw the fragment's length before its
+    // start, so the valid start range (and, here, the restricted slice of the
+    // position-weight CDF to sample from) can be computed from it directly.
+    // A length that cannot fit before `region_len + extension_budget` is
+    // DISCARDED, never clipped and never redrawn: clipping was measured to
+    // truncate the realized length distribution near a short region's edge
+    // (mean 300 -> 232.6, sd 30 -> 69.4 on a 400bp region), and redrawing
+    // manufactures a permanent dead zone at any boundary this treats as a
+    // terminus when it is not (P(reject) = 100% for a start within one
+    // read_length of the edge, measured directly). Discarding without a
+    // replacement draw is what a real molecule terminus actually looks like:
+    // some fragments that WOULD have covered that position simply were never
+    // sheared there in the first place. `num_frags` is therefore now an
+    // upper bound realized on interior/extendable regions and a legitimate,
+    // real depth reduction near an actual terminus -- not a bug either way.
+    let far_limit = region_len + extension_budget;
+    const MAX_LENGTH_ATTEMPTS: usize = 10;
     let mut fragments = Vec::with_capacity(num_frags);
-    while fragments.len() < num_frags && attempts < max_attempts {
-        let offset = sample_from_prefix_sum(&prefix_sum, total_weight, rng)?;
+    for _ in 0..num_frags {
+        let mut frag_len = 0usize;
+        for _ in 0..MAX_LENGTH_ATTEMPTS {
+            let candidate = fragment_model.generate_fragment(rng.random()?)?;
+            if candidate > 0 && (long_reads || keep_short || candidate >= read_length) {
+                frag_len = candidate;
+                break;
+            }
+        }
+        if frag_len == 0 {
+            continue; // model kept producing unusable lengths; skip this slot
+        }
+        if frag_len > far_limit {
+            continue; // cannot fit anywhere in this region even at offset 0
+        }
+        let start_limit = region_len.min(far_limit - frag_len + 1);
+        let offset = match sample_from_prefix_sum_restricted(&prefix_sum, start_limit, rng)? {
+            Some(o) => o,
+            None => continue, // zero weight in the range this length permits
+        };
         let start = region_start + offset;
-        let frag_len = fragment_model.generate_fragment(rng.random()?)?;
-        attempts += 1;
-        if !long_reads && !keep_short && frag_len < read_length {
-            continue;
-        }
-        let end = (start + frag_len).min(region_end);
-        if end == start {
-            continue;
-        }
-        if !long_reads && !keep_short && end - start < read_length {
-            continue;
-        }
-        fragments.push((start, end));
+        fragments.push((start, start + frag_len));
     }
-    if fragments.len() < num_frags {
+    if fragments.is_empty() && num_frags > 0 {
+        // See generate_fragments's identical guard for why this is a warn!,
+        // not a debug! -- a region that places 0/num_frags carries zero
+        // depth silently, which is the exact "denominator" shape #450/#451
+        // already burned this project once.
         warn!(
-            "GC-weighted fragment generation placed {}/{} fragments after {} attempts; \
-             coverage may be below target in this region.",
+            "Placed 0/{num_frags} GC-weighted fragments in a {region_len}bp region \
+             (extension_budget={extension_budget}) -- this region will carry ZERO depth. \
+             If this region is not a true sequence terminus, its caller needs a real \
+             extension_budget, not 0."
+        );
+    } else if fragments.len() < num_frags {
+        debug!(
+            "GC-weighted fragment generation placed {}/{} in this region (some fragments              could not fit before the region's boundary at their drawn length).",
             fragments.len(),
-            num_frags,
-            attempts
+            num_frags
         );
     }
 
@@ -321,87 +406,70 @@ pub fn generate_weighted_fragments(
 }
 
 fn cover_dataset(
+    // See `generate_fragments`'s doc comment for the full rationale
+    // (release/fragment-placement, commits ecdebff, e1a1629). 0 = span_length
+    // is a true terminus; positive = real sequence continues that far past
+    // it, and a fragment's end may run freely into it.
+    extension_budget: usize,
     span_length: usize,
-    read_length: usize,
+    // No longer used inside this function: the caller's pool-building step
+    // already filters lengths against read_length before they ever reach
+    // here. Kept as a parameter for call-site/signature stability.
+    _read_length: usize,
     target_count: usize,
     read_start: usize,
-    mut fragment_pool: Vec<usize>,
+    fragment_pool: Vec<usize>,
     rng: &mut NeatRng,
 ) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
-    // Places exactly target_count fragments so that mean depth equals the requested
-    // coverage. Stopping on fragment count rather than sweep count means the wildcard
-    // gap can be proportional to read_length without reducing mean coverage.
-    // Alternates sweep direction (3' to 5' then 5' to 3') for better realism.
-
-    rng.shuffle_in_place(&mut fragment_pool)?;
+    // LENGTH FIRST, then position, drawn independently and uniformly at
+    // random each time -- no sweep, no sequential pool cycling. Both of
+    // those were measured to cause the defects this replaces:
+    //   - sequential cycling through a shuffled pool correlates realized
+    //     length with position on a short span (only entries that happen to
+    //     fit get reused), collapsing a 60-entry pool to as few as 3 distinct
+    //     realized lengths;
+    //   - the sweep's fixed spacing and edge-anchored origins produce
+    //     per-base depth variance-to-mean ~0.2-0.3 against ~1.0 for
+    //     independent random placement (measured on a 2Mb synthetic
+    //     reference, matching a real NA12878 comparison whose OWN VMR was
+    //     5.4-9.0 -- so ~1.0 is a floor this restores, not a realism target;
+    //     see docs/claude_engineering_audit.md SS5.6's 2026-08-22 addendum).
+    //
+    // A length that cannot fit before `span_length + extension_budget` from
+    // some valid start is DISCARDED, never redrawn -- see the module-level
+    // note above the test criteria for why redrawing is wrong (it recreates
+    // an artificial dead zone at any boundary this treats as a terminus when
+    // real sequence actually continues past it).
+    if fragment_pool.is_empty() || span_length == 0 {
+        return Ok(Vec::new());
+    }
+    let far_limit = span_length + extension_budget;
     let pool_size = fragment_pool.len();
-    let mut pool_idx = 0usize;
     let mut fragment_set: Vec<(usize, usize)> = Vec::with_capacity(target_count);
-    let mut pos = (rng.rand_int()? as usize) % (read_length / 4).max(1);
-    let mut forward = true;
-    let mut non_placing_streak = 0usize;
 
-    while fragment_set.len() < target_count {
-        let fragment_length = fragment_pool[pool_idx];
-        pool_idx += 1;
-        if pool_idx == pool_size {
-            pool_idx = 0;
+    for _ in 0..target_count {
+        // Sample a fresh, uniformly-random pool entry each draw (with
+        // replacement), not a sequential cycle through a fixed shuffled
+        // order -- the pool is itself an i.i.d. sample from the fragment
+        // model, so this stays a fair sample of it regardless of the span.
+        let idx = (rng.rand_u32()? as usize) % pool_size;
+        let length = fragment_pool[idx];
+        if length == 0 || length > far_limit {
+            continue; // cannot fit anywhere in this span even at offset 0
         }
-
-        let (start, end) = if forward {
-            (pos, pos + fragment_length)
-        } else {
-            (pos.saturating_sub(fragment_length), pos)
-        };
-
-        if (forward && end > span_length) || (!forward && start == 0 && pos < fragment_length) {
-            // Sweep complete, reverse direction and pick a random starting offset.
-            forward = !forward;
-            pos = if forward {
-                (rng.rand_u32()? as usize) % (read_length / 4).max(1)
-            } else {
-                span_length - (rng.rand_u32()? as usize) % (read_length / 4).max(1)
-            };
-
-            // Only count fragments that can NEVER fit (length > span), not fragments
-            // that merely overshot from a high start position and will fit after restart.
-            if fragment_length > span_length {
-                non_placing_streak += 1;
-                // If we've seen pool_size consecutive fragments that are each individually
-                // larger than the span, every fragment in the pool is too large — break.
-                if non_placing_streak >= pool_size {
-                    debug!(
-                        "All fragments exceed span of {} bp; stopping early with {} fragments placed.",
-                        span_length,
-                        fragment_set.len()
-                    );
-                    break;
-                }
-            } else {
-                non_placing_streak = 0;
-            }
+        // Valid starts satisfy BOTH: within the ownership span [0, span_length),
+        // and leaving room for the whole fragment before far_limit. Whichever
+        // cap is tighter wins -- away from a true terminus (large
+        // extension_budget) the ownership cap always wins, so start is
+        // uniform across the FULL span regardless of length; near one, the
+        // room cap thins placement close to the edge, which is the real,
+        // expected depth ramp there, not an artifact.
+        let start_hi = span_length.min(far_limit - length + 1);
+        if start_hi == 0 {
             continue;
         }
-        non_placing_streak = 0;
-
-        fragment_set.push((start + read_start, end + read_start));
-        // Halved from read_length/4 to read_length/8 to tighten spacing between consecutive
-        // fragment placements, reducing systematic coverage gaps between sweep passes.
-        let wildcard = (rng.rand_u32()? % (read_length as u32 / 8).max(1)) as usize;
-
-        if forward {
-            pos = end + wildcard;
-            if pos >= span_length {
-                forward = false;
-                pos = span_length - (rng.rand_u32()? as usize) % (read_length / 4).max(1);
-            }
-        } else {
-            pos = start.saturating_sub(wildcard);
-            if pos == 0 {
-                forward = true;
-                pos = (rng.rand_u32()? as usize) % (read_length / 4).max(1);
-            }
-        }
+        let start = (rng.rand_u32()? as usize) % start_hi;
+        fragment_set.push((start + read_start, start + length + read_start));
     }
 
     fragment_set.sort_by_key(|&(s, _)| s);
@@ -428,6 +496,13 @@ pub(crate) fn prototype_insertion_read_windows(
         return Ok(Vec::new());
     }
     let fragments = cover_dataset(
+        // extension_budget = 0: this prototype samples the inserted sequence as a
+        // self-contained span, and its test asserts every window satisfies
+        // `end <= insertion_len`. Whether a real insertion's far edge is a terminus
+        // or continues into reference sequence is precisely the question the #516
+        // rework has to answer when this is wired up for real -- it is deliberately
+        // not decided here.
+        0,
         insertion_len,
         read_length,
         target_count,
@@ -659,6 +734,7 @@ mod tests {
         .unwrap();
         let target_count = span_length * coverage / read_length;
         let cover = cover_dataset(
+            0,
             span_length,
             read_length,
             target_count,
@@ -686,6 +762,7 @@ mod tests {
         .unwrap();
         let target_count = span_length / read_length * coverage;
         let cover = cover_dataset(
+            0,
             span_length,
             read_length,
             target_count,
@@ -711,6 +788,7 @@ mod tests {
         .unwrap();
         let fragment_model = FragmentLengthModel::default().unwrap();
         let reads = generate_fragments(
+            0,
             2000,
             read_length,
             0,
@@ -741,6 +819,7 @@ mod tests {
         .unwrap();
         let fragment_model = FragmentLengthModel::default().unwrap();
         let run1 = generate_fragments(
+            0,
             sequence.len(),
             read_length,
             0,
@@ -763,6 +842,7 @@ mod tests {
         .unwrap();
         let fragment_model = FragmentLengthModel::default().unwrap();
         let run2 = generate_fragments(
+            0,
             sequence.len(),
             read_length,
             0,
@@ -792,6 +872,7 @@ mod tests {
         .unwrap();
         let fragment_model = FragmentLengthModel::default().unwrap();
         let reads = generate_fragments(
+            0,
             seq_len,
             read_length,
             0,
@@ -832,6 +913,7 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["pool-fill-test".to_string()]).unwrap();
         let fragment_model = FragmentLengthModel::new_normal(600.0, 30.0).unwrap();
         let reads = generate_fragments(
+            0,
             seq_len,
             read_length,
             0,
@@ -864,6 +946,7 @@ mod tests {
         let mut rng = make_rng();
 
         let result = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             50,
@@ -897,6 +980,7 @@ mod tests {
         let mut rng = make_rng();
 
         let result = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             500,
@@ -927,6 +1011,7 @@ mod tests {
         let mut rng = make_rng();
 
         let fragments = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             2000,
@@ -958,6 +1043,7 @@ mod tests {
         let mut rng = make_rng();
 
         let fragments = generate_weighted_fragments(
+            0,
             &sequence_block,
             region_start,
             region_end,
@@ -998,6 +1084,7 @@ mod tests {
 
         let mut rng1 = make_rng();
         let run1 = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             2000,
@@ -1016,6 +1103,7 @@ mod tests {
 
         let mut rng2 = make_rng();
         let run2 = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             2000,
@@ -1048,6 +1136,7 @@ mod tests {
 
         let mut rng = make_rng();
         let unnormalized = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             10000,
@@ -1066,6 +1155,7 @@ mod tests {
 
         let mut rng = make_rng();
         let normalized = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             10000,
@@ -1106,6 +1196,7 @@ mod tests {
 
         let mut rng = make_rng();
         let result = generate_weighted_fragments(
+            0,
             &sequence_block,
             0,
             sequence_block.sequence.len(),
@@ -1149,6 +1240,7 @@ mod tests {
         let mut rng = make_rng();
 
         let result = generate_weighted_fragments(
+            0,
             &sequence_block,
             region_start,
             region_end,
@@ -1187,6 +1279,7 @@ mod tests {
 
         let target_count = span_length * coverage / read_length;
         let result = cover_dataset(
+            0,
             span_length,
             read_length,
             target_count,
@@ -1298,6 +1391,7 @@ mod tests {
         let mut rng = make_rng();
 
         let fragments = cover_dataset(
+            0,
             span_length,
             read_length,
             target_count,
@@ -1345,6 +1439,7 @@ mod tests {
         let mut rng = make_rng();
 
         let fragments = cover_dataset(
+            0,
             span_length,
             read_length,
             target_count,
@@ -1382,6 +1477,7 @@ mod tests {
         let fragment_model = FragmentLengthModel::new_normal(450.0, 50.0).unwrap();
 
         let fragments = generate_fragments(
+            0,
             span_length,
             read_length,
             0,
@@ -1435,6 +1531,7 @@ mod tests {
         let gc_bias_model = GcBiasModel::default(); // Uniform
 
         let fragments = generate_weighted_fragments(
+            0,
             &block,
             0,
             span_length,
@@ -1491,6 +1588,7 @@ mod tests {
         let gc_bias_model = GcBiasModel::from_weights(weights, read_length).unwrap();
 
         let fragments = generate_weighted_fragments(
+            0,
             &block,
             0,
             span_length,
@@ -1531,6 +1629,670 @@ mod tests {
             avg_depth > (coverage as f64 * 0.9),
             "Normalization failed to maintain coverage: {}",
             avg_depth
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // RESOLVED DESIGN (supersedes the "two bounds" framing in the previous
+    // commit's message). Simulated in Python, not yet implemented here:
+    // https://github.com/ncsa/eidolon (see release/fragment-placement history
+    // for the full simulation). Summary of what was checked and why it
+    // matters, since the two prior candidates both produce a measurable
+    // ARTIFICIAL dead zone at an ownership boundary where none should exist:
+    //
+    //   Draw LENGTH first, then constrain the START range based on whether
+    //   real sequence continues past the far boundary:
+    //     - EXTENDABLE boundary (an arbitrary line: BED target edge, SV
+    //       sub-region edge, chunk boundary -- real sequence continues past
+    //       it) -> start drawn uniformly over the FULL ownership interval,
+    //       independent of the drawn length; the end may run past the
+    //       boundary into that real flanking sequence. Never rejected.
+    //     - TRUE boundary (the actual start/end of the contig/molecule --
+    //       no sequence exists past it) -> start is drawn uniformly over
+    //       [region_start, region_end - length); if length > region length,
+    //       this candidate is discarded WITHOUT a replacement draw (fewer
+    //       fragments are realized near that end, not zero, and not clipped).
+    //
+    // This is NOT "reject-and-redraw" (which retries until something fits,
+    // discussed and rejected two commits back) and NOT "clip" (which
+    // truncates the sampled fragment to the boundary). Both of those apply the
+    // TRUE-boundary rule to EVERY boundary, which is what manufactures a dead
+    // zone at ownership lines that real, continuous DNA does not have.
+    //
+    // MEASURED (Python simulation, two adjacent 1500bp regions inside a
+    // 3000bp molecule, region A's right edge marked extendable into B, B's
+    // right edge marked as the true molecule end; seam/interior depth ratio,
+    // 1.0 = no artifact):
+    //   reject-and-redraw:    seam/interior = 0.12  (an 88% dead zone)
+    //   clip-at-boundary:     seam/interior = 0.77  (a 23% dead zone)
+    //   length-first/extend:  seam/interior = 1.08  (no dead zone, noise-level)
+    // At the TRUE end, length-first/extend reproduced the textbook
+    // Lander-Waterman ramp-to-zero of a direct single-molecule ground-truth
+    // simulation (no region split at all), rather than eliminating it --
+    // that ramp is real shotgun-sampling physics, not a bug, and only
+    // belongs at an actual molecule terminus, never at an arbitrary line.
+    //
+    // BONUS: this requires no rejection loop at all, which resolves the
+    // "reject-and-redraw can be slow or loop near a boundary" concern
+    // structurally rather than by bounding attempts. It is also very likely
+    // the same fix needed for cover_dataset's own length-fidelity and depth-
+    // VMR failures below -- both call for exactly this: draw from the real
+    // model every time (no pool cycling), position independently (no sweep).
+    // Confirming that on the actual Rust implementation, against the criteria
+    // already committed here, is the next piece of work, not yet done.
+    // ───────────────────────────────────────────────────────────────────────
+
+    // ───────────────────────────────────────────────────────────────────────
+    // FRAGMENT PLACEMENT CRITERIA (#TBD).
+    //
+    // `cover_dataset` cycles `fragment_pool` and silently drops any draw that
+    // does not fit the span, substituting one that does. `non_placing_streak`
+    // only trips on CONSECUTIVE oversized draws, so when most of the pool is
+    // too large it never fires: the loop grinds out `target_count` from the
+    // placeable tail. Sweep origins are additionally pinned within
+    // `read_length / 4` of a span edge, so those few lengths are laid down from
+    // the same place every pass.
+    //
+    // The count comes out exact, which is why every pre-existing test here
+    // passes. What collapses is the DISTRIBUTION, in three ways, each asserted
+    // below against a known answer that is independent of the implementation:
+    //
+    //   1. realized fragment lengths must be a fair sample of `fragment_pool`
+    //   2. starts must reach the whole span, not pile at its 5' edge
+    //   3. per-base depth must not be far less variable than a random placer
+    //
+    // MEASURED before the fix (eidolon output, not these unit tests):
+    //   200 bp BED target, model N(250,30) -> realized mean 186.0, sd 0.4,
+    //     3 distinct lengths in 60 fragments; all 60 starts inside 15 bp.
+    //   200 bp <DUP> sub-region -> 91 of 120 starts in an 8 bp window.
+    //   2 Mb contig at 30x -> per-base depth VMR 0.226, against 1.007/1.025/
+    //     1.016 for uniform-random placement with identical N and identical
+    //     length pool.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// A generous extension budget for tests that model an ARBITRARY ownership
+    /// boundary (a BED target, an SV coverage-multiplier sub-region, a chunk
+    /// edge) where real sequence genuinely continues past it -- as opposed to
+    /// `0`, which means the boundary is a true terminus. Every current
+    /// production call site passes `0` (see `generate_fragments`'s doc
+    /// comment); wiring a real value at ownership boundaries that are not
+    /// termini is the next step, not yet done.
+    const EXTENDABLE_BUDGET: usize = 1_000_000;
+
+    /// Deterministic stand-in for a fragment-length model: `n` lengths spread
+    /// evenly over [lo, hi]. Using an explicit pool (rather than sampling a
+    /// model) makes the known answer exact — the realized lengths must be a
+    /// fair sample of THIS list.
+    fn spread_pool(n: usize, lo: usize, hi: usize) -> Vec<usize> {
+        (0..n)
+            .map(|i| lo + (hi - lo) * i / (n - 1).max(1))
+            .collect()
+    }
+
+    /// A span this size is exactly what a BED target or SV coverage-multiplier
+    /// sub-region looks like in production -- real sequence continues past its
+    /// edges, so this must be sampled as EXTENDABLE (a large extension_budget),
+    /// not as a terminus. FIXED by the length-first/no-redraw core algorithm
+    /// (release/fragment-placement); was RED under the old sweep placer,
+    /// which collapsed a 60-entry pool to 3 distinct realized lengths.
+    ///
+    /// KNOWN ANSWER: the pool IS the input, so its mean and spread are
+    /// computable without reference to the placer.
+    #[test]
+    fn cover_dataset_preserves_the_fragment_length_distribution_on_a_short_span() {
+        let span = 200usize;
+        let read_length = 100usize;
+        let pool = spread_pool(60, 180, 320);
+        let pool_mean = pool.iter().sum::<usize>() as f64 / pool.len() as f64;
+        let target_count = 60;
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(
+            EXTENDABLE_BUDGET,
+            span,
+            read_length,
+            target_count,
+            0,
+            pool.clone(),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(
+            frags.len(),
+            target_count,
+            "count must still be exact when the boundary is extendable"
+        );
+
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        let distinct = lens.iter().collect::<std::collections::HashSet<_>>().len();
+
+        assert!(
+            distinct >= pool.len() / 4,
+            "realized lengths collapsed to {distinct} distinct value(s) from a \
+             {}-entry pool — the placer is resampling only the entries that fit \
+             the span, so the library is monodisperse",
+            pool.len()
+        );
+        assert!(
+            (mean - pool_mean).abs() < 0.15 * pool_mean,
+            "realized mean fragment length {mean:.1} is far from the pool mean \
+             {pool_mean:.1} — the length distribution is truncated, not sampled"
+        );
+    }
+
+    /// Same extendable-boundary reasoning as the length-fidelity test above.
+    /// FIXED by the same change: the old sweep pinned its origin within
+    /// `read_length / 4` of a span edge, so a short span restarted every pass
+    /// inside the same narrow band. MEASURED end-to-end under that placer: a
+    /// 400 bp BED target put ~55 of 120 starts inside 25 bp; a 200 bp target
+    /// put all 60 inside 15 bp.
+    ///
+    /// KNOWN ANSWER: with starts spread over the span, the share landing in any
+    /// `read_length / 4` window is about `(read_length / 4) / span`.
+    #[test]
+    fn cover_dataset_spreads_starts_across_the_span() {
+        let span = 400usize;
+        let read_length = 100usize;
+        let origin_window = read_length / 4;
+        let pool = spread_pool(120, 180, 320);
+        let target_count = 120;
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(
+            EXTENDABLE_BUDGET,
+            span,
+            read_length,
+            target_count,
+            0,
+            pool,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(frags.len(), target_count);
+
+        let head = frags.iter().filter(|&&(s, _)| s < origin_window).count();
+        let expected = (target_count * origin_window).div_ceil(span);
+        assert!(
+            head <= 3 * expected,
+            "{head} of {target_count} fragments start in the first {origin_window} bp \
+             of a {span} bp span (spread placement gives about {expected}) — \
+             placement is anchored to the sweep origin at the span edge"
+        );
+
+        // Every quarter of the span must receive starts; a stalled sweep leaves
+        // whole quarters empty.
+        for q in 0..4 {
+            let (lo, hi) = (q * span / 4, (q + 1) * span / 4);
+            let n = frags.iter().filter(|&&(s, _)| s >= lo && s < hi).count();
+            assert!(n > 0, "no fragment starts in span quarter [{lo}, {hi})");
+        }
+    }
+
+    /// CRITERION 3. Per-base depth must not be dramatically LESS variable than
+    /// a random placer. KNOWN ANSWER: uniform-random placement of the same
+    /// fragment count gives Poisson-like depth, VMR ~= 1. Real sequencing is
+    /// overdispersed (VMR > 1) from GC and mappability, so a random placer is
+    /// the floor, not the target.
+    ///
+    /// Currently FAILS at roughly VMR 0.23: depth is ~4x too clean, which makes
+    /// depth-based CNV/DUP/DEL calling look far better than it will on real data.
+    #[test]
+    fn cover_dataset_depth_is_not_underdispersed() {
+        let span = 200_000usize;
+        let read_length = 100usize;
+        let pool = spread_pool(400, 180, 320);
+        let coverage = 30usize;
+        let target_count = span * coverage / (2 * read_length);
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(0, span, read_length, target_count, 0, pool, &mut rng).unwrap();
+
+        // Difference array over both read windows of each pair.
+        let mut diff = vec![0i32; span + 1];
+        for &(s, e) in &frags {
+            for (a, b) in [
+                (s, (s + read_length).min(span)),
+                (e.saturating_sub(read_length), e.min(span)),
+            ] {
+                if a < b {
+                    diff[a] += 1;
+                    diff[b] -= 1;
+                }
+            }
+        }
+        let mut depth = Vec::with_capacity(span);
+        let mut acc = 0i32;
+        for d in &diff[..span] {
+            acc += d;
+            depth.push(acc as f64);
+        }
+        // Trim the edges, where any placer legitimately ramps.
+        let interior = &depth[2_000..span - 2_000];
+        let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+        let var = interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+        let vmr = var / mean;
+
+        assert!(
+            vmr >= 0.9,
+            "per-base depth VMR is {vmr:.3} (mean {mean:.2}, var {var:.2}); \
+             uniform-random placement of the same fragments gives ~1.0. Depth is \
+             far too uniform to exercise a depth-based caller honestly."
+        );
+    }
+
+    /// MUST NOT FIRE. The properties the sweep placer got right have to survive
+    /// any replacement: exact fragment count (so mean coverage stays exact),
+    /// fragments inside the span, and termination when nothing can be placed.
+    #[test]
+    fn placement_preserves_count_bounds_and_termination() {
+        let mut rng = make_rng();
+
+        let span = 50_000usize;
+        let read_length = 100usize;
+        let target_count = span * 20 / (2 * read_length);
+        let frags = cover_dataset(
+            0,
+            span,
+            read_length,
+            target_count,
+            0,
+            spread_pool(200, 180, 320),
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(frags.len(), target_count, "exact fragment count");
+        assert!(
+            frags.iter().all(|&(s, e)| s < e && e <= span),
+            "every fragment must lie inside the span"
+        );
+
+        // read_start must offset the output, not the bounds logic.
+        let offset = cover_dataset(
+            0,
+            span,
+            read_length,
+            100,
+            7_000,
+            spread_pool(200, 180, 320),
+            &mut rng,
+        )
+        .unwrap();
+        assert!(offset.iter().all(|&(s, _)| s >= 7_000));
+
+        // A whole contig genuinely shorter than every fragment cannot be
+        // covered — that must still return empty rather than loop or clip.
+        let none = cover_dataset(0, 5_000, 1_000, 250, 0, vec![30_000; 10], &mut rng).unwrap();
+        assert!(none.is_empty(), "unplaceable pool must yield no fragments");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Same three criteria against `generate_weighted_fragments` (the GC-bias
+    // path), under a UNIFORM GcBiasModel so any failure is attributable to
+    // placement, not to bias weighting. This path does not call
+    // `cover_dataset` — it samples a start from a GC-weighted prefix sum and
+    // draws each fragment's length independently from the model — so a priori
+    // it need not share the sweep placer's defect. Measuring it, not assuming
+    // it, per the same rule that governs the sweep placer's own criteria.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Deterministic non-periodic sequence so every GC window differs, ruling
+    /// out a periodic sequence silently making every window's weight identical.
+    fn make_gc_test_sequence(len: usize) -> Vec<eidolon_core::structs::nucleotides::Nucleotide> {
+        let bases = [A, C, G, T];
+        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                bases[((x >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// CRITERION 1 (weighted path). Same known answer as the sweep-placer
+    /// version: realized lengths must be a fair sample of the fragment model,
+    /// even on a span not much longer than the mean fragment.
+    #[test]
+    fn weighted_fragments_preserve_the_length_distribution_on_a_short_span() {
+        let span = 400usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap(); // mean=300, sd=30
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            0,
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            60, // coverage
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true, // paired_ended
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert!(!frags.is_empty(), "must place at least some fragments");
+
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        let distinct = lens.iter().collect::<std::collections::HashSet<_>>().len();
+
+        assert!(
+            distinct >= lens.len() / 3,
+            "realized lengths collapsed to {distinct} distinct value(s) out of {} \
+             fragments — clipping at the region edge is truncating the model",
+            lens.len()
+        );
+        assert!(
+            (mean - 300.0).abs() < 0.15 * 300.0,
+            "realized mean fragment length {mean:.1} is far from the model mean 300.0 \
+             — edge clipping is biasing the length distribution"
+        );
+    }
+
+    /// CRITERION 2 (weighted path). Starts must reach the whole span.
+    #[test]
+    fn weighted_fragments_spread_starts_across_the_span() {
+        let span = 1_000usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            0,
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            60,
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert!(!frags.is_empty());
+
+        for q in 0..4 {
+            let (lo, hi) = (q * span / 4, (q + 1) * span / 4);
+            let n = frags.iter().filter(|&&(s, _)| s >= lo && s < hi).count();
+            assert!(n > 0, "no fragment starts in span quarter [{lo}, {hi})");
+        }
+    }
+
+    /// CRITERION 3 (weighted path). Per-base depth must not be far less
+    /// variable than uniform-random placement (VMR ~= 1 is the floor a random
+    /// placer gives; real sequencing is overdispersed, VMR > 1).
+    #[test]
+    fn weighted_fragments_depth_is_not_underdispersed() {
+        let span = 200_000usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            0,
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            30,
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+
+        let mut diff = vec![0i32; span + 1];
+        for &(s, e) in &frags {
+            for (a, b) in [
+                (s, (s + read_length).min(span)),
+                (e.saturating_sub(read_length), e.min(span)),
+            ] {
+                if a < b {
+                    diff[a] += 1;
+                    diff[b] -= 1;
+                }
+            }
+        }
+        let mut depth = Vec::with_capacity(span);
+        let mut acc = 0i32;
+        for d in &diff[..span] {
+            acc += d;
+            depth.push(acc as f64);
+        }
+        let interior = &depth[2_000..span - 2_000];
+        let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+        let var = interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+        let vmr = var / mean;
+
+        assert!(
+            vmr >= 0.9,
+            "per-base depth VMR is {vmr:.3} (mean {mean:.2}, var {var:.2}) under the \
+             GC-weighted path — unexpectedly underdispersed"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // MEDIUM-SPAN tier, completing the span-size x placer matrix. Every span
+    // used by a pre-existing test in this file (before this session) was
+    // either ~1 fragment length or >=5_000bp -- nothing at the scale of a
+    // realistic BED target or SV event a few fragment-lengths wide. These
+    // measure, rather than assume, where each defect actually fades.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// MEDIUM tier, length fidelity. A span several fragment-lengths wide --
+    /// a realistic exon panel target or a mid-size SV -- not the read-length-
+    /// scale extreme already covered above.
+    #[test]
+    fn cover_dataset_length_fidelity_at_medium_span() {
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let pool = spread_pool(200, 180, 320);
+        let pool_mean = pool.iter().sum::<usize>() as f64 / pool.len() as f64;
+        let target_count = span * 60 / (2 * read_length);
+        let mut rng = make_rng();
+
+        let frags = cover_dataset(0, span, read_length, target_count, 0, pool, &mut rng).unwrap();
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        let distinct = lens.iter().collect::<std::collections::HashSet<_>>().len();
+        eprintln!(
+            "[medium-span cover_dataset] n={} mean={:.1} (pool mean {:.1}) distinct={}",
+            lens.len(),
+            mean,
+            pool_mean,
+            distinct
+        );
+        assert!(
+            (mean - pool_mean).abs() < 0.15 * pool_mean,
+            "medium-span mean {mean:.1} drifted from pool mean {pool_mean:.1}"
+        );
+    }
+
+    /// MEDIUM tier, depth VMR. Does the sweep's underdispersion fade smoothly
+    /// with span, or is it still present at a realistic target/SV scale?
+    #[test]
+    fn cover_dataset_depth_vmr_at_medium_span() {
+        // Same multi-replicate averaging as the weighted-path version of this
+        // test, and for the same reason: a single medium-span draw has too few
+        // independent autocorrelation blocks for a stable point estimate.
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let target_count = span * 60 / (2 * read_length);
+
+        let mut vmrs = Vec::new();
+        for seed in 0..12u32 {
+            let pool = spread_pool(200, 180, 320);
+            let mut rng =
+                NeatRng::new_from_seed(&vec![format!("cover-dataset-medium-span-{seed}")]).unwrap();
+            let frags =
+                cover_dataset(0, span, read_length, target_count, 0, pool, &mut rng).unwrap();
+            let mut diff = vec![0i32; span + 1];
+            for &(s, e) in &frags {
+                for (a, b) in [
+                    (s, (s + read_length).min(span)),
+                    (e.saturating_sub(read_length), e.min(span)),
+                ] {
+                    if a < b {
+                        diff[a] += 1;
+                        diff[b] -= 1;
+                    }
+                }
+            }
+            let mut depth = Vec::with_capacity(span);
+            let mut acc = 0i32;
+            for d in &diff[..span] {
+                acc += d;
+                depth.push(acc as f64);
+            }
+            let interior = &depth[300..span - 300];
+            let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+            let var =
+                interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+            vmrs.push(var / mean);
+        }
+        let avg_vmr = vmrs.iter().sum::<f64>() / vmrs.len() as f64;
+        eprintln!(
+            "[medium-span cover_dataset, {} replicates] per-replicate VMR={:?} avg={avg_vmr:.3}",
+            vmrs.len(),
+            vmrs.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>()
+        );
+        assert!(
+            avg_vmr >= 0.9,
+            "medium-span (3000bp, ~10x mean fragment length) depth VMR averaged over {} \
+             independent replicates is {avg_vmr:.3} -- underdispersion has not faded by \
+             this scale",
+            vmrs.len()
+        );
+    }
+
+    /// MEDIUM tier, weighted path, length fidelity.
+    #[test]
+    fn weighted_fragments_length_fidelity_at_medium_span() {
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+        let mut rng = make_rng();
+
+        let frags = generate_weighted_fragments(
+            0,
+            &sequence_block,
+            0,
+            span,
+            read_length,
+            0,
+            60,
+            &GcBiasModel::default(),
+            &fragment_model,
+            false,
+            true,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        let lens: Vec<usize> = frags.iter().map(|&(s, e)| e - s).collect();
+        let mean = lens.iter().sum::<usize>() as f64 / lens.len() as f64;
+        eprintln!("[medium-span weighted] n={} mean={:.1}", lens.len(), mean);
+        assert!(
+            (mean - 300.0).abs() < 0.15 * 300.0,
+            "medium-span weighted-path mean {mean:.1} drifted from model mean 300.0"
+        );
+    }
+
+    /// MEDIUM tier, weighted path, depth VMR.
+    #[test]
+    fn weighted_fragments_depth_vmr_at_medium_span() {
+        // Depth autocorrelates over roughly one fragment length, so a single
+        // medium-span draw has only ~span/fragment_length independent blocks to
+        // estimate variance from -- too few for a stable point estimate (a
+        // single-seed run here swung 0.845-0.90 across different edge trims
+        // with no consistent trend, which is the signature of estimator noise,
+        // not a real effect: the whole-contig version of this test measures
+        // VMR=0.984 with ~30x more independent blocks). Average across
+        // independent replicates instead of trusting one draw.
+        let span = 3_000usize;
+        let read_length = 100usize;
+        let fragment_model = FragmentLengthModel::default_normal().unwrap();
+
+        let mut vmrs = Vec::new();
+        for seed in 0..12u32 {
+            let sequence_block = make_sequence_block(make_gc_test_sequence(span));
+            let mut rng =
+                NeatRng::new_from_seed(&vec![format!("gc-bias-medium-span-{seed}")]).unwrap();
+            let frags = generate_weighted_fragments(
+                0,
+                &sequence_block,
+                0,
+                span,
+                read_length,
+                0,
+                60,
+                &GcBiasModel::default(),
+                &fragment_model,
+                false,
+                true,
+                false,
+                false,
+                &mut rng,
+            )
+            .unwrap();
+            let mut diff = vec![0i32; span + 1];
+            for &(s, e) in &frags {
+                for (a, b) in [
+                    (s, (s + read_length).min(span)),
+                    (e.saturating_sub(read_length), e.min(span)),
+                ] {
+                    if a < b {
+                        diff[a] += 1;
+                        diff[b] -= 1;
+                    }
+                }
+            }
+            let mut depth = Vec::with_capacity(span);
+            let mut acc = 0i32;
+            for d in &diff[..span] {
+                acc += d;
+                depth.push(acc as f64);
+            }
+            let interior = &depth[300..span - 300];
+            let mean = interior.iter().sum::<f64>() / interior.len() as f64;
+            let var =
+                interior.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / interior.len() as f64;
+            vmrs.push(var / mean);
+        }
+        let avg_vmr = vmrs.iter().sum::<f64>() / vmrs.len() as f64;
+        eprintln!(
+            "[medium-span weighted, {} replicates] per-replicate VMR={:?} avg={avg_vmr:.3}",
+            vmrs.len(),
+            vmrs.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>()
+        );
+        assert!(
+            avg_vmr >= 0.9,
+            "medium-span weighted-path depth VMR averaged over {} independent replicates \
+             is {avg_vmr:.3} -- underdispersion has not faded by this scale",
+            vmrs.len()
         );
     }
 }
