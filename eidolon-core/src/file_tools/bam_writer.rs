@@ -84,7 +84,8 @@ impl BamWriter {
         let ref_id = self.contig_id(&record.contig)?;
         let mate_ref_id = self.contig_id(&record.mate_contig)?;
         let cigar = rle_to_cigar(&record.cigar_ops);
-        let flags = read_flags(record.is_paired, record.is_reverse);
+        let flags =
+            read_flags_with_mapping(record.is_paired, record.is_reverse, record.is_unmapped);
         let bam_record = build_bam_record(
             &record.name,
             ref_id,
@@ -107,7 +108,8 @@ impl BamWriter {
         let ref_id = self.contig_id(&record.contig)?;
         let mate_ref_id = self.contig_id(&record.mate_contig)?;
         let cigar = rle_to_cigar(&record.cigar_ops);
-        let flags = read_flags(record.is_paired, record.is_reverse);
+        let flags =
+            read_flags_with_mapping(record.is_paired, record.is_reverse, record.is_unmapped);
         let bam_record = build_bam_record(
             &record.name,
             ref_id,
@@ -201,7 +203,8 @@ impl BamRecordStager for BamWriter {
         let ref_id = self.contig_id(&record.contig)?;
         let mate_ref_id = self.contig_id(&record.mate_contig)?;
         let cigar = rle_to_cigar(&record.cigar_ops);
-        let flags = read_flags(record.is_paired, record.is_reverse);
+        let flags =
+            read_flags_with_mapping(record.is_paired, record.is_reverse, record.is_unmapped);
         let bam_record = build_bam_record(
             &record.name,
             ref_id,
@@ -278,7 +281,8 @@ impl BamRecordStager for BamBodyWriter {
         let ref_id = self.contig_id(&record.contig)?;
         let mate_ref_id = self.contig_id(&record.mate_contig)?;
         let cigar = rle_to_cigar(&record.cigar_ops);
-        let flags = read_flags(record.is_paired, record.is_reverse);
+        let flags =
+            read_flags_with_mapping(record.is_paired, record.is_reverse, record.is_unmapped);
         let bam_record = build_bam_record(
             &record.name,
             ref_id,
@@ -408,20 +412,36 @@ fn char_to_cigar_kind(c: char) -> CigarKind {
 /// - R1 (forward): SEGMENTED | PROPERLY_SEGMENTED | MATE_REVERSE_COMPLEMENTED | FIRST_SEGMENT
 /// - R2 (reverse): SEGMENTED | PROPERLY_SEGMENTED | REVERSE_COMPLEMENTED | LAST_SEGMENT
 pub fn read_flags(is_paired_run: bool, is_reverse: bool) -> Flags {
+    read_flags_with_mapping(is_paired_run, is_reverse, false)
+}
+
+/// As [`read_flags`], plus the UNMAPPED bit for a read with no reference
+/// alignment — one lying wholly inside novel inserted sequence, which has no
+/// reference coordinate to align to (#516).
+///
+/// PROPERLY_SEGMENTED is cleared for such a pair: "proper" asserts both mates
+/// aligned in the expected orientation and spacing, which is exactly what is not
+/// true here. Leaving it set would make a downstream properly-paired count read
+/// as if the pair aligned cleanly.
+pub fn read_flags_with_mapping(is_paired_run: bool, is_reverse: bool, is_unmapped: bool) -> Flags {
     if !is_paired_run {
-        return Flags::empty();
+        return if is_unmapped {
+            Flags::UNMAPPED
+        } else {
+            Flags::empty()
+        };
     }
-    if is_reverse {
-        Flags::SEGMENTED
-            | Flags::PROPERLY_SEGMENTED
-            | Flags::REVERSE_COMPLEMENTED
-            | Flags::LAST_SEGMENT
+    let mut flags = if is_reverse {
+        Flags::SEGMENTED | Flags::REVERSE_COMPLEMENTED | Flags::LAST_SEGMENT
     } else {
-        Flags::SEGMENTED
-            | Flags::PROPERLY_SEGMENTED
-            | Flags::MATE_REVERSE_COMPLEMENTED
-            | Flags::FIRST_SEGMENT
+        Flags::SEGMENTED | Flags::MATE_REVERSE_COMPLEMENTED | Flags::FIRST_SEGMENT
+    };
+    if is_unmapped {
+        flags |= Flags::UNMAPPED;
+    } else {
+        flags |= Flags::PROPERLY_SEGMENTED;
     }
+    flags
 }
 
 /// Assembles a `RecordBuf` from alignment parameters.
@@ -514,6 +534,7 @@ mod tests {
 
     fn make_read(name: &str, pos: usize) -> ReadRecord {
         ReadRecord {
+            is_unmapped: false,
             name: name.to_string(),
             sequence: "ACGT".to_string(),
             quality_scores: vec![30, 30, 30, 30],
@@ -699,6 +720,7 @@ mod tests {
         assert!(writer.contig_id("chrX").is_err());
 
         let record = ReadRecord {
+            is_unmapped: false,
             name: "read1/1".to_string(),
             sequence: "ACGT".to_string(),
             quality_scores: vec![30, 30, 30, 30],

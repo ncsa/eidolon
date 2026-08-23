@@ -17,6 +17,7 @@ use crate::models::quality_scores::QualityScoreModel;
 use crate::models::sequencing_error_model::{
     SeqModelError, SequencingErrorModel, SequencingErrorType,
 };
+use crate::structs::haplotype_map::InsertionCoordinateMap;
 use crate::structs::mutated_map::{AdCounter, MutatedMap, MutatedMapError};
 use crate::structs::nucleotides::Nucleotide;
 use crate::structs::nucleotides::Nucleotide::N;
@@ -111,8 +112,55 @@ fn set_observed_template_lengths(r1: &mut ReadRecord, r2: &mut ReadRecord) {
     }
 }
 
+/// One fragment to be written, expressed in the coordinate space named by
+/// `haplotype`: reference coordinates when `None`, altered-haplotype coordinates
+/// when `Some`.
+///
+/// This exists so long insertions can be sampled in a coordinate space that has
+/// width where the reference has none, WITHOUT a second writer. The previous #516
+/// attempt added a parallel writer for exactly this and silently lost everything
+/// `write_block_fastq` does along the way — the heterozygous coin, allelic-depth
+/// counting, the #210 position-keyed read name, adapter readthrough, and the
+/// pair-desync guard. Routing both kinds of fragment through one function is what
+/// makes those impossible to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedFragment {
+    pub start: usize,
+    pub end: usize,
+    /// Index into the `haplotypes` slice passed alongside.
+    pub haplotype: Option<usize>,
+}
+
+impl From<(usize, usize)> for PlacedFragment {
+    /// A fragment sampled straight from the reference — the overwhelmingly common
+    /// case, and what every caller produced before insertions needed their own
+    /// coordinate space.
+    fn from((start, end): (usize, usize)) -> Self {
+        Self {
+            start,
+            end,
+            haplotype: None,
+        }
+    }
+}
+
+/// An altered haplotype that fragments in this block may have been sampled from:
+/// one literal insertion spliced into the reference.
+#[derive(Debug, Clone)]
+pub struct HaplotypeContext {
+    pub map: InsertionCoordinateMap,
+    /// The novel bases only — what the ALT adds beyond the anchor base.
+    pub inserted: Vec<Nucleotide>,
+    /// Block-local reference position of the insertion's anchor, so allelic depth
+    /// is attributed to the right variant.
+    pub anchor: usize,
+}
+
 pub fn write_block_fastq<B1: Write, B2: Write>(
-    block_fragments: Vec<(usize, usize)>,
+    block_fragments: Vec<PlacedFragment>,
+    // Altered haplotypes referenced by `PlacedFragment::haplotype`. Empty for a
+    // block with no long insertions, which is the common case.
+    haplotypes: &[HaplotypeContext],
     block_map: &MutatedMap,
     sequence_block: &SequenceBlock,
     paired_ended: bool,
@@ -151,12 +199,46 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     //     coordinates — the R2 window still starts at `end - effective_read_len`.
     let seq_len = sequence_block.sequence.len();
     let frag_pad = if paired_ended { read_length } else { 32 };
-    for (frag_idx, (start, end)) in block_fragments.into_iter().enumerate() {
-        let padded_end = (end + frag_pad).min(seq_len);
-        // Zero-copy: the fragment is only read (R1 reads it, R2 reads a suffix),
-        // never stored or mutated, so borrow it instead of allocating + copying
-        // a Vec per fragment. Borrows sequence_block for the iteration.
-        let fragment = sequence_block.get_subseq_slice(start, padded_end)?;
+    for (frag_idx, placed) in block_fragments.into_iter().enumerate() {
+        let (start, end) = (placed.start, placed.end);
+        let hap = placed.haplotype.map(|i| &haplotypes[i]);
+        // The span a fragment may be materialized over. For a reference fragment
+        // that is the contig; for a haplotype fragment it is the contig plus the
+        // inserted bases, which is exactly the extra width the insertion has.
+        let materializable_len = match hap {
+            None => seq_len,
+            Some(h) => h.map.haplotype_len(),
+        };
+        let padded_end = (end + frag_pad).min(materializable_len);
+        // Zero-copy for the common case: the fragment is only read (R1 reads it,
+        // R2 reads a suffix), never stored or mutated, so borrow it instead of
+        // allocating + copying a Vec per fragment. A haplotype fragment has to be
+        // built (its bases do not exist contiguously in the reference), so that
+        // path owns a buffer and borrows from it.
+        let hap_materialized;
+        let fragment: &[Nucleotide] = match hap {
+            None => sequence_block.get_subseq_slice(start, padded_end)?,
+            Some(h) => {
+                let Some((bases, segments)) = h.map.materialize_interval(
+                    &sequence_block.sequence,
+                    &h.inserted,
+                    start,
+                    padded_end,
+                ) else {
+                    // The map disagrees with the sequence it was built for, or the
+                    // interval is degenerate. Skipping is right (the alternative is
+                    // emitting reads from a coordinate space that does not exist),
+                    // but it must not be silent -- a region that quietly stops
+                    // producing reads is the failure shape this project keeps hitting.
+                    debug!(
+                        "haplotype fragment [{start},{padded_end}) could not be materialized; skipping"
+                    );
+                    continue;
+                };
+                hap_materialized = (bases, segments);
+                &hap_materialized.0
+            }
+        };
         // In long-read mode a fragment may be shorter than read_length; truncate the read
         // to the actual fragment length rather than discarding it.
         // With adapters on, a short insert generates an insert-length read here, then the
@@ -219,6 +301,41 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         }
 
         let ref_start = sequence_block.ref_start;
+        // Reference-space coordinates for the BAM record. For a reference fragment
+        // these are just the fragment's own coordinates offset by the block start.
+        // For a haplotype fragment they are the PROJECTION back to the reference:
+        // the inserted bases have no reference coordinate at all, so a read window
+        // beginning inside them projects to `None` and the record is emitted
+        // unmapped rather than being placed at the anchor with an all-insertion
+        // CIGAR (which is not a valid alignment -- it consumes no reference).
+        //
+        // The golden BAM is an answer key, not a prediction of aligner output
+        // (see #449), so an unmapped record still records where the read really
+        // came from via a provenance tag rather than discarding that.
+        let (r1_ref_pos, r2_ref_pos, tlen_span) = match hap {
+            None => (
+                Some(start + ref_start),
+                Some(end.saturating_sub(effective_read_len) + ref_start),
+                Some(end - start),
+            ),
+            Some(h) => {
+                let r1 = h
+                    .map
+                    .haplotype_base_to_reference(start)
+                    .map(|p| p + ref_start);
+                let r2_window = end.saturating_sub(effective_read_len);
+                let r2 = h
+                    .map
+                    .haplotype_base_to_reference(r2_window)
+                    .map(|p| p + ref_start);
+                // TLEN is only meaningful when both mates have a reference span.
+                let span = match (r1, r2) {
+                    (Some(a), Some(b)) => Some((b + effective_read_len).saturating_sub(a)),
+                    _ => None,
+                };
+                (r1, r2, span)
+            }
+        };
         let abs_start = start + ref_start;
         let abs_end = end + ref_start;
         // Per-fragment uniqueness tag in the read name. Without this, two
@@ -236,13 +353,28 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             read_name_prefix, abs_start, abs_end, frag_idx,
         );
 
+        // SAM convention: an unmapped read with a mapped mate still carries the
+        // mate's RNAME/POS, so the pair sorts together and the unmapped read stays
+        // located at the event it came from. Falling back to the insertion anchor
+        // covers the (rare) case where BOTH mates lie inside the inserted sequence.
+        let anchor_fallback = match hap {
+            Some(h) => h.anchor + ref_start,
+            None => abs_start,
+        };
+        let r1_pos = r1_ref_pos.or(r2_ref_pos).unwrap_or(anchor_fallback);
+        // Identical to the previous expression whenever `hap` is None: the
+        // projection of a reference fragment is the fragment itself.
         let r2_start = if paired_ended && abs_end >= effective_read_len {
-            abs_end - effective_read_len
+            r2_ref_pos
+                .or(r1_ref_pos)
+                .unwrap_or(abs_end - effective_read_len)
         } else {
             0
         };
         let tlen = if paired_ended {
-            (abs_end - abs_start) as i32
+            // A template length is only meaningful when both mates have a reference
+            // span; an unmapped mate leaves it 0, as SAM requires.
+            tlen_span.unwrap_or(0) as i32
         } else {
             0
         };
@@ -260,7 +392,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             sequencing_error_model,
             rng,
             sequence_block.contig.clone(),
-            abs_start,
+            r1_pos,
             sequence_block.contig.clone(),
             r2_start,
             tlen,
@@ -274,6 +406,14 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             }
             Err(e) => return Err(e),
         };
+        // No reference position => the read lies wholly inside inserted sequence.
+        // Emit it unmapped with an empty CIGAR rather than placing it at the anchor
+        // with an all-insertion CIGAR, which consumes no reference and is not a
+        // valid alignment. The bases still reach the FASTQ — they are real reads.
+        if r1_ref_pos.is_none() {
+            r1_record.is_unmapped = true;
+            r1_record.cigar_ops.clear();
+        }
         // R1 adapter readthrough: pad a short-insert read to read_length at its 3' end.
         if adapters_on {
             r1_record = append_adapter_readthrough(
@@ -297,8 +437,10 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut r2_record = if paired_ended {
             let quality_scores_2 =
                 quality_score_model.generate_quality_scores(effective_read_len, rng)?;
-            let r2_pos = abs_end.saturating_sub(effective_read_len);
-            let tlen_r2 = -((abs_end - abs_start) as i32);
+            let r2_pos = r2_ref_pos
+                .or(r1_ref_pos)
+                .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
+            let tlen_r2 = -(tlen_span.unwrap_or(0) as i32);
             // R2 covers the fragment's right end. Generate it FORWARD over that
             // window — so SNP/insertion/deletion handling is identical to R1 and
             // correct — then reverse-complement the whole record into a reverse
@@ -327,12 +469,16 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 sequence_block.contig.clone(),
                 r2_pos,
                 sequence_block.contig.clone(),
-                abs_start,
+                r1_pos,
                 tlen_r2,
                 true,
                 ad_counter,
             ) {
-                Ok(record) => {
+                Ok(mut record) => {
+                    if r2_ref_pos.is_none() {
+                        record.is_unmapped = true;
+                        record.cigar_ops.clear();
+                    }
                     // Flip to the reverse mate FIRST, then append the R2 adapter at
                     // the (now 3') end — so R2 carries the R2 adapter in read
                     // orientation, exactly as a trimmer expects.
@@ -760,6 +906,7 @@ pub fn generate_read(
     }
 
     Ok(ReadRecord {
+        is_unmapped: false,
         name,
         sequence: out_seq,
         quality_scores,
@@ -913,6 +1060,7 @@ mod tests {
     impl BamRecordStager for CapturedPairedReads {
         fn stage_read_record(&mut self, record: &ReadRecord) -> Result<(), BamWriterError> {
             self.0.push(ReadRecord {
+                is_unmapped: false,
                 name: record.name.clone(),
                 sequence: record.sequence.clone(),
                 quality_scores: record.quality_scores.clone(),
@@ -968,6 +1116,7 @@ mod tests {
     #[test]
     fn test_apply_haplotype_baseline_cigar_marks_inserted_bases() {
         let mut record = ReadRecord {
+            is_unmapped: false,
             name: "read".to_string(),
             sequence: "ACCCCCAAAAAAAAAAAAAAAAAAA".to_string(),
             quality_scores: vec![30; 25],
@@ -1263,6 +1412,7 @@ mod tests {
     // --- adapter readthrough (#125) ---
     fn adapter_rec(seq: &str, paired: bool, reverse: bool) -> ReadRecord {
         ReadRecord {
+            is_unmapped: false,
             name: "frag/1".to_string(),
             sequence: seq.to_string(),
             quality_scores: vec![30; seq.len()],
@@ -1396,7 +1546,8 @@ mod tests {
         let quality_model = QualityScoreModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["test".to_string()]).unwrap();
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             false,
@@ -1491,7 +1642,8 @@ mod tests {
         let quality_model = QualityScoreModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["uniq-name".to_string()]).unwrap();
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             false,
@@ -1584,7 +1736,8 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["zero-insert".to_string()]).unwrap();
         let adapter: Vec<Nucleotide> = vec![A, G, A, T, C, G, G, A, A, G, A, G, C];
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             true, // paired_ended
@@ -1680,7 +1833,8 @@ mod tests {
         let quality_model = QualityScoreModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["keep-short".to_string()]).unwrap();
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             false, // single-ended (simplest) — R1 only
@@ -1913,6 +2067,7 @@ mod tests {
     #[test]
     fn test_reverse_complement_record() {
         let rec = ReadRecord {
+            is_unmapped: false,
             name: "frag/2".to_string(),
             sequence: "AACGT".to_string(),
             quality_scores: vec![1, 2, 3, 4, 5],
@@ -2372,7 +2527,8 @@ mod tests {
         let mut buf2 = GzEncoder::new(VectorBuffer::new(), Compression::default());
         let stager: Option<&mut dyn BamRecordStager> = Some(bam_writer);
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             block,
             paired_ended,

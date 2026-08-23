@@ -994,7 +994,8 @@ fn process_chunk(
             let mut buffer2 = BlockGzWriter::new(writer2);
             debug!("Writing paired-ended contig fastq files");
             write_block_fastq(
-                block_fragments,
+                block_fragments.into_iter().map(Into::into).collect(),
+                &[],
                 mutated_map,
                 current_block,
                 true,
@@ -1019,7 +1020,8 @@ fn process_chunk(
             let dummy_data: VectorBuffer = VectorBuffer::new();
             let mut buffer2 = GzEncoder::new(dummy_data, Compression::default());
             write_block_fastq(
-                block_fragments,
+                block_fragments.into_iter().map(Into::into).collect(),
+                &[],
                 mutated_map,
                 current_block,
                 false,
@@ -1051,7 +1053,8 @@ fn process_chunk(
         let mut buf2 = std::io::sink();
         debug!("BAM-only: generating reads for {}", contig_name);
         write_block_fastq(
-            block_fragments,
+            block_fragments.into_iter().map(Into::into).collect(),
+            &[],
             mutated_map,
             current_block,
             ctx.config.paired_ended,
