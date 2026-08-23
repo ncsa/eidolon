@@ -42,7 +42,7 @@
 
 mod common;
 
-use common::{eidolon, h1n1_reference};
+use common::{eidolon, h1n1_reference, revcomp, synthetic_insert};
 use noodles::bam;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use std::path::{Path, PathBuf};
@@ -50,41 +50,6 @@ use std::path::{Path, PathBuf};
 const CONTIG: &str = "H1N1_PB2";
 const CONTIG_LEN: usize = 2280;
 const ANCHOR: usize = 400; // 1-based VCF POS
-
-/// Deterministic novel sequence. A 30-mer of this has a ~4^-30 chance of occurring
-/// in the reference by accident, so a probe hit is proof the inserted bases reached
-/// the output rather than something spliced from the fixture. Issue #580 tracks
-/// replacing random sequence with mobile-element consensus; that would break this
-/// evidence property, which is why #516 deliberately keeps random sequence.
-fn synthetic_insert(n: usize) -> String {
-    let mut s = String::with_capacity(n);
-    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-    for _ in 0..n {
-        x = x
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        s.push(match (x >> 33) & 3 {
-            0 => 'A',
-            1 => 'C',
-            2 => 'G',
-            _ => 'T',
-        });
-    }
-    s
-}
-
-fn revcomp(s: &str) -> String {
-    s.chars()
-        .rev()
-        .map(|c| match c {
-            'A' => 'T',
-            'C' => 'G',
-            'G' => 'C',
-            'T' => 'A',
-            other => other,
-        })
-        .collect()
-}
 
 fn ref_base_at(pos_1based: usize) -> char {
     let text = std::fs::read_to_string(h1n1_reference()).unwrap();
