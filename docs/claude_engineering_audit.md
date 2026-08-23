@@ -438,6 +438,86 @@ invented constant.**
 > direction it was wrong in. The guess was half wrong. The taxonomy entry stands; the
 > editorializing inside it did not survive contact with the data.
 
+> **⚠️ New finding, same taxonomy class (2026-08-22), from a live #516 fragment-placement
+> investigation** — the fragment placer's implicit depth-uniformity target had never been
+> checked against real aligned data either, in either direction: neither "is it worse than
+> a naive random placer" nor "how much worse than real sequencing should we expect."
+>
+> `cover_dataset` (`eidolon/src/gen_reads/utils/generate_fragments.rs`) sweeps fragments end
+> to end rather than sampling positions independently — never validated against anything.
+> Per-base depth variance-to-mean ratio (VMR; 1.0 = Poisson/uniform-random, real sequencing
+> is *higher* from GC/mappability/library-prep bias) measured on a synthetic 2Mb uniform-GC
+> reference at 30×: **0.226**, against 1.007–1.025 for a matched-N, matched-length uniform-
+> random control. A real aligned BAM already present on this workstation —
+> `/home/joshfactorial/code/data/na12878_chr22.bam`, GIAB NA12878/HG001, novoalign against
+> GRCh38 (`chr22 LN:50818468`, confirmed matching the local `chr22.fa`) — had never been used
+> for this comparison. It was, for the first time, across four independent 200kb windows:
+>
+> | | VMR | autocorrelation |
+> |---|---|---|
+> | eidolon (current `cover_dataset`, chr22:20.0–20.2Mb, 60×) | 0.282 | ACF<0.5 at lag 36bp; **goes negative** (−0.06 to −0.33) at lag 100–300bp |
+> | NA12878 chr22:20.0–20.2Mb | 8.983 | ACF<0.5 at lag ~600bp; still 0.56 at lag 500bp |
+> | NA12878 chr22:30.0–30.2Mb | 7.959 | — |
+> | NA12878 chr22:40.0–40.2Mb | 7.336 | — |
+> | NA12878 chr22:25.0–25.2Mb | 5.373 | — |
+>
+> Two distinct, independently-confirmed defects, not one: eidolon is **~20–30× less variable
+> than real data** in total, and its autocorrelation **goes negative** at 100–300bp lag — an
+> anti-clustering, comb-like regularity from the sweep's fixed spacing — where real data is
+> strongly *positively* correlated out past 500bp. The 1.0 "uniform-random" floor used
+> throughout the #516 placement-criteria tests (`release/fragment-placement`) is therefore a
+> correctness *floor*, confirmed here to be necessary (current output is 20–30× under even
+> that), but it is nowhere near the realism *target* real data implies (~5–9× that floor,
+> with kilobase-scale structure) — closing the second gap needs the GC-bias model
+> (`generate_weighted_fragments`, off by default, #576) and possibly more, not just the
+> placement fix. Filed as its own follow-on rather than assumed solved by the bug fix.
+
+> **⚠️ A related finding (2026-08-22) that cost real time by not being checked against the
+> tracker first.** Fixing the placement floor above (length-first sampling replacing the
+> sweep) broke two `sv_support_matrix.rs` tests checking coverage-multiplier depth accuracy
+> (DEL/DUP/CNV). The instinct was "my change introduced a regression" — reasonable, but it
+> led to an hour-plus mechanistic investigation (disproving an R1/R2-asymmetry theory,
+> instrumenting the runner with temporary `eprintln!`s to trace fragment counts through
+> `build_coverage_multipliers`/`suppress_junction_double_count`) before finding that
+> [#499](https://github.com/ncsa/eidolon/issues/499) — closed two days earlier, 2026-08-20 —
+> had already diagnosed the *same class* of mechanism (chimeric junction reads landing
+> outside the coverage-multiplied budget, excess scaling ~1/event_length) with a specific
+> falsifiable prediction ("negligible by ~100kb") that this investigation ended up re-running
+> from scratch instead of finding on the issue tracker first.
+>
+> The re-derivation was not entirely wasted, though: an A/B test (Terminal-everywhere vs
+> full extension on the identical scenario, ratio 1.57 vs 1.12) proved the NEW placement
+> mechanism adds a **second**, distinct boundary effect on top of #499's — fragments now
+> legitimately extend across a coverage-multiplier boundary (correct and necessary; it is
+> what removes the artificial dead zone documented above), which costs a narrow segment some
+> of its own declared depth to redistribution. Total read count and R1/R2 totals are exactly
+> conserved before/after (confirmed directly), so this is redistribution, not loss.
+>
+> Both mechanisms — #499's and the new one — turned out to share the same shape: real,
+> understood, and **vanishing at realistic scale**. Measured directly, not assumed: a 1200bp
+> event on H1N1 (2280bp contig, ~400bp flanks) needed a 1.13× correction; the identical
+> 1200bp event on a real chr22 window (megabase flanks) needed only 1.07×; a realistic 100kb
+> event with megabase flanks needed 1.003× — indistinguishable from noise. This is exactly
+> the "Size sweep: 1kb/100kb/1Mb" experiment `docs/sv_polish_roadmap.md` had proposed and
+> left unrun since 2026-08-14; running it (`eidolon::tests::sv_support_matrix::
+> depth_modulation_is_accurate_at_realistic_scale` now pins the 1Mb-scale result as a
+> permanent guard) closed both the roadmap's open question and this investigation's own,
+> and confirmed no production-code change belongs in `generate_fragments.rs`/`runner.rs` for
+> this — H1N1 (8 contigs of viral-genome scale, largest realistic event ~1.2kb) simply cannot
+> host an event "much larger than fragment length" with wide flanks at the same time, so a
+> coverage-multiplier depth check on it is a fast mechanism check, never a precision one.
+> Fixed the two tests (seed-averaging for reliability, honest tolerance rationale; the test
+> specifically pinning #499's now-superseded direction was deleted per its own stated
+> protocol) and added the realistic-scale test rather than touching the placement code.
+>
+> The generalizable lesson, worth restating precisely: **when a change appears to break an
+> existing check, search the tracker for the mechanism before re-deriving it.** This is not
+> the "check a third-party tool's version before working around it" rule (§ CLAUDE.md rule
+> 3) applied to third-party tools — it is the same rule applied to this project's own prior
+> work. A closed issue with a diagnosed mechanism and a stated, unrun falsifiable prediction
+> is exactly the kind of thing `gh issue view`/`gh issue list --search` should be checked
+> against before spending an hour on mechanism-hunting from scratch.
+
 ---
 
 ## 6. Case study: BND
