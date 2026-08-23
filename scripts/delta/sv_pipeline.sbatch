@@ -1639,6 +1639,21 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
 
     echo "  INS read support: $supported of $n_ins planted insertion(s) present in the reads"
     INS_UNSUPPORTED="$unsupported"
+
+    # Rule 4: a metric over an unknown — or tiny — denominator is not a result. The COSMIC
+    # somatic model plants very few insertions on a single chromosome (job 21378484: FOUR, on
+    # chr22 at SV_RATE_SCALE=30), and "4 of 4, 100%" reads exactly like "validated" while
+    # resting on four draws. It is not a hard failure — the run's DEL/DUP/INV results are
+    # unaffected and the check still catches a real 0/5 — but it must never be quoted as
+    # evidence that insertions work at scale.
+    local min_denom="${INS_MIN_DENOM:-20}"
+    if [[ "$n_ins" -lt "$min_denom" ]]; then
+        INS_DENOM_THIN="$n_ins"
+        echo "  DENOMINATOR TOO SMALL: $n_ins insertion(s) is below $min_denom, so the percentage"
+        echo "    above cannot support a conclusion about insertion realization at scale. A pass"
+        echo "    here means these $n_ins worked, nothing more. Raise SV_RATE_SCALE, use a larger"
+        echo "    reference, or include germline insertions to get a real denominator."
+    fi
     if [[ "$unsupported" -gt 0 ]]; then
         # Sparse interior coverage costs a few insertions on any real run; a #516-class
         # regression costs nearly all of them. Only the latter invalidates INS recall.
@@ -1659,6 +1674,7 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
 }
 INS_UNSUPPORTED=0
 INS_VERIFY_FAILED=0
+INS_DENOM_THIN=0
 if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
     if ! verify_planted_ins "$OUTDIR/truth_sv_INS.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
         INS_VERIFY_FAILED=1
@@ -1680,6 +1696,10 @@ elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
     # above ~a read length would fail, which would block DEL/DUP/INV work that is unaffected.
     # It is a distinct, visible status instead — the numbers are usable EXCEPT for INS.
     RUN_STATUS="complete, but INS INVALID ($INS_UNSUPPORTED insertion(s) absent from the reads — #516)"
+elif [[ "${INS_DENOM_THIN:-0}" -gt 0 ]]; then
+    # Passing on a handful of insertions is not evidence that insertions work. Say so in the
+    # banner, where it cannot be skipped, rather than only in the INS block above.
+    RUN_STATUS="complete; INS read support passed on only $INS_DENOM_THIN insertion(s) — too few to conclude"
 else
     RUN_STATUS="complete"
 fi

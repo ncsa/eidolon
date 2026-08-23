@@ -35,6 +35,8 @@ only one probe per insertion@for (k = 1; k <= 5; k++) {@for (k = 3; k <= 3; k++)
 support floor never trips@if [[ "$pct" -lt "$min_pct" ]]; then@if false; then
 probes taken from the head@s = int(L * k / 6) - 14@s = 1 + 0 * k
 unsupported insertions are not counted@unsupported=$((unsupported + 1))@unsupported=$((unsupported + 0))
+thin denominator is never flagged@if [[ "$n_ins" -lt "$min_denom" ]]; then@if false; then
+thin denominator is not exported@INS_DENOM_THIN="$n_ins"@INS_DENOM_THIN=0
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -172,6 +174,38 @@ verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
 out="$(<"$WORK/out")"
 has "a 100% floor rejects any unsupported insertion" "$out" "below the 100% floor"
 unset INS_SUPPORT_MIN_PCT
+
+echo "=== a tiny denominator is called out, not quietly passed ==="
+# Job 21378484 planted FOUR insertions on chr22 and reported "4 of 4, 100%". That reads as
+# validation and is four draws. The check still runs; the banner must say it proves little.
+bcftools() {
+    [[ "${1:-}" == "query" ]] || return 2
+    local i; for i in $(seq 1 4); do printf 'chr1\t%s\tA\tA%s\n' "$((100 * i))" "$INS300"; done
+}
+EXPOSE="1-300" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0
+verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
+out="$(<"$WORK/out")"
+has "a 4-insertion run is flagged as too small" "$out" "DENOMINATOR TOO SMALL: 4 insertion(s)"
+is "the thin denominator is exported for the banner" 4 "$INS_DENOM_THIN"
+is "a thin denominator is not itself a failure" 0 "$INS_UNSUPPORTED"
+
+echo "=== a real denominator is not flagged ==="
+bcftools() {
+    [[ "${1:-}" == "query" ]] || return 2
+    local i; for i in $(seq 1 20); do printf 'chr1\t%s\tA\tA%s\n' "$((100 * i))" "$INS300"; done
+}
+EXPOSE="1-300" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0
+verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
+out="$(<"$WORK/out")"
+case "$out" in *"DENOMINATOR TOO SMALL"*) bad "20 insertions are not flagged as too small" "no notice" "$out";; *) ok "20 insertions are not flagged as too small";; esac
+is "a real denominator leaves the flag clear" 0 "$INS_DENOM_THIN"
+
+echo "=== the minimum denominator is configurable ==="
+EXPOSE="1-300" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0 INS_MIN_DENOM=50
+verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
+out="$(<"$WORK/out")"
+has "raising INS_MIN_DENOM flags 20 as too small" "$out" "DENOMINATOR TOO SMALL: 20 insertion(s)"
+unset INS_MIN_DENOM
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
