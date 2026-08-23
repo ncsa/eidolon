@@ -130,7 +130,7 @@ BND recovery support a caller/representation limitation rather than a simulator 
 | Fragment spanning a whole DUP | — | 60–800 bp blocks all match the derived haplotype | ✅ measured; earlier ❌ was noise |
 | Two junctions within one fragment | all 4 preserved | 60 chimeric; depth matches derived haplotype | ✅ |
 | Literal INS, ≤ ~150 bp | preserved | inserted bases present in reads | ✅ |
-| Literal INS, ≳ 200 bp | preserved **with full SVLEN** | **head only** — interior and far end in 0 reads | ❌ [#516](https://github.com/ncsa/eidolon/issues/516) partial |
+| Literal INS, ≳ 200 bp | preserved **with full SVLEN** | interior and tail both present (600 bp: 25 head / 19 middle / 16 tail) | ✅ [#516](https://github.com/ncsa/eidolon/issues/516) fixed |
 | Literal DEL (`TTTT…`→`A`) | preserved | **D=49** vs 20 baseline | ✅ |
 
 ### Untested cells: none remain
@@ -160,26 +160,46 @@ in 2026-08 on the strength of `truth INS: 0` in the SV harness — which turned 
 measuring the harness's own selector, not the generator. See §"De novo generation" below and
 `docs/claude_engineering_audit.md` §5.3.
 
-**[#516] Large insertions are only PARTIALLY realized, which is worse than not at all.** An
-insertion longer than roughly one read is spliced into the haplotype, but only its first
-~100–150 bases are ever sequenced. Measured on the H1N1 fixture at `read_len=100`,
-`fragment_mean=250`, counting reads containing a 30-mer from the head / middle / far end of the
-inserted sequence:
+**[#516] Large insertions were only PARTIALLY realized — FIXED.** Kept here because the
+defect's shape is the most instructive one in this repo: the head was always present while the
+interior collapsed to zero, so any probe near the insertion's start said it worked, which is
+where a casual check looks. The truth VCF meanwhile declared the full `SVLEN`.
 
-| insert | head | middle | tail |
+Measured on the H1N1 fixture at `read_len=100`, `fragment_mean=250`, `GT 0/1`, counting reads
+containing a 30-mer from the head / middle / far end of the inserted sequence. Identical
+fixture and config before and after, so the columns are directly comparable:
+
+| insert | head (was → now) | middle (was → now) | tail (was → now) |
 |---|---|---|---|
-| 50 bp | 16 | 13 | 8 |
-| 150 bp | 21 | 5 | 0 |
-| 200 bp | 25 | **0** | **0** |
-| 600 bp | 27 | **0** | **0** |
+| 50 bp | 16 → 22 | 13 → 15 | 8 → 15 |
+| 150 bp | 21 → 19 | 5 → **20** | **0 → 22** |
+| 200 bp | 25 → 20 | **0 → 15** | **0 → 15** |
+| 600 bp | 27 → 25 | **0 → 19** | **0 → 16** |
 
-The head is always present while the interior collapses to zero — so any probe near the
-insertion's start says it works, which is where a casual check looks. The truth VCF meanwhile
-declares the full `SVLEN`.
+The fix samples fragments in *altered-haplotype* coordinates, where an insertion has real
+width, so fragments begin inside it. `eidolon/tests/long_insertion_rework.rs` pins eight
+criteria on eidolon's own FASTQ, and `eidolon/tests/gate2_realigned_ins.rs` pins the same
+insertion through **bwa-mem2**: a homozygous 600 bp insertion at 60x yields 5/5 interior
+probes against 0/5 in a same-seed no-variant control, 96 breakpoint clips against 0, and 51
+reads unmapped-with-mapped-mate against 0.
 
-**Located mechanism.** Fragments and read windows are chosen purely in *reference* offsets
+At genome scale, de novo on a 5 Mb chr22 window (default germline model, `sv_rate_scale=8`):
+**427 of 440** insertions ≥200 bp have their middle sequence in the reads, with zero
+fallbacks. The remaining 13 are thinly covered rather than absent — mean interior depth 3.96
+against 6.77 for the rest, still 68% of their length covered. Interior coverage of a
+heterozygous insertion runs at ~half the flanking reference (7.0 vs 13.0 reads per 30-mer),
+which is the correct ratio, not a shortfall.
+
+**What is NOT yet established:** Delta job 21378484 (chr22, `SV_RATE_SCALE=30`, COSMIC
+pancancer somatic) verified 4 of 4 planted insertions at 5/5 interior probes including one of
+2127 bp — real evidence, but a denominator of four. `verify_planted_ins` now refuses to let a
+run that small read as validation. A larger-denominator campaign is outstanding.
+
+**The historical mechanism**, kept because it explains why the defect was invisible:
+
+Fragments and read windows were chosen purely in *reference* offsets
 (`cover_dataset`, `generate_fragments.rs:323`), and an insertion has zero reference width, so no
-read window can ever *begin* inside one. Reads are assembled per-read by walking a reference
+read window could ever *begin* inside one. Reads are assembled per-read by walking a reference
 slice and expanding variants inline, bounded by `bases_written < read_length`
 (`fastq_tools.rs:429`) with a `break 'outer` at `:555` that discards the rest of the insert
 silently — no log, no counter. Hence:
@@ -203,25 +223,27 @@ That is not primarily a caller limitation. Manta documents a *fully assembled* c
 insertions from a breakend signature alone, as `IMPRECISE <INS>` with
 `LEFT_SVINSSEQ`/`RIGHT_SVINSSEQ`. Most of the planted set was inside that range, and Manta
 reported nothing within 2 kb of any of them — because the evidence for the declared length was
-not in the reads. **INS recall figures are invalid above ~a read length; DEL/DUP/INV/BND/CNV
-are unaffected.**
+not in the reads. **INS recall figures from campaigns before the fix are invalid above ~a
+read length and must not be re-quoted; DEL/DUP/INV/BND/CNV from those runs are unaffected.**
+Job 21378484 is the first post-fix counter-example: Manta's single INS call was an exact
+position-and-size match to a planted 93 bp insertion, dropped only by `--passonly` as
+`MinSomaticScore`, while the three larger insertions it did not call were all confirmed
+present in the reads at 5/5 interior probes. Evidence present, caller declined — which is a
+different finding from evidence absent, and the read-level probe is what separates them.
 
-Suspected mechanism, same family as #498: fragments are placed against *reference*
-coordinates and the insert is spliced in afterwards, so a fragment can reach into the start of
-an insertion but none ever *begins* inside it — nothing samples the interior.
+**The interim `read_len - 1` cap on de novo insertions has been REMOVED.** While #516 was
+open, `gen-reads` refused to plant a de novo insertion whose novel sequence exceeded what a
+read could carry, rather than emit a truth record the reads could not support. That truncated
+the model's own distribution — the bundled default puts `Ins` at log-normal (5.7, 1.0),
+median ~299 bp, so at `read_len=150` roughly three quarters of INS draws were refused.
 
-**De novo insertions are now CAPPED at `read_len - 1` (interim, pending #516).** Rather than
-emit a truth record the reads cannot support, `gen-reads` refuses to plant a de novo insertion
-whose novel sequence exceeds what a read can carry, logging the count dropped. Two consequences,
-both intended:
-
-- **The realized INS rate is below the model's `Ins` probability.** The bundled default puts
-  `Ins` at log-normal (5.7, 1.0) — median ~299 bp — so at `read_len=150` roughly three quarters
-  of INS draws are refused. The truth VCF is now self-consistent; the *distribution* is
-  deliberately truncated and no longer matches the source corpus at the upper tail.
-- **`input_vcf` insertions are NOT capped.** Input fidelity is the stronger contract — what you
-  supply comes out — and silently discarding a user-supplied variant is worse than rendering it
-  partially. A large insertion supplied via `input_vcf` still behaves as the #516 row describes.
+With insertions sampled in altered-haplotype coordinates the cap is unnecessary, and its
+removal is pinned by `eidolon/tests/multi_sv_integration.rs`, which now asserts the opposite
+of what it once did: a de novo insertion MAY declare more novel bases than `read_len - 1`.
+Reinstating the cap, or unwiring the sampler, fails that assertion while every other
+assertion in the file stays green — which is the specific regression it exists to catch.
+De novo insertion sizes now follow the model rather than the read length; measured largest
+realized on a 5 Mb chr22 window is 9,093 bp.
 
 Pinned by `runner.rs`'s `unrealizable_insertions_are_dropped_at_exactly_the_boundary` and
 `the_insertion_cap_does_not_touch_other_variant_types` (a must-not-fire: dropping large

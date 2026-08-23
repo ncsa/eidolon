@@ -69,15 +69,14 @@ fn gen_reads_emits_bnd_inv_and_de_novo_ins_in_one_run() {
     // mostly samples DEL/DUP/CNV at typical rates; we just want a guaranteed
     // de novo INS record to verify the literal-Insertion path.
     config.sv_rate_scale = Some(50.0);
-    // #516: de novo insertions longer than `read_len - 1` are now REFUSED rather than planted,
-    // because reads can carry at most that much of an insertion's novel sequence and emitting
-    // the record would put a length in the truth VCF the reads do not support. The default SV
-    // model puts Ins at log-normal (5.7, 1.0) — median ~299 bp — so at a default read length
-    // essentially every de novo insertion is correctly dropped and this test found none.
+    // #516 HISTORY: de novo insertions longer than `read_len - 1` were once REFUSED rather
+    // than planted, because reads could carry at most that much of an insertion's novel
+    // sequence. That cap is GONE — insertions are sampled in altered-haplotype coordinates
+    // now — and the assertion further down pins its removal. Do not reintroduce the old
+    // wording here; it contradicted that assertion in this very file for one commit.
     //
-    // A longer read makes more of the model's own distribution realizable instead of weakening
-    // the assertion — the record this test wants to see should be one the engine can actually
-    // render. 150 is the largest that still fits the helper's hardcoded 200bp fragment.
+    // The read length stays at 150 for a different reason: it is the largest that still fits
+    // the helper's hardcoded 200 bp fragment.
     config.read_len = 150;
     config.rng_seed = "v1.12.0-multi-sv".to_string();
 
