@@ -146,6 +146,20 @@ check_outdir_version "$EIDOLON_BIN" "$OUTDIR" || exit 1
 # stamp to compare against, so a stale binary runs silently and its results are
 # indistinguishable from a current one. Job 20682989 reproduced job 20675480's caller
 # numbers exactly and the log could not answer "was the fix even in this build?".
+#
+# A second, distinct way to get the same silence: `$SCRATCH` itself resolving to
+# something other than what a manual `cargo build --release` just verified. Anyone
+# juggling more than one Delta project has a reason NOT to export `$SCRATCH`
+# unconditionally in their shell rc (it would make the two projects' env vars fight
+# each other), so it's set manually per session -- and a plain (non-exported)
+# assignment doesn't reach a child `sbatch` job at all. The job then falls back to
+# whatever Delta's own platform default `$SCRATCH` is, which is a valid path (so
+# nothing here fails loudly) but not the one that was just built into. Job 21367013
+# built and verified `+29f29a9` by hand immediately before submitting and still ran
+# `+4a3ea4a` -- a stale binary from an unrelated old build sitting at the platform
+# default. Printing `$SCRATCH` here, next to the binary path it produced, is what
+# makes that mismatch visible without having to reason through the full path by hand.
+echo "SCRATCH:        ${SCRATCH:-unset}"
 echo "eidolon binary: $EIDOLON_BIN"
 echo "eidolon version: ${EIDOLON_VERSION:-unknown}"
 echo "repo HEAD:      $(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"

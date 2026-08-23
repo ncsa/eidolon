@@ -143,16 +143,52 @@ point, and the gate is what will define "fixed" for them.
 
 Only after a type has passed its gates on a fast fixture:
 
-1. **Size sweep: 1 kb / 100 kb / 1 Mb.** The first question this answers is whether
-   [#499](https://github.com/ncsa/eidolon/issues/499)'s ~8% over-delivery is **size-dependent**.
-   If it is a boundary effect it should scale as roughly `fragment_length / event_length` and
-   nearly vanish at 1 Mb; if it holds at 8% it is a multiplier bug. Either answer localises a
-   mechanism the issue currently lacks, and the measurement is the same either way.
+1. ~~**Size sweep: 1 kb / 100 kb / 1 Mb.**~~ **RUN, 2026-08-22, during the
+   release/fragment-placement investigation.** It is a boundary effect, and it does nearly
+   vanish at realistic size: 1200bp event / ~400bp flanks (H1N1) needed a 1.13x correction;
+   the SAME 1200bp event with megabase flanks (a real chr22 window) needed only 1.07x; at a
+   realistic 100kb event size with megabase flanks, 1.003x -- see
+   `eidolon::tests::sv_support_matrix::depth_modulation_is_accurate_at_realistic_scale`,
+   which pins this at 1Mb scale as a permanent regression guard, and
+   `docs/claude_engineering_audit.md` §5.6's 2026-08-22 addendum for the full measurement.
+   Two mechanisms turned out to contribute, not one: #499's own (chimeric junction reads
+   landing outside the coverage-multiplied budget) plus a second, independent one found by
+   this investigation (fragment placement legitimately extending across a coverage-
+   multiplier boundary, correct and necessary for removing an artificial dead zone there,
+   but costing some of the segment's own declared depth to redistribution). Both are real,
+   both vanish at scale, and #499 was closed on this basis. **Practical takeaway: H1N1
+   cannot host an event "much larger than fragment length" with wide flanks at the same
+   time -- it is 2280bp total -- so any coverage-multiplier depth check on it is a fast
+   mechanism check, never a precision one. Prefer events large relative to fragment length,
+   and genuinely large references, whenever depth-multiplier accuracy is what's being
+   validated; small references (viral genomes, small scaffolds) are fine for mechanism
+   testing but should not be used to validate depth precision.**
 2. **Repeat context.** H1N1 has no segmental duplications, no centromere, no N-gaps. Real SVs
    are overwhelmingly repeat-mediated. Plant the same event inside a segdup, inside a simple
    repeat, and in unique sequence, and compare.
 3. **N-gaps.** What happens when an event overlaps an assembly gap — is it planted, refused, or
-   silently mangled?
+   silently mangled? **Partially answered, 2026-08-23.** The *read-generation* half is now
+   covered and guarded: `regions_of_interest` is built from `get_non_n_regions()`, so N bases
+   are excluded from generation, and fragment placement must not extend a fragment's end
+   across a gap even though it deliberately extends across chunk and coverage-multiplier
+   boundaries. That distinction was gotten wrong once already (review of the
+   fragment-placement branch: 103 of 6000 reads carried gap sequence, against 0 before that
+   branch) and is now pinned by
+   `eidolon::tests::sv_support_matrix::fragments_do_not_extend_across_an_assembly_gap`,
+   shown non-vacuous by mutation. **Still open:** what happens to an *SV event* whose span
+   overlaps a gap — whether it is planted, refused, or silently mangled — which is a
+   different code path (`sv_modulation_range` / the SV samplers) and untested.
+
+4. **Targeted (BED) coverage semantics.** Measured 2026-08-23 while validating the
+   fragment-placement rewrite: on an exome-scale BED (436 targets, mean width 178 bp,
+   real chr22 sequence) a requested `coverage: 60` delivers ~24.5x on target, because
+   40.5% of read bases legitimately spill past targets narrower than the fragment
+   length. Documented as a caveat in the README's `target_bed` section; making
+   `coverage` mean on-target depth automatically is
+   [#578](https://github.com/ncsa/eidolon/issues/578). Note the design trap recorded
+   there: isolated exome targets lose ~59% of their spill while *adjacent* segments (an
+   SV interval and its baseline neighbours) exchange spill and lose ~0-7%, so a uniform
+   inflation factor would break SV depth modulation.
 
 ## Phase 2 — scorers at scale
 
