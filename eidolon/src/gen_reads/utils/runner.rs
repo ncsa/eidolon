@@ -945,8 +945,26 @@ fn process_chunk(
                         // realizing only one (or corrupting both), fall back to the
                         // pre-#516 behaviour and say so, so a partially-realized
                         // insertion is never mistaken for a working one.
+                        // MEASURED frequency, recorded because the first estimate of it
+                        // was wrong by orders of magnitude. This fires only when several
+                        // long insertions pack into ONE sub-region, which needs an SV
+                        // rate far above anything realistic:
+                        //   default germline model, 5Mb, sv_rate_scale=8  -> 10,124 SVs
+                        //     sampled (overlap rejection saturated), 440 long INS, 64 of
+                        //     them in fallback regions
+                        //   COSMIC tumour model, 5Mb, sv_rate_scale=30    -> 3 SVs,
+                        //     ZERO INS, ZERO fallbacks
+                        // The second is what the Delta SV pipeline actually runs
+                        // (TUMOR_MODEL=cosmic_v104_pancancer_model.json.gz); a full-chr22
+                        // smoke run at that setting produced 1 INS in total. So in
+                        // practice this path is near-unreachable, and it is the default
+                        // germline model at high rate_scale that reaches it -- not the
+                        // tumour configuration the validation campaigns use.
                         warn!(
-                            "{contig_name}: {} long insertions share one sub-region                              [{sub_start},{sub_end}); haplotype sampling handles one at a                              time, so these keep the pre-#516 head-only behaviour (#516)",
+                            "{contig_name}: {} long insertions share one sub-region \
+                             [{sub_start},{sub_end}); haplotype sampling handles one at \
+                             a time, so these keep the pre-#516 head-only behaviour \
+                             (#516)",
                             many.len()
                         );
                     }
