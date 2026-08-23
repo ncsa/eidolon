@@ -179,6 +179,17 @@ Only after a type has passed its gates on a fast fixture:
    overlaps a gap — whether it is planted, refused, or silently mangled — which is a
    different code path (`sv_modulation_range` / the SV samplers) and untested.
 
+4. **Targeted (BED) coverage semantics.** Measured 2026-08-23 while validating the
+   fragment-placement rewrite: on an exome-scale BED (436 targets, mean width 178 bp,
+   real chr22 sequence) a requested `coverage: 60` delivers ~24.5x on target, because
+   40.5% of read bases legitimately spill past targets narrower than the fragment
+   length. Documented as a caveat in the README's `target_bed` section; making
+   `coverage` mean on-target depth automatically is
+   [#578](https://github.com/ncsa/eidolon/issues/578). Note the design trap recorded
+   there: isolated exome targets lose ~59% of their spill while *adjacent* segments (an
+   SV interval and its baseline neighbours) exchange spill and lose ~0-7%, so a uniform
+   inflation factor would break SV depth modulation.
+
 ## Phase 2 — scorers at scale
 
 Only once Phase 1 is clean. Whole-genome campaigns with truvari + Manta + Delly, as today, but
