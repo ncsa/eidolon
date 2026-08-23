@@ -167,7 +167,17 @@ Only after a type has passed its gates on a fast fixture:
    are overwhelmingly repeat-mediated. Plant the same event inside a segdup, inside a simple
    repeat, and in unique sequence, and compare.
 3. **N-gaps.** What happens when an event overlaps an assembly gap — is it planted, refused, or
-   silently mangled?
+   silently mangled? **Partially answered, 2026-08-23.** The *read-generation* half is now
+   covered and guarded: `regions_of_interest` is built from `get_non_n_regions()`, so N bases
+   are excluded from generation, and fragment placement must not extend a fragment's end
+   across a gap even though it deliberately extends across chunk and coverage-multiplier
+   boundaries. That distinction was gotten wrong once already (review of the
+   fragment-placement branch: 103 of 6000 reads carried gap sequence, against 0 before that
+   branch) and is now pinned by
+   `eidolon::tests::sv_support_matrix::fragments_do_not_extend_across_an_assembly_gap`,
+   shown non-vacuous by mutation. **Still open:** what happens to an *SV event* whose span
+   overlaps a gap — whether it is planted, refused, or silently mangled — which is a
+   different code path (`sv_modulation_range` / the SV samplers) and untested.
 
 ## Phase 2 — scorers at scale
 

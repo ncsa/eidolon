@@ -429,6 +429,109 @@ fn write_fasta(path: &Path, contig: &str, seq: &str) {
     std::fs::write(path, out).unwrap();
 }
 
+/// REGRESSION GUARD for the assembly-gap boundary. `regions_of_interest` is built
+/// from `get_non_n_regions()`, so N bases are deliberately excluded from read
+/// generation -- but fragment placement is allowed to extend a fragment's END past
+/// its owning region's edge (that is what removes the artificial dead zone at chunk
+/// and coverage-multiplier boundaries). An assembly gap is the one boundary that
+/// extension must treat as a true terminus, or reads carry fabricated gap sequence.
+///
+/// Caught in review of the fragment-placement branch, then measured: 103 of 6000
+/// reads contained `N` on a reference with a 2 kb gap, against 0 both before that
+/// branch and at its step 1 (before extension was wired into runner.rs) -- so it
+/// was introduced by the extension wiring specifically, and is not pre-existing.
+/// Nothing in the suite covered N-gaps at all, which is why it reached a PR;
+/// `docs/sv_polish_roadmap.md`'s Phase 1 item 3 had already flagged that blind spot.
+#[test]
+fn fragments_do_not_extend_across_an_assembly_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (left, gap, right) = (5_000usize, 2_000usize, 5_000usize);
+    let contig_len = left + gap + right;
+
+    // [0, 5000) real | [5000, 7000) N | [7000, 12000) real
+    let mut seq = synthetic_sequence(left);
+    seq.push_str(&"N".repeat(gap));
+    seq.push_str(&synthetic_sequence(right));
+    let reference = tmp.path().join("ngap.fa");
+    write_fasta(&reference, "ngap1", &seq);
+
+    let out = tmp.path().join("run");
+    std::fs::create_dir_all(&out).unwrap();
+    let cfg = out.join("c.yml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 2\npaired_ended: true\n\
+             fragment_mean: 250\nfragment_st_dev: 30\n\
+             produce_vcf: false\nproduce_fastq: false\nproduce_bam: true\n\
+             sv_rate_scale: 0.0\nmutation_rate: 0.0\noverwrite_output: true\n\
+             output_dir: {out}\noutput_filename: o\nrng_seed: ngap guard\nnum_threads: 1\n",
+            ref = reference.display(),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(&cfg)
+        .assert()
+        .success();
+
+    // Read the BAM directly rather than the FASTQ: a placed read's reference span is
+    // the thing that must not enter the gap, and grepping sequence for 'N' would also
+    // be satisfied by a sequencing-error N, which is a different mechanism.
+    let file = std::fs::File::open(out.join("o.bam")).expect("bam produced");
+    let mut reader = bam::io::Reader::new(file);
+    reader.read_header().unwrap();
+    let (mut total, mut into_gap) = (0usize, 0usize);
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        let Some(Ok(pos)) = rec.alignment_start() else {
+            continue;
+        };
+        let mut span = 0usize;
+        for op in rec.cigar().iter() {
+            let op = op.unwrap();
+            if matches!(
+                op.kind(),
+                Kind::Match
+                    | Kind::Deletion
+                    | Kind::Skip
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch
+            ) {
+                span += op.len();
+            }
+        }
+        total += 1;
+        // 1-based inclusive read span vs the 1-based gap [left+1, left+gap].
+        let (rs, re) = (pos.get(), pos.get() + span.saturating_sub(1));
+        if rs <= left + gap && re > left {
+            into_gap += 1;
+        }
+    }
+
+    assert!(
+        total > 100,
+        "fixture produced too few reads ({total}) to be meaningful"
+    );
+    assert_eq!(
+        into_gap,
+        0,
+        "{into_gap} of {total} reads overlap the assembly gap at [{}, {}] -- fragment \
+         extension crossed an N-region boundary, so those reads carry fabricated gap \
+         sequence. Extension must stop at a gap even though it correctly crosses chunk \
+         and coverage-multiplier boundaries.",
+        left + 1,
+        left + gap
+    );
+    // Must-not-fire half: the gap must not have suppressed generation elsewhere.
+    assert!(
+        contig_len > 0 && total >= 4_000,
+        "expected roughly full coverage of the two real intervals, got {total} reads"
+    );
+}
+
 /// CONFIRMS the size-dependence recorded above and in
 /// docs/claude_engineering_audit.md §5.6 (2026-08-22 addendum) at the scale that
 /// actually matters: H1N1 cannot host a "much larger than fragment length" event with

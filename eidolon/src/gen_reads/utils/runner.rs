@@ -743,6 +743,16 @@ fn process_chunk(
 
     debug!("    > Generating bias map.");
     let raw_regions = current_block.get_non_n_regions();
+    // Unclipped non-N interval bounds, captured BEFORE the BED intersection and
+    // chunk clipping below, because those two narrow the intervals for
+    // *ownership* while a fragment's END is deliberately allowed to run past
+    // them (see the extension_budget doc on generate_fragments). An assembly
+    // N-gap is the one boundary it must NOT run past: those bases are excluded
+    // from read generation on purpose, and a fragment spilling into one emits
+    // reads containing fabricated gap sequence. Bounding extension by the
+    // enclosing non-N interval keeps chunk- and multiplier-boundary extension
+    // (both wanted) while making a gap a true terminus (like the contig end).
+    let non_n_bounds: Vec<(usize, usize)> = raw_regions.iter().map(|r| (r.start, r.end)).collect();
     let bed_regions: Vec<SequenceMap> = if let Some(bed) = ctx.target_bed {
         let contig_beds = bed.get(&contig_name).map(|v| v.as_slice()).unwrap_or(&[]);
         intersect_with_bed(&raw_regions, contig_beds, 0)
@@ -825,9 +835,16 @@ fn process_chunk(
                 if scaled == 0 {
                     continue;
                 }
-                // How far real sequence continues past this sub-region's own
-                // right edge, up to the contig's true end -- including across
-                // a coverage-multiplier boundary (a narrow SV's own edge).
+                // How far real, materializable sequence continues past this
+                // sub-region's own right edge -- bounded by the enclosing non-N
+                // interval, NOT by contig_len: an assembly gap's N bases are
+                // excluded from read generation deliberately, so a fragment
+                // extending across one would emit reads carrying fabricated gap
+                // sequence (measured: 103 of 6000 reads contained N on a
+                // reference with a 2kb gap, against 0 both before this branch
+                // and at step 1, before extension was wired in). Chunk and
+                // coverage-multiplier boundaries are still crossed freely --
+                // only a gap (or the contig end) is a true terminus.
                 // That measurably redistributes some of a narrow segment's
                 // own declared depth to its neighbor (confirmed a real
                 // redistribution, not a bug: total read count and R1/R2
@@ -844,7 +861,12 @@ fn process_chunk(
                 // narrower than the fragment-length scale. See
                 // docs/claude_engineering_audit.md §5.6's 2026-08-22 addendum
                 // and docs/sv_polish_roadmap.md's Phase 1 item 1.
-                let extension_budget = contig_len.saturating_sub(sub_end);
+                let materializable_end = non_n_bounds
+                    .iter()
+                    .find(|&&(ns, ne)| sub_start >= ns && sub_start < ne)
+                    .map(|&(_, ne)| ne)
+                    .unwrap_or(contig_len);
+                let extension_budget = materializable_end.saturating_sub(sub_end);
                 let frags = if ctx.gc_bias_model.is_uniform() {
                     generate_fragments(
                         extension_budget,
