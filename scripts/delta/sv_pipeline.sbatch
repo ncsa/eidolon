@@ -1206,19 +1206,88 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     # while its warning text claimed the latter.
     # A breakend has no SVLEN and END==POS, so it falls back to the 2 Mb floor, which
     # displaces a point event completely.
+    # Two ways this control lied about itself before, both measured on job 21382756
+    # (3 contigs, SV_RATE_SCALE=100, 481 scoreable records):
+    #
+    #   1. A record shifted past the end of its contig silently VANISHED. truvari reported
+    #      "base cnt 481, comp cnt 461" — 20 records, 4% of the control's own denominator,
+    #      gone with no mention. A control that quietly shrinks is rule 4 inside the
+    #      calibration step.
+    #   2. At ~5 SVs/Mb a displaced record can land within truvari's refdist of a DIFFERENT
+    #      truth record and match it. Seven did, giving recall=0.0146 against a threshold of
+    #      0.001 — which, over 481 records, means "exactly zero matches allowed". The scorer
+    #      was fine; coincidence is not a scorer defect, and at high density it is guaranteed.
+    #
+    # So: shift within the contig (backwards when forward will not fit), drop what cannot be
+    # placed at all, drop what lands near a same-type truth record, and REPORT all three
+    # counts. Only then does a surviving match mean the scorer is loose.
+    local body="$OUTDIR/.decoy_${label}.body" fai="$REFERENCE.fai" bound=1
+    if [[ ! -s "$fai" ]]; then
+        # Never a silent skip: "could not bound the control" must not read as
+        # "the control passed" — that is this file's whole thesis.
+        bound=0
+        echo "  decoy $label: no $fai — displacement is NOT bounded by contig length, so a" >&2
+        echo "    record can run off a contig end and shrink this control silently." >&2
+    fi
+    bcftools view -H "$truth" > "$body" || { echo "  decoy $label: could not read truth (skipped)"; return 0; }
+
+    local stats="$OUTDIR/.decoy_${label}.stats"
     { bcftools view -h "$truth"
-      bcftools view -H "$truth" | awk -F'\t' 'BEGIN{OFS="\t"}
-        { len=0
-          if (match($8, /SVLEN=-?[0-9]+/)) { len=substr($8, RSTART+6, RLENGTH-6); if (len<0) len=-len }
+      awk -F'\t' -v faif="$fai" -v bodyf="$body" -v collide=1000 -v statf="$stats" -v bound="$bound" '
+        BEGIN{ OFS="\t"
+            if (bound) { while ((getline l < faif) > 0) { split(l, f, "\t"); clen[f[1]] = f[2] } }
+            # Index every truth record by contig+type so a displaced copy can be checked
+            # against the ones it might collide with.
+            while ((getline l < bodyf) > 0) {
+                split(l, f, "\t")
+                t = "."; if (match(f[8], /SVTYPE=[A-Z]+/)) t = substr(f[8], RSTART+7, RLENGTH-7)
+                k = f[1] SUBSEP t; n[k]++; tp[k, n[k]] = f[2]
+            }
+        }
+        { len = 0
+          if (match($8, /SVLEN=-?[0-9]+/)) { len = substr($8, RSTART+6, RLENGTH-6); if (len < 0) len = -len }
+          end = $2; if (match($8, /END=[0-9]+/)) end = substr($8, RSTART+4, RLENGTH-4)
+          span = end - $2; if (span < 0) span = 0
           shift_by = 2000000; if (2*len > shift_by) shift_by = 2*len
-          $2 = $2 + shift_by
-          # END must move with POS or the record describes a span it no longer occupies.
+          L = clen[$1] + 0
+          newpos = $2 + shift_by
+          # Forward if the whole span still fits; otherwise mirror the displacement.
+          # Without a .fai there is no contig length to check, so forward is all there is.
+          if (bound && L > 0 && newpos + span > L) {
+              newpos = $2 - shift_by
+              if (newpos < 1) { dropped++; next }   # neither direction fits this contig
+          }
+          t = "."; if (match($8, /SVTYPE=[A-Z]+/)) t = substr($8, RSTART+7, RLENGTH-7)
+          k = $1 SUBSEP t
+          for (i = 1; i <= n[k]; i++) {
+              d = tp[k, i] - newpos; if (d < 0) d = -d
+              if (d <= collide) { collided++; next }
+          }
+          delta = newpos - $2
+          $2 = newpos
           if (match($8, /END=[0-9]+/)) {
-              e = substr($8, RSTART+4, RLENGTH-4) + shift_by
+              e = substr($8, RSTART+4, RLENGTH-4) + delta
               $8 = substr($8, 1, RSTART-1) "END=" e substr($8, RSTART+RLENGTH)
           }
-          print }'; } \
+          kept++
+          print
+        }
+        END { printf "%d\t%d\t%d\n", kept+0, dropped+0, collided+0 > statf }' "$body"; } \
       | bcftools sort -O z -o "$decoy" 2>/dev/null || { echo "  decoy $label: could not build (skipped)"; return 0; }
+
+    local d_kept=0 d_dropped=0 d_collided=0
+    if [[ -s "$stats" ]]; then IFS=$'\t' read -r d_kept d_dropped d_collided < "$stats"; fi
+    local d_total=$(( d_kept + d_dropped + d_collided ))
+    if [[ "$d_dropped" -gt 0 || "$d_collided" -gt 0 ]]; then
+        echo "  decoy    $label: displaced $d_kept of $d_total; $d_dropped unplaceable on their contig," \
+             "$d_collided within 1000bp of another truth record of the same type (both excluded)"
+    fi
+    # A control that has shed most of its records is not a control any more.
+    if [[ "$d_kept" -lt 1 ]] || [[ "$d_total" -gt 0 && $(( d_kept * 100 / d_total )) -lt 50 ]]; then
+        echo "ERROR: decoy control for $label kept only $d_kept of $d_total record(s) — too few to" >&2
+        echo "  calibrate anything. A recall of 0 from a control this thin is not evidence." >&2
+        return 1
+    fi
     bcftools index -f -t "$decoy" 2>/dev/null || true
     rm -rf "$out"
     local err="$OUTDIR/.decoy_${label}.stderr"

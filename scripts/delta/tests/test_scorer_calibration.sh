@@ -60,6 +60,10 @@ decoy always passes@if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then@if true; t
 decoy tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: decoy control for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=0; if false; then echo "ERROR: decoy control for $label DID NOT RUN
 selftest tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: scorer selftest for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=1.0; if false; then echo "ERROR: scorer selftest for $label DID NOT RUN
 decoy match is only a warning@echo "ERROR: decoy control for $label matched@return 0; echo "ERROR: decoy control for $label matched
+decoy ignores the contig bound@if (bound && L > 0 && newpos + span > L) {@if (0) {
+decoy keeps colliding records@if (d <= collide) { collided++; next }@if (0) { collided++; next }
+decoy tolerates a control that shed everything@if [[ "$d_kept" -lt 1 ]] || [[ "$d_total" -gt 0 && $(( d_kept * 100 / d_total )) -lt 50 ]]; then@if false; then
+decoy hides what it dropped@if [[ "$d_dropped" -gt 0 || "$d_collided" -gt 0 ]]; then@if false; then
 empty stratum silently dropped (pre-fix)@TYPES_UNMEASURED+=("$svt")@:
 coverage-hole summary never printed@echo "  SV types with an EMPTY denominator@echo "  suppressed
 empty stratum reported for every type@if [[ "$n" -eq 0 ]]; then@if [[ "$n" -ge 0 ]]; then
@@ -524,6 +528,77 @@ rm -f "$WORK/r.fa.fai"
 head -c 10000 /dev/zero > "$WORK/r.fa"
 is "falls back to ~0.98x the FASTA bytes" 9800 "$(reference_bp "$WORK/r.fa")"
 is "a missing reference reports 0 (-> worst case)" 0 "$(reference_bp "$WORK/nope.fa")"
+
+echo "── decoy is bounded by the contig and avoids colliding with the truth (job 21382756) ──"
+# Job 21382756 exposed two ways this control misreported ITSELF: 20 of 481 records ran off a
+# contig end and vanished with no mention (truvari saw "base cnt 481, comp cnt 461"), and 7
+# displaced records landed on top of a DIFFERENT truth record at ~5 SVs/Mb and matched it,
+# giving recall=0.0146 against a threshold that means "zero matches allowed". Neither was a
+# scorer defect. Both now have to be handled and counted.
+SAVED_REF="$REFERENCE"
+REFERENCE="$WORK/ref2.fa"
+: > "$REFERENCE"
+printf 'c2\t10000000\t0\t60\t61\nc3\t1000000\t0\t60\t61\nc4\t100000000\t0\t60\t61\n' > "$REFERENCE.fai"
+{ printf '##fileformat=VCFv4.2\n'
+  printf '##contig=<ID=c2,length=10000000>\n##contig=<ID=c3,length=1000000>\n##contig=<ID=c4,length=100000000>\n'
+  printf '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="t">\n'
+  printf '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="l">\n'
+  printf '##INFO=<ID=END,Number=1,Type=Integer,Description="e">\n'
+  printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+  # +2Mb would end past c2's 10Mb end -> must mirror to 7000000 instead of vanishing
+  printf 'c2\t9000000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-1000;END=9001000\n'
+  # c3 is 1Mb: neither +2Mb nor -2Mb fits, so this one is genuinely unplaceable
+  printf 'c3\t500000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-1000;END=501000\n'
+  # +2Mb lands at 3000000, within 1000bp of the next record, which is the same SVTYPE
+  printf 'c4\t1000000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=3000;END=1003000\n'
+  printf 'c4\t3000500\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=3000;END=3003500\n'
+  printf 'c4\t20000000\t.\tG\t<INV>\t60\tPASS\tSVTYPE=INV;SVLEN=800;END=20000800\n'
+  printf 'c4\t30000000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=30000500\n'
+} > "$WORK/truth2.vcf"
+bgzip -f -c "$WORK/truth2.vcf" > "$WORK/truth2.vcf.gz"
+bcftools index -f -t "$WORK/truth2.vcf.gz"
+
+STUB_MODE=json; STUB_RECALL=0.0
+dout="$(decoy_truvari "$WORK/truth2.vcf.gz" bound 2>&1)"
+D2="$WORK/.decoy_bound.vcf.gz"
+p2() { bcftools query -f '%CHROM\t%POS\n' "$D2" 2>/dev/null | awk -F'\t' -v c="$1" -v p="$2" '$1==c && $2==p' | wc -l; }
+
+is "a record that would overrun the contig is mirrored, not lost" 1 "$(p2 c2 7000000)"
+is "and it is NOT placed past the contig end"                     0 "$(p2 c2 11000000)"
+is "a record that fits neither direction is dropped"              0 "$(p2 c3 2500000)"
+is "a displaced record landing on another truth record is excluded" 0 "$(p2 c4 3000000)"
+is "a non-colliding record is still displaced"                    1 "$(p2 c4 5000500)"
+is "the surviving decoy holds exactly the placeable, non-colliding records" 4 \
+   "$(bcftools view -H "$D2" 2>/dev/null | wc -l)"
+has "the unplaceable record is reported, not silent" "$dout" "1 unplaceable"
+has "the collision is reported, not silent"          "$dout" "1 within 1000bp"
+
+echo "── a decoy that has shed most of its records is not a control ──"
+{ printf '##fileformat=VCFv4.2\n##contig=<ID=c3,length=1000000>\n'
+  printf '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="t">\n'
+  printf '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="l">\n'
+  printf '##INFO=<ID=END,Number=1,Type=Integer,Description="e">\n'
+  printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+  printf 'c3\t100000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=100500\n'
+  printf 'c3\t400000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=400500\n'
+  printf 'c3\t700000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=700500\n'
+} > "$WORK/truth3.vcf"
+bgzip -f -c "$WORK/truth3.vcf" > "$WORK/truth3.vcf.gz"
+bcftools index -f -t "$WORK/truth3.vcf.gz"
+out="$(decoy_truvari "$WORK/truth3.vcf.gz" thin 2>&1)"; rc=$?
+is "an all-unplaceable decoy FAILS rather than reporting zero" 1 "$rc"
+has "and says how thin"  "$out" "kept only 0 of 3 record(s)"
+has "and says why it matters" "$out" "calibrate anything"
+case "$out" in *"PASS"*) bad "a thin decoy never claims PASS" "no PASS" "$out";; *) ok "a thin decoy never claims PASS";; esac
+
+echo "── without a .fai the control still runs, and says it is unbounded ──"
+rm -f "$REFERENCE.fai"
+out="$(decoy_truvari "$WORK/truth2.vcf.gz" nofai 2>&1)"; rc=$?
+is "a missing .fai does not skip the control" 0 "$rc"
+has "a missing .fai is called out"            "$out" "NOT bounded by contig length"
+has "and the control still reaches a verdict" "$out" "PASS"
+REFERENCE="$SAVED_REF"
+
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
