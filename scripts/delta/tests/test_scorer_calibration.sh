@@ -94,6 +94,25 @@ MUTATIONS
     exit $?
 fi
 
+# Prerequisites. Unlike the other two suites, this one drives REAL bcftools and bgzip —
+# truvari is stubbed, the VCF handling is not. A missing tool otherwise surfaces as
+# "is in a format that cannot be usefully indexed" thirty lines later, which reads like a
+# bad fixture rather than a missing package. On Ubuntu bgzip ships in `tabix`, NOT in
+# `bcftools`; that cost one red CI run.
+missing=
+for tool in bcftools bgzip; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "FATAL: this suite needs real VCF tooling and is missing:$missing" >&2
+    echo "  Ubuntu/Debian:  sudo apt-get install -y bcftools tabix   (bgzip is in tabix)" >&2
+    echo "  conda:          conda install -c bioconda bcftools htslib" >&2
+    echo "  Refusing to run: a calibration suite that cannot build a VCF would report" >&2
+    echo "  failures about its own fixtures, not about the code under test." >&2
+    exit 2
+fi
+
+
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
