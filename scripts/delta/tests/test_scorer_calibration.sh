@@ -61,7 +61,7 @@ decoy tolerates a control that did not run@    if ! r=$(truvari_metric "$out/sum
 selftest tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: scorer selftest for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=1.0; if false; then echo "ERROR: scorer selftest for $label DID NOT RUN
 decoy match is only a warning@echo "ERROR: decoy control for $label matched@return 0; echo "ERROR: decoy control for $label matched
 decoy ignores the contig bound@if (bound && L > 0 && newpos + span > L) {@if (0) {
-decoy keeps colliding records@if (d <= collide) { collided++; next }@if (0) { collided++; next }
+decoy keeps colliding records@if (newpos <= te[k, i] + collide && newend >= tp[k, i] - collide) { collided++; next }@if (0) { collided++; next }
 decoy tolerates a control that shed everything@if [[ "$d_kept" -lt 1 ]] || [[ "$d_total" -gt 0 && $(( d_kept * 100 / d_total )) -lt 50 ]]; then@if false; then
 decoy hides what it dropped@if [[ "$d_dropped" -gt 0 || "$d_collided" -gt 0 ]]; then@if false; then
 empty stratum silently dropped (pre-fix)@TYPES_UNMEASURED+=("$svt")@:
@@ -549,11 +549,17 @@ printf 'c2\t10000000\t0\t60\t61\nc3\t1000000\t0\t60\t61\nc4\t100000000\t0\t60\t6
   printf 'c2\t9000000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-1000;END=9001000\n'
   # c3 is 1Mb: neither +2Mb nor -2Mb fits, so this one is genuinely unplaceable
   printf 'c3\t500000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-1000;END=501000\n'
-  # +2Mb lands at 3000000, within 1000bp of the next record, which is the same SVTYPE
+  # +2Mb lands at 3000000-3003000, overlapping the next record's span (same SVTYPE)
   printf 'c4\t1000000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=3000;END=1003000\n'
   printf 'c4\t3000500\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=3000;END=3003500\n'
   printf 'c4\t20000000\t.\tG\t<INV>\t60\tPASS\tSVTYPE=INV;SVLEN=800;END=20000800\n'
   printf 'c4\t30000000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=30000500\n'
+  # JOB 21387104's geometry: +2Mb puts this 900kb DUP at 42.0-42.9Mb, which OVERLAPS the
+  # next record's span while starting 500kb away from it. A start-proximity test misses
+  # that completely, and truvari matched exactly this shape — a decoy DUP 900kb from a
+  # truth DUP — because it matches large symbolic SVs on size and overlap, not refdist.
+  printf 'c4\t40000000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=900000;END=40900000\n'
+  printf 'c4\t42500000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=900000;END=43400000\n'
 } > "$WORK/truth2.vcf"
 bgzip -f -c "$WORK/truth2.vcf" > "$WORK/truth2.vcf.gz"
 bcftools index -f -t "$WORK/truth2.vcf.gz"
@@ -568,10 +574,12 @@ is "and it is NOT placed past the contig end"                     0 "$(p2 c2 110
 is "a record that fits neither direction is dropped"              0 "$(p2 c3 2500000)"
 is "a displaced record landing on another truth record is excluded" 0 "$(p2 c4 3000000)"
 is "a non-colliding record is still displaced"                    1 "$(p2 c4 5000500)"
-is "the surviving decoy holds exactly the placeable, non-colliding records" 4 \
+is "a displaced span that OVERLAPS a truth record 500kb away is excluded" 0 "$(p2 c4 42000000)"
+is "a displaced span that overlaps nothing is kept"  1 "$(p2 c4 44500000)"
+is "the surviving decoy holds exactly the placeable, non-colliding records" 5 \
    "$(bcftools view -H "$D2" 2>/dev/null | wc -l)"
 has "the unplaceable record is reported, not silent" "$dout" "1 unplaceable"
-has "the collision is reported, not silent"          "$dout" "1 within 1000bp"
+has "the collisions are reported, not silent"        "$dout" "2 overlapping"
 
 echo "── a decoy that has shed most of its records is not a control ──"
 { printf '##fileformat=VCFv4.2\n##contig=<ID=c3,length=1000000>\n'

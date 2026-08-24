@@ -1241,7 +1241,8 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
             while ((getline l < bodyf) > 0) {
                 split(l, f, "\t")
                 t = "."; if (match(f[8], /SVTYPE=[A-Z]+/)) t = substr(f[8], RSTART+7, RLENGTH-7)
-                k = f[1] SUBSEP t; n[k]++; tp[k, n[k]] = f[2]
+                e = f[2]; if (match(f[8], /END=[0-9]+/)) e = substr(f[8], RSTART+4, RLENGTH-4)
+                k = f[1] SUBSEP t; n[k]++; tp[k, n[k]] = f[2]; te[k, n[k]] = e
             }
         }
         { len = 0
@@ -1259,9 +1260,15 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
           }
           t = "."; if (match($8, /SVTYPE=[A-Z]+/)) t = substr($8, RSTART+7, RLENGTH-7)
           k = $1 SUBSEP t
+          newend = newpos + span
+          # SPAN OVERLAP, not start proximity. truvari matches a large symbolic SV on size
+          # similarity and overlap rather than on refdist, and a displacement preserves size
+          # exactly, so pctsize is satisfied for free. Job 21387104 matched a decoy DEL 4.5 kb
+          # from a truth DEL and a decoy DUP 900 kb from a truth DUP — both far outside any
+          # sane point-proximity window, both overlapping spans. A start-distance test models
+          # the wrong matching rule; a decoy must simply not overlap a same-type truth record.
           for (i = 1; i <= n[k]; i++) {
-              d = tp[k, i] - newpos; if (d < 0) d = -d
-              if (d <= collide) { collided++; next }
+              if (newpos <= te[k, i] + collide && newend >= tp[k, i] - collide) { collided++; next }
           }
           delta = newpos - $2
           $2 = newpos
@@ -1280,7 +1287,7 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     local d_total=$(( d_kept + d_dropped + d_collided ))
     if [[ "$d_dropped" -gt 0 || "$d_collided" -gt 0 ]]; then
         echo "  decoy    $label: displaced $d_kept of $d_total; $d_dropped unplaceable on their contig," \
-             "$d_collided within 1000bp of another truth record of the same type (both excluded)"
+             "$d_collided overlapping a truth record of the same type (both excluded)"
     fi
     # A control that has shed most of its records is not a control any more.
     if [[ "$d_kept" -lt 1 ]] || [[ "$d_total" -gt 0 && $(( d_kept * 100 / d_total )) -lt 50 ]]; then
