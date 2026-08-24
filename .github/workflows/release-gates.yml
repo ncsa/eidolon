@@ -1,0 +1,72 @@
+# Pre-release gate: run the tests CI cannot normally reach.
+#
+# WHY THIS EXISTS: six tests in this repo are `#[ignore]`d because they need external
+# tools — bwa-mem2 for the realigned SV gates, samtools/bcftools for the validate
+# differential. `cargo test` skips them, CI reports green, and nobody notices when one
+# breaks. `gate2_realigned_dup` was red on develop AND main through an entire release
+# before anyone ran it by hand (#582). An ignored test that nothing ever runs is not a
+# test, it is a comment.
+#
+# Deliberately NOT nightly and NOT on every PR. The realigned gates are the strongest
+# correctness evidence this repo has — they ask whether a real aligner, given eidolon's
+# FASTQ, produces the evidence a caller keys on — and that question is worth asking when
+# a release is proposed, not on every push to a topic branch.
+#
+# Triggers: a PR into main (this repo releases by merging develop -> main), or manually
+# via the Actions tab before cutting a release.
+
+name: release-gates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  realigned-gates:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ubuntu-latest-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ubuntu-latest-cargo-
+
+    # Upstream ships a prebuilt static x86_64 build; bwa-mem2 is not in the Ubuntu
+    # archive (`bwa` is, and is a different tool the gates do not use). The tarball
+    # carries per-ISA kernels plus a dispatcher, so it picks AVX2 on the runner itself.
+    - name: Install bwa-mem2
+      run: |
+        set -euo pipefail
+        curl -fsSL https://github.com/bwa-mem2/bwa-mem2/releases/download/v2.2.1/bwa-mem2-2.2.1_x64-linux.tar.bz2 \
+          | sudo tar xj -C /opt
+        echo /opt/bwa-mem2-2.2.1_x64-linux >> "$GITHUB_PATH"
+
+    - name: Install samtools and bcftools
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq samtools bcftools
+
+    # Fail loudly here rather than inside a test. A gate that cannot find its aligner
+    # must not be mistaken for a gate that ran.
+    - name: Confirm the tools are really on PATH
+      run: |
+        bwa-mem2 version
+        samtools --version | head -1
+        bcftools --version | head -1
+
+    # --ignored runs ONLY the ignored tests: the five realigned SV gates and the
+    # validate differential. --no-fail-fast so one failing gate does not conceal the rest.
+    - name: Run the ignored tests (realigned SV gates + validate differential)
+      run: cargo test --workspace --no-fail-fast -- --ignored --nocapture

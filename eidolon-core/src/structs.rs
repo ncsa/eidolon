@@ -5,6 +5,7 @@
 //! that will generate the data that generate-reads can then use to run simulations.
 pub mod bed_record;
 pub mod distributions;
+pub mod haplotype_map;
 pub mod mutated_map;
 pub mod nucleotides;
 pub mod read_record;

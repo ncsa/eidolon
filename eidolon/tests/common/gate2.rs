@@ -15,6 +15,7 @@
 
 use super::{GenReadsConfig, eidolon, fresh_workdir, h1n1_reference};
 use noodles::sam;
+use noodles::sam::alignment::record::Sequence as _;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
@@ -115,7 +116,12 @@ pub fn bwa_mem2() -> String {
 
 /// Generate paired reads over H1N1, optionally planting one symbolic SV. The control run uses
 /// the same reference, seed and coverage, so the two differ **only** by the variant.
-pub fn generate_reads(work: &Path, tag: &str, sv: Option<&SvSpec>) -> (PathBuf, PathBuf) {
+pub fn generate_reads(
+    work: &Path,
+    tag: &str,
+    sv: Option<&SvSpec>,
+    novel: Option<&str>,
+) -> (PathBuf, PathBuf) {
     let mut config = GenReadsConfig::new(h1n1_reference(), work.to_path_buf(), tag);
     config.coverage = 60;
     config.read_len = 100;
@@ -152,6 +158,24 @@ pub fn generate_reads(work: &Path, tag: &str, sv: Option<&SvSpec>) -> (PathBuf, 
         )
         .unwrap();
         match sv.mate {
+            // A literal insertion: REF is the anchor base, ALT is that base plus the novel
+            // sequence. Symbolic <INS> is deliberately NOT used — it carries no bases, so the
+            // test would have no known answer to probe the reads for, which is the whole point
+            // of an insertion gate.
+            None if novel.is_some() => {
+                let novel = novel.unwrap();
+                let base = ref_base(sv.contig, sv.pos);
+                writeln!(
+                    f,
+                    "{}\t{}\t.\t{base}\t{base}{novel}\t60\tPASS\tSVTYPE=INS;SVLEN={};END={}\tGT\t{}",
+                    sv.contig,
+                    sv.pos,
+                    novel.len(),
+                    sv.pos,
+                    sv.gt
+                )
+                .unwrap();
+            }
             None => {
                 writeln!(
                     f,
@@ -285,10 +309,20 @@ pub struct Signatures {
     /// Mean depth over `SvSpec::probe`, if set.
     pub depth_probe: f64,
     pub reads: usize,
+    /// Read that failed to align while its mate aligned fine. The **insertion** signature: a
+    /// fragment landing wholly inside inserted sequence has no reference home, so the aligner
+    /// can place its mate and not it. Callers (Manta, Delly) collect exactly these to assemble
+    /// the inserted allele. Counted across all contigs, since an unmapped read has none.
+    pub unmapped_with_mapped_mate: usize,
+    /// Interior 30-mers of the novel sequence that appear in at least one read, either strand.
+    pub novel_probe_hits: usize,
+    /// How many interior probes were tried — the denominator `novel_probe_hits` is over. A
+    /// hit count without it is a metric over an unknown denominator (CLAUDE.md rule 4).
+    pub novel_probes: usize,
 }
 
 /// Accumulate the signatures over `contig` for an event spanning `pos..=end`.
-pub fn analyse(sam_path: &Path, sv: &SvSpec) -> Signatures {
+pub fn analyse(sam_path: &Path, sv: &SvSpec, novel: Option<&str>) -> Signatures {
     let (contig, pos, end) = (sv.contig, sv.pos, sv.end);
     let mut reader = std::fs::File::open(sam_path)
         .map(std::io::BufReader::new)
@@ -301,8 +335,29 @@ pub fn analyse(sam_path: &Path, sv: &SvSpec) -> Signatures {
     let mut depth = vec![0usize; contig_len];
     let mut sig = Signatures::default();
 
+    // Only populated when there is a novel sequence to look for; the H1N1 fixture at 60x is
+    // ~8 k reads, so holding them is cheap, and searching once per probe beats re-reading.
+    let mut read_seqs: Vec<String> = Vec::new();
+
     for result in reader.records() {
         let record = result.unwrap();
+
+        // Counted before the on-target filter below: an unmapped read has no reference name,
+        // so filtering on one would discard every record this signature is about.
+        if let Ok(flags) = record.flags() {
+            if flags.is_unmapped() && !flags.is_mate_unmapped() {
+                sig.unmapped_with_mapped_mate += 1;
+            }
+        }
+        if novel.is_some() {
+            read_seqs.push(
+                record
+                    .sequence()
+                    .iter()
+                    .map(|b| char::from(b).to_ascii_uppercase())
+                    .collect(),
+            );
+        }
 
         // Breakend evidence lives on BOTH contigs, so these three counters are accumulated
         // before the on-target filter below (which exists for depth, a single-contig measure).
@@ -407,18 +462,58 @@ pub fn analyse(sam_path: &Path, sv: &SvSpec) -> Signatures {
     if let Some((lo, hi)) = sv.probe {
         sig.depth_probe = mean(lo, hi);
     }
+
+    // Interior probes only. The HEAD of an insertion is present even when the insertion is
+    // only partially realized — that is exactly how #516 hid for eight releases — so probing
+    // it would report success on a broken run. Five interior points, matching the Delta
+    // harness's `verify_planted_ins`, so a local failure and a cluster failure mean the same
+    // thing.
+    if let Some(novel) = novel {
+        let n = novel.len();
+        if n >= 30 {
+            let mut offsets: Vec<usize> = (1..=5)
+                .map(|k| (n * k / 6).saturating_sub(15).min(n - 30))
+                .collect();
+            offsets.dedup();
+            sig.novel_probes = offsets.len();
+            for off in offsets {
+                let probe = &novel[off..off + 30];
+                let rc = super::revcomp(probe);
+                if read_seqs
+                    .iter()
+                    .any(|r| r.contains(probe) || r.contains(&rc))
+                {
+                    sig.novel_probe_hits += 1;
+                }
+            }
+        }
+    }
     sig
 }
 
 /// Run a gate: generate with and without the SV, align both, and return `(with_sv, control)`.
 pub fn run_gate(sv: &SvSpec) -> (Signatures, Signatures, tempfile::TempDir) {
+    run_gate_inner(sv, None)
+}
+
+/// Run an **insertion** gate: the same run-versus-control shape, but the planted record is a
+/// literal insertion of `novel` rather than a symbolic SV, so the reads can be probed for the
+/// inserted bases themselves.
+pub fn run_ins_gate(sv: &SvSpec, novel: &str) -> (Signatures, Signatures, tempfile::TempDir) {
+    run_gate_inner(sv, Some(novel))
+}
+
+fn run_gate_inner(sv: &SvSpec, novel: Option<&str>) -> (Signatures, Signatures, tempfile::TempDir) {
     let bwa = bwa_mem2();
     let (dir, work) = fresh_workdir();
 
-    let (vr1, vr2) = generate_reads(&work, "withsv", Some(sv));
-    let (cr1, cr2) = generate_reads(&work, "control", None);
+    let (vr1, vr2) = generate_reads(&work, "withsv", Some(sv), novel);
+    let (cr1, cr2) = generate_reads(&work, "control", None, None);
 
-    let with_sv = analyse(&align(&bwa, &work, "withsv", &vr1, &vr2), sv);
-    let control = analyse(&align(&bwa, &work, "control", &cr1, &cr2), sv);
+    let with_sv = analyse(&align(&bwa, &work, "withsv", &vr1, &vr2), sv, novel);
+    // The control is probed for the SAME novel sequence: it has no insertion, so every hit
+    // there is a false positive and the probes are worthless. Without this the probe count
+    // could be satisfied by sequence that was in the fixture all along.
+    let control = analyse(&align(&bwa, &work, "control", &cr1, &cr2), sv, novel);
     (with_sv, control, dir)
 }

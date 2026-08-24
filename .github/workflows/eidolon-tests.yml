@@ -48,8 +48,11 @@ jobs:
       run: cargo build --workspace --all-targets
       env:
         RUSTFLAGS: "-D warnings"
+    # --no-fail-fast: plain `cargo test` STOPS at the first failing test binary, so a
+    # single failure hides every binary after it. Measured once at 31 of 41 binaries run,
+    # reported as one failure. The run must report on everything it was asked to run.
     - name: Run tests
-      run: cargo test --verbose --workspace
+      run: cargo test --verbose --workspace --no-fail-fast
 
   # The Delta harness scripts determine numbers the ACCESS report cites and were
   # covered by nothing automatic (#466). They are bash, so cargo test cannot reach
@@ -61,8 +64,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v5
-    - name: Install bcftools
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq bcftools
+    # bgzip ships in `tabix`, not in `bcftools`. test_scorer_calibration.sh drives real
+    # bcftools/bgzip (only truvari is stubbed), and without bgzip it fails with an
+    # indexing error that looks like a bad fixture.
+    - name: Install bcftools and bgzip
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq bcftools tabix
     - name: Shell syntax check
       run: |
         for f in scripts/delta/*.sh scripts/delta/*.sbatch scripts/delta/tests/*.sh; do
@@ -77,3 +83,11 @@ jobs:
       run: scripts/delta/tests/test_ins_verification.sh
     - name: Prove the INS harness tests are non-vacuous
       run: scripts/delta/tests/test_ins_verification.sh --mutate
+    # The scorer calibration suite guards the selftest and decoy controls — the only things
+    # separating "the caller found it" from "the matching window is loose enough to accept
+    # anything". It was written but never wired into CI, and the decoy shipped two defects
+    # that reported themselves as scorer failures (#582's sibling; job 21382756).
+    - name: Scorer calibration harness tests
+      run: scripts/delta/tests/test_scorer_calibration.sh
+    - name: Prove the calibration tests are non-vacuous
+      run: scripts/delta/tests/test_scorer_calibration.sh --mutate
