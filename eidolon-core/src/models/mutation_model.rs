@@ -400,6 +400,29 @@ mod tests {
     /// This is a data assertion, not a code one: it fails if the shipped default is
     /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level
     /// metric.
+    ///
+    /// ## Provenance of the repaired file, so it can be audited rather than trusted
+    ///
+    /// `default_mutation_model.json.gz` was repaired by hand, which a diff of a
+    /// gzipped blob cannot show. Both halves are reconstructible from files already
+    /// in this directory, and a reviewer can check them without trusting the commit:
+    ///
+    /// - **`snp_distro`** de-cumulated equals `default_trinuc_model.json.gz`'s
+    ///   `snp_distro` to 2.9e-15.
+    /// - **`transition_matrix`** equals `default_mutation_model_bkup.json.gz`'s to
+    ///   within one ULP — rows `a` and `t` are exactly equal, `c` and `g` differ by
+    ///   5.6e-17 and 1.1e-16, i.e. double round-trip noise, not a different fit.
+    ///
+    /// The two files are otherwise NOT interchangeable, which is the whole point of
+    /// the assertion below: `_bkup` predates the trinucleotide work (it stores
+    /// `snp_model`, not `snp_trinuc_model`) and its `snp_distro` is exactly uniform —
+    /// CpG share 6.2500%, i.e. 4/64 — so it is context-neutral by construction. The
+    /// corrupt file was a botched upgrade *from* that state: it took a real
+    /// context-weighted `snp_distro` and cumulated it twice, which flattened CpG back
+    /// to ~1.0x while looking nothing like the uniform original.
+    ///
+    /// Both files also still carry the dead `insertion_probability` key; see
+    /// `IndelModel`'s legacy-load test for why that is left alone.
     #[test]
     fn default_model_context_weights_elevate_cpg() {
         let model = MutationModel::default().unwrap();

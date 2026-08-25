@@ -200,9 +200,17 @@ mod tests {
     }
 
     /// Every model file built before `insertion_probability` was removed still
-    /// carries the key — the bundled `tools/cosmic_*.json.gz` included. Dropping the
-    /// struct field must not make those files unreadable, so this pins that serde
-    /// keeps ignoring the unknown key rather than erroring.
+    /// carries the key — the bundled `tools/cosmic_*.json.gz` included, and so do
+    /// `model_data/default_mutation_model.json.gz` and its `_bkup` sibling. That is
+    /// deliberate: the shipped files are NOT regenerated to drop the key, because a
+    /// user's own models cannot be, and the two must stay readable by the same code
+    /// path. `IndelModel` therefore carries no `deny_unknown_fields`, and this test
+    /// pins that serde keeps ignoring the key rather than erroring.
+    ///
+    /// The key is inert wherever it appears: nothing reads it, and the ins:del
+    /// balance comes from the mutation model's `variant_dist`. Do not "tidy" it out
+    /// of the shipped data files — that would buy nothing and would make a
+    /// freshly-built model differ from a legacy one for no functional reason.
     #[test]
     fn legacy_model_with_insertion_probability_still_loads() {
         let legacy = r#"{
