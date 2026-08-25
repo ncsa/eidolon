@@ -453,6 +453,20 @@ an SV-aware caller. We closed that gap: simulate an SV-rich tumor/normal pair
 (60×, purity 0.8), call somatic SVs with **Manta** (tumor/normal mode), and score
 against eidolon's SV truth with **truvari**.
 
+> **Every recall figure in §3.5–3.7 is `--passonly` recall** — computed over the
+> caller's PASS records only, because that is what this pipeline hands truvari.
+> A call the caller made and then filtered (Manta's `MinSomaticScore`, typically)
+> is counted as a false negative, so **these figures are lower bounds on caller
+> recall, not estimates of it** (#541). The gap is real and measurable: on job
+> 21391393 `manta_DEL` reads 0.882 PASS-only against 0.947 all-calls, and
+> `manta_overall` 0.830 against 0.882. `scorer_recall.tsv` carries both rows for
+> every stratum, labelled — quote the PASS-only number as the headline and the
+> all-calls number when the question is "what did the caller actually find?".
+>
+> One stratum is worse than a lower bound and must not be quoted at all:
+> `manta_INS` is routinely *wholly* filtered, so its recall describes the filter
+> and nothing else (#511).
+
 On the classes Manta and truvari can score (DEL/DUP/INV), eidolon's variants —
 **including large events up to 1 Mb** — are recovered at **0.88–1.00 recall
 (32/35 = 91%)** in this single run.
@@ -460,7 +474,8 @@ On the classes Manta and truvari can score (DEL/DUP/INV), eidolon's variants —
 **Replicated (n=18 = 3 tissue models × 3 seeds × 2 callers).** Because that single
 run rests on few events per type, we replicated SV recovery at higher SV count.
 The replicated means are **DEL 0.84 ± 0.11, DUP 0.85 ± 0.11, INV 0.92 ± 0.09**
-(Manta ≈ Delly throughout). Replication **corrected the single run's optimism** —
+(Manta ≈ Delly throughout), all PASS-only and therefore lower bounds per the note
+above. Replication **corrected the single run's optimism** —
 in particular `INV 1.000` was a small-n artifact; the replicated mean is 0.92 with
 a 0.75–1.00 range. The qualitative conclusion is unchanged and now carries honest
 confidence intervals: DEL/DUP/INV recover at ~0.84–0.92, tool-independently. The
