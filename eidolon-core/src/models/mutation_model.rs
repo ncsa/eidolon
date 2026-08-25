@@ -131,21 +131,16 @@ impl MutationModel {
         // build transition matrices from data for snps and trinucs
         let snp_trinuc_model =
             SnpTrinucModel::from_raw_data(trinuc_frequency, trinuc_transition_frequency)?;
-        // Probability, given that it is an indel, that it is an insertion.
         // Fall back to the default indel model when no indel data was observed.
+        // The insertion-vs-deletion balance is NOT stored here: it is already
+        // variant_probs[1] and variant_probs[2] (the `variant_dist` weights), which
+        // is what drives generation. This model carries the length distributions only.
         let indel_denom = variant_probs[1] + variant_probs[2];
         let indel_model = if indel_denom == 0.0 || ins_lengths.is_empty() || del_lengths.is_empty()
         {
             IndelModel::default()?
         } else {
-            let insertion_probability = variant_probs[1] / indel_denom;
-            IndelModel::from_raw_data(
-                insertion_probability,
-                ins_lengths,
-                ins_weights,
-                del_lengths,
-                del_weights,
-            )?
+            IndelModel::from_raw_data(ins_lengths, ins_weights, del_lengths, del_weights)?
         };
         let statistical_models = StatisticalModels {
             transition_matrix,
