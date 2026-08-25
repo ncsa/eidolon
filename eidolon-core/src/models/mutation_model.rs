@@ -131,21 +131,16 @@ impl MutationModel {
         // build transition matrices from data for snps and trinucs
         let snp_trinuc_model =
             SnpTrinucModel::from_raw_data(trinuc_frequency, trinuc_transition_frequency)?;
-        // Probability, given that it is an indel, that it is an insertion.
         // Fall back to the default indel model when no indel data was observed.
+        // The insertion-vs-deletion balance is NOT stored here: it is already
+        // variant_probs[1] and variant_probs[2] (the `variant_dist` weights), which
+        // is what drives generation. This model carries the length distributions only.
         let indel_denom = variant_probs[1] + variant_probs[2];
         let indel_model = if indel_denom == 0.0 || ins_lengths.is_empty() || del_lengths.is_empty()
         {
             IndelModel::default()?
         } else {
-            let insertion_probability = variant_probs[1] / indel_denom;
-            IndelModel::from_raw_data(
-                insertion_probability,
-                ins_lengths,
-                ins_weights,
-                del_lengths,
-                del_weights,
-            )?
+            IndelModel::from_raw_data(ins_lengths, ins_weights, del_lengths, del_weights)?
         };
         let statistical_models = StatisticalModels {
             transition_matrix,
@@ -391,6 +386,76 @@ mod tests {
         model.write_to_file(&output_file).unwrap();
         let loaded = MutationModel::from_file(&output_file).unwrap();
         assert_eq!(loaded.mutation_rate, model.mutation_rate);
+    }
+
+    /// The embedded default model must carry real trinucleotide biology, not a
+    /// context-neutral or corrupted weight vector.
+    ///
+    /// #372 wired `context_weights()` into placement, but that only helps if the
+    /// model FILE carries meaningful weights. `default_mutation_model_bkup.json.gz`
+    /// holds the older context-neutral default (CpG share exactly 6.25% = uniform);
+    /// the replacement must actually elevate CpG, which is where SBS1 lives and the
+    /// single most mutable context in any real genome.
+    ///
+    /// This is a data assertion, not a code one: it fails if the shipped default is
+    /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level
+    /// metric.
+    ///
+    /// ## Provenance of the repaired file, so it can be audited rather than trusted
+    ///
+    /// `default_mutation_model.json.gz` was repaired by hand, which a diff of a
+    /// gzipped blob cannot show. Both halves are reconstructible from files already
+    /// in this directory, and a reviewer can check them without trusting the commit:
+    ///
+    /// - **`snp_distro`** de-cumulated equals `default_trinuc_model.json.gz`'s
+    ///   `snp_distro` to 2.9e-15.
+    /// - **`transition_matrix`** equals `default_mutation_model_bkup.json.gz`'s to
+    ///   within one ULP — rows `a` and `t` are exactly equal, `c` and `g` differ by
+    ///   5.6e-17 and 1.1e-16, i.e. double round-trip noise, not a different fit.
+    ///
+    /// The two files are otherwise NOT interchangeable, which is the whole point of
+    /// the assertion below: `_bkup` predates the trinucleotide work (it stores
+    /// `snp_model`, not `snp_trinuc_model`) and its `snp_distro` is exactly uniform —
+    /// CpG share 6.2500%, i.e. 4/64 — so it is context-neutral by construction. The
+    /// corrupt file was a botched upgrade *from* that state: it took a real
+    /// context-weighted `snp_distro` and cumulated it twice, which flattened CpG back
+    /// to ~1.0x while looking nothing like the uniform original.
+    ///
+    /// Both files also still carry the dead `insertion_probability` key; see
+    /// `IndelModel`'s legacy-load test for why that is left alone.
+    #[test]
+    fn default_model_context_weights_elevate_cpg() {
+        let model = MutationModel::default().unwrap();
+        let weights = model.context_weights().unwrap();
+        assert_eq!(weights.len(), 64, "expected 64 trinucleotide frames");
+
+        let mean: f64 = weights.values().sum::<f64>() / weights.len() as f64;
+        assert!(mean > 0.0, "context weights are all zero");
+
+        let cpg = [(A, C, G), (C, C, G), (G, C, G), (T, C, G)];
+        let mut ratios = Vec::new();
+        for ctx in cpg {
+            let w = *weights
+                .get(&TrinucFrame::from(ctx))
+                .expect("CpG frame missing from context weights");
+            ratios.push(w / mean);
+        }
+        let group = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        eprintln!(
+            "[default-model] CpG weight/mean ratios ACG={:.2} CCG={:.2} GCG={:.2} TCG={:.2}; \
+             group mean {:.2}x",
+            ratios[0], ratios[1], ratios[2], ratios[3], group
+        );
+
+        assert!(
+            group >= 2.0,
+            "the embedded default model does not elevate CpG: the four CpG contexts \
+             average {group:.2}x the mean context weight (expected >=2x; a correctly \
+             built model runs ~4.4x, and 1.0x means context-neutral placement). \
+             A monotonically-increasing-with-index weight vector here is the \
+             signature of a snp_distro that was cumulated twice — de-cumulating it \
+             a second time recovers default_trinuc_model.json.gz exactly."
+        );
     }
 
     #[test]

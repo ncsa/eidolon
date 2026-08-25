@@ -34,8 +34,13 @@ pub enum IndelModelError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndelModel {
-    // Based what was in the original NEAT
-    pub(crate) insertion_probability: f64,
+    // NEAT 2.1 stored a single `INDEL_FREQ` dict keyed by *signed* indel length, so
+    // the sign carried insertion-vs-deletion and the magnitude carried length.
+    // Splitting that into two unsigned distributions dropped the sign, which is why
+    // an explicit `insertion_probability` was added here. It was redundant: the
+    // ins:del balance is already the second and third weights of the mutation
+    // model's `variant_dist`, which is what actually drives generation. The field
+    // was computed from `variant_dist`, serialized, and never read.
     ins_dist: DiscreteDistribution<usize>,
     del_dist: DiscreteDistribution<usize>,
 }
@@ -44,7 +49,6 @@ static DATA_FILE: &[u8] = include_bytes!("model_data/default_indel_model.json.gz
 
 impl IndelModel {
     pub fn from_raw_data(
-        insertion_probability: f64,
         ins_lens: Vec<usize>,
         ins_weights: Vec<f64>,
         del_lens: Vec<usize>,
@@ -52,11 +56,7 @@ impl IndelModel {
     ) -> Result<Self, IndelModelError> {
         let ins_dist = DiscreteDistribution::new(&ins_weights, &ins_lens)?;
         let del_dist = DiscreteDistribution::new(&del_weights, &del_lens)?;
-        Ok(IndelModel {
-            insertion_probability,
-            ins_dist,
-            del_dist,
-        })
+        Ok(IndelModel { ins_dist, del_dist })
     }
     // Returns Result because it deserializes an embedded model file; std::Default
     // requires infallible `fn default() -> Self`, which doesn't fit.
@@ -77,10 +77,6 @@ impl IndelModel {
     pub fn write_to_file(&self, filename: &PathBuf) -> Result<(), IndelModelError> {
         model_writer(self, filename)?;
         Ok(())
-    }
-
-    pub fn is_insertion(&self, rand: f64) -> Result<bool, IndelModelError> {
-        Ok(rand < self.insertion_probability)
     }
 
     pub fn new_insert_length(&self, rand: f64) -> Result<usize, IndelModelError> {
@@ -120,7 +116,6 @@ mod tests {
 
     fn make_model() -> IndelModel {
         IndelModel {
-            insertion_probability: 0.75,
             ins_dist: DiscreteDistribution::new(&vec![100.0, 1.0], &vec![1, 2]).unwrap(),
             del_dist: DiscreteDistribution::new(&vec![1.0, 1000.0], &vec![3, 4]).unwrap(),
         }
@@ -136,7 +131,6 @@ mod tests {
         .unwrap();
 
         let indel_model = IndelModel {
-            insertion_probability: 0.75,
             ins_dist: DiscreteDistribution::new(&vec![100.0, 1.0], &vec![1, 2]).unwrap(),
             del_dist: DiscreteDistribution::new(&vec![1.0, 1000.0], &vec![3, 4]).unwrap(),
         };
@@ -159,7 +153,6 @@ mod tests {
         .unwrap();
 
         let indel_model = IndelModel {
-            insertion_probability: 0.75,
             ins_dist: DiscreteDistribution::new(&vec![100.0, 1.0], &vec![1, 2]).unwrap(),
             del_dist: DiscreteDistribution::new(&vec![1.0, 1000.0], &vec![3, 4]).unwrap(),
         };
@@ -171,29 +164,6 @@ mod tests {
         let insertion2 = indel_model.generate_random_insertion(12, &mut rng).unwrap();
         assert_eq!(insertion2.len(), 12);
         assert_eq!(insertion2, Vec::from([G, T, T, G, G, G, T, C, T, C, T, T]));
-    }
-
-    #[test]
-    fn test_is_insertion_below_threshold() {
-        let model = make_model();
-        assert!(model.is_insertion(0.3).unwrap());
-    }
-
-    #[test]
-    fn test_is_insertion_above_threshold() {
-        let model = make_model();
-        assert!(!model.is_insertion(0.8).unwrap());
-    }
-
-    #[test]
-    fn test_is_insertion_at_boundary() {
-        // uses strict <, so rand == insertion_probability → false
-        let model = IndelModel {
-            insertion_probability: 0.5,
-            ins_dist: DiscreteDistribution::new(&vec![1.0], &vec![1]).unwrap(),
-            del_dist: DiscreteDistribution::new(&vec![1.0], &vec![1]).unwrap(),
-        };
-        assert!(!model.is_insertion(0.5).unwrap());
     }
 
     #[test]
@@ -213,7 +183,48 @@ mod tests {
         let model = IndelModel::default().unwrap();
         model.write_to_file(&path).unwrap();
         let loaded = IndelModel::from(&path).unwrap();
-        assert!((loaded.insertion_probability - model.insertion_probability).abs() < 1e-10);
+        // Assert the surviving content: both length distributions must sample
+        // identically after a write/read cycle.
+        for r in [0.0, 0.25, 0.5, 0.75, 0.999] {
+            assert_eq!(
+                loaded.new_insert_length(r).unwrap(),
+                model.new_insert_length(r).unwrap(),
+                "insertion length distribution changed across a file round trip at r={r}"
+            );
+            assert_eq!(
+                loaded.new_delete_length(r).unwrap(),
+                model.new_delete_length(r).unwrap(),
+                "deletion length distribution changed across a file round trip at r={r}"
+            );
+        }
+    }
+
+    /// Every model file built before `insertion_probability` was removed still
+    /// carries the key — the bundled `tools/cosmic_*.json.gz` included, and so do
+    /// `model_data/default_mutation_model.json.gz` and its `_bkup` sibling. That is
+    /// deliberate: the shipped files are NOT regenerated to drop the key, because a
+    /// user's own models cannot be, and the two must stay readable by the same code
+    /// path. `IndelModel` therefore carries no `deny_unknown_fields`, and this test
+    /// pins that serde keeps ignoring the key rather than erroring.
+    ///
+    /// The key is inert wherever it appears: nothing reads it, and the ins:del
+    /// balance comes from the mutation model's `variant_dist`. Do not "tidy" it out
+    /// of the shipped data files — that would buy nothing and would make a
+    /// freshly-built model differ from a legacy one for no functional reason.
+    #[test]
+    fn legacy_model_with_insertion_probability_still_loads() {
+        let legacy = r#"{
+            "insertion_probability": 0.4538979885714955,
+            "ins_dist": {"values": [1, 2], "weights": [0.5, 1.0]},
+            "del_dist": {"values": [3, 4], "weights": [0.5, 1.0]}
+        }"#;
+        let model: IndelModel =
+            serde_json::from_str(legacy).expect("a pre-removal model file must still deserialize");
+        // and the distributions it does carry must be usable
+        assert_eq!(model.new_insert_length(0.0).unwrap(), 1);
+        assert_eq!(model.new_insert_length(0.9).unwrap(), 2);
+        assert_eq!(model.new_delete_length(0.0).unwrap(), 3);
+        assert_eq!(model.new_delete_length(0.9).unwrap(), 4);
     }
 
     #[test]
@@ -223,8 +234,7 @@ mod tests {
         let del_lens = vec![1, 5];
         let del_weights = vec![0.9, 0.1];
         let model =
-            IndelModel::from_raw_data(0.4, ins_lens, ins_weights, del_lens, del_weights).unwrap();
-        assert_eq!(model.insertion_probability, 0.4);
+            IndelModel::from_raw_data(ins_lens, ins_weights, del_lens, del_weights).unwrap();
         assert_eq!(model.new_insert_length(0.0).unwrap(), 1);
         assert_eq!(model.new_delete_length(0.0).unwrap(), 1);
         assert_eq!(model.new_delete_length(0.95).unwrap(), 5);
