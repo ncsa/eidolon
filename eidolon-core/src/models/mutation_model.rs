@@ -388,6 +388,53 @@ mod tests {
         assert_eq!(loaded.mutation_rate, model.mutation_rate);
     }
 
+    /// The embedded default model must carry real trinucleotide biology, not a
+    /// context-neutral or corrupted weight vector.
+    ///
+    /// #372 wired `context_weights()` into placement, but that only helps if the
+    /// model FILE carries meaningful weights. `default_mutation_model_bkup.json.gz`
+    /// holds the older context-neutral default (CpG share exactly 6.25% = uniform);
+    /// the replacement must actually elevate CpG, which is where SBS1 lives and the
+    /// single most mutable context in any real genome.
+    ///
+    /// This is a data assertion, not a code one: it fails if the shipped default is
+    /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level
+    /// metric.
+    #[test]
+    fn default_model_context_weights_elevate_cpg() {
+        let model = MutationModel::default().unwrap();
+        let weights = model.context_weights().unwrap();
+        assert_eq!(weights.len(), 64, "expected 64 trinucleotide frames");
+
+        let mean: f64 = weights.values().sum::<f64>() / weights.len() as f64;
+        assert!(mean > 0.0, "context weights are all zero");
+
+        let cpg = [(A, C, G), (C, C, G), (G, C, G), (T, C, G)];
+        let mut ratios = Vec::new();
+        for ctx in cpg {
+            let w = *weights
+                .get(&TrinucFrame::from(ctx))
+                .expect("CpG frame missing from context weights");
+            ratios.push(w / mean);
+        }
+        let group = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        eprintln!(
+            "[default-model] CpG weight/mean ratios ACG={:.2} CCG={:.2} GCG={:.2} TCG={:.2}; \
+             group mean {:.2}x",
+            ratios[0], ratios[1], ratios[2], ratios[3], group
+        );
+
+        assert!(
+            group >= 2.0,
+            "the embedded default model does not elevate CpG: the four CpG contexts \
+             average {group:.2}x the mean context weight (expected >=2x; a correctly \
+             built model runs ~4.4x, and 1.0x means context-neutral placement). \
+             A monotonically-increasing-with-index weight vector here is the \
+             signature of a snp_distro that was cumulated twice — de-cumulating it \
+             a second time recovers default_trinuc_model.json.gz exactly."
+        );
+    }
+
     #[test]
     fn test_default_homozygous_frequency_is_realistic() {
         // Guards against the NEAT-lineage default that silently shipped for years:
