@@ -2947,16 +2947,80 @@ fn append_info_tag(info: &mut Option<String>, tag: String) {
     });
 }
 
+/// Split a GT into its allele tokens, handling both `/` and `|` separators.
+fn gt_alleles(gt: &str) -> Vec<&str> {
+    if gt.contains('/') {
+        gt.split('/').collect()
+    } else {
+        gt.split('|').collect()
+    }
+}
+
+/// True when a GT calls the reference on every allele (`0/0`, `0|0`, `0`).
+///
+/// Such a record says this sample does NOT carry the alt — it is common in cohort VCFs,
+/// where a site is present because some other sample has it. `gt_from_str` maps it to
+/// `Heterozygous` (it sees a zero allele and stops), so the alt was generated at ~0.5
+/// while the truth VCF carried `GT=0/0` beside `AF=0.4857` (#591).
+fn is_hom_ref(gt: &str) -> bool {
+    let alleles = gt_alleles(gt);
+    !alleles.is_empty() && alleles.iter().all(|a| a.trim() == "0")
+}
+
+/// True when every allele of a GT is `.` — a no-call.
+///
+/// `gt_from_str` cannot express this: it skips `.` alleles, never sets `found_zero`, and
+/// falls through to `Homozygous`. So a `./.` record silently becomes homozygous ALT and
+/// the truth VCF then carries `GT=./.` next to `AF=1.0000` — a record contradicting
+/// itself (#591). Detect it on the raw string, before that lossy conversion.
+fn is_no_call(gt: &str) -> bool {
+    let alleles = gt_alleles(gt);
+    !alleles.is_empty() && alleles.iter().all(|a| a.trim() == ".")
+}
+
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
+    let (mut n_complex, mut n_null, mut n_nocall, mut n_homref) = (0usize, 0usize, 0usize, 0usize);
     for (contig, variants) in raw {
         let mut kept = Vec::new();
         for v in variants {
+            // Order matters only for which warning a doubly-bad record gets; each arm drops.
             if v.variant_type == VariantType::Complex && v.alternate.is_literal() {
+                n_complex += 1;
                 warn!(
                     "Skipping complex variant at {}:{} (multi-base REF and ALT that is not \
                      a simple indel) — not yet supported",
                     contig, v.location
+                );
+            } else if v.alternate.as_literal() == Some(v.reference.as_slice()) {
+                // REF == ALT is not a variant: there is no alternate allele to carry. Keeping
+                // it would put an unachievable record in the truth VCF, where it becomes a
+                // false negative for every caller and inflates the recall denominator (#591).
+                n_null += 1;
+                warn!(
+                    "Skipping non-variant at {}:{} (ALT is identical to REF, so there is no \
+                     alternate allele to generate)",
+                    contig, v.location
+                );
+            } else if is_hom_ref(&v.genotype_str) {
+                // 0/0 says this sample carries the reference on every allele. Generating the
+                // ALT anyway produced AF~0.49 beside GT=0/0 (#591). Common in cohort VCFs,
+                // where the site exists because a DIFFERENT sample carries it.
+                n_homref += 1;
+                warn!(
+                    "Skipping homozygous-reference record at {}:{} (GT={}) — this sample \
+                     does not carry the alternate allele",
+                    contig, v.location, v.genotype_str
+                );
+            } else if is_no_call(&v.genotype_str) {
+                // A no-call says nothing about what to generate. Applying it as homozygous
+                // ALT — which is what the genotype parser does by default — asserts a
+                // variant the GT explicitly declines to call (#591).
+                n_nocall += 1;
+                warn!(
+                    "Skipping no-call genotype at {}:{} (GT={}) — a no-call carries no \
+                     instruction about what to generate",
+                    contig, v.location, v.genotype_str
                 );
             } else {
                 kept.push(v);
@@ -2965,6 +3029,15 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
         if !kept.is_empty() {
             out.insert(contig, kept);
         }
+    }
+    // A step that drops input deliberately has to say how much, or a shrunken truth set
+    // looks like a small one.
+    let dropped = n_complex + n_null + n_nocall + n_homref;
+    if dropped > 0 {
+        warn!(
+            "input_vcf: dropped {dropped} record(s) — {n_complex} complex, {n_null} \
+             ALT-equals-REF, {n_nocall} no-call genotype, {n_homref} homozygous-reference"
+        );
     }
     out
 }
@@ -3653,6 +3726,97 @@ mod tests {
         assert_eq!(result2[0].end, 200); // global 1200 - 1000
         assert_eq!(result2[1].start, 300); // global 1300 - 1000
         assert_eq!(result2[1].end, 350); // global 1350 - 1000
+    }
+
+    /// #591: an input record that asserts no alternate allele must not become one.
+    ///
+    /// Three shapes, all of which used to be silently GENERATED and then written into the
+    /// truth VCF contradicting themselves. Measured on H1N1 before the fix:
+    ///
+    ///   REF==ALT   ->  GT=1/1  AD=0,42  AF=1.0000   (there is no alt allele at all)
+    ///   GT=./.     ->  GT=./.  AD=0,44  AF=1.0000   (the GT declines to call it)
+    ///   GT=0/0     ->  GT=0/0  AD=18,17 AF=0.4857   (the GT calls reference twice)
+    ///
+    /// Each is a false negative for every caller scored against that truth, and inflates
+    /// the recall denominator by a record no caller could ever produce.
+    #[test]
+    fn input_records_that_assert_no_alternate_allele_are_dropped() {
+        let mk = |location: usize,
+                  reference: Vec<Nucleotide>,
+                  alt: Vec<Nucleotide>,
+                  gt: &str,
+                  vt: VariantType| Variant {
+            location,
+            reference,
+            alternate: AlternateType::Literal(alt),
+            variant_type: vt,
+            genotype: Genotype::Homozygous,
+            allele_fraction: None,
+            genotype_str: gt.to_string(),
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: vec![],
+            sample: vec![],
+            provenance: Provenance::InputVcf,
+        };
+        use Nucleotide::{A, C, T};
+
+        let raw = HashMap::from([(
+            "chr1".to_string(),
+            vec![
+                // dropped: no alternate allele exists
+                mk(100, vec![A], vec![A], "1/1", VariantType::SNP),
+                // dropped: the genotype declines to call
+                mk(200, vec![A], vec![T], "./.", VariantType::SNP),
+                mk(250, vec![A], vec![T], ".|.", VariantType::SNP),
+                // dropped: the genotype calls reference on every allele
+                mk(300, vec![A], vec![T], "0/0", VariantType::SNP),
+                mk(350, vec![A], vec![T], "0|0", VariantType::SNP),
+                // MUST NOT FIRE — every one of these is a real variant call
+                mk(400, vec![A], vec![T], "1/1", VariantType::SNP),
+                mk(500, vec![A], vec![T], "0/1", VariantType::SNP),
+                mk(600, vec![A], vec![T], "1|0", VariantType::SNP),
+                // a PARTIAL no-call still calls one alt allele, so it is a variant
+                mk(700, vec![A], vec![T], "./1", VariantType::SNP),
+                // REF and ALT differ in length: an indel, not a null variant
+                mk(800, vec![A, C], vec![A], "1/1", VariantType::Deletion),
+            ],
+        )]);
+
+        let kept = filter_input_vcf(raw);
+        let mut locs: Vec<usize> = kept
+            .get("chr1")
+            .map(|v| v.iter().map(|x| x.location).collect())
+            .unwrap_or_default();
+        locs.sort_unstable();
+        assert_eq!(
+            locs,
+            vec![400, 500, 600, 700, 800],
+            "expected only the records that actually assert an alternate allele to survive; \
+             dropping a real call here would silently shrink the truth set"
+        );
+    }
+
+    #[test]
+    fn no_call_and_hom_ref_genotypes_are_recognised_on_the_raw_string() {
+        // gt_from_str cannot express either: it skips '.' alleles (so "./." falls through to
+        // Homozygous) and stops at the first '0' (so "0/0" reads as Heterozygous). Both have
+        // to be caught before that conversion.
+        for gt in ["./.", ".|.", ".", "./././."] {
+            assert!(is_no_call(gt), "{gt} is a no-call");
+            assert!(!is_hom_ref(gt), "{gt} is not homozygous reference");
+        }
+        for gt in ["0/0", "0|0", "0", "0/0/0"] {
+            assert!(is_hom_ref(gt), "{gt} is homozygous reference");
+            assert!(!is_no_call(gt), "{gt} is not a no-call");
+        }
+        // MUST NOT FIRE: each of these calls at least one alternate allele.
+        for gt in ["0/1", "1/1", "1|0", "./1", "1/.", "0/2"] {
+            assert!(!is_no_call(gt), "{gt} calls an allele and is not a no-call");
+            assert!(!is_hom_ref(gt), "{gt} carries an alt and is not hom-ref");
+        }
     }
 
     #[test]
