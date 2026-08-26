@@ -88,6 +88,9 @@ unknown reference size reads as small@        if (bp <= 0 || cov <= 0) { print 2
 reference_bp ignores the .fai@    if [[ -s "$ref.fai" ]]; then@    if false; then
 probe matcher ignores the reverse strand@{ for (i = 1; i <= n; i++) if (index($0, fwd[i]) || index($0, rev[i])) hits[i]++ }@{ for (i = 1; i <= n; i++) if (index($0, fwd[i])) hits[i]++ }
 probe matcher drops zero-support probes@END { for (i = 1; i <= n; i++) print chrom[i], pos[i], len[i], hits[i] }@END { for (i = 1; i <= n; i++) if (hits[i] > 0) print chrom[i], pos[i], len[i], hits[i] }
+all-calls pass still filters (#541)@        filter_args=()@        filter_args=(--passonly)
+only one scoring pass happens (#541)@    TRUVARI_ALL_CALLS=1 run_truvari "$@"@    :
+all-calls overwrites the PASS-only result (#541)@        suffix="_allcalls"@        suffix=""
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -162,6 +165,50 @@ truvari() {
             mkdir -p "$out"
             printf '{"recall": %s, "precision": 1.0, "f1": 1.0, "TP-base": %s, "FN": %s, "FP": 0}\n' \
                 "$STUB_RECALL" "${STUB_TPBASE:-0}" "${STUB_FN:-0}" > "$out/summary.json"
+            return 0 ;;
+        # A stub that actually HONOURS --passonly. The `json` mode above returns a fixed
+        # verdict, so it can prove the two scoring passes are wired up but cannot prove they
+        # measure different things — which is the whole of #541. This one matches comp to
+        # truth on CHROM+POS, drops non-PASS comp records when --passonly is present, and
+        # writes a real summary.json. It is deliberately dumber than truvari: we are testing
+        # OUR filter wiring, not truvari's matching.
+        filter)
+            local b="" c="" passonly=0 prev2=""
+            for a in "$@"; do
+                [[ "$prev2" == "-b" ]] && b="$a"
+                [[ "$prev2" == "-c" ]] && c="$a"
+                [[ "$a" == "--passonly" ]] && passonly=1
+                prev2="$a"
+            done
+            mkdir -p "$out"
+            python3 - "$b" "$c" "$passonly" "$out/summary.json" <<'PYSTUB'
+import gzip, io, json, sys
+def load(path):
+    op = gzip.open if path.endswith(".gz") else open
+    rows = []
+    with op(path, "rt") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 7:
+                rows.append((f[0], f[1], f[6]))
+    return rows
+truth, comp, passonly, outp = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+t = load(truth)
+c = load(comp)
+if passonly:
+    c = [r for r in c if r[2] in ("PASS", ".")]
+tk = {(x[0], x[1]) for x in t}
+ck = {(x[0], x[1]) for x in c}
+tp = len(tk & ck)
+fn = len(tk) - tp
+fp = len(ck - tk)
+recall = tp / len(tk) if tk else None
+prec = tp / len(ck) if ck else None
+json.dump({"recall": recall, "precision": prec,
+           "f1": None, "TP-base": tp, "FN": fn, "FP": fp}, open(outp, "w"))
+PYSTUB
             return 0 ;;
     esac
 }
@@ -625,6 +672,60 @@ is "a missing .fai does not skip the control" 0 "$rc"
 has "a missing .fai is called out"            "$out" "NOT bounded by contig length"
 has "and the control still reaches a verdict" "$out" "PASS"
 REFERENCE="$SAVED_REF"
+
+
+echo "── #541: the two recalls must DIFFER by exactly what --passonly removed ──"
+# run_truvari_both scores every stratum twice. That wiring is asserted above; what was
+# never asserted is that the two passes MEASURE DIFFERENT THINGS. #541's evidence: job
+# 21072620 scored a perfect Manta DUP call as a false negative purely because
+# --passonly dropped it, and recall=0.875 was an underestimate nobody could quantify.
+#
+# Uses the `filter` stub, which honours --passonly against a real VCF.
+mk_vcf() {  # <path> <FILTER for the 4th record>
+    { printf '##fileformat=VCFv4.2\n##contig=<ID=c1,length=100000000>\n'
+      printf '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="t">\n'
+      printf '##INFO=<ID=END,Number=1,Type=Integer,Description="e">\n'
+      printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+      printf 'c1\t1000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=1500\n'
+      printf 'c1\t20000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=23000\n'
+      printf 'c1\t50000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=50800\n'
+      printf 'c1\t70000\t.\tG\t<DEL>\t60\t%s\tSVTYPE=DEL;END=70900\n' "$2"
+    } > "${1%.gz}"
+    bgzip -f -c "${1%.gz}" > "$1"; bcftools index -f -t "$1"
+}
+T541="$WORK/t541.vcf.gz"; mk_vcf "$T541" PASS      # truth: 4 records
+recall_of() { python3 -c "
+import json,sys
+s=json.load(open(sys.argv[1]))
+print('' if s.get('recall') is None else '%.6f' % s['recall'])" "$1"; }
+
+echo "  -- every call PASS: the two recalls MUST be identical (must-not-fire) --"
+Q_ALLPASS="$WORK/q541_allpass.vcf.gz"; mk_vcf "$Q_ALLPASS" PASS
+STUB_MODE=filter run_truvari_both "$T541" f541_allpass "$Q_ALLPASS" >/dev/null 2>&1
+r_pass="$(recall_of "$OUTDIR/truvari_f541_allpass/summary.json")"
+r_all="$(recall_of "$OUTDIR/truvari_f541_allpass_allcalls/summary.json")"
+is "all-PASS query: PASS-only recall is 1.0"  "1.000000" "$r_pass"
+is "all-PASS query: all-calls recall matches" "$r_pass"  "$r_all"
+
+echo "  -- one matching call non-PASS: PASS-only must be lower by exactly that record --"
+Q_ONEFILT="$WORK/q541_onefilt.vcf.gz"; mk_vcf "$Q_ONEFILT" MinSomaticScore
+STUB_MODE=filter run_truvari_both "$T541" f541_onefilt "$Q_ONEFILT" >/dev/null 2>&1
+p_json="$OUTDIR/truvari_f541_onefilt/summary.json"
+a_json="$OUTDIR/truvari_f541_onefilt_allcalls/summary.json"
+r_pass="$(recall_of "$p_json")"; r_all="$(recall_of "$a_json")"
+tp_pass="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['TP-base'])" "$p_json")"
+tp_all="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['TP-base'])" "$a_json")"
+is "filtered call: all-calls recovers all 4"        4 "$tp_all"
+is "filtered call: PASS-only recovers only 3"       3 "$tp_pass"
+is "filtered call: all-calls recall is 1.0"         "1.000000" "$r_all"
+is "filtered call: PASS-only recall is 3/4"         "0.750000" "$r_pass"
+# The number #541 exists to expose: the gap is OUR filter, not the caller.
+gap="$(python3 -c "print('%.6f' % (float('$r_all') - float('$r_pass')))")"
+is "the gap equals exactly one record of four" "0.250000" "$gap"
+
+echo "  -- and both filters reach the recall report, labelled --"
+has "report carries the PASS-only row" "$(cat "$OUTDIR/scorer_recall.tsv")" "f541_onefilt	PASS-only"
+has "report carries the all-calls row" "$(cat "$OUTDIR/scorer_recall.tsv")" "f541_onefilt	all-calls"
 
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
