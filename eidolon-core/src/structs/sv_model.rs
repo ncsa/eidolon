@@ -836,7 +836,11 @@ impl SvModel {
                 SvType::Cnv => ("<CNV>".to_string(), None, None),
                 SvType::Inv => ("<INV>".to_string(), None, None),
                 SvType::Bnd => {
-                    // For de novo BNDs, generate an intra-chromosomal translocation
+                    // NOT REACHED FOR DE NOVO BND. `sample_symbolic_svs` filters SvType::Bnd out of the
+                    // per-contig type list (see the BND-share comment above) and routes every
+                    // de novo breakend through the inter-chromosomal translocation sampler,
+                    // which requires two distinct contigs. This arm survives for the
+                    // input-VCF path only; it generates an intra-chromosomal translocation
                     // to a random mate position on the same contig. Retry up to
                     // 32 times if the picked mate position falls in an N-tract
                     // (so the BND truth record is recoverable by callers — see

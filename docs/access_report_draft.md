@@ -634,9 +634,17 @@ breakpoints, and repeat / segmental-duplication context that make real somatic S
 hard to call. The 0.88–1.00 DEL/DUP/INV recall is therefore an **upper bound**
 relative to real, repeat-embedded variants (#312). Two further items: eidolon encodes
 tandem-dup junctions as generic BND pairs rather than the canonical `DUP` that
-callers and truth sets expect (#313), and SV-scale insertions did not appear in any
-run (`INS: 0`) despite a non-zero model probability (#314). None is a defect in the
-validated read generation — all are realism / interoperability improvements.
+callers and truth sets expect (#313). None is a defect in the validated read generation —
+all are realism / interoperability improvements.
+
+> **Superseded 2026-08-25.** This paragraph also listed "SV-scale insertions did not
+> appear in any run (`INS: 0`) despite a non-zero model probability (#314)". That is
+> resolved and #314 is closed. Three causes were compounded, and only the last was a
+> defect in generation: the truth VCF held insertions as untagged literal records the SV
+> selector could not see (fixed v3.1.x); the COSMIC pan-cancer model plants few somatic
+> insertions on one chromosome (chr22 at `SV_RATE_SCALE=30` yields **4**; chr20+21+22
+> yields **11**, and **38** at scale 100); and insertions past a read length were not
+> realized in the reads at all (#516, fixed).
 
 ### 3.7.1 BND: measuring our own defect (v1.13.1 → v3.1.0)
 
@@ -1025,11 +1033,20 @@ This is read-level and representation validation, not a caller recall estimate. 
 full-GRCh38 stress run completed successfully as the release-candidate check: job
 `21282504` produced 140 tagged SVs (31 at CCF 0.2, 43 at CCF 0.5, 66 at CCF 1.0),
 2,837 chimeric alignments, 588,995,182 mapped reads, and a 71 GB BAM. Known SV limitations
-remain: literal insertions beyond `read_len - 1` are only partially realized (#516),
-inserted sequence in input BND alleles is not yet carried through junction reads (#498),
-symbolic `<INS>` is not a supported read-level path (#500), non-binary SV depth has a
-small measured over-delivery bias (#499), and nominal-rate single replicates are too
-sparse to establish INS caller recall.
+remain, **updated 2026-08-25**: inserted sequence in input BND alleles is not yet carried
+through junction reads (#498), symbolic `<INS>` is not a supported read-level path (#500),
+literal deletions past ~a read length are only partially realized (#590), and the golden
+BAM does not represent an insertion longer than a read in any CIGAR (#589).
+
+Two entries previously listed here are resolved. **Literal insertions beyond
+`read_len - 1` (#516) are fixed** — insertions are sampled in altered-haplotype
+coordinates now, and 38 of 38 planted insertions (62–2127 bp) were confirmed present in
+the reads on Delta job 21382756. **INS caller recall is no longer unmeasurable**: job
+21391393 gives Manta 2/11 all-calls (0.182), with the reads independently verified to
+carry all 11, so that figure is a caller ceiling rather than a simulator gap. #499's
+over-delivery is largely gone as measured against a control run (2.671 → 1.970 against an
+expected 2.000), but the junction-read excess behind it is still present at other
+multipliers and the mechanism is not fully explained (#584).
 
 ---
 

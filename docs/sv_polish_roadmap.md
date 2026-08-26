@@ -42,7 +42,9 @@ position.
 | — | **BND + inserted seq** | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) insert dropped from reads |
 | — | **`<INS>` symbolic** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) silent no-op |
 | — | **BND unpaired `A.`** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
-| — | **literal INS ≳200 bp** | ❌ [#516](https://github.com/ncsa/eidolon/issues/516) head only |
+| — | **literal INS ≳200 bp** | ✅ fixed ([#516](https://github.com/ncsa/eidolon/issues/516)) — 38/38 verified in reads, 62–2127 bp, Delta job 21382756 |
+| — | **literal INS in the golden BAM** | ❌ [#589](https://github.com/ncsa/eidolon/issues/589) an insertion longer than a read appears in no CIGAR |
+| — | **literal DEL ≳ read length** | ❌ [#590](https://github.com/ncsa/eidolon/issues/590) only partially realized (0.70 of flank depth at 500 bp) |
 
 ### De novo
 
@@ -53,7 +55,7 @@ position.
 | 3 | **INV** | recall 1.000 / 1.000; precision artifact understood and attributable to our representation |
 | 4 | **BND (cancer)** | 0.920 Manta, rates reproduced from PCAWG. Delly's 0.440 is a caller limitation per the pipeline's own guide |
 | 5 | **CNV** | 4 of 6 by direction — a denominator of 6 is thin |
-| 6 | **INS** | ~3 draws per 30× genome, ~1 surviving the #516 cap. Not validatable from single replicates |
+| 6 | **INS** | The #516 cap is gone; every draw is now realized. Still sparse per replicate — chr22 at `SV_RATE_SCALE=30` yields 4, chr20+21+22 yields 11, scale 100 yields 38. Manta recovers 2/11 all-calls, a caller ceiling with the reads verified to carry all 11 |
 
 ## The three gates
 
@@ -136,7 +138,7 @@ DEL → DUP → INV → BND → CNV → INS
 ```
 
 Each type is done when all three gates pass **and** the gate tests are shown non-vacuous by
-mutation. The broken cells (#498, #500, #516) are expected to fail their gates; that is the
+mutation. The broken cells (#498, #500, and now #589/#590 — #516 is fixed) are expected to fail their gates; that is the
 point, and the gate is what will define "fixed" for them.
 
 ## Phase 1 — realistic sizes in realistic contexts
