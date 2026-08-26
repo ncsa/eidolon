@@ -544,3 +544,178 @@ fn junction_evidence_survives_longer_fragments() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n  "));
 }
+
+// ── CRITERION 9: the golden BAM must DESCRIBE the insertion, not just carry it ──────
+//
+// #516 got the inserted bases into the reads. #589 was the other half: nothing told the
+// CIGAR builder which fragment bases were inserted, so a read crossing the anchor was
+// written as pure `M` and claimed inserted bases as reference matches. Measured before
+// the fix on a 500 bp insertion at read_len 150: the largest `I` operation anywhere in
+// the BAM was **2 bp** — sequencing-error indels only — and one read at POS 693 carried
+// 108 reference bases followed by 42 insertion bases (zero mismatches against the novel
+// sequence) under the CIGAR `150M`.
+//
+// The general property, and the one asserted here, is stronger than "an I op exists":
+// **every mapped read must reconstruct against the reference from its own POS and
+// CIGAR.** That is what a golden BAM being alignment truth means, and it is the check
+// that caught this (it also cleared eidolon of the sibling defect in ncsa/neat#326,
+// where every gapped reverse read fails to reconstruct).
+
+/// The full base sequence of CONTIG, uppercased — the reference a golden-BAM alignment
+/// is supposed to describe.
+fn contig_bases() -> Vec<u8> {
+    let text = std::fs::read_to_string(h1n1_reference()).unwrap();
+    let mut seq = String::new();
+    let mut in_contig = false;
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix('>') {
+            if in_contig {
+                break;
+            }
+            in_contig = name.split_whitespace().next() == Some(CONTIG);
+            continue;
+        }
+        if in_contig {
+            seq.push_str(line.trim());
+        }
+    }
+    seq.to_ascii_uppercase().into_bytes()
+}
+
+/// Walk a read's CIGAR against the reference and count mismatches over the M/=/X blocks.
+/// Returns `(mismatches, compared)`.
+fn reconstruct(
+    reference: &[u8],
+    pos_1based: usize,
+    cigar: &[(char, usize)],
+    seq: &[u8],
+) -> (usize, usize) {
+    let (mut ri, mut qi) = (pos_1based - 1, 0usize);
+    let (mut mism, mut total) = (0usize, 0usize);
+    for &(op, n) in cigar {
+        match op {
+            'M' | '=' | 'X' => {
+                for k in 0..n {
+                    if ri + k < reference.len() && qi + k < seq.len() {
+                        total += 1;
+                        if reference[ri + k].to_ascii_uppercase()
+                            != seq[qi + k].to_ascii_uppercase()
+                        {
+                            mism += 1;
+                        }
+                    }
+                }
+                ri += n;
+                qi += n;
+            }
+            'I' | 'S' => qi += n,
+            'D' | 'N' => ri += n,
+            _ => {}
+        }
+    }
+    (mism, total)
+}
+
+#[test]
+fn the_golden_bam_cigar_describes_a_long_insertion() {
+    let dir = tempfile::tempdir().unwrap();
+    let insert = synthetic_insert(500);
+    let cell = run(
+        dir.path(),
+        "bam_cigar_ins",
+        &[ins_record(ANCHOR, &insert, "1/1", "ins500")],
+        "read_len: 150\nfragment_mean: 300\n",
+    );
+
+    let contig_seq = contig_bases();
+    let mut largest_i = 0usize;
+    let mut broken = 0usize;
+    let mut checked = 0usize;
+
+    // H1N1 has EIGHT contigs and the BAM carries reads from all of them. Reconstructing a
+    // read against the wrong contig's bases reports ~4340 of 5212 "broken" and means
+    // nothing — so resolve each record's reference name and keep only CONTIG's.
+    let ref_names: Vec<String> = {
+        let file = std::fs::File::open(cell.dir.join("o.bam")).unwrap();
+        let mut reader = bam::io::Reader::new(file);
+        let header = reader.read_header().unwrap();
+        header
+            .reference_sequences()
+            .keys()
+            .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+            .collect()
+    };
+
+    for record in cell.bam_records() {
+        let on_target = record
+            .reference_sequence_id()
+            .and_then(|r| r.ok())
+            .and_then(|id| ref_names.get(id))
+            .is_some_and(|n| n == CONTIG);
+        if !on_target {
+            continue;
+        }
+        let flags = record.flags();
+        if flags.is_unmapped() {
+            continue; // reads wholly inside the insertion are unmapped by design
+        }
+        let Some(Ok(start)) = record.alignment_start() else {
+            continue;
+        };
+        let ops: Vec<(char, usize)> = record
+            .cigar()
+            .iter()
+            .map(|o| {
+                let o = o.unwrap();
+                let c = match o.kind() {
+                    Kind::Match => 'M',
+                    Kind::Insertion => 'I',
+                    Kind::Deletion => 'D',
+                    Kind::SoftClip => 'S',
+                    Kind::Skip => 'N',
+                    Kind::SequenceMatch => '=',
+                    Kind::SequenceMismatch => 'X',
+                    _ => '?',
+                };
+                (c, o.len())
+            })
+            .collect();
+        for &(c, n) in &ops {
+            if c == 'I' && n > largest_i {
+                largest_i = n;
+            }
+        }
+        let seq: Vec<u8> = record.sequence().iter().collect();
+        let (mism, total) = reconstruct(&contig_seq, usize::from(start), &ops, &seq);
+        if total > 0 {
+            checked += 1;
+            if (mism as f64) / (total as f64) > 0.20 {
+                broken += 1;
+            }
+        }
+    }
+
+    assert!(
+        checked > 100,
+        "only {checked} mapped reads examined — too few to conclude"
+    );
+
+    // The insertion has to appear AS an insertion. A 150 bp read can carry at most 149
+    // inserted bases and still have one reference-anchored base, so that is the ceiling;
+    // anything in the tens proves the op is real rather than a stray error indel (which
+    // top out at a couple of bases).
+    assert!(
+        largest_i >= 50,
+        "the largest insertion CIGAR op in the golden BAM is {largest_i} bp for a planted \
+         500 bp insertion — the bases are in the reads but no CIGAR says so, which is #589. \
+         Sequencing-error indels alone produce 1-2 bp ops."
+    );
+
+    // The property that generalises: the recorded alignment must describe the read.
+    assert_eq!(
+        broken, 0,
+        "{broken} of {checked} mapped reads do not reconstruct against the reference from \
+         their own POS+CIGAR. A read crossing the insertion anchor recorded as pure M \
+         claims inserted bases are reference matches."
+    );
+}

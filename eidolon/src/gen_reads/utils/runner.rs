@@ -2292,6 +2292,8 @@ fn generate_chimeric_pair(
     let mut throwaway_ad = AdCounter::new();
     let r1 = generate_read(
         &seq1,
+        // BND junction reads are stitched from reference pieces; every base is 'M'.
+        None,
         &[], // Mutations already applied in get_stitched_sequence
         &HashMap::new(),
         read_len,
@@ -2318,6 +2320,8 @@ fn generate_chimeric_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only; no haplotype insertion mask.
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2392,6 +2396,8 @@ fn generate_inv_pair(
 
     let r1 = generate_read(
         &seq1,
+        // Reference-derived bases only; no haplotype insertion mask.
+        None,
         &[],
         &HashMap::new(),
         read_len,
@@ -2418,6 +2424,8 @@ fn generate_inv_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only; no haplotype insertion mask.
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2491,6 +2499,8 @@ fn generate_del_pair(
 
     let r1 = generate_read(
         &seq1,
+        // Reference-derived bases only; no haplotype insertion mask.
+        None,
         &[],
         &HashMap::new(),
         read_len,
@@ -2517,6 +2527,8 @@ fn generate_del_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only; no haplotype insertion mask.
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2612,6 +2624,8 @@ fn generate_dup_pair(
 
     let r1 = generate_read(
         &seq1,
+        // Reference-derived bases only; no haplotype insertion mask.
+        None,
         &[],
         &HashMap::new(),
         read_len,
@@ -2638,6 +2652,8 @@ fn generate_dup_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only; no haplotype insertion mask.
+            None,
             &[],
             &HashMap::new(),
             read_len,
