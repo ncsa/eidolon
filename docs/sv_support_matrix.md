@@ -495,9 +495,13 @@ previously an argument from two callers agreeing; it is now a measurement.
 
 ### INS: one planted, one verified present, zero found
 
-`truth INS: 1` (65 bp) is the #516 cap working as designed, and the drop log proves it rather
+`truth INS: 1` (65 bp) was the #516 cap working as designed, and the drop log proved it rather
 than implying it: 2 insertions dropped (chr2, chr19) + 1 kept = 3 draws, against ~3.5 expected
 from `Ins = 0.0279` over ~130 SVs, of which ~0.9 were expected to survive the 150 bp cap.
+
+**That cap no longer exists** (#516 fixed, 2026-08-24). Every draw is now realized, so a
+run's INS count is the model's own rate rather than the rate times a survival fraction —
+which is why the numbers in this section cannot be compared to a post-fix run.
 
 `INS read support: 1 of 1` — 7 reads carry a 30-mer from the **middle** of the inserted
 sequence. This is the first campaign to check that the reads contained what the truth declared
@@ -512,8 +516,9 @@ sequence. This is the first campaign to check that the reads contained what the 
 > replicate archived as a clean result ([#540](https://github.com/ncsa/eidolon/issues/540)).
 >
 > The `1 of 1` above came through the same code path. It did print its detail line, so it is
-> probably a true pass, but **treat the #516 cap as unverified in production** until #540 is
-> fixed and both replicates are re-checked.
+> probably a true pass, but **treated the #516 cap as unverified in production** until #540 is
+> fixed and both replicates are re-checked. Moot for the cap itself, which is gone; the #540
+> concern about a replicate archiving a clean result without printing its detail line stands.
 
 Neither caller found it. Manta's only INS call was a false positive on another chromosome
 (`chr11:99348945`, 58 bp, non-PASS); nothing was called within 2 kb of the planted event. Delly

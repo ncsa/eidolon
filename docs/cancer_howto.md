@@ -240,10 +240,12 @@ survived alignment with 100% mapping). The full-GRCh38 stress run then produced 
 SVs across CCF 0.2/0.5/1.0, 2,837 chimeric alignments, 100% mapping, and a 71 GB BAM.
 The no-subclone path remains unchanged.
 
-SV limitations remain explicit: literal insertions longer than `read_len - 1` are
-partially realized (#516), inserted novel sequence in input BND ALT alleles is not yet
-carried through junction reads (#498), symbolic `<INS>` is not a supported read-level
-path (#500), and non-binary SV depth multipliers have a measured small over-delivery
+SV limitations remain explicit (**updated 2026-08-25**): inserted novel sequence in input
+BND ALT alleles is not yet carried through junction reads (#498), symbolic `<INS>` is not a
+supported read-level path (#500), literal deletions past ~a read length are only partially
+realized (#590), and the golden BAM does not represent an insertion longer than a read in
+any CIGAR (#589). Literal insertions longer than `read_len - 1` **are now realized** —
+#516 is fixed and its interim cap removed. Non-binary SV depth multipliers have a small over-delivery
 bias (#499). These limitations affect specific SV representations; they do not remove
 the CCF tags or the CCF scaling of the supported paths.
 

@@ -63,7 +63,7 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 | Continuous per-variant allele fraction     | ❌ (genotype `{0.5, 1.0}`)     | ❌ (genotype `{0.5, 1.0}`)                | ✅ input-VCF `AF`/`AD` → matched AF spectrum (pooled / somatic) |
 | Long reads (ONT / PacBio)                  | ❌                             | ⚠️ PacBio-like single-end "given a model" | ⚠️ `long_reads:` fragment mode; no long-read error model yet (#319) |
 | Parallelism                                | Manual job sharding (`--job`)  | Multiprocessing (`--threads`): genome split into ~8 chunks/thread, then stitched | Multithreading (rayon) |
-| Deterministic output                       | Not guaranteed                 | Not guaranteed across thread counts       | ✅ byte-identical for a given seed, **any** thread count  |
+| Deterministic output                       | Not guaranteed                 | Not guaranteed across thread counts       | ✅ byte-identical for a given seed, across thread counts (`determinism.rs` pins single-threaded and rayon-default) |
 | Speed (single thread, vs NEAT 4.6.1)       | —                              | 1× (baseline)                             | **~10–13× faster** (E. coli 10.4× · yeast 11.2× · chr22 13.3×) |
 | Peak memory (same runs)                    | —                              | 1× (baseline)                             | **3–7× less**, and flatter (chr22 227 MB vs 1525 MB)      |
 | VCF comparison tooling                      | Bundled scripts                | ✅ `compare-vcfs`                          | ✅ `compare-vcfs`                                        |
@@ -485,7 +485,7 @@ When an SV zeroes out coverage (hom `<DEL>` or `INFO/CN=0`), the mutation rate o
 
 **De novo SV generation**
 
-`eidolon` can sample symbolic SVs (`<DEL>`, `<DUP>`, `<CNV>`) directly from a learned `SvModel` rather than relying on user-supplied records. Generation is **off by default** (opt-in via `sv_rate_scale`) so v1.9 pipelines remain unchanged.
+`eidolon` can sample SVs directly from a learned `SvModel` rather than relying on user-supplied records: `<DEL>`, `<DUP>`, `<CNV>`, `<INV>` and literal insertions are drawn per contig, and `<BND>` translocations are drawn separately as mate pairs across two contigs. **`<BND>` therefore needs a reference with at least two contigs** — on a single-contig reference the correct yield is zero rather than a same-contig junction, so a chr22-only run reports `truth BND: 0` by construction. Generation is **off by default** (opt-in via `sv_rate_scale`) so v1.9 pipelines remain unchanged.
 
 To enable, add a single line to your gen-reads YAML:
 
