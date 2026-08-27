@@ -228,8 +228,16 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let hap_materialized;
         // `frag_ops` is produced by the same match as `fragment` so the borrow lives in the
         // arm that initializes the buffer — the two must stay index-parallel.
-        let (fragment, frag_ops): (&[Nucleotide], Option<&[char]>) = match hap {
-            None => (sequence_block.get_subseq_slice(start, padded_end)?, None),
+        let (fragment, frag_ops, frag_dels): (
+            &[Nucleotide],
+            Option<&[char]>,
+            Option<&[(usize, usize)]>,
+        ) = match hap {
+            None => (
+                sequence_block.get_subseq_slice(start, padded_end)?,
+                None,
+                None,
+            ),
             Some(h) => {
                 let Some((bases, segments)) =
                     h.map
@@ -248,8 +256,13 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 hap_materialized = (
                     bases,
                     InsertionCoordinateMap::cigar_ops_for_segments(&segments),
+                    InsertionCoordinateMap::deletion_runs_for_segments(&segments),
                 );
-                (&hap_materialized.0, Some(&hap_materialized.1[..]))
+                (
+                    &hap_materialized.0,
+                    Some(&hap_materialized.1[..]),
+                    Some(&hap_materialized.2[..]),
+                )
             }
         };
         // In long-read mode a fragment may be shorter than read_length; truncate the read
@@ -296,7 +309,16 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // Deciding it once, per fragment, is the whole point of sampling haplotypes
         // rather than flipping a coin per read: it is what makes a heterozygous
         // insertion actually come out at ~half depth.
-        let hap_anchor = |pos: usize| haplotypes.iter().any(|h| h.map.anchors().any(|a| a == pos));
+        // A variant expressed by haplotype sampling must NOT also be applied inline, or
+        // it is applied twice. Deletions count as much as insertions here (#590):
+        // whether a fragment carries the event is decided by which haplotype it was
+        // drawn from, so a reference fragment correctly shows no event and an alt
+        // fragment already has it built into its coordinates.
+        let hap_anchor = |pos: usize| {
+            haplotypes.iter().any(|h| {
+                h.map.anchors().any(|a| a == pos) || h.map.deletion_anchors().any(|a| a == pos)
+            })
+        };
         // R1 window: [start, start + effective_read_len); var offset = pos - start.
         // For a haplotype fragment these are HAPLOTYPE offsets, so a reference
         // variant position has to be projected before it can be located in the read.
@@ -441,6 +463,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut r1_record = match generate_read(
             fragment,
             frag_ops,
+            frag_dels,
             &reads1_flagged,
             &read1_variants,
             effective_read_len,
@@ -528,9 +551,27 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                     (Some(ops), Some(off)) if off <= ops.len() => Some(&ops[off..]),
                     _ => None,
                 };
+            // Rebased to the R2 window the same way `r2_ops` is sliced. A deletion
+            // sitting before the window is not crossed by R2 and must not contribute a
+            // D; one at offset 0 is flush against the window's left edge and is not
+            // spanned either.
+            let r2_del_buf: Vec<(usize, usize)>;
+            let r2_dels: Option<&[(usize, usize)]> =
+                match (frag_dels, (end - start).checked_sub(effective_read_len)) {
+                    (Some(runs), Some(off)) => {
+                        r2_del_buf = runs
+                            .iter()
+                            .filter(|(at, _)| *at > off)
+                            .map(|(at, len)| (at - off, *len))
+                            .collect();
+                        Some(&r2_del_buf[..])
+                    }
+                    _ => None,
+                };
             match generate_read(
                 r2_sub,
                 r2_ops,
+                r2_dels,
                 &reads2_flagged,
                 &read2_variants,
                 effective_read_len,
@@ -663,7 +704,9 @@ pub fn write_haplotype_fragments<W: Write>(
         let mut ad_counter = AdCounter::new();
         let mut record = generate_read(
             &sequence,
-            // Chimeric reads are stitched from reference pieces; every base is 'M'.
+            // Chimeric reads are stitched from reference pieces: every base is 'M', and
+            // no haplotype deletion applies.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -728,7 +771,9 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         let r1_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
         let mut r1 = match generate_read(
             &fragment.r1_sequence,
-            // Chimeric reads are stitched from reference pieces; every base is 'M'.
+            // Chimeric reads are stitched from reference pieces: every base is 'M', and
+            // no haplotype deletion applies.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -755,7 +800,9 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         let r2_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
         let mut r2 = match generate_read(
             &fragment.r2_sequence,
-            // Chimeric reads are stitched from reference pieces; every base is 'M'.
+            // Chimeric reads are stitched from reference pieces: every base is 'M', and
+            // no haplotype deletion applies.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -844,6 +891,17 @@ pub fn generate_read(
     // reference, so a read crossing the anchor was recorded as pure M and claimed inserted
     // bases as reference matches — 108M42I written as 150M (#589).
     hap_ops: Option<&[char]>,
+    // Deletions carried by the haplotype, as `(query offset, reference bases removed)`
+    // relative to the start of `sequence`. A `D` consumes reference WITHOUT consuming
+    // query, so it cannot live in `hap_ops` — see
+    // `InsertionCoordinateMap::deletion_runs_for_segments`.
+    //
+    // Without these a junction-spanning read is recorded as unbroken `M` from its own
+    // start, which paints its post-junction bases straight across the span the deletion
+    // removed — so the coverage never collapses even though no fragment was placed
+    // there (#590). Measured that way: a homozygous 500 bp deletion still read 0.14 of
+    // flank depth with the placement already correct.
+    hap_dels: Option<&[(usize, usize)]>,
     flagged_positions: &[usize],
     variant_map: &HashMap<usize, &Variant>,
     read_length: usize,
@@ -1022,6 +1080,17 @@ pub fn generate_read(
         // 'D' ops for skipped reference bases (sequencing deletion errors only)
         for _ in 0..deletion_skip {
             cigar_ops.push('D');
+        }
+
+        // 'D' ops for a deletion the HAPLOTYPE carries. The map reports these by query
+        // offset, so they land once exactly that many bases have been written — which
+        // also means a read truncated before the junction correctly emits none.
+        if let Some(runs) = hap_dels {
+            for &(at, len) in runs {
+                if at == bases_written {
+                    cigar_ops.extend(std::iter::repeat_n('D', len));
+                }
+            }
         }
 
         seq_index += 1;
@@ -1274,7 +1343,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["haplotype-read".to_string()]).unwrap();
         let mut record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -1457,7 +1528,9 @@ mod tests {
         .unwrap();
         let record = generate_read(
             &rev_comp_seq,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &flagged_positions,
             &variant_map,
@@ -2036,7 +2109,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["no_error".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2074,7 +2149,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["invariant".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2122,7 +2199,8 @@ mod tests {
         for i in 0..50 {
             let _ = generate_read(
                 &sequence,
-                // Reference-derived bases only; no haplotype insertion mask.
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
                 None,
                 &[5],
                 &variant_map,
@@ -2168,7 +2246,8 @@ mod tests {
         for i in 0..50 {
             let _ = generate_read(
                 &sequence,
-                // Reference-derived bases only; no haplotype insertion mask.
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
                 None,
                 &[5],
                 &variant_map,
@@ -2249,7 +2328,8 @@ mod tests {
         for i in 0..n {
             let _ = generate_read(
                 &sequence,
-                // Reference-derived bases only; no haplotype insertion mask.
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
                 None,
                 &[5],
                 &variant_map,
@@ -2302,7 +2382,8 @@ mod tests {
         for i in 0..n {
             let _ = generate_read(
                 &sequence,
-                // Reference-derived bases only; no haplotype insertion mask.
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
                 None,
                 &[5],
                 &variant_map,
@@ -2347,7 +2428,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["snp_cigar".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[3],
             &variant_map,
@@ -2393,7 +2476,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["ins_variant".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[3],
             &variant_map,
@@ -2434,7 +2519,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["error_indel".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2479,7 +2566,9 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["del_len".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2548,7 +2637,9 @@ mod tests {
 
         let record = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &flagged_positions,
             &variant_map,
@@ -2626,7 +2717,9 @@ mod tests {
         .unwrap();
         let result = generate_read(
             &sequence,
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
             None,
             &flagged_positions,
             &variant_map,
