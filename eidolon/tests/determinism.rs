@@ -24,9 +24,21 @@ mod common;
 use common::{GenReadsConfig, eidolon, fresh_workdir, h1n1_reference, read_gzip_fastq_lines};
 
 fn run_gen_reads(seed: &str, output_dir: &std::path::Path, name: &str, threads: Option<usize>) {
+    run_gen_reads_cfg(seed, output_dir, name, threads, None)
+}
+
+/// As above, but able to switch on de novo SVs — which is the path #599 lived on.
+fn run_gen_reads_cfg(
+    seed: &str,
+    output_dir: &std::path::Path,
+    name: &str,
+    threads: Option<usize>,
+    sv_rate_scale: Option<f64>,
+) {
     let mut config = GenReadsConfig::new(h1n1_reference(), output_dir.to_path_buf(), name);
     config.rng_seed = seed.to_string();
     config.num_threads = threads;
+    config.sv_rate_scale = sv_rate_scale;
     let yaml = config.write_yaml();
     eidolon()
         .args(["gen-reads", "-c"])
@@ -129,5 +141,53 @@ fn different_seeds_produce_different_output() {
     assert_ne!(
         a, b,
         "different seeds produced identical FASTQ — seed argument is not load-bearing",
+    );
+}
+
+/// **#599.** With SVs switched on, the same seed produced a DIFFERENT SET of reads on
+/// every run — not merely a different order.
+///
+/// Measured before the fix, four consecutive single-threaded runs at one seed:
+/// 2259, 2265, 2271, 2268 R1 records. The truth VCF was byte-identical all four times
+/// (213 SVs), so SV sampling was fine; the divergence was in chimeric junction reads.
+/// `process_chimeric_variants` walked `ctx.mutated_maps` — a HashMap, iteration order
+/// randomized per process — while threading ONE `rng` through the whole loop, so contig
+/// order decided which draws each junction received. The fragment-length retry loop could
+/// then settle after a different number of draws, changing the read COUNT too.
+///
+/// Every other test in this file leaves SVs off, which is exactly why none of them saw it.
+/// The multiset comparison used here is the same invariant the rest of the file asserts —
+/// line order may still vary, the record set may not.
+#[test]
+fn same_seed_with_svs_produces_the_same_record_multiset() {
+    let (_a, dir_a) = fresh_workdir();
+    let (_b, dir_b) = fresh_workdir();
+    let seed = "sv determinism seed";
+
+    // High enough that the H1N1 fixture actually carries junctions to generate reads for;
+    // with none planted the test would pass vacuously.
+    run_gen_reads_cfg(seed, &dir_a, "sv_a", Some(1), Some(50.0));
+    run_gen_reads_cfg(seed, &dir_b, "sv_b", Some(1), Some(50.0));
+
+    // The shared default config is single-end, so there is one mate file, matching the
+    // other tests in this file.
+    let a = sorted_records(read_gzip_fastq_lines(&dir_a.join("sv_a_r1.fastq.gz")));
+    let b = sorted_records(read_gzip_fastq_lines(&dir_b.join("sv_b_r1.fastq.gz")));
+
+    assert!(
+        !a.is_empty(),
+        "no reads generated — the SV run produced nothing to compare"
+    );
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "same seed produced {} records in one run and {} in the other — the read SET is \
+         unstable, not just its order (#599)",
+        a.len(),
+        b.len()
+    );
+    assert_eq!(
+        a, b,
+        "same seed produced a different record multiset across two runs (#599)"
     );
 }
