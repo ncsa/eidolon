@@ -589,6 +589,47 @@ impl SvModel {
         if !lambda.is_finite() || lambda <= 0.0 {
             return Vec::new();
         }
+
+        // SVs the user already supplied come OUT of this contig's budget rather than
+        // adding to it (#603). Without this, `input_vcf` SVs plus `sv_rate_scale = r`
+        // produce the input count PLUS a full de novo draw, so aggregate SV density is
+        // higher than either number implies — silently, with no warning or counter.
+        //
+        // This mirrors what the SNP/indel path already does: `generate_mutated_map` looks
+        // up the local rate at each input position, subtracts it from the expected de novo
+        // count, and excludes the position from the pool. One input variant, one unit of
+        // budget. The same arithmetic applies here because each input SV is one realized
+        // event.
+        //
+        // Only FILE-SUPPLIED span SVs count against it:
+        //   - `Provenance::Denovo` entries in `existing_svs` are the genome-wide
+        //     translocation pass's own output, already accounted for in the `p_bnd` share
+        //     subtracted above. Counting them would deduct the same events twice.
+        //   - BND is excluded for the same reason from the other direction: this budget
+        //     covers span types only, so an input breakend does not spend it.
+        let supplied_span_svs = existing_svs
+            .iter()
+            .filter(|v| matches!(v.provenance, Provenance::InputVcf | Provenance::SomaticVcf))
+            .filter(|v| {
+                v.alternate
+                    .as_symbolic()
+                    .is_none_or(|sv| sv.sv_type != SvType::Bnd)
+            })
+            .count();
+        // No clamp: the guard below already treats a spent budget and an overspent one
+        // the same way. A `.max(0.0)` here is unobservable — a mutation removing it
+        // failed no test, which is the definition of a line that should not be there.
+        let lambda = lambda - supplied_span_svs as f64;
+        if lambda <= 0.0 {
+            // Not an error: the supplied SVs already meet or exceed the density this
+            // contig's rate asks for. Say so, because "no de novo SVs appeared" otherwise
+            // looks like a broken model rather than a spent budget.
+            info!(
+                "{contig_name}: {supplied_span_svs} supplied SV(s) meet or exceed this \
+                 contig's de novo budget; sampling none"
+            );
+            return Vec::new();
+        }
         let n_sv = match sample_poisson(lambda, rng) {
             Ok(n) => n as usize,
             Err(e) => {
@@ -1935,6 +1976,149 @@ mod tests {
     fn acgt_sequence(len: usize) -> Vec<Nucleotide> {
         let bases = [Nucleotide::A, Nucleotide::C, Nucleotide::G, Nucleotide::T];
         (0..len).map(|i| bases[i % 4]).collect()
+    }
+
+    /// Build a symbolic SV to hand to the sampler as already-present.
+    fn existing_sv(sv_type: SvType, location: usize, span: usize, prov: Provenance) -> Variant {
+        let mut sd = SvData::new(
+            match sv_type {
+                SvType::Del => "<DEL>",
+                SvType::Dup => "<DUP>",
+                SvType::Bnd => "<BND>",
+                _ => "<INV>",
+            },
+            sv_type,
+        );
+        sd.end = Some(location + span);
+        Variant {
+            variant_type: VariantType::Complex,
+            location,
+            reference: vec![Nucleotide::A],
+            alternate: AlternateType::Symbolic(sd),
+            genotype_str: "1/1".to_string(),
+            genotype: Genotype::Homozygous,
+            allele_fraction: None,
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: Vec::new(),
+            sample: Vec::new(),
+            provenance: prov,
+        }
+    }
+
+    /// Mean de novo count over many seeds. The draw is Poisson, so a single seed says
+    /// nothing about the rate — only the mean does.
+    fn mean_sampled(model: &SvModel, existing: &[Variant], contig_len: usize, reps: usize) -> f64 {
+        let seq = acgt_sequence(contig_len);
+        let mut total = 0usize;
+        for i in 0..reps {
+            let mut rng = NeatRng::new_from_seed(&vec!["603".to_string(), i.to_string()]).unwrap();
+            total += model
+                .sample_variants("chr1", contig_len, existing, &seq, 2, 1.0, 0.25, &mut rng)
+                .len();
+        }
+        total as f64 / reps as f64
+    }
+
+    /// #603: SVs supplied by the user come OUT of the de novo budget rather than adding
+    /// to it. Before this, `input_vcf` SVs plus `sv_rate_scale > 0` produced the input
+    /// count PLUS a full de novo draw, so total burden was additive and silently higher
+    /// than either number implied.
+    #[test]
+    fn supplied_svs_reduce_the_de_novo_budget_instead_of_adding_to_it() {
+        // 200 kb at 1e-4/base => lambda = 20 expected de novo SVs.
+        const LEN: usize = 200_000;
+        const REPS: usize = 60;
+        let m = model_with_single_type(SvType::Del, 1e-4);
+
+        let baseline = mean_sampled(&m, &[], LEN, REPS);
+        assert!(
+            (baseline - 20.0).abs() < 4.0,
+            "expected ~20 de novo SVs with an empty input, got {baseline:.1} — the rest of \
+             this test compares against that number, so it has to be near lambda first"
+        );
+
+        // Six supplied span SVs should cost six units of budget.
+        let supplied: Vec<Variant> = (0..6)
+            .map(|i| existing_sv(SvType::Del, 1_000 + i * 20_000, 500, Provenance::InputVcf))
+            .collect();
+        let reduced = mean_sampled(&m, &supplied, LEN, REPS);
+
+        let drop = baseline - reduced;
+        assert!(
+            (drop - 6.0).abs() < 2.5,
+            "6 supplied SVs should reduce the de novo mean by ~6 (got {baseline:.1} -> \
+             {reduced:.1}, a drop of {drop:.1}). A drop near 0 means the budget is still \
+             additive, which is #603."
+        );
+    }
+
+    /// MUST NOT FIRE, twice over. Neither of these is a user-supplied span SV, so neither
+    /// may spend the budget.
+    #[test]
+    fn de_novo_translocations_and_supplied_bnds_do_not_spend_the_span_budget() {
+        const LEN: usize = 200_000;
+        const REPS: usize = 60;
+        let m = model_with_single_type(SvType::Del, 1e-4);
+        let baseline = mean_sampled(&m, &[], LEN, REPS);
+
+        // The genome-wide translocation pass seeds its own output here. It is already
+        // accounted for by the p_bnd share, so counting it would deduct twice.
+        let preplaced: Vec<Variant> = (0..6)
+            .map(|i| existing_sv(SvType::Bnd, 1_000 + i * 20_000, 0, Provenance::Denovo))
+            .collect();
+        let with_preplaced = mean_sampled(&m, &preplaced, LEN, REPS);
+        assert!(
+            (baseline - with_preplaced).abs() < 2.5,
+            "de novo translocations must not spend the span budget: {baseline:.1} -> \
+             {with_preplaced:.1}"
+        );
+
+        // A de novo SPAN SV, which the type filter above does NOT catch. Today
+        // `existing_svs` only ever carries de novo BNDs, so without this case a mutation
+        // deleting the provenance check survives untouched — measured, it did. The check
+        // is defence for the day a second sampling pass seeds span SVs here: counting
+        // them would deduct the same events twice.
+        let denovo_span: Vec<Variant> = (0..6)
+            .map(|i| existing_sv(SvType::Del, 1_000 + i * 20_000, 500, Provenance::Denovo))
+            .collect();
+        let with_denovo_span = mean_sampled(&m, &denovo_span, LEN, REPS);
+        assert!(
+            (baseline - with_denovo_span).abs() < 2.5,
+            "a DE NOVO span SV must not spend the budget — it is already counted: \
+             {baseline:.1} -> {with_denovo_span:.1}"
+        );
+
+        // A supplied BREAKEND belongs to the translocation pass's budget, not this one.
+        let supplied_bnd: Vec<Variant> = (0..6)
+            .map(|i| existing_sv(SvType::Bnd, 1_000 + i * 20_000, 0, Provenance::InputVcf))
+            .collect();
+        let with_bnd = mean_sampled(&m, &supplied_bnd, LEN, REPS);
+        assert!(
+            (baseline - with_bnd).abs() < 2.5,
+            "a supplied BND must not spend the SPAN budget: {baseline:.1} -> {with_bnd:.1}"
+        );
+    }
+
+    /// When the supplied SVs already meet the contig's density, the correct de novo yield
+    /// is zero — not a negative budget, and not a full extra draw.
+    #[test]
+    fn supplied_svs_exceeding_the_budget_yield_no_de_novo_svs() {
+        const LEN: usize = 50_000; // lambda = 5 at 1e-4
+        let m = model_with_single_type(SvType::Del, 1e-4);
+        let supplied: Vec<Variant> = (0..40)
+            .map(|i| existing_sv(SvType::Del, 200 + i * 1_000, 300, Provenance::InputVcf))
+            .collect();
+        let mut rng = deterministic_rng();
+        let seq = acgt_sequence(LEN);
+        let sampled = m.sample_variants("chr1", LEN, &supplied, &seq, 2, 1.0, 0.25, &mut rng);
+        assert!(
+            sampled.is_empty(),
+            "40 supplied SVs far exceed a budget of ~5; expected no de novo SVs, got {}",
+            sampled.len()
+        );
     }
 
     #[test]
