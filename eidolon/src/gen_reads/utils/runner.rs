@@ -2967,6 +2967,40 @@ fn is_hom_ref(gt: &str) -> bool {
     !alleles.is_empty() && alleles.iter().all(|a| a.trim() == "0")
 }
 
+/// Rewrite each no-call allele in a PARTIAL no-call as a reference allele: `./1` -> `0/1`,
+/// `././1` -> `0/0/1`. Returns `None` when nothing changed.
+///
+/// Two reasons, and the downstream one decides it. **Semantically**, `./1` tells us about
+/// exactly one alternate allele; generating `1/1` invents a second we were never given,
+/// while `0/1` asserts precisely what the input said and nothing more.
+///
+/// **Downstream**, `bcftools` classifies a partial no-call as neither het nor hom —
+/// measured, `GT="het"` selects only `0/1` and `GT="hom"` only `1/1`, while `./1` appears
+/// solely under `GT="mis"`. A `./1` truth record therefore drops out of *any*
+/// zygosity-stratified analysis without a word. `0/1` is understood everywhere.
+///
+/// This also fixes the allele fraction for free: `dosage_fraction` skips `.` alleles, so
+/// `./1` scored alt=1 of total=1 = 1.0 and the variant was generated as fully homozygous
+/// (#591). `0/1` scores 1 of 2 = 0.5 with no special case, and generalises to any ploidy.
+fn normalize_partial_no_call(gt: &str) -> Option<String> {
+    if !gt.contains('.') {
+        return None;
+    }
+    let sep = if gt.contains('/') { '/' } else { '|' };
+    let out: Vec<String> = gt
+        .split(sep)
+        .map(|a| {
+            if a.trim() == "." {
+                "0".to_string()
+            } else {
+                a.trim().to_string()
+            }
+        })
+        .collect();
+    let joined = out.join(&sep.to_string());
+    if joined == gt { None } else { Some(joined) }
+}
+
 /// True when every allele of a GT is `.` — a no-call.
 ///
 /// `gt_from_str` cannot express this: it skips `.` alleles, never sets `found_zero`, and
@@ -2981,6 +3015,7 @@ fn is_no_call(gt: &str) -> bool {
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
     let (mut n_complex, mut n_null, mut n_nocall, mut n_homref) = (0usize, 0usize, 0usize, 0usize);
+    let mut n_partial = 0usize;
     for (contig, variants) in raw {
         let mut kept = Vec::new();
         for v in variants {
@@ -3023,6 +3058,24 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
                     contig, v.location, v.genotype_str
                 );
             } else {
+                // A PARTIAL no-call is a real call on at least one allele, so it is kept —
+                // but the `.` is rewritten to `0` first. Done after the full-no-call and
+                // hom-ref arms above so those keep their own, clearer warnings.
+                let mut v = v;
+                if let Some(fixed) = normalize_partial_no_call(&v.genotype_str) {
+                    n_partial += 1;
+                    debug!(
+                        "Normalizing partial no-call at {}:{}: GT={} -> {} (an uncalled \
+                         allele is generated as reference, not as a second alt)",
+                        contig, v.location, v.genotype_str, fixed
+                    );
+                    v.genotype_str = fixed;
+                    // Normalization replaced at least one `.` with `0`, so the result
+                    // carries a reference allele by construction and the coarse label is
+                    // Heterozygous. The precise per-copy dosage comes from
+                    // `dosage_fraction()` reading the string, which now counts that `0`.
+                    v.genotype = Genotype::Heterozygous;
+                }
                 kept.push(v);
             }
         }
@@ -3032,6 +3085,12 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
     }
     // A step that drops input deliberately has to say how much, or a shrunken truth set
     // looks like a small one.
+    if n_partial > 0 {
+        info!(
+            "input_vcf: normalized {n_partial} partial no-call genotype(s) — an uncalled \
+             allele is generated as reference (./1 -> 0/1)"
+        );
+    }
     let dropped = n_complex + n_null + n_nocall + n_homref;
     if dropped > 0 {
         warn!(
@@ -3796,6 +3855,69 @@ mod tests {
             vec![400, 500, 600, 700, 800],
             "expected only the records that actually assert an alternate allele to survive; \
              dropping a real call here would silently shrink the truth set"
+        );
+    }
+
+    /// A partial no-call is kept, but its `.` becomes `0` — #591 follow-up.
+    ///
+    /// Before: `./1` was written to the truth VCF verbatim and generated at AF 1.0000,
+    /// because `dosage_fraction` skips `.` alleles and scored it alt=1 of total=1.
+    /// Two things were wrong with that. It invents a second alt allele the input never
+    /// mentioned, and — measured with bcftools — `./1` is classified as neither het nor
+    /// hom: `GT="het"` selects only `0/1`, `GT="hom"` only `1/1`, and `./1` appears solely
+    /// under `GT="mis"`. A truth record like that drops out of any zygosity-stratified
+    /// analysis silently.
+    #[test]
+    fn a_partial_no_call_is_normalized_to_a_reference_allele() {
+        assert_eq!(normalize_partial_no_call("./1").as_deref(), Some("0/1"));
+        assert_eq!(normalize_partial_no_call("1/.").as_deref(), Some("1/0"));
+        assert_eq!(normalize_partial_no_call(".|1").as_deref(), Some("0|1"));
+        // generalises past diploid: one called alt of three copies
+        assert_eq!(normalize_partial_no_call("././1").as_deref(), Some("0/0/1"));
+
+        // MUST NOT FIRE: nothing to normalize, so nothing is rewritten.
+        for gt in ["0/1", "1/1", "1|0", "0/0/1", "0"] {
+            assert_eq!(
+                normalize_partial_no_call(gt),
+                None,
+                "{gt} has no uncalled allele and must be left exactly as supplied"
+            );
+        }
+    }
+
+    /// The normalized record must reach the kept set carrying the rewritten GT — a unit
+    /// test on the helper alone would pass even if it were never wired in.
+    #[test]
+    fn the_normalized_partial_no_call_is_what_gets_kept() {
+        let v = Variant {
+            location: 700,
+            reference: vec![Nucleotide::A],
+            alternate: AlternateType::Literal(vec![Nucleotide::T]),
+            variant_type: VariantType::SNP,
+            genotype: Genotype::Homozygous,
+            allele_fraction: None,
+            genotype_str: "./1".to_string(),
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: vec![],
+            sample: vec![],
+            provenance: Provenance::InputVcf,
+        };
+        let kept = filter_input_vcf(HashMap::from([("chr1".to_string(), vec![v])]));
+        let got = &kept.get("chr1").expect("record kept")[0];
+        assert_eq!(got.genotype_str, "0/1", "the `.` must be rewritten to `0`");
+        assert_eq!(
+            got.genotype,
+            Genotype::Heterozygous,
+            "one alt of two copies is heterozygous, not homozygous"
+        );
+        // 1 of 2 copies, not 1 of 1 — this is the AF that reaches read generation.
+        assert!(
+            (got.dosage_fraction() - 0.5).abs() < 1e-9,
+            "expected dosage 0.5, got {}",
+            got.dosage_fraction()
         );
     }
 
