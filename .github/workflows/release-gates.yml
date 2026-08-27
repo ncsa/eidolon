@@ -25,7 +25,43 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  issues: read
+
 jobs:
+
+  # Some work cannot be validated by any amount of CI: it needs a real reference on Delta.
+  # #607 is the current example — five SV fixes measured only on a 13.5 kb viral fixture
+  # whose longest contig is shorter than the guards being exercised. Merging develop into
+  # main is this repo's release point, so that is where the question has to be asked.
+  #
+  # The TRACKER is the source of truth, deliberately: a checklist committed to docs/ goes
+  # stale the moment someone forgets to tick it, and then reads as "validated" forever.
+  # An open `release-blocker` issue cannot rot in that direction.
+  release-blockers:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Refuse to release with open release-blocker issues
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        open=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                 --label release-blocker --state open \
+                 --json number,title --jq '.[] | "  #\(.number) \(.title)"')
+        if [ -n "$open" ]; then
+          echo "::error::develop carries work that is not validated on real data yet."
+          echo ""
+          echo "Open release-blocker issue(s):"
+          echo "$open"
+          echo ""
+          echo "These are NOT things CI can check. Resolve or de-label them, then re-run."
+          exit 1
+        fi
+        echo "No open release-blocker issues."
 
   realigned-gates:
 
