@@ -34,6 +34,7 @@ use crate::{
             nucleotides::Nucleotide,
             read_record::ReadRecord,
             sequence_block::{RegionType, SequenceBlock, SequenceMap},
+            sv_model::MIN_SV_LENGTH_BP,
             variants::{SvData, Variant},
         },
     },
@@ -919,9 +920,35 @@ fn process_chunk(
                 // same fraction belong on the same molecule; two at different fractions
                 // (a het and a hom, say) do not, and giving each group its own haplotype
                 // keeps each event's dosage independent rather than averaging them.
+                // SV-scale literal deletions belong on a haplotype for the mirror-image
+                // reason (#590). The per-base path can only SKIP deleted bases while
+                // rendering a read; it cannot stop fragments being PLACED across a span
+                // that, on this molecule, does not exist. Measured on a homozygous
+                // deletion against a no-variant control, depth inside the deleted span
+                // as a fraction of flank: 0.42 at 120 bp and 0.70 at 500 bp, where the
+                // identical event written as symbolic <DEL> gives 0.00.
+                //
+                // MIN_SV_LENGTH_BP is the codebase's own SV threshold, and the line is
+                // drawn there rather than at read_len (as insertions are) because the
+                // per-base path fails well before a read length. Below it the residual
+                // is small (measured 0.09 of flank at 30 bp) and routing every
+                // indel-model deletion through a materialized haplotype would change
+                // every run for no measurable gain.
+                let sv_dels: Vec<&Variant> = mutated_map
+                    .variant_map
+                    .values()
+                    .filter(|v| {
+                        v.location >= sub_start
+                            && v.location < sub_end
+                            && v.alternate.as_literal().is_some_and(|alt| {
+                                v.reference.len().saturating_sub(alt.len()) >= MIN_SV_LENGTH_BP
+                            })
+                    })
+                    .collect();
+
                 let mut ref_cov = scaled;
                 let mut alt_plans: Vec<(usize, usize)> = Vec::new(); // (hap_idx, alt_cov)
-                if !long_ins.is_empty() {
+                if !long_ins.is_empty() || !sv_dels.is_empty() {
                     // Mirror the allele semantics generate_read uses for a literal
                     // variant, so haplotype sampling and inline application agree: an
                     // explicit allele_fraction wins, otherwise homozygous is always alt
@@ -939,21 +966,34 @@ fn process_chunk(
                     // float noise does not split a group that is conceptually one.
                     let mut groups: std::collections::BTreeMap<u64, Vec<&Variant>> =
                         std::collections::BTreeMap::new();
-                    for v in &long_ins {
+                    // Insertions and deletions share the grouping: two events at the same
+                    // alt fraction belong on the SAME molecule, whichever kind they are.
+                    for v in long_ins.iter().chain(sv_dels.iter()) {
                         let key = (fraction_of(v) * 1000.0).round() as u64;
                         groups.entry(key).or_default().push(v);
                     }
                     let mut spent = 0usize;
                     for (key, members) in groups {
                         let f = key as f64 / 1000.0;
-                        let entries: Vec<(usize, Vec<Nucleotide>)> = members
-                            .iter()
-                            .filter_map(|v| {
-                                let alt = v.alternate.as_literal()?;
-                                Some((v.location, alt.get(v.reference.len()..)?.to_vec()))
-                            })
-                            .collect();
-                        let Some(map) = InsertionCoordinateMap::new(contig_len, entries) else {
+                        let mut ins_entries: Vec<(usize, Vec<Nucleotide>)> = Vec::new();
+                        let mut del_entries: Vec<(usize, usize)> = Vec::new();
+                        for v in &members {
+                            let Some(alt) = v.alternate.as_literal() else {
+                                continue;
+                            };
+                            if alt.len() > v.reference.len() {
+                                if let Some(novel) = alt.get(v.reference.len()..) {
+                                    ins_entries.push((v.location, novel.to_vec()));
+                                }
+                            } else if v.reference.len() > alt.len() {
+                                del_entries.push((v.location, v.reference.len() - alt.len()));
+                            }
+                        }
+                        let Some(map) = InsertionCoordinateMap::with_deletions(
+                            contig_len,
+                            ins_entries,
+                            del_entries,
+                        ) else {
                             // Refused only for genuinely ambiguous input (two insertions
                             // anchored at the same base, an anchor off the contig). Say
                             // so: these events keep the pre-#516 head-only behaviour and
@@ -2306,7 +2346,9 @@ fn generate_chimeric_pair(
     let mut throwaway_ad = AdCounter::new();
     let r1 = generate_read(
         &seq1,
-        // BND junction reads are stitched from reference pieces; every base is 'M'.
+        // BND junction reads are stitched from reference pieces: every base is 'M', and
+        // no haplotype deletion applies.
+        None,
         None,
         &[], // Mutations already applied in get_stitched_sequence
         &HashMap::new(),
@@ -2334,7 +2376,8 @@ fn generate_chimeric_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2410,7 +2453,9 @@ fn generate_inv_pair(
 
     let r1 = generate_read(
         &seq1,
-        // Reference-derived bases only; no haplotype insertion mask.
+        // Reference-derived bases only: no haplotype insertion mask, no haplotype
+        // deletion.
+        None,
         None,
         &[],
         &HashMap::new(),
@@ -2438,7 +2483,8 @@ fn generate_inv_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2513,7 +2559,9 @@ fn generate_del_pair(
 
     let r1 = generate_read(
         &seq1,
-        // Reference-derived bases only; no haplotype insertion mask.
+        // Reference-derived bases only: no haplotype insertion mask, no haplotype
+        // deletion.
+        None,
         None,
         &[],
         &HashMap::new(),
@@ -2541,7 +2589,8 @@ fn generate_del_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
             None,
             &[],
             &HashMap::new(),
@@ -2638,7 +2687,9 @@ fn generate_dup_pair(
 
     let r1 = generate_read(
         &seq1,
-        // Reference-derived bases only; no haplotype insertion mask.
+        // Reference-derived bases only: no haplotype insertion mask, no haplotype
+        // deletion.
+        None,
         None,
         &[],
         &HashMap::new(),
@@ -2666,7 +2717,8 @@ fn generate_dup_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
-            // Reference-derived bases only; no haplotype insertion mask.
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
             None,
             &[],
             &HashMap::new(),

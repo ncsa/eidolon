@@ -172,6 +172,17 @@ impl Cell {
     }
 }
 
+/// A literal deletion record: REF spans the anchor plus `n` deleted bases, ALT is the
+/// anchor alone — the ordinary VCF spelling, and the one #590 was about.
+fn del_record(pos: usize, n: usize, gt: &str, id: &str) -> String {
+    let seq = contig_bases();
+    let refe: String = (pos - 1..pos - 1 + n + 1)
+        .map(|i| seq[i] as char)
+        .collect::<String>();
+    let anchor = seq[pos - 1] as char;
+    format!("{CONTIG}\t{pos}\t{id}\t{refe}\t{anchor}\t60\tPASS\t.\tGT\t{gt}")
+}
+
 fn ins_record(pos: usize, insert: &str, gt: &str, id: &str) -> String {
     let base = ref_base_at(pos);
     format!("{CONTIG}\t{pos}\t{id}\t{base}\t{base}{insert}\t60\tPASS\t.\tGT\t{gt}")
@@ -717,5 +728,156 @@ fn the_golden_bam_cigar_describes_a_long_insertion() {
         "{broken} of {checked} mapped reads do not reconstruct against the reference from \
          their own POS+CIGAR. A read crossing the insertion anchor recorded as pure M \
          claims inserted bases are reference matches."
+    );
+}
+
+// ── CRITERION 10: a literal deletion must REMOVE COVERAGE, not just skip bases ──────
+//
+// #590. The per-base path can only skip deleted bases while rendering a read; it cannot
+// stop fragments being PLACED across a span that, on this molecule, does not exist.
+// Measured before the fix, depth inside the deleted span as a fraction of the same window
+// in a no-variant control: 0.42 at 120 bp and 0.70 at 500 bp, where the identical event
+// written as symbolic <DEL> gives 0.00. The deletion now lives in the haplotype map, so
+// the deleted bases have no coordinate for a fragment to start at.
+//
+// The denominator is the SAME WINDOW IN A CONTROL RUN, not a flank of the variant run.
+// #499's closing note prescribes that, #582 is what ignoring it costs, and measuring this
+// against a flank reports 0.40 for a het where the control denominator gives 0.474.
+
+/// Mean depth over a 0-based half-open reference window, from the golden BAM.
+fn mean_depth(cell: &Cell, from: usize, to: usize) -> f64 {
+    let mut depth = vec![0usize; CONTIG_LEN];
+    // H1N1 has EIGHT contigs and the BAM carries reads from all of them. Without this
+    // filter every contig's reads land in one depth array — measured 415x against a
+    // configured 60x, which swamps the local signal entirely and reports a working
+    // deletion as 0.98 of control.
+    let ref_names: Vec<String> = {
+        let file = std::fs::File::open(cell.dir.join("o.bam")).unwrap();
+        let mut reader = bam::io::Reader::new(file);
+        let header = reader.read_header().unwrap();
+        header
+            .reference_sequences()
+            .keys()
+            .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+            .collect()
+    };
+    for record in cell.bam_records() {
+        if record.flags().is_unmapped() {
+            continue;
+        }
+        let on_target = record
+            .reference_sequence_id()
+            .and_then(|r| r.ok())
+            .and_then(|id| ref_names.get(id))
+            .is_some_and(|n| n == CONTIG);
+        if !on_target {
+            continue;
+        }
+        let Some(Ok(start)) = record.alignment_start() else {
+            continue;
+        };
+        let mut pos = usize::from(start) - 1;
+        for op in record.cigar().iter() {
+            let op = op.unwrap();
+            match op.kind() {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    for p in pos..(pos + op.len()).min(CONTIG_LEN) {
+                        depth[p] += 1;
+                    }
+                    pos += op.len();
+                }
+                // A deletion consumes reference WITHOUT covering it — which is exactly
+                // the signal being measured, so it must advance without incrementing.
+                Kind::Deletion | Kind::Skip => pos += op.len(),
+                _ => {}
+            }
+        }
+    }
+    let slice = &depth[from.min(CONTIG_LEN)..to.min(CONTIG_LEN)];
+    slice.iter().sum::<usize>() as f64 / slice.len().max(1) as f64
+}
+
+#[test]
+fn a_literal_deletion_removes_coverage_over_its_span() {
+    let dir = tempfile::tempdir().unwrap();
+    const DEL_POS: usize = 800; // 1-based VCF POS
+    const DEL_LEN: usize = 500;
+    let cfg = "read_len: 150\nfragment_mean: 300\n";
+
+    let control = run(dir.path(), "del_control", &[], cfg);
+    let hom = run(
+        dir.path(),
+        "del_hom",
+        &[del_record(DEL_POS, DEL_LEN, "1/1", "del_hom")],
+        cfg,
+    );
+    let het = run(
+        dir.path(),
+        "del_het",
+        &[del_record(DEL_POS, DEL_LEN, "0/1", "del_het")],
+        cfg,
+    );
+
+    // Deep interior of the deleted span, clear of both junctions by more than a fragment.
+    let (lo, hi) = (DEL_POS + 100, DEL_POS + DEL_LEN - 100);
+    let ctl = mean_depth(&control, lo, hi);
+    assert!(
+        ctl > 10.0,
+        "control depth over the window is only {ctl:.1}x — too low to measure a collapse \
+         against, so the assertions below would pass for the wrong reason"
+    );
+
+    let hom_ratio = mean_depth(&hom, lo, hi) / ctl;
+    assert!(
+        hom_ratio < 0.05,
+        "a HOMOZYGOUS {DEL_LEN} bp deletion must remove essentially all coverage over its \
+         span; got {hom_ratio:.3} of the control ({:.1}x vs {ctl:.1}x). Before #590 this \
+         read 0.70 — the per-base path skipped the bases while fragments were still \
+         placed across them.",
+        mean_depth(&hom, lo, hi)
+    );
+
+    let het_ratio = mean_depth(&het, lo, hi) / ctl;
+    assert!(
+        (0.35..0.65).contains(&het_ratio),
+        "a HETEROZYGOUS deletion must halve coverage, not remove it: got {het_ratio:.3}. \
+         A value near 0 would mean the deletion was applied to both haplotypes."
+    );
+
+    // MUST NOT FIRE: the rest of the contig is untouched. The first attempt at #590 drove
+    // coverage through the SV multiplier instead, which split the contig into sub-regions
+    // that both fell under `generate_fragments`'s min-region guard — every read on the
+    // contig vanished while the deleted span read 0.00 and looked like a success.
+    let outside_ctl = mean_depth(&control, 1_600, 2_200);
+    let outside_hom = mean_depth(&hom, 1_600, 2_200);
+    assert!(
+        outside_ctl > 10.0,
+        "control flank depth {outside_ctl:.1}x is too low to be a reference point"
+    );
+    assert!(
+        (outside_hom / outside_ctl - 1.0).abs() < 0.20,
+        "coverage OUTSIDE the deleted span changed: {outside_hom:.1}x vs {outside_ctl:.1}x \
+         in the control. A deletion must not affect the rest of the contig."
+    );
+
+    // The junction has to be described in the CIGAR too, or a read crossing it is
+    // recorded as unbroken M and paints its post-junction bases across the removed span.
+    let largest_d = hom
+        .bam_records()
+        .iter()
+        .flat_map(|r| {
+            r.cigar()
+                .iter()
+                .filter_map(|o| o.ok())
+                .filter(|o| o.kind() == Kind::Deletion)
+                .map(|o| o.len())
+                .collect::<Vec<_>>()
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        largest_d, DEL_LEN,
+        "the golden BAM's largest D operation should equal the planted deletion; got \
+         {largest_d}. Sequencing-error deletions alone top out at a couple of bases."
     );
 }
