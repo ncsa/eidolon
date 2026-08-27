@@ -69,6 +69,12 @@ struct ContigContext<'a> {
     bam_context: Option<Arc<BamContext>>,
     reference: Arc<HashMap<String, Vec<Nucleotide>>>,
     mutated_maps: Arc<HashMap<String, MutatedMap>>,
+    // Contigs in REFERENCE FILE order. `mutated_maps` and `reference` are HashMaps, whose
+    // iteration order Rust randomizes per process; anything that walks them while drawing
+    // from a shared RNG becomes nondeterministic run to run. That is #599: chimeric read
+    // generation iterated `mutated_maps` directly and produced a different read set every
+    // run at a fixed seed, single-threaded. Iterate this instead and look the map up.
+    contig_order: Arc<Vec<String>>,
     max_del_lens: HashMap<String, usize>,
 }
 
@@ -347,6 +353,7 @@ pub fn run_neat(
         bam_context,
         reference,
         mutated_maps: shared_mutated_maps,
+        contig_order: Arc::new(contig_order_in_file.clone()),
         max_del_lens,
     };
 
@@ -1588,7 +1595,14 @@ fn process_chimeric_variants(
     let mut all_reads = Vec::new();
     let mut processed_ids = HashSet::new();
 
-    for (contig_name, m_map) in ctx.mutated_maps.iter() {
+    // Reference-file order, NOT HashMap order — see `ContigContext::contig_order` (#599).
+    // A single `rng` is threaded through this whole loop, so the order in which contigs
+    // are visited decides which draws each junction gets; a randomized order changed the
+    // emitted read set, and even its size, on every run.
+    for contig_name in ctx.contig_order.iter() {
+        let Some(m_map) = ctx.mutated_maps.get(contig_name) else {
+            continue;
+        };
         for sv_rec in &m_map.sv_records {
             let sv = match sv_rec.alternate.as_symbolic() {
                 Some(s) => s,
