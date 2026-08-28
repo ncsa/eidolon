@@ -60,6 +60,28 @@
 
 set -euo pipefail
 
+# Send this script's stderr to the SAME place as its stdout.
+#
+# Defence in depth, not the fix. The actual defect was `exec 8<>lock 2>/dev/null` in
+# lib_report.sh's index_reference_locked: `exec` with redirections and no command applies
+# them to the CURRENT SHELL permanently, so that 2>/dev/null — meant to suppress one failed
+# open — sent every subsequent >&2 in the job to /dev/null. Job 21532276 ran ten more
+# minutes and exited 1 with its .err frozen at 127 bytes; all three read-evidence gates and
+# the entire failure gate wrote into nothing, and the three loci the run named existed
+# nowhere on disk. That is fixed at source.
+#
+# This stays because the same class of mistake is one character away at all times, and
+# because a diagnostic belongs NEXT TO the step that produced it. Two files with no ordering
+# between them is why stage 3b's comment has to repeat its warning 900 lines later.
+#
+# SLURM-level errors (prolog, OOM kill, node failure) still reach .err — they come from
+# outside this script.
+exec 2>&1
+
+# Prove the redirect took, at the top, where it is cheap to notice. A harness whose failure
+# diagnostics are invisible reports every failure as silence (#583).
+echo "[selftest] stderr reaches this log (if this line is missing, diagnostics are being lost)" >&2
+
 # ── Parameters ───────────────────────────────────────────────────────────
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"   # archive_run() + Delta path resolution

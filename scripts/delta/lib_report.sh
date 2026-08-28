@@ -301,7 +301,14 @@ lock_outdir() {
 # and skips. Degrades to the unlocked check if the reference dir isn't writable.
 index_reference_locked() {
     local ref="$1"
-    if exec 8<>"${ref}.index.lock" 2>/dev/null; then
+    # BRACES ARE LOAD-BEARING. `exec` with redirections and no command applies them to the
+    # CURRENT SHELL, permanently — so the bare `exec 8<>lock 2>/dev/null` this replaces sent
+    # every subsequent >&2 in the job to /dev/null. Job 21532276 lost all three read-evidence
+    # gates' diagnostics and its whole failure gate that way: .err stopped at 127 bytes the
+    # moment this function ran (immediately before bwa), while the job continued for another
+    # ten minutes and exited 1. The three failing loci it named existed nowhere on disk.
+    # Grouping scopes the 2>/dev/null to the group while fd 8 still persists after it.
+    if { exec 8<>"${ref}.index.lock"; } 2>/dev/null; then
         flock 8
         if [[ ! -s "${ref}.bwt.2bit.64" ]] && [[ ! -s "${ref}.bwt" ]]; then
             echo "  Indexing reference for BWA-MEM2 (one-time, lock held)..."
