@@ -220,8 +220,7 @@ fn ordinary_reads_are_emitted_in_reference_file_order() {
     let lines = read_gzip_fastq_lines(&dir.join("order_r1.fastq.gz"));
 
     let reference_order = [
-        "H1N1_HA", "H1N1_MP", "H1N1_NA", "H1N1_NP", "H1N1_NS", "H1N1_PA", "H1N1_PB1",
-        "H1N1_PB2",
+        "H1N1_HA", "H1N1_MP", "H1N1_NA", "H1N1_NP", "H1N1_NS", "H1N1_PA", "H1N1_PB1", "H1N1_PB2",
     ];
 
     let mut emitted: Vec<String> = Vec::new();
