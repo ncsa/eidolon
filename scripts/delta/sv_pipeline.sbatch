@@ -1748,12 +1748,195 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
     fi
     rm -f "$seqs"
 }
+# Derive DEL junction probes from the REFERENCE. Emits two 4-column TSVs in the layout
+# count_probe_hits already consumes (chrom, pos, len, probe), so the matcher is reused
+# unmodified rather than forked.
+#
+# JUNCTION probe: 15 bp ending at the anchor POS, joined to 15 bp starting after END. On a
+# haplotype that took the deletion those two flanks are adjacent, so a spanning read carries
+# the 30-mer contiguously; in the reference they are `dlen` bases apart, so it cannot occur
+# by construction (~4^-30 by chance). Built from the reference FASTA, NOT from the VCF's ALT
+# or from anything eidolon emitted — a known answer independent of the code under test.
+#
+# CONTROL probe: the same left flank joined to the FIRST 15 DELETED bases, i.e. the reference
+# reading straight through the deletion start. It is present exactly when the locus is covered
+# by reads that did not take the deletion. Without it, "junction count 0" at an uncovered locus
+# is indistinguishable from a deletion that was never realized — a metric over an unknown
+# denominator (rule 4). DEL_SKIPPED counts records that could not be probed at all.
+build_del_probes() {  # <truth_sv.vcf.gz> <reference.fa> <junction.tsv> <control.tsv>
+    local truth="$1" ref="$2" jout="$3" cout="$4"
+    local recs
+    if ! recs="$(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/END\n' -i 'INFO/SVTYPE="DEL"' "$truth" 2>/dev/null)"; then
+        return 1
+    fi
+    : > "$jout"
+    : > "$cout"
+    DEL_SKIPPED=0
+    [[ -n "$recs" ]] || return 0
+    local c p r a e end dlen seqs left right delhead
+    while IFS=$'\t' read -r c p r a e; do
+        [[ -n "$c" ]] || continue
+        # Symbolic <DEL> carries END; a literal one does not, and its deleted bases are REF
+        # past the anchor. Deleted span is POS+1..END either way.
+        if [[ -z "$e" || "$e" == "." ]]; then end=$(( p + ${#r} - 1 )); else end="$e"; fi
+        dlen=$(( end - p ))
+        # Below 15 the control's right half would run past END into post-deletion sequence and
+        # the two probes would converge, so the control would stop discriminating. Anchors
+        # within 15 bp of a contig start have no left flank.
+        if (( dlen < 15 || p < 15 )); then
+            DEL_SKIPPED=$(( DEL_SKIPPED + 1 ))
+            continue
+        fi
+        if ! seqs="$(samtools faidx "$ref" "$c:$(( p - 14 ))-$p" "$c:$(( end + 1 ))-$(( end + 15 ))" "$c:$(( p + 1 ))-$(( p + 15 ))" 2>/dev/null \
+             | awk '/^>/ { i++; next } { gsub(/[^ACGTNacgtn]/, ""); s[i] = s[i] toupper($0) }
+                    END { print s[1] "\t" s[2] "\t" s[3] }')"; then
+            return 1
+        fi
+        IFS=$'\t' read -r left right delhead <<< "$seqs"
+        # A short fetch means the region ran off the contig end. Dropping it is correct;
+        # dropping it SILENTLY is how a denominator shrinks without anyone noticing.
+        if [[ ${#left} -ne 15 || ${#right} -ne 15 || ${#delhead} -ne 15 ]]; then
+            DEL_SKIPPED=$(( DEL_SKIPPED + 1 ))
+            continue
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$c" "$p" "$dlen" "$left$right"   >> "$jout"
+        printf '%s\t%s\t%s\t%s\n' "$c" "$p" "$dlen" "$left$delhead" >> "$cout"
+    done <<< "$recs"
+    return 0
+}
+
+# READ-LEVEL verification of planted DELETIONS — the DEL analogue of verify_planted_ins, and
+# the check that was missing when #590 was vetted (#607).
+#
+# WHY THIS EXISTS: #516's lesson generalizes past INS. The truth VCF declares an event; if the
+# reads do not carry it, every VCF-against-VCF recall printed above describes our own read
+# generation rather than the caller. #590 routed literal deletions through the haplotype map
+# so that reads would reflect them, and that was vetted on a 13.5 kb viral fixture and nowhere
+# else. This is where it meets real coverage.
+#
+# The assertion is deliberately NOT "the deleted bases are absent from the reads". At VAF < 1
+# the reference haplotype still carries them and so does the normal sample, so absence is
+# unassertable. Presence of the novel junction is assertable; see build_del_probes.
+#
+# Set VERIFY_DEL_READS=0 to skip.
+verify_planted_del() {  # <truth_sv.vcf.gz> <tumor.bam> <reference.fa> <outdir>
+    local truth="$1" bam="$2" ref="$3" dir="$4"
+    [[ "${VERIFY_DEL_READS:-1}" == "1" ]] || { echo "  (DEL read verification skipped)"; return 0; }
+    if [[ ! -f "$bam" ]]; then
+        echo "ERROR: $bam is missing — DEL read verification was not evaluated" >&2
+        return 1
+    fi
+    if [[ ! -f "$ref" ]]; then
+        echo "ERROR: reference $ref is missing — DEL read verification was not evaluated" >&2
+        return 1
+    fi
+
+    local jprobes="$dir/.del_junction_probes.tsv" cprobes="$dir/.del_control_probes.tsv"
+    DEL_SKIPPED=0
+    if ! build_del_probes "$truth" "$ref" "$jprobes" "$cprobes"; then
+        echo "ERROR: could not build DEL junction probes from $truth — verification was not evaluated" >&2
+        return 1
+    fi
+
+    local n_probes; n_probes=$(wc -l < "$jprobes" 2>/dev/null || echo 0)
+    if [[ "$n_probes" -eq 0 ]]; then
+        echo "  DEL read check: no DEL record could be probed (${DEL_SKIPPED} skipped) — nothing to verify"
+        return 0
+    fi
+
+    local seqs="$dir/.del_seqs.txt"
+    : > "$seqs"
+    local c p _l _q lo
+    while IFS=$'\t' read -r c p _l _q; do
+        lo=$(( p > 1000 ? p - 1000 : 1 ))
+        # A junction read spans the anchor (large D, or split with the junction bases retained
+        # in the soft clip), so it overlaps this window regardless of how far away END is.
+        if ! samtools view "$bam" "$c:$lo-$(( p + 1000 ))" 2>/dev/null | cut -f10 >> "$seqs"; then
+            echo "ERROR: samtools could not read the DEL locus $c:$p — verification was not evaluated" >&2
+            rm -f "$seqs"
+            return 1
+        fi
+    done < "$jprobes"
+
+    local jrows crows
+    if ! jrows="$(count_probe_hits "$jprobes" < "$seqs")" || ! crows="$(count_probe_hits "$cprobes" < "$seqs")"; then
+        echo "ERROR: probe matching failed — DEL read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    local jn cn
+    jn="$(printf '%s\n' "$jrows" | awk -F'\t' '$4 ~ /^[0-9]+$/ { n++ } END { print n + 0 }')"
+    cn="$(printf '%s\n' "$crows" | awk -F'\t' '$4 ~ /^[0-9]+$/ { n++ } END { print n + 0 }')"
+    if [[ "$jn" -ne "$n_probes" || "$cn" -ne "$n_probes" ]]; then
+        echo "ERROR: probe matcher evaluated $jn/$cn of $n_probes probes — DEL read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    # Pair the two hit lists by POSITION, not by trusting that two independent matcher runs
+    # emitted rows in the same order. If they ever disagree the comparison below is comparing
+    # unrelated loci, and it would do so silently.
+    local merged
+    merged="$(paste <(printf '%s\n' "$jrows") <(printf '%s\n' "$crows"))"
+    local misaligned
+    misaligned="$(printf '%s\n' "$merged" | awk -F'\t' '($1 != $5 || $2 != $6) { n++ } END { print n + 0 }')"
+    if [[ "$misaligned" -ne 0 ]]; then
+        echo "ERROR: $misaligned junction/control probe row(s) describe different loci —" >&2
+        echo "  DEL read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    echo "  DEL read-level support (30-mer spanning the junction, built from the reference):"
+    local realized=0 unrealized=0 uncovered=0 c p jl jhits chits
+    while IFS=$'\t' read -r c p jl jhits _ _ _ chits; do
+        if [[ "${jhits:-0}" -gt 0 ]]; then
+            realized=$(( realized + 1 ))
+            printf '    %s:%s  %s bp  %s junction read(s)\n' "$c" "$p" "$jl" "$jhits"
+        elif [[ "${chits:-0}" -eq 0 ]]; then
+            # Neither probe matched: nothing spans this locus at all. That is not evidence
+            # either way, and must not be scored as a failure.
+            uncovered=$(( uncovered + 1 ))
+            printf '    %s:%s  %s bp  NO SPANNING READS (uninterpretable, not counted)\n' "$c" "$p" "$jl"
+        else
+            unrealized=$(( unrealized + 1 ))
+            printf '    %s:%s  %s bp  NO JUNCTION, %s read(s) read THROUGH the deletion\n' "$c" "$p" "$jl" "$chits" >&2
+        fi
+    done <<< "$merged"
+
+    if [[ $(( realized + unrealized + uncovered )) -ne "$n_probes" ]]; then
+        echo "ERROR: DEL result accounting covered $(( realized + unrealized + uncovered )) of $n_probes probes" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    echo "  DEL read support: $realized realized, $unrealized NOT realized, $uncovered uncovered, $DEL_SKIPPED unprobeable"
+    DEL_UNREALIZED="$unrealized"
+    if [[ "$unrealized" -gt 0 ]]; then
+        echo "ERROR: $unrealized of $n_probes planted deletion(s) have reads reading straight" >&2
+        echo "  THROUGH them and no junction evidence. The deletion was declared in the truth" >&2
+        echo "  VCF but not realized in the reads — any DEL recall above describes our own read" >&2
+        echo "  generation, not the caller. See #516 for the INS precedent and #590." >&2
+    fi
+    rm -f "$seqs"
+}
+
 INS_UNSUPPORTED=0
 INS_VERIFY_FAILED=0
 INS_DENOM_THIN=0
 if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
     if ! verify_planted_ins "$OUTDIR/truth_sv_INS.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
         INS_VERIFY_FAILED=1
+    fi
+fi
+
+DEL_UNREALIZED=0
+DEL_VERIFY_FAILED=0
+DEL_SKIPPED=0
+if [[ -f "$OUTDIR/truth_sv_DEL.vcf.gz" ]]; then
+    if ! verify_planted_del "$OUTDIR/truth_sv_DEL.vcf.gz" "$TUMOR_BAM" "$REFERENCE" "$OUTDIR"; then
+        DEL_VERIFY_FAILED=1
     fi
 fi
 
@@ -1767,6 +1950,16 @@ elif [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
     RUN_STATUS="FAILED ($SCORE_COVERAGE_FAIL comparison(s) scored a SUBSET of the truth)"
 elif [[ "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
     RUN_STATUS="FAILED (INS read verification was not evaluated)"
+elif [[ "${DEL_VERIFY_FAILED:-0}" -ne 0 ]]; then
+    RUN_STATUS="FAILED (DEL read verification was not evaluated)"
+elif [[ "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+    # Unlike INS below, this IS a hard failure. The two have different epistemic status:
+    # #516 is a known-open defect, so failing every campaign that plants a long insertion
+    # would block unrelated DEL/DUP/INV work. #590 by contrast claims deletions ARE realized
+    # in the reads, and this run is what validates that claim (#607). A green exit over a
+    # result that contradicts a shipped fix is precisely the "shipped green" failure this
+    # pipeline exists to prevent.
+    RUN_STATUS="FAILED (DEL INVALID — $DEL_UNREALIZED deletion(s) not realized in the reads; #590)"
 elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
     # Deliberately not a hard failure while #516 is open: every campaign planting insertions
     # above ~a read length would fail, which would block DEL/DUP/INV work that is unaffected.
@@ -1877,6 +2070,11 @@ prune_bams() {  # <outdir>
         echo "[prune] KEEPING BAMs: INS read verification failed before evaluating every probe" >&2
         return 0
     fi
+    if [[ "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+        echo "[prune] KEEPING BAMs: DEL read evidence is missing or unevaluated — the BAM is" >&2
+        echo "  the only artifact that can show what the reads actually carry at those loci." >&2
+        return 0
+    fi
     # MUST NOT FIRE without a completed score. Deleting the BAMs of a run that died before
     # stage 5 destroys the only artifact that makes it re-callable, and the FASTQ is already
     # gone by this point, so there is no way back.
@@ -1903,7 +2101,8 @@ archive_run sv "$OUTDIR" truvari_manta_overall/summary.json scorer_recall.tsv
 # exit non-zero — because a run that published recalls over a subset of the truth, or
 # scored with an uncalibrated scorer, must not look successful to whoever reads the
 # SLURM exit status.
-if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
+if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:-0}" -ne 0 \
+      || "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
     echo "" >&2
     [[ "$CAL_FAIL" -ne 0 ]] && \
         echo "FAILED: scorer calibration (Rule 0) — no caller results were produced." >&2
@@ -1915,5 +2114,12 @@ if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:
     fi
     [[ "${INS_VERIFY_FAILED:-0}" -eq 0 ]] || \
         echo "FAILED: INS read verification did not evaluate every probe; BAMs were kept for diagnosis." >&2
+    [[ "${DEL_VERIFY_FAILED:-0}" -eq 0 ]] || \
+        echo "FAILED: DEL read verification did not evaluate every probe; BAMs were kept for diagnosis." >&2
+    if [[ "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+        echo "FAILED: $DEL_UNREALIZED planted deletion(s) are absent from the reads while reads" >&2
+        echo "  read straight through them. Any DEL recall above measures our read generation," >&2
+        echo "  not the caller. BAMs were kept. See #590 and #607." >&2
+    fi
     exit 1
 fi

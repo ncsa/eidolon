@@ -75,19 +75,30 @@ jobs:
           [ -e "$f" ] || continue
           bash -n "$f" || exit 1
         done
-    - name: BND geometry harness tests
-      run: scripts/delta/tests/test_bnd_geometry.sh
+    # Globbed, NOT enumerated. Three suites were added one at a time and each needed two new
+    # lines here; test_del_verification.sh was written and would have run nowhere, exactly the
+    # hand-maintained-list drift that left truth_sv_BNDinv.vcf.gz unscored in job 20745149.
+    # The scorer calibration suite in particular was written and left unwired for months —
+    # it guards the selftest and decoy controls, the only things separating "the caller found
+    # it" from "the matching window is loose enough to accept anything" (job 21382756).
+    - name: Delta harness tests
+      run: |
+        n=0
+        for t in scripts/delta/tests/*.sh; do
+          [ -e "$t" ] || continue
+          echo "──── $t"
+          bash "$t" || exit 1
+          n=$((n + 1))
+        done
+        # A glob that matches nothing exits 0 from the loop and reads as success.
+        [ "$n" -gt 0 ] || { echo "no harness suites ran — the glob matched nothing" >&2; exit 1; }
+        echo "$n harness suite(s) passed"
+    # Every suite must also fail when the code under it is broken. A suite that cannot is
+    # decoration, and this is the step that says so.
     - name: Prove the harness tests are non-vacuous
-      run: scripts/delta/tests/test_bnd_geometry.sh --mutate
-    - name: INS read-verification harness tests
-      run: scripts/delta/tests/test_ins_verification.sh
-    - name: Prove the INS harness tests are non-vacuous
-      run: scripts/delta/tests/test_ins_verification.sh --mutate
-    # The scorer calibration suite guards the selftest and decoy controls — the only things
-    # separating "the caller found it" from "the matching window is loose enough to accept
-    # anything". It was written but never wired into CI, and the decoy shipped two defects
-    # that reported themselves as scorer failures (#582's sibling; job 21382756).
-    - name: Scorer calibration harness tests
-      run: scripts/delta/tests/test_scorer_calibration.sh
-    - name: Prove the calibration tests are non-vacuous
-      run: scripts/delta/tests/test_scorer_calibration.sh --mutate
+      run: |
+        for t in scripts/delta/tests/*.sh; do
+          [ -e "$t" ] || continue
+          echo "──── $t --mutate"
+          bash "$t" --mutate || exit 1
+        done
