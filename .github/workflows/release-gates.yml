@@ -95,13 +95,36 @@ jobs:
 
     # Upstream ships a prebuilt static x86_64 build; bwa-mem2 is not in the Ubuntu
     # archive (`bwa` is, and is a different tool the gates do not use). The tarball
-    # carries per-ISA kernels plus a dispatcher, so it picks AVX2 on the runner itself.
+    # carries per-ISA kernels plus a dispatcher.
+    #
+    # Do NOT trust that dispatcher. Its CPU probe is coarser than what the kernels
+    # actually require: on a runner with AVX512F but not the full BW/VL/DQ/CLWB set it
+    # launches bwa-mem2.avx512bw, which refuses to start with "Please verify that both
+    # the operating system and the processor support ... AVX512BW ...". GitHub allocates
+    # runner hardware per job, so this failed AT RANDOM — the same job passed at 01:27
+    # and failed at 03:27 with no change to this workflow. A release gate that flips on
+    # which machine it landed on is worse than no gate; it teaches people to re-run until
+    # green. Pick the newest kernel that actually RUNS here instead.
     - name: Install bwa-mem2
       run: |
         set -euo pipefail
         curl -fsSL https://github.com/bwa-mem2/bwa-mem2/releases/download/v2.2.1/bwa-mem2-2.2.1_x64-linux.tar.bz2 \
           | sudo tar xj -C /opt
-        echo /opt/bwa-mem2-2.2.1_x64-linux >> "$GITHUB_PATH"
+        D=/opt/bwa-mem2-2.2.1_x64-linux
+        picked=""
+        for k in avx512bw avx2 sse42 sse41; do
+          if [ -x "$D/bwa-mem2.$k" ] && "$D/bwa-mem2.$k" version >/dev/null 2>&1; then
+            picked="$k"; break
+          fi
+        done
+        if [ -z "$picked" ]; then
+          echo "no bwa-mem2 kernel runs on this runner:" >&2
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -c '^avx512' || true
+          exit 1
+        fi
+        echo "selected bwa-mem2.$picked"
+        sudo ln -sf "$D/bwa-mem2.$picked" "$D/bwa-mem2"
+        echo "$D" >> "$GITHUB_PATH"
 
     - name: Install samtools and bcftools
       run: sudo apt-get update -qq && sudo apt-get install -y -qq samtools bcftools
