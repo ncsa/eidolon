@@ -1931,12 +1931,171 @@ if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
     fi
 fi
 
+# Largest CIGAR op of a given kind among SAM records on stdin. Split out so the parsing is
+# testable without samtools or a BAM.
+max_cigar_op() {  # <op char>  < sam records
+    awk -v want="$1" '
+        BEGIN { FS = "\t"; max = 0 }
+        {
+            n = split($6, parts, /[0-9]+/)       # ops, in order
+            split($6, lens, /[MIDNSHP=X]/)       # lengths, in order
+            for (i = 2; i <= n; i++) if (parts[i] == want && lens[i - 1] + 0 > max) max = lens[i - 1] + 0
+        }
+        END { print max + 0 }
+    '
+}
+
+# Mean depth over a region, or "." when samtools cannot read it. Kept separate so callers can
+# tell "zero coverage" (a real measurement) from "could not measure" (not a measurement).
+region_mean_depth() {  # <bam> <chrom> <start> <end>
+    local d
+    d="$(samtools depth -a -r "$2:$3-$4" "$1" 2>/dev/null | awk '{ s += $3; n++ } END { if (n) printf "%.4f", s / n; else print "0" }')" || return 1
+    [[ -n "$d" ]] || return 1
+    printf '%s' "$d"
+}
+
+# CIGAR-level evidence that planted SVs reached the alignment (#589, #590).
+#
+# WHY THIS EXISTS: #589 was exactly this — an insertion longer than a read appearing in NO
+# read's CIGAR, junction reads recorded as pure M. The truth VCF declared it, the reads half
+# carried it, and the CIGAR said nothing. Nothing in the pipeline looked at a CIGAR op until
+# now, so that defect was invisible here and was caught locally instead.
+#
+# For each planted INS the reads near the locus must carry an I op; for each DEL, a D op. This
+# is independent of verify_planted_del, which asks whether the junction SEQUENCE is present:
+# a read can carry the junction bases in a soft clip while the aligner still records pure M.
+# Both must hold.
+verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
+    local truth="$1" bam="$2" dir="$3"
+    [[ "${VERIFY_CIGAR_OPS:-1}" == "1" ]] || { echo "  (CIGAR op verification skipped)"; return 0; }
+    if [[ ! -f "$bam" ]]; then
+        echo "ERROR: $bam is missing — CIGAR op verification was not evaluated" >&2
+        return 1
+    fi
+
+    local svt op recs c p len end n_ev=0 n_missing=0 observed
+    CIGAR_MISSING=0
+    for svt in INS DEL; do
+        [[ -f "$dir/truth_sv_${svt}.vcf.gz" ]] || continue
+        op="I"; [[ "$svt" == "DEL" ]] && op="D"
+        if ! recs="$(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/END\n' "$dir/truth_sv_${svt}.vcf.gz" 2>/dev/null)"; then
+            echo "ERROR: could not read $dir/truth_sv_${svt}.vcf.gz — CIGAR op verification was not evaluated" >&2
+            return 1
+        fi
+        [[ -n "$recs" ]] || continue
+        while IFS=$'\t' read -r c p _r _a end; do
+            [[ -n "$c" ]] || continue
+            # Only events big enough that an aligner is expected to record the op at all. A
+            # 10 bp indel can legitimately be absorbed into mismatches.
+            if [[ "$svt" == "DEL" ]]; then
+                [[ -z "$end" || "$end" == "." ]] && continue
+                len=$(( end - p ))
+            else
+                len=$(( ${#_a} - ${#_r} ))
+            fi
+            (( len >= 50 )) || continue
+            n_ev=$(( n_ev + 1 ))
+            if ! observed="$(samtools view "$bam" "$c:$(( p > 500 ? p - 500 : 1 ))-$(( p + 500 ))" 2>/dev/null | max_cigar_op "$op")"; then
+                echo "ERROR: samtools could not read $c:$p — CIGAR op verification was not evaluated" >&2
+                return 1
+            fi
+            if [[ "${observed:-0}" -eq 0 ]]; then
+                n_missing=$(( n_missing + 1 ))
+                printf '    %s %s:%s  %s bp  NO %s OP IN ANY READ\n' "$svt" "$c" "$p" "$len" "$op" >&2
+            fi
+        done <<< "$recs"
+    done
+
+    if [[ "$n_ev" -eq 0 ]]; then
+        echo "  CIGAR op check: no INS/DEL >= 50 bp planted — nothing to verify"
+        return 0
+    fi
+    echo "  CIGAR op support: $(( n_ev - n_missing )) of $n_ev planted INS/DEL >= 50 bp carry an I/D op"
+    CIGAR_MISSING="$n_missing"
+    if [[ "$n_missing" -gt 0 ]]; then
+        echo "ERROR: $n_missing of $n_ev planted event(s) appear in NO read's CIGAR. That is #589's" >&2
+        echo "  exact signature — the event is declared, and the alignment does not describe it." >&2
+    fi
+}
+
+# Depth evidence that planted deletions actually removed coverage (#590, #221).
+#
+# Compares mean depth INSIDE each deleted span against equal-sized flanks just outside it. The
+# flanks are the control, so this needs no second run and no normal BAM. #607 asks for exactly
+# this plus the must-not-fire half: coverage OUTSIDE the span must be unchanged. The first #590
+# attempt looked like a success (deleted span read 0.00) while the whole contig was empty —
+# the flank ratio is what makes that distinguishable.
+verify_del_depth() {  # <truth_sv_DEL.vcf.gz> <tumor.bam> <outdir>
+    local truth="$1" bam="$2" dir="$3"
+    [[ "${VERIFY_DEL_DEPTH:-1}" == "1" ]] || { echo "  (DEL depth verification skipped)"; return 0; }
+    local recs
+    if ! recs="$(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/END\n' "$truth" 2>/dev/null)"; then
+        echo "ERROR: could not read $truth — DEL depth verification was not evaluated" >&2
+        return 1
+    fi
+    DEL_DEPTH_BAD=0
+    DEL_DEPTH_DEAD=0
+    local n=0 c p end len inside lflank rflank flank ratio
+    while IFS=$'\t' read -r c p _r _a end; do
+        [[ -n "$c" ]] || continue
+        [[ -z "$end" || "$end" == "." ]] && continue
+        len=$(( end - p ))
+        (( len >= 50 )) || continue
+        (( p - len >= 1 )) || continue
+        inside="$(region_mean_depth "$bam" "$c" "$(( p + 1 ))" "$end")" || {
+            echo "ERROR: could not measure depth at $c:$p — DEL depth verification was not evaluated" >&2; return 1; }
+        lflank="$(region_mean_depth "$bam" "$c" "$(( p - len ))" "$p")" || {
+            echo "ERROR: could not measure left flank at $c:$p — DEL depth verification was not evaluated" >&2; return 1; }
+        rflank="$(region_mean_depth "$bam" "$c" "$(( end + 1 ))" "$(( end + len ))")" || {
+            echo "ERROR: could not measure right flank at $c:$p — DEL depth verification was not evaluated" >&2; return 1; }
+        n=$(( n + 1 ))
+        read -r flank ratio <<< "$(awk -v l="$lflank" -v r="$rflank" -v i="$inside" \
+            'BEGIN { f = (l + r) / 2; printf "%.4f %.4f", f, (f > 0 ? i / f : -1) }')"
+        # A dead flank means there is no local baseline, so the inside value means nothing.
+        # Reporting it as a successful deletion is how the first #590 attempt passed.
+        if awk -v f="$flank" 'BEGIN { exit !(f < 1) }'; then
+            DEL_DEPTH_DEAD=$(( DEL_DEPTH_DEAD + 1 ))
+            printf '    %s:%s  %s bp  FLANK DEPTH %s — no local baseline, inside depth is uninterpretable\n' \
+                "$c" "$p" "$len" "$flank" >&2
+        elif awk -v x="$ratio" -v t="${DEL_DEPTH_MAX_RATIO:-0.95}" 'BEGIN { exit !(x > t) }'; then
+            DEL_DEPTH_BAD=$(( DEL_DEPTH_BAD + 1 ))
+            printf '    %s:%s  %s bp  inside/flank %s — coverage NOT removed\n' "$c" "$p" "$len" "$ratio" >&2
+        else
+            printf '    %s:%s  %s bp  inside/flank %s (flank %s)\n' "$c" "$p" "$len" "$ratio" "$flank"
+        fi
+    done <<< "$recs"
+
+    if [[ "$n" -eq 0 ]]; then
+        echo "  DEL depth check: no symbolic DEL >= 50 bp with usable flanks — nothing to verify"
+        return 0
+    fi
+    echo "  DEL depth: $(( n - DEL_DEPTH_BAD - DEL_DEPTH_DEAD )) of $n deletion(s) removed coverage; $DEL_DEPTH_BAD did not, $DEL_DEPTH_DEAD had a dead flank"
+    if [[ "$DEL_DEPTH_BAD" -gt 0 || "$DEL_DEPTH_DEAD" -gt 0 ]]; then
+        echo "ERROR: DEL coverage evidence is missing or uninterpretable. See #590 and #221." >&2
+    fi
+}
+
 DEL_UNREALIZED=0
 DEL_VERIFY_FAILED=0
 DEL_SKIPPED=0
 if [[ -f "$OUTDIR/truth_sv_DEL.vcf.gz" ]]; then
     if ! verify_planted_del "$OUTDIR/truth_sv_DEL.vcf.gz" "$TUMOR_BAM" "$REFERENCE" "$OUTDIR"; then
         DEL_VERIFY_FAILED=1
+    fi
+fi
+
+CIGAR_MISSING=0
+CIGAR_VERIFY_FAILED=0
+if ! verify_sv_cigar_ops "$OUTDIR/truth_sv_scoreable.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
+    CIGAR_VERIFY_FAILED=1
+fi
+
+DEL_DEPTH_BAD=0
+DEL_DEPTH_DEAD=0
+DEL_DEPTH_FAILED=0
+if [[ -f "$OUTDIR/truth_sv_DEL.vcf.gz" ]]; then
+    if ! verify_del_depth "$OUTDIR/truth_sv_DEL.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
+        DEL_DEPTH_FAILED=1
     fi
 fi
 
@@ -1960,6 +2119,12 @@ elif [[ "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
     # result that contradicts a shipped fix is precisely the "shipped green" failure this
     # pipeline exists to prevent.
     RUN_STATUS="FAILED (DEL INVALID — $DEL_UNREALIZED deletion(s) not realized in the reads; #590)"
+elif [[ "${CIGAR_VERIFY_FAILED:-0}" -ne 0 || "${DEL_DEPTH_FAILED:-0}" -ne 0 ]]; then
+    RUN_STATUS="FAILED (CIGAR/depth verification was not evaluated)"
+elif [[ "${CIGAR_MISSING:-0}" -gt 0 ]]; then
+    RUN_STATUS="FAILED ($CIGAR_MISSING planted event(s) appear in no read CIGAR — #589)"
+elif [[ "${DEL_DEPTH_BAD:-0}" -gt 0 || "${DEL_DEPTH_DEAD:-0}" -gt 0 ]]; then
+    RUN_STATUS="FAILED (DEL coverage not removed or flank dead — #590/#221)"
 elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
     # Deliberately not a hard failure while #516 is open: every campaign planting insertions
     # above ~a read length would fail, which would block DEL/DUP/INV work that is unaffected.
@@ -2070,6 +2235,11 @@ prune_bams() {  # <outdir>
         echo "[prune] KEEPING BAMs: INS read verification failed before evaluating every probe" >&2
         return 0
     fi
+    if [[ "${CIGAR_MISSING:-0}" -gt 0 || "${CIGAR_VERIFY_FAILED:-0}" -ne 0 \
+          || "${DEL_DEPTH_BAD:-0}" -gt 0 || "${DEL_DEPTH_DEAD:-0}" -gt 0 || "${DEL_DEPTH_FAILED:-0}" -ne 0 ]]; then
+        echo "[prune] KEEPING BAMs: CIGAR or depth evidence is missing or unevaluated." >&2
+        return 0
+    fi
     if [[ "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
         echo "[prune] KEEPING BAMs: DEL read evidence is missing or unevaluated — the BAM is" >&2
         echo "  the only artifact that can show what the reads actually carry at those loci." >&2
@@ -2102,7 +2272,9 @@ archive_run sv "$OUTDIR" truvari_manta_overall/summary.json scorer_recall.tsv
 # scored with an uncalibrated scorer, must not look successful to whoever reads the
 # SLURM exit status.
 if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:-0}" -ne 0 \
-      || "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+      || "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 \
+      || "${CIGAR_VERIFY_FAILED:-0}" -ne 0 || "${CIGAR_MISSING:-0}" -gt 0 \
+      || "${DEL_DEPTH_FAILED:-0}" -ne 0 || "${DEL_DEPTH_BAD:-0}" -gt 0 || "${DEL_DEPTH_DEAD:-0}" -gt 0 ]]; then
     echo "" >&2
     [[ "$CAL_FAIL" -ne 0 ]] && \
         echo "FAILED: scorer calibration (Rule 0) — no caller results were produced." >&2
@@ -2121,5 +2293,11 @@ if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:
         echo "  read straight through them. Any DEL recall above measures our read generation," >&2
         echo "  not the caller. BAMs were kept. See #590 and #607." >&2
     fi
+    [[ "${CIGAR_MISSING:-0}" -eq 0 ]] || \
+        echo "FAILED: $CIGAR_MISSING planted event(s) appear in no read's CIGAR (#589)." >&2
+    [[ "${DEL_DEPTH_BAD:-0}" -eq 0 ]] || \
+        echo "FAILED: $DEL_DEPTH_BAD deletion(s) did not remove coverage (#590)." >&2
+    [[ "${DEL_DEPTH_DEAD:-0}" -eq 0 ]] || \
+        echo "FAILED: $DEL_DEPTH_DEAD deletion(s) had a dead flank; inside depth is uninterpretable." >&2
     exit 1
 fi
