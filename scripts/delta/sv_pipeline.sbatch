@@ -60,6 +60,28 @@
 
 set -euo pipefail
 
+# Send this script's stderr to the SAME place as its stdout.
+#
+# Defence in depth, not the fix. The actual defect was `exec 8<>lock 2>/dev/null` in
+# lib_report.sh's index_reference_locked: `exec` with redirections and no command applies
+# them to the CURRENT SHELL permanently, so that 2>/dev/null — meant to suppress one failed
+# open — sent every subsequent >&2 in the job to /dev/null. Job 21532276 ran ten more
+# minutes and exited 1 with its .err frozen at 127 bytes; all three read-evidence gates and
+# the entire failure gate wrote into nothing, and the three loci the run named existed
+# nowhere on disk. That is fixed at source.
+#
+# This stays because the same class of mistake is one character away at all times, and
+# because a diagnostic belongs NEXT TO the step that produced it. Two files with no ordering
+# between them is why stage 3b's comment has to repeat its warning 900 lines later.
+#
+# SLURM-level errors (prolog, OOM kill, node failure) still reach .err — they come from
+# outside this script.
+exec 2>&1
+
+# Prove the redirect took, at the top, where it is cheap to notice. A harness whose failure
+# diagnostics are invisible reports every failure as silence (#583).
+echo "[selftest] stderr reaches this log (if this line is missing, diagnostics are being lost)" >&2
+
 # ── Parameters ───────────────────────────────────────────────────────────
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"   # archive_run() + Delta path resolution
@@ -1846,16 +1868,26 @@ verify_planted_del() {  # <truth_sv.vcf.gz> <tumor.bam> <reference.fa> <outdir>
 
     local seqs="$dir/.del_seqs.txt"
     : > "$seqs"
-    local c p _l _q lo
-    while IFS=$'\t' read -r c p _l _q; do
-        lo=$(( p > 1000 ? p - 1000 : 1 ))
-        # A junction read spans the anchor (large D, or split with the junction bases retained
-        # in the soft clip), so it overlaps this window regardless of how far away END is.
-        if ! samtools view "$bam" "$c:$lo-$(( p + 1000 ))" 2>/dev/null | cut -f10 >> "$seqs"; then
-            echo "ERROR: samtools could not read the DEL locus $c:$p — verification was not evaluated" >&2
-            rm -f "$seqs"
-            return 1
-        fi
+    local c p dlen _q lo end
+    while IFS=$'\t' read -r c p dlen _q; do
+        # BOTH breakpoint neighbourhoods, not just the anchor.
+        #
+        # This used to search POS +/- 1000 only, on the premise that "a junction read spans the
+        # anchor regardless of how far away END is". Job 21532276 disproved it: three large
+        # deletions (405 kb, 54 kb, 30 kb) reported NO JUNCTION with zero hits at POS and 2, 6
+        # and 2 hits at END. Past roughly a read length there is no spanning read — bwa emits
+        # split alignments, and the record carrying the junction bases in its soft clip can be
+        # anchored on either side. The depth gate said all 76 deletions removed coverage and
+        # disagreed with this probe; the probe was wrong, not the simulator (#590).
+        for lo in "$p" "$(( p + dlen ))"; do
+            end=$(( lo + 1000 ))
+            (( lo > 1000 )) && lo=$(( lo - 1000 )) || lo=1
+            if ! samtools view "$bam" "$c:$lo-$end" 2>/dev/null | cut -f10 >> "$seqs"; then
+                echo "ERROR: samtools could not read the DEL locus $c:$p — verification was not evaluated" >&2
+                rm -f "$seqs"
+                return 1
+            fi
+        done
     done < "$jprobes"
 
     local jrows crows
@@ -2002,6 +2034,17 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
             if [[ "${observed:-0}" -eq 0 ]]; then
                 n_missing=$(( n_missing + 1 ))
                 printf '    %s %s:%s  %s bp  NO %s OP IN ANY READ\n' "$svt" "$c" "$p" "$len" "$op" >&2
+            else
+                # Report the largest op against the declared length rather than asserting they
+                # match. #607 asked for "largest D op equal to the deletion length", which holds
+                # only while a single read can express the event: past roughly a read length bwa
+                # emits split alignments instead, so a 405 kb deletion legitimately has no 405 kb
+                # D op. Asserting equality would fail every large event; asserting non-zero alone
+                # is near-vacuous, since one error-derived 1 bp op passes. Printing both keeps the
+                # weakness visible instead of hiding it behind a green count — the junction probe
+                # and the depth gate are what actually cover large events.
+                printf '    %s %s:%s  declared %s bp  largest %s op %s bp\n' \
+                    "$svt" "$c" "$p" "$len" "$op" "$observed"
             fi
         done <<< "$recs"
     done
