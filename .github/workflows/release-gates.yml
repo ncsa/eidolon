@@ -12,20 +12,68 @@
 # FASTQ, produces the evidence a caller keys on — and that question is worth asking when
 # a release is proposed, not on every push to a topic branch.
 #
-# Triggers: a PR into main (this repo releases by merging develop -> main), or manually
-# via the Actions tab before cutting a release.
+# Triggers: any PR into develop or main, or manually via the Actions tab.
+#
+# Firing on develop is what actually EXERCISES this workflow. A gate that only runs when a
+# release is cut is a gate nobody has seen work, and `delta-harness` proved that costs a red
+# CI run to discover (bgzip lives in `tabix`, not `bcftools`). Running the realigned gates on
+# every PR into develop is ~30 s of tests plus a tarball download, against the DUP gate having
+# sat red on develop AND main through an entire release because nothing ran it.
+#
+# The release-blocker check is the exception and stays main-only, via an `if` on the job:
+# develop is ALLOWED to carry work that is not yet validated on real data — that is the normal
+# state between a fix and its Delta campaign. Only cutting a release is not allowed to.
 
 name: release-gates
 
 on:
   workflow_dispatch:
   pull_request:
-    branches: [ "main" ]
+    branches: [ "develop", "main" ]
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  issues: read
+
 jobs:
+
+  # Some work cannot be validated by any amount of CI: it needs a real reference on Delta.
+  # #607 is the current example — five SV fixes measured only on a 13.5 kb viral fixture
+  # whose longest contig is shorter than the guards being exercised. Merging develop into
+  # main is this repo's release point, so that is where the question has to be asked.
+  #
+  # The TRACKER is the source of truth, deliberately: a checklist committed to docs/ goes
+  # stale the moment someone forgets to tick it, and then reads as "validated" forever.
+  # An open `release-blocker` issue cannot rot in that direction.
+  release-blockers:
+
+    # main only. Blocking every develop PR on an open Delta-validation issue would stop all
+    # day-to-day work for exactly the reason the issue exists.
+    if: github.base_ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Refuse to release with open release-blocker issues
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        open=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                 --label release-blocker --state open \
+                 --json number,title --jq '.[] | "  #\(.number) \(.title)"')
+        if [ -n "$open" ]; then
+          echo "::error::develop carries work that is not validated on real data yet."
+          echo ""
+          echo "Open release-blocker issue(s):"
+          echo "$open"
+          echo ""
+          echo "These are NOT things CI can check. Resolve or de-label them, then re-run."
+          exit 1
+        fi
+        echo "No open release-blocker issues."
 
   realigned-gates:
 
