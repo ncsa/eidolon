@@ -30,12 +30,13 @@ if [[ "${1:-}" == "--mutate" ]]; then
             printf '  caught   %s\n' "$label"
         fi
     done <<'MUTATIONS'
+searches only the anchor breakpoint@for lo in "$p" "$(( p + dlen ))"; do@for lo in "$p"; do
 junction probe joins the wrong flank@printf '%s\t%s\t%s\t%s\n' "$c" "$p" "$dlen" "$left$right"   >> "$jout"@printf '%s\t%s\t%s\t%s\n' "$c" "$p" "$dlen" "$left$delhead" >> "$jout"
 left flank is off by one@"$c:$(( p - 14 ))-$p"@"$c:$(( p - 15 ))-$p"
 right flank starts at END not END+1@"$c:$(( end + 1 ))-$(( end + 15 ))"@"$c:$end-$(( end + 14 ))"
 uncovered locus is scored as a failure@elif [[ "${chits:-0}" -eq 0 ]]; then@elif false; then
 unprobeable records are not counted@DEL_SKIPPED=$(( DEL_SKIPPED + 1 ))@:
-samtools failures are swallowed@if ! samtools view "$bam" "$c:$lo-$(( p + 1000 ))"@if samtools view "$bam" "$c:$lo-$(( p + 1000 ))"
+samtools failures are swallowed@if ! samtools view "$bam" "$c:$lo-$end"@if samtools view "$bam" "$c:$lo-$end"
 row misalignment is ignored@if [[ "$misaligned" -ne 0 ]]; then@if false; then
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
@@ -82,11 +83,25 @@ samtools() {
         return 0
     fi
     if [[ "${1:-}" == "view" ]]; then
+        # $3 is the region. The anchor window covers POS=1000, the far window covers END=2000.
+        local win="near"
+        case "${3:-}" in *:1*-3000|*:1000-*) win="far" ;; esac
+        [[ "${3:-}" == *"-3000" ]] && win="far"
         case "${VIEW_MODE:-junction}" in
             fail)      return 2 ;;
             uncovered) return 0 ;;
             junction)  printf 'r1\t0\tchr1\t1\t60\t30M\t*\t0\t0\tCCC%sCCC\t*\n' "$JUNCTION" ;;
             through)   printf 'r1\t0\tchr1\t1\t60\t30M\t*\t0\t0\tCCC%sCCC\t*\n' "$CONTROL" ;;
+            # Job 21532276: for a large deletion the junction-bearing read anchors at END, and
+            # nothing is at POS. The probe searched POS only and called three good deletions
+            # unrealized. Must pass.
+            far_only)
+                if [[ "$win" == "far" ]]; then
+                    printf 'r1\t0\tchr1\t1\t60\t30M\t*\t0\t0\tCCC%sCCC\t*\n' "$JUNCTION"
+                else
+                    printf 'r2\t0\tchr1\t1\t60\t30M\t*\t0\t0\tCCC%sCCC\t*\n' "$CONTROL"
+                fi
+                ;;
         esac
         return 0
     fi
@@ -125,6 +140,17 @@ rc=$?; out="$(<"$WORK/out")"
 has "unrealized deletion is reported explicitly" "$out" "read THROUGH the deletion"
 is "unrealized deletion is counted" 1 "$DEL_UNREALIZED"
 has "unrealized deletion names the issue" "$out" "#590"
+
+echo "=== junction only at END, nothing at POS (must NOT fire) ==="
+# Regression for job 21532276. Past ~a read length there is no read spanning the deletion;
+# bwa splits, and the record carrying the junction can anchor on either side. Searching only
+# the anchor reported three genuinely-realized deletions as unrealized.
+DEL_UNREALIZED=0
+VIEW_MODE=far_only verify_planted_del "$truth" "$bam" "$ref" "$WORK" > "$WORK/out" 2>&1
+rc=$?; out="$(<"$WORK/out")"
+is "junction found at the far breakpoint" 0 "$rc"
+is "far-anchored junction is NOT called unrealized" 0 "$DEL_UNREALIZED"
+has "far-anchored junction counts as realized" "$out" "1 realized"
 
 echo "=== locus with no spanning reads (must NOT fire) ==="
 DEL_UNREALIZED=0
