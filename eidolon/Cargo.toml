@@ -25,3 +25,7 @@ clap = { version = "4.5.1", features = ["derive"] }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+
+# Inherit the workspace clippy gate (#616); the allow-list lives in the root Cargo.toml.
+[lints]
+workspace = true

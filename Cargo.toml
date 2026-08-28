@@ -14,6 +14,49 @@ authors = ["Joshua Allen", "Mikolaj Kowalik", "See coauthors of Python Neat vers
 description = "Toolkit for generating simulated NGS read data in fastq and vcf formats. Feature set under development."
 repository = "https://github.com/ncsa/eidolon"
 
+# Clippy is a CI gate (eidolon-tests.yml). It runs with `-D warnings`, so anything not
+# explicitly allowed below fails the build.
+#
+# Every entry here is PRE-EXISTING DEBT, not a policy decision — 29 lint kinds across the
+# workspace when clippy was first switched on (#616). They are allowed so the gate could go
+# in BLOCKING on day one instead of running non-blocking "for now", which is how this kind of
+# gap reopens (#616 says so explicitly). New code cannot introduce any lint outside this
+# list, and the list only shrinks.
+#
+# #617 removes these one at a time. Deleting a line here IS the fix being merged: if the
+# lint is genuinely gone the build stays green, and if it is not, CI says so. Do not add to
+# this list to make a build pass — fix the code or argue the lint down in review.
+[workspace.lints.clippy]
+collapsible_if = "allow"
+default_constructed_unit_structs = "allow"
+derivable_impls = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+empty_line_after_doc_comments = "allow"
+explicit_counter_loop = "allow"
+field_reassign_with_default = "allow"
+for_kv_map = "allow"
+io_other_error = "allow"
+iter_cloned_collect = "allow"
+len_zero = "allow"
+manual_contains = "allow"
+manual_ignore_case_cmp = "allow"
+manual_is_multiple_of = "allow"
+manual_pattern_char_comparison = "allow"
+manual_range_contains = "allow"
+manual_repeat_n = "allow"
+manual_str_repeat = "allow"
+manual_strip = "allow"
+needless_range_loop = "allow"
+ptr_arg = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_cast = "allow"
+unnecessary_min_or_max = "allow"
+useless_conversion = "allow"
+useless_format = "allow"
+useless_vec = "allow"
+
 [workspace.dependencies]
 thiserror = "2.0.16"
 chrono = "0.4.38"
