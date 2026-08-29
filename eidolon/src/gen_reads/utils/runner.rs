@@ -1,7 +1,8 @@
 use eidolon_core::file_tools::block_gz::BlockGzWriter;
 use eidolon_core::file_tools::file_io::create_output_file;
 use eidolon_core::rng::NeatRng;
-use eidolon_core::structs::variants::{Genotype, Provenance, SvType, VariantType};
+use eidolon_core::structs::sv_model::sample_novel_insertion_bases;
+use eidolon_core::structs::variants::{AlternateType, Genotype, Provenance, SvType, VariantType};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -253,6 +254,10 @@ pub fn run_neat(
         // dropouts rather than being filled with fabricated sequence.
         reference_map.insert(name, seq);
     }
+    // Must run AFTER the reference is loaded: realizing a symbolic <INS> needs the local
+    // base composition to draw from, and the anchor base to build the literal ALT.
+    let input_variants = realize_symbolic_insertions(input_variants, &reference_map, rng);
+
     let reference = Arc::new(reference_map);
 
     let bam_context: Option<Arc<BamContext>> = if config.produce_bam {
@@ -2315,10 +2320,29 @@ fn generate_chimeric_pair(
     // L1 = offset
     // L2 = frag_len - offset
 
-    let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
-        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, &ctx.reference)?;
+    // Novel sequence at the junction comes out of the fragment budget, it does not extend
+    // it: L1 + |insert| + L2 == frag_len. See `bnd_fragment_split` for why — the short
+    // version is that the insert consumes read bases but no reference bases, so the pair
+    // must span LESS reference than the library mean.
+    let insert = bnd_insert_bases(sv);
+    let (insert_used, len2) = bnd_fragment_split(frag_len, offset, insert.len());
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
+        get_bnd_pieces(contig, pos, sv, offset, len2, &ctx.reference)?;
+
+    let seq1 = get_stitched_sequence(
+        ctx,
+        &c1,
+        s1,
+        e1,
+        rev1,
+        &c2,
+        s2,
+        e2,
+        rev2,
+        &insert[..insert_used],
+        rng,
+    )?;
 
     let read_len = ctx.config.read_len;
     // The trailing 16-hex `frag_idx` matches the uniqueness-tag pattern that
@@ -2423,7 +2447,7 @@ fn generate_inv_pair(
         ctx,
     )?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     // The trailing 16-hex `frag_idx` matches the uniqueness-tag pattern that
@@ -2530,7 +2554,7 @@ fn generate_del_pair(
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
         get_del_pieces(contig, location, end, offset, frag_len - offset, ctx)?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     // QNAME format mirrors BND/INV's `EIDOLON_chimeric_*` scheme so the
@@ -2668,7 +2692,7 @@ fn generate_dup_pair(
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
         get_dup_pieces(contig, location, end, offset, frag_len - offset, ctx)?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     let base_name = format!(
@@ -2902,6 +2926,16 @@ fn get_bnd_pieces(
     })
 }
 
+/// Stitch the two reference pieces of a breakend, splicing any inserted sequence between
+/// them.
+///
+/// `insert` is the novel sequence the BND ALT declares at the junction (VCF 4.2 §5.4). It
+/// goes between the pieces in every one of the four bracket forms and is NEVER
+/// reverse-complemented: it is written in the orientation of the record that declares it,
+/// while `rev1`/`rev2` describe only how each REFERENCE piece is read. Reverse-complementing
+/// it would put real bases in the read in an order the truth VCF does not claim — the same
+/// silent truth/reads disagreement as omitting it (#498).
+#[allow(clippy::too_many_arguments)]
 fn get_stitched_sequence(
     ctx: &ContigContext,
     c1: &str,
@@ -2912,6 +2946,7 @@ fn get_stitched_sequence(
     s2: usize,
     e2: usize,
     rev2: bool,
+    insert: &[Nucleotide],
     rng: &mut NeatRng,
 ) -> Result<Vec<Nucleotide>, GenerateReadsError> {
     let mut seq1 = get_mutated_subseq(ctx, c1, s1, e1, rng)?;
@@ -2922,8 +2957,51 @@ fn get_stitched_sequence(
     if rev2 {
         seq2 = reverse_complement(seq2);
     }
+    seq1.extend_from_slice(insert);
     seq1.extend(seq2);
     Ok(seq1)
+}
+
+/// The inserted bases a breakend declares, as nucleotides.
+///
+/// Every character is kept. `Nucleotide::from(char)` maps anything that is not a base to
+/// `N`, which is deliberate here: callers size the fragment against this length, so dropping
+/// an unreadable character would make the spliced sequence shorter than the budget reserved
+/// for it and shift the junction. An `N` in the read is a visible "we could not read this
+/// base"; a length mismatch is silent.
+/// Divide a fragment across `[piece1 | insert | piece2]`, returning `(insert_used, len2)`.
+///
+/// INVARIANT: `offset + insert_used + len2 == frag_len` for any `offset <= frag_len`. The
+/// insert comes OUT of the fragment budget, it does not extend it.
+///
+/// WHY THAT MATTERS: the inserted bases consume READ bases but no REFERENCE bases, so a
+/// correctly built pair spans LESS reference than the library mean — a reduced insert size
+/// is one of the signatures a caller uses to detect an insertion at a junction. Letting the
+/// fragment grow by the insert length instead keeps the reference span at the library mean
+/// and erases that signature, while placing the mate further into the second piece than the
+/// fragment distribution allows. The result is systematically discordant pairs at every
+/// inserted junction and an inferred event size that does not match what was planted.
+///
+/// (It does NOT inflate depth: R1 and R2 are each `read_len` bases regardless of how long
+/// the fragment is, so the bases emitted per fragment do not change. An earlier version of
+/// this comment claimed otherwise.)
+///
+/// Split out from `generate_chimeric_pair` so the invariant is testable without a reference
+/// or a `ContigContext` — no read-content check can see this, since the insert is still
+/// present, adjacent and correctly oriented.
+///
+/// A fragment can end INSIDE a long insert: then it carries a prefix of the insert and no
+/// second reference piece at all, which is the ordinary truncation any read sees at a
+/// junction.
+fn bnd_fragment_split(frag_len: usize, offset: usize, insert_len: usize) -> (usize, usize) {
+    let after_junction = frag_len.saturating_sub(offset);
+    let insert_used = insert_len.min(after_junction);
+    let len2 = after_junction - insert_used;
+    (insert_used, len2)
+}
+
+fn bnd_insert_bases(sv: &SvData) -> Vec<Nucleotide> {
+    sv.bnd_insert.chars().map(Nucleotide::from).collect()
 }
 
 fn get_mutated_subseq(
@@ -3094,10 +3172,108 @@ fn is_no_call(gt: &str) -> bool {
     !alleles.is_empty() && alleles.iter().all(|a| a.trim() == ".")
 }
 
+/// Give a symbolic `<INS>` from an input VCF the novel sequence it needs to reach the reads.
+///
+/// WHY THIS EXISTS: a symbolic `<INS>` carries no sequence, so there was nothing to splice
+/// and the record became a silent no-op — preserved verbatim in the truth VCF while the
+/// reads came out byte-identical in behaviour to a no-variant control, same `I` count, same
+/// `D` count, same depth (#500). A benchmark built from that truth scores a caller as having
+/// missed an insertion that was never in the data.
+///
+/// Realizing it is the biologically honest reading: `<INS>` in a real callset means "an
+/// insertion of about this size, sequence unresolved", and generating reads for it requires
+/// choosing a sequence. The bases are drawn by `sample_novel_insertion_bases` — the SAME
+/// sampler the de novo path uses, so one model does not plant two different kinds of
+/// insertion depending on which door the record came through. #580 tracks making that
+/// sampler mobile-element-aware; when it lands, both paths get it at once.
+///
+/// The record becomes LITERAL, which is what routes the bases through the insertion
+/// machinery, and the truth VCF then states exactly what was planted rather than a size and
+/// a promise. `SVTYPE=INS` beside a literal ALT is what Manta emits for a resolved insertion.
+///
+/// A `<INS>` with no usable `SVLEN` cannot be realized at all — there is no length to
+/// synthesise — so it is dropped with a warning rather than kept as an unachievable truth
+/// record, the same reasoning as #591's REF==ALT arm.
+fn realize_symbolic_insertions(
+    input: Option<HashMap<String, Vec<Variant>>>,
+    reference: &HashMap<String, Vec<Nucleotide>>,
+    rng: &mut NeatRng,
+) -> Option<HashMap<String, Vec<Variant>>> {
+    let mut input = input?;
+    let (mut realized, mut dropped) = (0usize, 0usize);
+
+    for (contig, variants) in input.iter_mut() {
+        let Some(sequence) = reference.get(contig) else {
+            continue; // not a loaded contig; nothing downstream will read it either
+        };
+        let mut kept: Vec<Variant> = Vec::with_capacity(variants.len());
+        for mut v in std::mem::take(variants) {
+            let Some(sv) = v.alternate.as_symbolic() else {
+                kept.push(v);
+                continue;
+            };
+            if sv.sv_type != SvType::Ins {
+                kept.push(v);
+                continue;
+            }
+            let length = match sv.svlen {
+                Some(n) if n > 0 => n as usize,
+                _ => {
+                    dropped += 1;
+                    warn!(
+                        "Skipping symbolic <INS> at {}:{} — no positive INFO/SVLEN, so there \
+                         is no length to synthesise and the record cannot reach the reads. \
+                         Supply an explicit ALT sequence or an SVLEN.",
+                        contig,
+                        v.location + 1
+                    );
+                    continue;
+                }
+            };
+            let anchor_0based = v.location.min(sequence.len().saturating_sub(1));
+            let novel = match sample_novel_insertion_bases(sequence, anchor_0based, length, rng) {
+                Ok(bases) => bases,
+                Err(e) => {
+                    dropped += 1;
+                    warn!(
+                        "Skipping symbolic <INS> at {}:{} — could not draw novel sequence: {e}",
+                        contig,
+                        v.location + 1
+                    );
+                    continue;
+                }
+            };
+            let anchor_base = sequence[anchor_0based];
+            let mut alt_bases = Vec::with_capacity(length + 1);
+            alt_bases.push(anchor_base);
+            alt_bases.extend(novel);
+
+            v.reference = vec![anchor_base];
+            v.alternate = AlternateType::Literal(alt_bases);
+            v.variant_type = VariantType::Insertion;
+            realized += 1;
+            kept.push(v);
+        }
+        *variants = kept;
+    }
+
+    if realized > 0 {
+        info!(
+            "Realized {realized} symbolic <INS> record(s) with synthesised novel sequence \
+             so the reads carry them (#500)"
+        );
+    }
+    if dropped > 0 {
+        warn!("Dropped {dropped} symbolic <INS> record(s) that could not be realized");
+    }
+    Some(input)
+}
+
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
     let (mut n_complex, mut n_null, mut n_nocall, mut n_homref) = (0usize, 0usize, 0usize, 0usize);
     let mut n_partial = 0usize;
+    let mut n_single_bnd = 0usize;
     for (contig, variants) in raw {
         let mut kept = Vec::new();
         for v in variants {
@@ -3118,6 +3294,37 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
                     "Skipping non-variant at {}:{} (ALT is identical to REF, so there is no \
                      alternate allele to generate)",
                     contig, v.location
+                );
+            } else if v
+                .alternate
+                .as_symbolic()
+                .is_some_and(|sv| sv.sv_type == SvType::Bnd && sv.mate_contig.is_none())
+            {
+                // A single breakend (VCF 4.2 §5.4: `A.` / `.A`) declares a junction whose
+                // partner is unknown or absent — a telomeric fusion, or a mate that could
+                // not be resolved. eidolon has no way to build a junction read without a
+                // partner, and the result was worse than ignoring the record: depth at the
+                // locus fell 72.0 -> 42.4, a 41% loss, with ZERO chimeric reads (#500). The
+                // truth declared a breakend, the reads contained no junction, and coverage
+                // was silently destroyed around it — a depth-based caller sees a partial
+                // deletion no record describes.
+                //
+                // Rejected rather than ignored: keeping it in the truth VCF would assert a
+                // breakend the reads do not carry, and corrupting coverage is strictly worse
+                // than refusing the record. Revisit when junction generation can represent
+                // an unresolved partner.
+                n_single_bnd += 1;
+                warn!(
+                    "Skipping single breakend at {}:{} (ALT {}) — a breakend with no mate \
+                     cannot be turned into junction reads, and accepting it destroys local \
+                     coverage without producing a junction. Supply the mate record, or drop \
+                     this one.",
+                    contig,
+                    v.location,
+                    v.alternate
+                        .as_symbolic()
+                        .map(|sv| sv.raw_alt.clone())
+                        .unwrap_or_default()
                 );
             } else if is_hom_ref(&v.genotype_str) {
                 // 0/0 says this sample carries the reference on every allele. Generating the
@@ -3173,11 +3380,12 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
              allele is generated as reference (./1 -> 0/1)"
         );
     }
-    let dropped = n_complex + n_null + n_nocall + n_homref;
+    let dropped = n_complex + n_null + n_nocall + n_homref + n_single_bnd;
     if dropped > 0 {
         warn!(
             "input_vcf: dropped {dropped} record(s) — {n_complex} complex, {n_null} \
-             ALT-equals-REF, {n_nocall} no-call genotype, {n_homref} homozygous-reference"
+             ALT-equals-REF, {n_nocall} no-call genotype, {n_homref} homozygous-reference, \
+             {n_single_bnd} single breakend"
         );
     }
     out
@@ -3652,6 +3860,47 @@ fn intersect_with_bed(
 
 #[cfg(test)]
 mod tests {
+
+    /// The fragment budget is CONSERVED: an inserted breakend sequence comes out of the
+    /// fragment, it does not extend it.
+    ///
+    /// Getting this wrong is invisible to every read-content check — the insert is present,
+    /// adjacent and correctly oriented — while every fragment crossing an inserted breakend
+    /// spans the wrong amount of reference, so the mate lands further away than the fragment
+    /// distribution allows and the insertion's reduced-insert-size signature is erased.
+    /// Found by mutating `len2` back to the un-adjusted value and watching all three
+    /// end-to-end #498 tests still pass.
+    #[test]
+    fn bnd_fragment_split_conserves_the_fragment_length() {
+        for frag_len in [50usize, 151, 300, 301, 1000] {
+            for offset in 0..=frag_len {
+                for insert_len in [0usize, 1, 12, 24, 200, 5000] {
+                    let (used, len2) = bnd_fragment_split(frag_len, offset, insert_len);
+                    assert_eq!(
+                        offset + used + len2,
+                        frag_len,
+                        "frag_len={frag_len} offset={offset} insert_len={insert_len} \
+                         split into {offset}+{used}+{len2}"
+                    );
+                    assert!(used <= insert_len, "used more insert than exists");
+                }
+            }
+        }
+    }
+
+    /// Known answers for the three regimes, so a change that keeps the sum right but moves
+    /// bases between the insert and the second piece still fails.
+    #[test]
+    fn bnd_fragment_split_known_answers() {
+        // Insert fits: it is fully used and the second piece takes the remainder.
+        assert_eq!(bnd_fragment_split(300, 100, 24), (24, 176));
+        // No insert: the second piece takes everything after the junction.
+        assert_eq!(bnd_fragment_split(300, 100, 0), (0, 200));
+        // Insert longer than what is left: truncated, and NO second reference piece.
+        assert_eq!(bnd_fragment_split(300, 100, 500), (200, 0));
+        // Junction at the very end of the fragment: nothing after it at all.
+        assert_eq!(bnd_fragment_split(300, 300, 24), (0, 0));
+    }
     // Junction-suppression tests predate haplotype-aware placement and are written
     // in plain (start, end) spans, which is still the right level for them:
     // suppression is about where a fragment sits, not which haplotype it came from.

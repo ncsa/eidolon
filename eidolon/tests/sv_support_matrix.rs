@@ -849,11 +849,12 @@ fn literal_indels_reach_the_reads() {
 }
 
 #[test]
-fn symbolic_ins_is_currently_a_silent_no_op() {
+fn symbolic_ins_is_realized_with_novel_sequence() {
     // CHARACTERIZATION of #500. `<INS>` carries no sequence, so nothing is spliced —
     // but the truth VCF still declares a 60bp insertion, so a benchmark built from it
-    // scores a caller as having missed something that was never in the data.
-    // If this FAILS, symbolic <INS> is now realized: flip it to a positive assertion.
+    // Was a CHARACTERIZATION of #500, now the regression guard for its fix: a symbolic
+    // <INS> is realized with synthesised novel sequence, so it reaches the reads instead of
+    // being preserved in the truth VCF while the reads match a no-variant control.
     let tmp = tempfile::tempdir().unwrap();
     let control = run_cell(tmp.path(), "control", &[]);
     let base = reads_with_op(&control, EV.0, 450, 560, Kind::Insertion);
@@ -867,17 +868,22 @@ fn symbolic_ins_is_currently_a_silent_no_op() {
     let got = reads_with_op(&out, EV.0, 450, 560, Kind::Insertion);
     eprintln!("[#500] symbolic <INS>: {got} reads with CIGAR I vs {base} in the control");
     assert!(
-        got <= base + 2,
-        "symbolic <INS> produced {got} insertions against a background of {base} — it may \
-         now be realized. If so, #500 is FIXED: flip this to assert the insertion appears"
+        got > base + 2,
+        "symbolic <INS> produced {got} reads with an I op against a background of {base} — \
+         indistinguishable from the no-variant control, so the record is a silent no-op and \
+         a benchmark built from this truth scores a caller as having missed an insertion \
+         that was never in the data (#500)"
     );
 }
 
 #[test]
-fn a_single_breakend_currently_destroys_coverage() {
-    // CHARACTERIZATION of #500. An unresolved-partner breakend is valid VCF 4.2. It
-    // produces no junction reads AND silently removes ~40% of local depth, so a depth
-    // caller sees a partial deletion that no record describes.
+fn a_single_breakend_is_rejected_and_leaves_coverage_intact() {
+    // Was a CHARACTERIZATION of #500, now the regression guard for its fix. An
+    // unresolved-partner breakend is valid VCF 4.2, and eidolon cannot build a junction read
+    // without a partner. It used to be accepted anyway: no junction reads AND ~40% of local
+    // depth silently removed, so a depth caller saw a partial deletion no record described.
+    // It is now rejected at input_vcf filtering, which both keeps it out of the truth VCF
+    // and leaves coverage alone.
     let tmp = tempfile::tempdir().unwrap();
     let control = run_cell(tmp.path(), "control", &[]);
     let r = format!("{}\t500\tsbnd\tA\tA.\t60\tPASS\tSVTYPE=BND\tGT\t0/1", EV.0);
@@ -889,15 +895,22 @@ fn a_single_breakend_currently_destroys_coverage() {
         "[#500] single breakend: depth ratio {ratio:.2}, chimeric reads {}",
         chimeric_reads(&out)
     );
+    assert!(
+        !truth_has_id(&out, "sbnd"),
+        "a single breakend reached the truth VCF — it declares a junction the reads cannot \
+         contain, because there is no mate to build one from (#500)"
+    );
     assert_eq!(
         chimeric_reads(&out),
         0,
-        "a single breakend now makes junction reads — #500 may be fixed"
+        "a single breakend produced junction reads without a mate to join to"
     );
+    // The point of rejecting it: coverage must be untouched. 0.85 was the old FAILING
+    // threshold — the defect measured 0.59 — so this asserts the opposite of what it did.
     assert!(
-        ratio < 0.85,
-        "single breakend depth ratio {ratio:.2} is no longer depressed — #500 may be \
-         FIXED: verify and replace this with the intended behaviour"
+        ratio > 0.85,
+        "single breakend depth ratio {ratio:.2} is still depressed — the record is being \
+         dropped from the truth but is still eating local coverage (#500)"
     );
 }
 
@@ -921,11 +934,11 @@ fn inter_chromosomal_breakends_produce_junction_reads() {
 }
 
 #[test]
-fn bnd_inserted_sequence_is_currently_dropped_from_reads() {
-    // CHARACTERIZATION of #498. The ALT carries novel bases at the junction; the truth
-    // VCF keeps them and the reads do not. Probe is deliberately NOT a homopolymer, and
-    // is matched against sequence lines only — a G-run probe matched quality strings and
-    // reported 71 false hits when the true answer was 0.
+fn bnd_inserted_sequence_reaches_the_reads() {
+    // Was a CHARACTERIZATION of #498, now the regression guard for its fix: the ALT carries
+    // novel bases at the junction and the reads must contain them. Probe is deliberately NOT
+    // a homopolymer, and is matched against sequence lines only — a G-run probe matched
+    // quality strings and reported 71 false hits when the true answer was 0.
     let tmp = tempfile::tempdir().unwrap();
     let a =
         "H1N1_HA\t600\td1\tA\tACTGACTGCATG[H1N1_PB2:900[\t60\tPASS\tSVTYPE=BND;MATEID=d2\tGT\t0/1";
@@ -949,9 +962,10 @@ fn bnd_inserted_sequence_is_currently_dropped_from_reads() {
         .filter(|l| l.contains("CTGACTGCATG"))
         .count();
     eprintln!("[#498] reads carrying the junction insert: {hits}");
-    assert_eq!(
-        hits, 0,
-        "the junction insert now appears in {hits} read(s) — #498 may be FIXED: flip \
-         this to assert the insert IS present"
+    assert!(
+        hits > 0,
+        "the junction insert appears in NO read. The truth VCF keeps the full ALT, so a \
+         benchmark built from this data asserts an insertion the reads do not contain — \
+         #498 has regressed."
     );
 }

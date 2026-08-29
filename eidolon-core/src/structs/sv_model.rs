@@ -337,7 +337,7 @@ impl SvModel {
                 }
             };
             if sv.sv_type == SvType::Bnd {
-                let (_c, _p, join_after, mate_right) =
+                let (_c, _p, join_after, mate_right, _ins) =
                     crate::structs::variants::parse_bnd_alt(&sv.raw_alt);
                 // A single breakend with no parseable mate locus yields (false, false)
                 // from the parser, which would masquerade as DuplicationLike. Only count
@@ -1582,11 +1582,18 @@ pub(crate) fn anchor_window_alignable(sequence: &[Nucleotide], pos: usize, windo
 }
 
 /// Draw `length` random nucleotides for a novel insertion, weighted by the
-/// single-base composition of a 501 bp window centered on `anchor_0based`
+/// single-base composition of a 501 bp window centered on `anchor_0based`.
+///
+/// Public because the `input_vcf` path needs it too: a symbolic `<INS>` supplied by a user
+/// carries no sequence, and realizing it must draw from the same distribution the de novo
+/// path uses or the two would plant biologically different insertions from one model (#500).
+/// Original doc follows.
+///
+/// Weighted by the single-base composition of a 501 bp window centered on `anchor_0based`
 /// (±250 bp, clamped to contig bounds; `N`s in the window are ignored).
 /// Falls back to uniform ACGT if the window has no usable bases (e.g.
 /// an all-N region). #190.
-fn sample_novel_insertion_bases(
+pub fn sample_novel_insertion_bases(
     sequence: &[Nucleotide],
     anchor_0based: usize,
     length: usize,
@@ -2953,7 +2960,7 @@ mod tests {
             .map(|(i, alt)| {
                 let mut sd = SvData::new(*alt, SvType::Bnd);
                 sd.end = Some(100 + i);
-                let (c, p, ja, mr) = parse_bnd_alt(alt);
+                let (c, p, ja, mr, _ins) = parse_bnd_alt(alt);
                 sd.mate_contig = c;
                 sd.mate_pos = p;
                 sd.bnd_join_after = ja;
