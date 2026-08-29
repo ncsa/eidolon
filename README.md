@@ -44,7 +44,7 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 
 |                                            | **NEAT 2.x** (genReads)        | **NEAT 4.x**                              | **`eidolon`**                                              |
 | ------------------------------------------ | ------------------------------ | ----------------------------------------- | -------------------------------------------------------- |
-| Latest version                             | 2.1                            | 4.6.1                                      | 3.1.0                                                    |
+| Latest version                             | 2.1                            | 4.6.1                                      | 3.2.0                                                    |
 | Language                                   | Python 2                       | Python 3                                  | Rust                                                     |
 | FASTQ reads (single / paired)              | ✅                             | ✅                                        | ✅                                                       |
 | Golden BAM + VCF truth set                 | ✅                             | ✅                                        | ✅                                                       |
@@ -239,7 +239,7 @@ required. If you prefer to build from source or grab a release binary, read on.
 
 You will need to install the rust toolchain to compile `eidolon`, including `cargo`. Check the cargo documentation for instructions (https://doc.rust-lang.org/cargo/getting-started/installation.html). Alternatively, you can try one of the binaries on the release page. Select the one that matches your system and let us know if you run into errors. During compilation, you may run into errors, such as cmake not found. Some of the packages `eidolon` uses have these dependencies. For Debian/Ubuntu this should be a simple `sudo apt install cmake` and for RHEL/Rocky type distros this should be `sudo dnf install cmake`. There may be some other requirements. Drop a comment if you need specific help.
 
-Download the executable in the release (current version 3.1.0).
+Download the executable in the release (current version 3.2.0).
 
 ```bash
 $ eidolon --help
