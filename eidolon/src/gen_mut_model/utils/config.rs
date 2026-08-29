@@ -38,7 +38,7 @@ impl RunConfiguration {
             Ok(l) => l,
             Err(error) => panic!(
                 "Problem reading the config file: {:?}. System error: {}",
-                &yml_file, error,
+                yml_file, error,
             ),
         };
         // Uses serde_yml to read the file into a HashMap

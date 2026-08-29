@@ -65,7 +65,7 @@ pub fn write_vcf(
     writeln!(&mut buffer, "##reference={}", reference_path.display())?;
     for contig in contig_order {
         let length = fasta_lengths[contig];
-        writeln!(&mut buffer, "##contig=<ID={},length={}>", &contig, length)?;
+        writeln!(&mut buffer, "##contig=<ID={},length={}>", contig, length)?;
     }
     // VCF spec §1.4.1: meta-information lines must be KEY=VALUE. #207.
     writeln!(

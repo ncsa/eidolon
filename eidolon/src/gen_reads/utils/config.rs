@@ -210,7 +210,7 @@ impl RunConfiguration {
             Ok(l) => l,
             Err(error) => panic!(
                 "Problem reading the config file: {:?}. System error: {}",
-                &yaml_file, error,
+                yaml_file, error,
             ),
         };
         // Uses serde_yml to read the file into a HashMap
@@ -245,7 +245,7 @@ impl RunConfiguration {
 
         info!(
             "Running eidolon to generate reads on {:?} with...",
-            &config.reference
+            config.reference
         );
 
         for (key, value) in scrape_config {
@@ -720,7 +720,7 @@ impl RunConfiguration {
                 info!("\t>Producing fastq files:");
                 let mut fastq_1 = config.output_dir.clone();
                 fastq_1.push(format!("{}_r1.fastq.gz", config.output_filename));
-                info!("\t\t> {:?}", &fastq_1);
+                info!("\t\t> {:?}", fastq_1);
                 config.output_fastq_1 = Some(fastq_1);
                 let mut fastq_2 = config.output_dir.clone();
                 fastq_2.push(format!("{}_r2.fastq.gz", config.output_filename));
@@ -731,19 +731,19 @@ impl RunConfiguration {
             // single-ended
             let mut fastq_1 = config.output_dir.clone();
             fastq_1.push(format!("{}_r1.fastq.gz", config.output_filename));
-            info!("\t>Producing fastq file: {:?}", &fastq_1);
+            info!("\t>Producing fastq file: {:?}", fastq_1);
             config.output_fastq_1 = Some(fastq_1);
         }
         if config.produce_vcf {
             let mut vcf = config.output_dir.clone();
             vcf.push(format!("{}.vcf.gz", config.output_filename));
-            info!("\t>Producing VCF file: {:?}", &vcf);
+            info!("\t>Producing VCF file: {:?}", vcf);
             config.output_vcf = Some(vcf);
         }
         if config.produce_bam {
             let mut bam = config.output_dir.clone();
             bam.push(format!("{}.bam", config.output_filename));
-            info!("\t>Producing BAM file: {:?}", &bam);
+            info!("\t>Producing BAM file: {:?}", bam);
             config.output_bam = Some(bam);
         }
 
@@ -794,7 +794,7 @@ impl RunConfiguration {
                 for seed_term in seed.split_whitespace() {
                     config.seed_vec.push(seed_term.to_string());
                 }
-                info!("\t>Reproducibility seed string: {}", &seed);
+                info!("\t>Reproducibility seed string: {}", seed);
                 Ok(())
             }
 
@@ -807,7 +807,7 @@ impl RunConfiguration {
                 for item in raw_string.split_whitespace() {
                     config.seed_vec.push(item.to_string());
                 }
-                info!("\t>Reproducibility seed string: {}", &raw_string);
+                info!("\t>Reproducibility seed string: {}", raw_string);
                 Ok(())
             }
         }

@@ -12,7 +12,7 @@ pub fn model_writer<T: Serialize>(model: T, filename: &PathBuf) -> std::io::Resu
     let data = serde_json::to_vec(&model).unwrap();
     // Overwrite check is the caller's responsibility (e.g., config builder)
     let fileout = create_output_file(filename, true)
-        .unwrap_or_else(|_| panic!("Error creating output {:?}", &filename));
+        .unwrap_or_else(|_| panic!("Error creating output {:?}", filename));
     let writer = BufWriter::new(fileout);
     let mut encoder = GzEncoder::new(writer, Compression::default());
     encoder.write_all(&data)?;
@@ -25,7 +25,7 @@ where
 {
     // This will take any serializable model and write it to file.
     let filein =
-        File::open(filename).unwrap_or_else(|_| panic!("Error opening file {:?}", &filename));
+        File::open(filename).unwrap_or_else(|_| panic!("Error opening file {:?}", filename));
     let reader = GzDecoder::new(BufReader::new(filein));
     let value: T = serde_json::from_reader(reader)?;
     Ok(value)
@@ -38,7 +38,7 @@ where
 {
     // This will take any serializable model and write it to file.
     let filein =
-        File::open(filename).unwrap_or_else(|_| panic!("Error opening file {:?}", &filename));
+        File::open(filename).unwrap_or_else(|_| panic!("Error opening file {:?}", filename));
     let reader = BufReader::new(filein);
     let value: T = serde_json::from_reader(reader)?;
     Ok(value)

@@ -9,7 +9,7 @@ use crate::filter_reads::{errors::FilterReadsError, utils::config::RunConfigurat
 
 pub fn main(config: &PathBuf) -> Result<(), FilterReadsError> {
     info!("////////////// Welcome to eidolon filter reads! \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\");
-    info!("Using Configuration file input: {:?}", &config);
+    info!("Using Configuration file input: {:?}", config);
     let run_config = RunConfiguration::from(config);
     // bed_file: path to bed file to use for filtering
     // file_to_filter: fastq or vcf ready for filtering, can be gzipped or not
@@ -21,10 +21,10 @@ pub fn main(config: &PathBuf) -> Result<(), FilterReadsError> {
     for input_file in run_config.file_map.keys() {
         let (output_file, is_gzip, is_fastq) = run_config.file_map[input_file].clone();
         if is_fastq {
-            info!("Filtering input fastq file: {:?}", &input_file);
+            info!("Filtering input fastq file: {:?}", input_file);
             filter_fastq(&bed_table, input_file, is_gzip, &output_file)?;
         } else {
-            info!("Filtering input vcf file: {:?}", &input_file);
+            info!("Filtering input vcf file: {:?}", input_file);
             filter_vcf(&bed_table, input_file, is_gzip, &output_file)?;
         }
         info!(

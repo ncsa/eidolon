@@ -21,6 +21,39 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+  # Clippy was not run anywhere: no CI job, no clippy.toml, no [lints] table (#616). The
+  # build job below already denies plain rustc warnings because a silent one disabled the
+  # #451 regression guard; the same "warnings are load-bearing" argument covers clippy and
+  # did not reach it.
+  #
+  # This gate is BLOCKING from day one. It can be, despite 29 pre-existing lint kinds,
+  # because those are allow-listed in the root Cargo.toml — so new code is gated now while
+  # the debt is paid down in #617. #616 offered "add it non-blocking, flip later"; a
+  # permanently-non-blocking gate is how the gap reopens, so it is not done that way here.
+  #
+  # `clippy::pedantic` is deliberately NOT enabled: measured at 2021 warnings, it is not a
+  # usable gate. Default level already found a real, actionable list.
+  clippy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ubuntu-latest-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ubuntu-latest-cargo-
+    # --all-targets so tests and benches are linted too, matching the build job. The
+    # allow-list lives in Cargo.toml rather than in flags here so that a local
+    # `cargo clippy` is the same gate a developer will hit in CI.
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
   build:
 
     runs-on: ubuntu-latest
