@@ -51,6 +51,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # KNOWN GAP: this asks for @stable and therefore sets RUSTUP_TOOLCHAIN, which overrides
+      # rust-toolchain.toml — so release binaries are built with a FLOATING compiler while
+      # everything else in the repo is pinned. It was left alone deliberately: this workflow
+      # only runs on `v*.*.*` tags, so a change here gets no signal until a release is cut,
+      # and an unverified edit in the release path is worse than a named inconsistency.
+      # Tracked separately; fix it alongside a release where it can actually be observed.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
