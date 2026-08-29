@@ -1184,6 +1184,7 @@ fn reverse_complement_record(mut record: ReadRecord) -> ReadRecord {
 ///   - take quality scores from the same quality model,
 ///   - are soft-clipped (`'S'`) in the golden BAM — they are not reference-aligned,
 ///   - carry no variants (adapter is not reference-derived).
+///
 /// Pass the R1 adapter for R1, and the R2 adapter for the post-flip R2 read.
 /// (The end-to-end fastp/cutadapt trim check is an integration step — see #125.)
 fn append_adapter_readthrough(

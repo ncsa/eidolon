@@ -1842,6 +1842,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     /// BGZF-defining markers directly:
     ///   - The first 4 bytes have FLG.FEXTRA=1 (gzip magic + 0x04 flag byte)
     ///   - The "BC" subfield identifier appears in the gzip extra field
+    ///
     /// Plain gzip has FLG=0x00 and no extra field, so this test fails loudly
     /// if anyone swaps the writer back.
     #[test]

@@ -265,8 +265,6 @@ pub fn read_file_bytes(path: &Path) -> Vec<u8> {
 
 // ── working-directory helper ────────────────────────────────────────────────
 
-/// Convenience wrapper: a tempdir plus a couple of paths inside it. Returned as a
-/// tuple so callers can keep the `TempDir` alive for the duration of the test.
 // ── synthetic insertion sequence ─────────────────────────────────────────────
 
 /// Deterministic novel sequence for a planted insertion.
@@ -316,6 +314,8 @@ pub fn revcomp(s: &str) -> String {
         .collect()
 }
 
+/// Convenience wrapper: a tempdir plus a couple of paths inside it. Returned as a
+/// tuple so callers can keep the `TempDir` alive for the duration of the test.
 pub fn fresh_workdir() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().to_path_buf();
