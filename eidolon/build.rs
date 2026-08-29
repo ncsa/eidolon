@@ -28,11 +28,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EIDOLON_GIT_SHA");
 
     // An explicit override wins, so a packager can stamp a known provenance without git.
-    if let Ok(forced) = std::env::var("EIDOLON_GIT_SHA") {
-        if !forced.trim().is_empty() {
-            println!("cargo:rustc-env=EIDOLON_GIT_SHA={}", forced.trim());
-            return;
-        }
+    if let Ok(forced) = std::env::var("EIDOLON_GIT_SHA")
+        && !forced.trim().is_empty()
+    {
+        println!("cargo:rustc-env=EIDOLON_GIT_SHA={}", forced.trim());
+        return;
     }
 
     println!("cargo:rustc-env=EIDOLON_GIT_SHA={}", git_describe());

@@ -211,17 +211,18 @@ pub fn validate_bam(path: &Path) -> Vec<Finding> {
                     SAMTOOLS_VIEW_UNREADABLE,
                 ));
             }
-            if coordinate_sorted && let Some((pref, pstart)) = prev {
-                if ref_id < pref || (ref_id == pref && start < pstart) {
-                    findings.push(Finding::error(
-                        recno,
-                        format!(
-                            "record {recno}: position {start} follows {pstart} on reference \
+            if coordinate_sorted
+                && let Some((pref, pstart)) = prev
+                && (ref_id < pref || (ref_id == pref && start < pstart))
+            {
+                findings.push(Finding::error(
+                    recno,
+                    format!(
+                        "record {recno}: position {start} follows {pstart} on reference \
                              {ref_id} — the header declares SO:coordinate but records are unsorted"
-                        ),
-                        SAMTOOLS_INDEX_UNSORTED,
-                    ));
-                }
+                    ),
+                    SAMTOOLS_INDEX_UNSORTED,
+                ));
             }
             prev = Some((ref_id, start));
         }

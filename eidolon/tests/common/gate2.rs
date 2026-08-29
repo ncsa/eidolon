@@ -344,10 +344,11 @@ pub fn analyse(sam_path: &Path, sv: &SvSpec, novel: Option<&str>) -> Signatures 
 
         // Counted before the on-target filter below: an unmapped read has no reference name,
         // so filtering on one would discard every record this signature is about.
-        if let Ok(flags) = record.flags() {
-            if flags.is_unmapped() && !flags.is_mate_unmapped() {
-                sig.unmapped_with_mapped_mate += 1;
-            }
+        if let Ok(flags) = record.flags()
+            && flags.is_unmapped()
+            && !flags.is_mate_unmapped()
+        {
+            sig.unmapped_with_mapped_mate += 1;
         }
         if novel.is_some() {
             read_seqs.push(
