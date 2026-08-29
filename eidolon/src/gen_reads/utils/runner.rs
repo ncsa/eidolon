@@ -216,7 +216,7 @@ pub fn run_neat(
         input_variants
     };
 
-    info!("Reading fasta file: {}", &config.reference.display());
+    info!("Reading fasta file: {}", config.reference.display());
     let mut reference_map = HashMap::new();
     let mut contig_order_in_file = Vec::new();
     let fasta = FastaStream::open(&config.reference)?;
@@ -532,16 +532,16 @@ pub fn run_neat(
     let mut files_written = Vec::new();
     if config.paired_ended {
         if let Some(filename1) = &config.output_fastq_1 {
-            info!("Successfully wrote fastq file: {:?}", &filename1);
+            info!("Successfully wrote fastq file: {:?}", filename1);
             files_written.push(filename1.clone());
             if let Some(filename2) = &config.output_fastq_2 {
-                info!("Successfully wrote fastq file: {:?}", &filename2);
+                info!("Successfully wrote fastq file: {:?}", filename2);
                 files_written.push(filename2.clone());
             }
         }
     } else {
         if let Some(filename1) = &config.output_fastq_1 {
-            info!("Successfully wrote fastq file: {:?}", &filename1);
+            info!("Successfully wrote fastq file: {:?}", filename1);
             files_written.push(filename1.clone());
         }
     }
