@@ -31,7 +31,6 @@ pub fn generate_fragments(
     extension_budget: usize,
     sequence_length: usize,
     read_length: usize,
-    max_del_len: usize,
     start: usize,
     coverage: usize,
     paired_ended: bool,
@@ -58,9 +57,9 @@ pub fn generate_fragments(
     // For long-read paired-end mode the region only needs deletion padding; for all other
     // modes the full read_length must fit.
     let min_region = if long_reads && paired_ended {
-        max_del_len * 2
+        0
     } else {
-        read_length + max_del_len * 2
+        read_length
     };
     if sequence_length <= min_region {
         debug!("Sequence length was too short, maybe because of a small bed region.");
@@ -270,7 +269,6 @@ pub fn generate_weighted_fragments(
     region_start: usize,
     region_end: usize,
     read_length: usize,
-    max_del_len: usize,
     coverage: usize,
     gc_bias_model: &GcBiasModel,
     fragment_model: &FragmentLengthModel,
@@ -284,11 +282,7 @@ pub fn generate_weighted_fragments(
     const MAX_COVERAGE_MULTIPLIER: usize = 100;
 
     let region_len = region_end.saturating_sub(region_start);
-    let min_region = if long_reads {
-        max_del_len * 2
-    } else {
-        read_length + max_del_len * 2
-    };
+    let min_region = if long_reads { 0 } else { read_length };
     if region_len <= min_region {
         debug!("Region too short for weighted fragment generation.");
         return Ok(Vec::new());
@@ -629,7 +623,6 @@ mod tests {
             2000,
             read_length,
             0,
-            0,
             coverage,
             false,
             false,
@@ -660,7 +653,6 @@ mod tests {
             sequence.len(),
             read_length,
             0,
-            0,
             coverage,
             false,
             false,
@@ -682,7 +674,6 @@ mod tests {
             0,
             sequence.len(),
             read_length,
-            0,
             0,
             coverage,
             false,
@@ -712,7 +703,6 @@ mod tests {
             0,
             seq_len,
             read_length,
-            0,
             0,
             coverage,
             true,
@@ -754,7 +744,6 @@ mod tests {
             seq_len,
             read_length,
             0,
-            0,
             coverage,
             true,
             false,
@@ -788,7 +777,6 @@ mod tests {
             0,
             50,
             30,
-            10,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -822,7 +810,6 @@ mod tests {
             0,
             500,
             10,
-            0,
             5,
             &model,
             &fragment_model,
@@ -853,7 +840,6 @@ mod tests {
             0,
             2000,
             100,
-            0,
             10,
             &GcBiasModel::default(),
             &fragment_model,
@@ -885,7 +871,6 @@ mod tests {
             region_start,
             region_end,
             100,
-            0,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -926,7 +911,6 @@ mod tests {
             0,
             2000,
             100,
-            0,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -945,7 +929,6 @@ mod tests {
             0,
             2000,
             100,
-            0,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -978,7 +961,6 @@ mod tests {
             0,
             10000,
             100,
-            0,
             10,
             &model,
             &fragment_model,
@@ -997,7 +979,6 @@ mod tests {
             0,
             10000,
             100,
-            0,
             10,
             &model,
             &fragment_model,
@@ -1038,7 +1019,6 @@ mod tests {
             0,
             sequence_block.sequence.len(),
             read_len,
-            0,
             target_coverage,
             &model,
             &fragment_model,
@@ -1082,7 +1062,6 @@ mod tests {
             region_start,
             region_end,
             read_length,
-            0,
             coverage,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1255,7 +1234,6 @@ mod tests {
             span_length,
             read_length,
             0,
-            0,
             coverage,
             true,  // paired_ended
             false, // long_reads
@@ -1310,7 +1288,6 @@ mod tests {
             0,
             span_length,
             read_length,
-            0,
             coverage,
             &gc_bias_model,
             &fragment_model,
@@ -1367,7 +1344,6 @@ mod tests {
             0,
             span_length,
             read_length,
-            0,
             coverage,
             &gc_bias_model,
             &fragment_model,
@@ -1742,7 +1718,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             60, // coverage
             &GcBiasModel::default(),
             &fragment_model,
@@ -1787,7 +1762,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             60,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1824,7 +1798,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             30,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1975,7 +1948,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             60,
             &GcBiasModel::default(),
             &fragment_model,
@@ -2021,7 +1993,6 @@ mod tests {
                 0,
                 span,
                 read_length,
-                0,
                 60,
                 &GcBiasModel::default(),
                 &fragment_model,

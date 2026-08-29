@@ -76,7 +76,6 @@ struct ContigContext<'a> {
     // generation iterated `mutated_maps` directly and produced a different read set every
     // run at a fixed seed, single-threaded. Iterate this instead and look the map up.
     contig_order: Arc<Vec<String>>,
-    max_del_lens: HashMap<String, usize>,
 }
 
 pub fn run_neat(
@@ -314,7 +313,6 @@ pub fn run_neat(
     // Phase 1: Generate MutatedMaps for all contigs
     info!("Generating mutations for all contigs");
     let mut all_mutated_maps = HashMap::new();
-    let mut max_del_lens = HashMap::new();
     for (m_idx, name) in contig_order_in_file.iter().enumerate() {
         // Skip contigs whose sequence wasn't loaded (non-target under
         // target_bed). m_idx stays the original file position, so the loaded
@@ -323,7 +321,7 @@ pub fn run_neat(
             continue;
         };
         let m_rng = rng.derive_child((m_idx + 1000000) as u64);
-        let (m_map, max_del) = generate_mutated_map(
+        let m_map = generate_mutated_map(
             name,
             seq,
             config,
@@ -336,7 +334,6 @@ pub fn run_neat(
             m_rng,
         )?;
         all_mutated_maps.insert(name.clone(), m_map);
-        max_del_lens.insert(name.clone(), max_del);
     }
     let shared_mutated_maps = Arc::new(all_mutated_maps);
 
@@ -355,7 +352,6 @@ pub fn run_neat(
         reference,
         mutated_maps: shared_mutated_maps,
         contig_order: Arc::new(contig_order_in_file.clone()),
-        max_del_lens,
     };
 
     let mut mutated_maps: HashMap<String, Vec<MutatedMap>> = HashMap::new();
@@ -816,7 +812,6 @@ fn process_chunk(
             format!("MutatedMap for {} not found", contig_name),
         ))
     })?;
-    let max_del_len = *ctx.max_del_lens.get(&contig_name).unwrap_or(&0);
 
     // Keep short inserts when adapters are on (readthrough pads them) OR when the
     // adapter-free short-insert control is requested. Drives both fragment retention
@@ -1042,7 +1037,6 @@ fn process_chunk(
                         extension_budget,
                         hap_span,
                         ctx.config.read_len,
-                        max_del_len,
                         hap_start,
                         alt_cov,
                         ctx.config.paired_ended,
@@ -1067,7 +1061,6 @@ fn process_chunk(
                         extension_budget,
                         sub_end - sub_start,
                         ctx.config.read_len,
-                        max_del_len,
                         sub_start,
                         scaled,
                         ctx.config.paired_ended,
@@ -1083,7 +1076,6 @@ fn process_chunk(
                         sub_start,
                         sub_end,
                         ctx.config.read_len,
-                        max_del_len,
                         scaled,
                         ctx.gc_bias_model,
                         ctx.fragment_length_model,
@@ -1412,13 +1404,10 @@ fn generate_mutated_map(
     mutation_model: &MutationModel,
     default_run_mutation_rate: f64,
     mut rng: NeatRng,
-) -> Result<(MutatedMap, usize), GenerateReadsError> {
+) -> Result<MutatedMap, GenerateReadsError> {
     let contig_len = sequence.len();
     if contig_len == 0 {
-        return Ok((
-            MutatedMap::from_interval(0, 0, vec![]).map_err(GenerateReadsError::from)?,
-            0,
-        ));
+        return MutatedMap::from_interval(0, 0, vec![]).map_err(GenerateReadsError::from);
     }
 
     let sequence_map = map_buffer(sequence);
@@ -1439,10 +1428,7 @@ fn generate_mutated_map(
     };
 
     if regions_of_interest.is_empty() {
-        return Ok((
-            MutatedMap::from_interval(0, contig_len, vec![]).map_err(GenerateReadsError::from)?,
-            0,
-        ));
+        return MutatedMap::from_interval(0, contig_len, vec![]).map_err(GenerateReadsError::from);
     }
 
     let mut rate_segments: Vec<(usize, usize, f64)> = regions_of_interest
@@ -1568,13 +1554,6 @@ fn generate_mutated_map(
             .sum();
     }
 
-    let mut max_del_len = 0;
-    for v in &block_variants {
-        if v.variant_type == VariantType::Deletion && v.reference.len() > 1 {
-            max_del_len = max_del_len.max(v.reference.len() - 1);
-        }
-    }
-
     let num_mutations = num_mutations_sum.trunc() as usize;
     if num_mutations > 0 {
         let result = generate_variants(
@@ -1612,11 +1591,6 @@ fn generate_mutated_map(
                         append_info_tag(&mut variant.info, format!("EIDOLON_VAF={:.4}", p * af));
                     }
                 }
-                if variant.variant_type == VariantType::Deletion
-                    && variant.reference.len() - 1 > max_del_len
-                {
-                    max_del_len = variant.reference.len() - 1;
-                }
                 block_variants.push(variant);
             }
         }
@@ -1625,7 +1599,7 @@ fn generate_mutated_map(
     block_variants.extend(sv_variants);
     let mutated_map = MutatedMap::from_interval(0, contig_len, block_variants)
         .map_err(GenerateReadsError::from)?;
-    Ok((mutated_map, max_del_len))
+    Ok(mutated_map)
 }
 
 fn process_chimeric_variants(
