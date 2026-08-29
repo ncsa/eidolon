@@ -27,7 +27,6 @@ repository = "https://github.com/ncsa/eidolon"
 # lint is genuinely gone the build stays green, and if it is not, CI says so. Do not add to
 # this list to make a build pass — fix the code or argue the lint down in review.
 [workspace.lints.clippy]
-collapsible_if = "allow"
 default_constructed_unit_structs = "allow"
 derivable_impls = "allow"
 explicit_counter_loop = "allow"

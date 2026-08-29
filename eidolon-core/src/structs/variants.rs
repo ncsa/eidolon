@@ -780,23 +780,23 @@ pub(crate) fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, 
     let bracket_start = alt.find('[').or_else(|| alt.find(']'));
     let bracket_end = alt.rfind('[').or_else(|| alt.rfind(']'));
 
-    if let (Some(s), Some(e)) = (bracket_start, bracket_end) {
-        if s < e {
-            let p = &alt[s + 1..e];
-            let join_after = s > 0;
-            let bracket = alt.chars().nth(s).unwrap();
-            let mate_extends_right = bracket == '[';
+    if let (Some(s), Some(e)) = (bracket_start, bracket_end)
+        && s < e
+    {
+        let p = &alt[s + 1..e];
+        let join_after = s > 0;
+        let bracket = alt.chars().nth(s).unwrap();
+        let mate_extends_right = bracket == '[';
 
-            if let Some((contig, pos_str)) = p.split_once(':') {
-                if let Ok(pos) = pos_str.parse::<usize>() {
-                    return (
-                        Some(contig.to_string()),
-                        Some(pos),
-                        join_after,
-                        mate_extends_right,
-                    );
-                }
-            }
+        if let Some((contig, pos_str)) = p.split_once(':')
+            && let Ok(pos) = pos_str.parse::<usize>()
+        {
+            return (
+                Some(contig.to_string()),
+                Some(pos),
+                join_after,
+                mate_extends_right,
+            );
         }
     }
     (None, None, false, false)
@@ -1186,6 +1186,20 @@ mod tests {
         // Single breakends have no mate info in brackets
         assert_eq!(parse_bnd_alt("G."), (None, None, false, false));
         assert_eq!(parse_bnd_alt(".A"), (None, None, false, false));
+    }
+
+    /// A malformed ALT with a SINGLE bracket must parse to "not a breakend", not panic.
+    ///
+    /// `s` and `e` are the FIRST and LAST bracket, so one bracket means `s == e` and the
+    /// slice `&alt[s + 1..e]` is a reversed range — an index panic on user input. The
+    /// `s < e` guard is the only thing preventing it, and nothing tested that: relaxing it
+    /// to `s <= e` passed all 403 lib tests while panicking here. Found by mutating the
+    /// condition while collapsing this `if` (#617).
+    #[test]
+    fn malformed_single_bracket_bnd_alt_does_not_panic() {
+        assert_eq!(parse_bnd_alt("G["), (None, None, false, false));
+        assert_eq!(parse_bnd_alt("]G"), (None, None, false, false));
+        assert_eq!(parse_bnd_alt("["), (None, None, false, false));
     }
 
     #[test]

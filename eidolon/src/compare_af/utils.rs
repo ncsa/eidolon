@@ -83,14 +83,15 @@ fn af_for_allele(
     n_alts: usize,
 ) -> (Option<f64>, Option<f64>) {
     let depth = depth_from_ad(fmt, sample);
-    if !fmt.is_empty() && !sample.is_empty() {
-        if let Some(af_i) = field_index(fmt, "AF") {
-            let vals: Vec<&str> = sample.split(':').collect();
-            if let Some(raw) = vals.get(af_i)
-                && let Some(v) = pick_per_allele(raw, alt_idx, n_alts, 'A')
-            {
-                return (Some(v), depth);
-            }
+    if !fmt.is_empty()
+        && !sample.is_empty()
+        && let Some(af_i) = field_index(fmt, "AF")
+    {
+        let vals: Vec<&str> = sample.split(':').collect();
+        if let Some(raw) = vals.get(af_i)
+            && let Some(v) = pick_per_allele(raw, alt_idx, n_alts, 'A')
+        {
+            return (Some(v), depth);
         }
     }
     for kv in info.split(';') {
