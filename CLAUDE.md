@@ -277,6 +277,14 @@ contig lengths).
 - **Model fidelity** (built model file actually shapes gen-reads output) is covered by
   `model_fragment_fidelity.rs` and `model_output_fidelity.rs`; `docs/model_builder_baseline.md`
   records the Delta resource envelope and the fidelity status.
+- **The toolchain is pinned** in `rust-toolchain.toml`, so `cargo clippy -D warnings` here
+  gives the same verdict CI does. It was not always so: three PRs passed clippy locally and
+  failed on the runner (#618 `useless_borrows_in_formatting`, 23 sites; #621; #626
+  `byte_char_slices`) purely because the workstation was four minor versions behind. If you
+  see a lint you cannot reproduce, check `rustup show` before believing it is flaky.
+  Bump the pin deliberately and in its own PR — new lints are a feature, not an ambush.
+  **`dtolnay/rust-toolchain@stable` sets `RUSTUP_TOOLCHAIN` and silently overrides the pin**;
+  `rust_binaries.yml` still does this (tag-only, so a change there gets no PR-time signal).
 
 ## Git / GitHub mechanics
 - **`gh pr edit` is broken on this repo** (deprecated Projects-classic GraphQL). Patch a
