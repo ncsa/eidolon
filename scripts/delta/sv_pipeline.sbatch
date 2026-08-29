@@ -2057,7 +2057,7 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         return 1
     fi
 
-    local svt op recs c p len end n_ev=0 n_missing=0 observed
+    local svt op recs c p len end n_ev=0 n_missing=0 n_uninterp=0 observed
     local min_clip="${CIGAR_MIN_CLIP:-20}" ctl_off="${CIGAR_CONTROL_OFFSET:-5000}"
     local win="${CIGAR_WINDOW:-300}"
     local at_locus ctl_l ctl_r background sam
@@ -2087,25 +2087,50 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
                 local lo=$(( $1 > win ? $1 - win : 1 ))
                 samtools view "$bam" "$c:$lo-$(( $1 + win ))" 2>/dev/null | count_clipped_reads "$min_clip"
             }
-            if ! at_locus="$(fetch_clips "$p")"; then
+            # BOTH breakpoints, not just the anchor. A junction-clipped read anchors on
+            # whichever side the aligner could place, and for a deletion that is frequently
+            # the far one: job 21600878 failed chr22:32540349 (489 bp) with ZERO clips at POS
+            # and EIGHT at its END, and chr20:28029319 (405 kb) with 0 and 1. Both deletions
+            # were fine — the junction probe and the depth gate passed all 76.
+            #
+            # This is #613 exactly, in a gate written three days after it was fixed there.
+            # `verify_planted_del` already searches both windows for the same reason.
+            local far="$p"
+            [[ "$svt" == "DEL" ]] && far="$end"
+            local at_pos at_far
+            if ! at_pos="$(fetch_clips "$p")" || ! at_far="$(fetch_clips "$far")"; then
                 echo "ERROR: samtools could not read $c:$p — CIGAR op verification was not evaluated" >&2
                 return 1
             fi
+            # MAX, not sum: for a short deletion the two windows overlap and summing would
+            # double-count the same reads. Either breakpoint carrying the signal is enough.
+            at_locus="$at_pos"
+            [[ "${at_far:-0}" -gt "${at_locus:-0}" ]] && at_locus="$at_far"
             # Two flanking controls, placed clear of the event itself. The MINIMUM is the
             # background: if another SV happens to fall in one window it inflates that side,
             # and taking the smaller keeps this from failing a good locus for a neighbour's
             # sake. Background is normally 0, so this reduces to "clipped reads exist here and
             # not nearby" — which is exactly the measured separation.
             ctl_l="$(fetch_clips "$(( p > ctl_off + win ? p - ctl_off : 1 ))")"
-            ctl_r="$(fetch_clips "$(( p + len + ctl_off ))")"
+            ctl_r="$(fetch_clips "$(( far + ctl_off ))")"
             background="$ctl_l"
             [[ "${ctl_r:-0}" -lt "${background:-0}" ]] && background="$ctl_r"
             observed="$(samtools view "$bam" "$c:$(( p > 500 ? p - 500 : 1 ))-$(( p + 500 ))" 2>/dev/null | max_cigar_op "$op")"
 
-            if [[ "${at_locus:-0}" -le "${background:-0}" ]]; then
+            if [[ "${at_locus:-0}" -eq 0 && "${background:-0}" -eq 0 ]]; then
+                # NOTHING is clipped anywhere near here, control included. That is not
+                # evidence the event is missing, it is evidence there is no clipping signal
+                # in this neighbourhood to measure — an unmappable region, or an event whose
+                # allele fraction is too low to put a clipped read at the breakpoint. Scoring
+                # it as a failure is the mistake `verify_planted_del` already avoids with its
+                # third "uncovered" outcome, and this gate was missing it (#630).
+                n_uninterp=$(( n_uninterp + 1 ))
+                printf '    %s %s:%s  %s bp  NO CLIPPING NEARBY AT ALL (uninterpretable, not counted)\n' \
+                    "$svt" "$c" "$p" "$len"
+            elif [[ "${at_locus:-0}" -le "${background:-0}" ]]; then
                 n_missing=$(( n_missing + 1 ))
-                printf '    %s %s:%s  %s bp  NO CLIP SUPPORT (%s clipped here vs %s in flanking control)\n' \
-                    "$svt" "$c" "$p" "$len" "${at_locus:-0}" "${background:-0}" >&2
+                printf '    %s %s:%s  %s bp  NO CLIP SUPPORT (%s clipped at POS/%s at END vs %s in flanking control)\n' \
+                    "$svt" "$c" "$p" "$len" "${at_pos:-0}" "${at_far:-0}" "${background:-0}" >&2
             else
                 # The largest I/D op is INFORMATION, not the assertion — see the note above.
                 # Printing it keeps visible how rarely an aligner uses one for these events.
@@ -2119,8 +2144,9 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         echo "  CIGAR clip check: no INS/DEL >= 50 bp planted — nothing to verify"
         return 0
     fi
-    echo "  CIGAR clip support: $(( n_ev - n_missing )) of $n_ev planted INS/DEL >= 50 bp show" \
-         "clipped reads above their flanking control"
+    echo "  CIGAR clip support: $(( n_ev - n_missing - n_uninterp )) of $n_ev planted" \
+         "INS/DEL >= 50 bp show clipped reads above their flanking control;" \
+         "$n_uninterp had no clipping nearby at all (uninterpretable)"
     CIGAR_MISSING="$n_missing"
     if [[ "$n_missing" -gt 0 ]]; then
         echo "ERROR: $n_missing of $n_ev planted event(s) produce no more clipped reads than the" >&2
