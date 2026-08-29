@@ -921,11 +921,11 @@ fn inter_chromosomal_breakends_produce_junction_reads() {
 }
 
 #[test]
-fn bnd_inserted_sequence_is_currently_dropped_from_reads() {
-    // CHARACTERIZATION of #498. The ALT carries novel bases at the junction; the truth
-    // VCF keeps them and the reads do not. Probe is deliberately NOT a homopolymer, and
-    // is matched against sequence lines only — a G-run probe matched quality strings and
-    // reported 71 false hits when the true answer was 0.
+fn bnd_inserted_sequence_reaches_the_reads() {
+    // Was a CHARACTERIZATION of #498, now the regression guard for its fix: the ALT carries
+    // novel bases at the junction and the reads must contain them. Probe is deliberately NOT
+    // a homopolymer, and is matched against sequence lines only — a G-run probe matched
+    // quality strings and reported 71 false hits when the true answer was 0.
     let tmp = tempfile::tempdir().unwrap();
     let a =
         "H1N1_HA\t600\td1\tA\tACTGACTGCATG[H1N1_PB2:900[\t60\tPASS\tSVTYPE=BND;MATEID=d2\tGT\t0/1";
@@ -949,9 +949,10 @@ fn bnd_inserted_sequence_is_currently_dropped_from_reads() {
         .filter(|l| l.contains("CTGACTGCATG"))
         .count();
     eprintln!("[#498] reads carrying the junction insert: {hits}");
-    assert_eq!(
-        hits, 0,
-        "the junction insert now appears in {hits} read(s) — #498 may be FIXED: flip \
-         this to assert the insert IS present"
+    assert!(
+        hits > 0,
+        "the junction insert appears in NO read. The truth VCF keeps the full ALT, so a \
+         benchmark built from this data asserts an insertion the reads do not contain — \
+         #498 has regressed."
     );
 }

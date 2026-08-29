@@ -337,7 +337,7 @@ impl SvModel {
                 }
             };
             if sv.sv_type == SvType::Bnd {
-                let (_c, _p, join_after, mate_right) =
+                let (_c, _p, join_after, mate_right, _ins) =
                     crate::structs::variants::parse_bnd_alt(&sv.raw_alt);
                 // A single breakend with no parseable mate locus yields (false, false)
                 // from the parser, which would masquerade as DuplicationLike. Only count
@@ -2953,7 +2953,7 @@ mod tests {
             .map(|(i, alt)| {
                 let mut sd = SvData::new(*alt, SvType::Bnd);
                 sd.end = Some(100 + i);
-                let (c, p, ja, mr) = parse_bnd_alt(alt);
+                let (c, p, ja, mr, _ins) = parse_bnd_alt(alt);
                 sd.mate_contig = c;
                 sd.mate_pos = p;
                 sd.bnd_join_after = ja;

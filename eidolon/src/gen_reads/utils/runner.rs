@@ -2315,10 +2315,28 @@ fn generate_chimeric_pair(
     // L1 = offset
     // L2 = frag_len - offset
 
-    let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
-        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, &ctx.reference)?;
+    // Novel sequence at the junction comes out of the fragment budget, it does not extend
+    // it: L1 + |insert| + L2 == frag_len. Letting the fragment grow instead would inflate
+    // depth around every inserted breakend and change the very coverage a caller measures.
+    let insert = bnd_insert_bases(sv);
+    let (insert_used, len2) = bnd_fragment_split(frag_len, offset, insert.len());
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
+        get_bnd_pieces(contig, pos, sv, offset, len2, &ctx.reference)?;
+
+    let seq1 = get_stitched_sequence(
+        ctx,
+        &c1,
+        s1,
+        e1,
+        rev1,
+        &c2,
+        s2,
+        e2,
+        rev2,
+        &insert[..insert_used],
+        rng,
+    )?;
 
     let read_len = ctx.config.read_len;
     // The trailing 16-hex `frag_idx` matches the uniqueness-tag pattern that
@@ -2423,7 +2441,7 @@ fn generate_inv_pair(
         ctx,
     )?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     // The trailing 16-hex `frag_idx` matches the uniqueness-tag pattern that
@@ -2530,7 +2548,7 @@ fn generate_del_pair(
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
         get_del_pieces(contig, location, end, offset, frag_len - offset, ctx)?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     // QNAME format mirrors BND/INV's `EIDOLON_chimeric_*` scheme so the
@@ -2668,7 +2686,7 @@ fn generate_dup_pair(
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
         get_dup_pieces(contig, location, end, offset, frag_len - offset, ctx)?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     let base_name = format!(
@@ -2902,6 +2920,16 @@ fn get_bnd_pieces(
     })
 }
 
+/// Stitch the two reference pieces of a breakend, splicing any inserted sequence between
+/// them.
+///
+/// `insert` is the novel sequence the BND ALT declares at the junction (VCF 4.2 §5.4). It
+/// goes between the pieces in every one of the four bracket forms and is NEVER
+/// reverse-complemented: it is written in the orientation of the record that declares it,
+/// while `rev1`/`rev2` describe only how each REFERENCE piece is read. Reverse-complementing
+/// it would put real bases in the read in an order the truth VCF does not claim — the same
+/// silent truth/reads disagreement as omitting it (#498).
+#[allow(clippy::too_many_arguments)]
 fn get_stitched_sequence(
     ctx: &ContigContext,
     c1: &str,
@@ -2912,6 +2940,7 @@ fn get_stitched_sequence(
     s2: usize,
     e2: usize,
     rev2: bool,
+    insert: &[Nucleotide],
     rng: &mut NeatRng,
 ) -> Result<Vec<Nucleotide>, GenerateReadsError> {
     let mut seq1 = get_mutated_subseq(ctx, c1, s1, e1, rng)?;
@@ -2922,8 +2951,39 @@ fn get_stitched_sequence(
     if rev2 {
         seq2 = reverse_complement(seq2);
     }
+    seq1.extend_from_slice(insert);
     seq1.extend(seq2);
     Ok(seq1)
+}
+
+/// The inserted bases a breakend declares, as nucleotides.
+///
+/// Every character is kept. `Nucleotide::from(char)` maps anything that is not a base to
+/// `N`, which is deliberate here: callers size the fragment against this length, so dropping
+/// an unreadable character would make the spliced sequence shorter than the budget reserved
+/// for it and shift the junction. An `N` in the read is a visible "we could not read this
+/// base"; a length mismatch is silent.
+/// Divide a fragment across `[piece1 | insert | piece2]`, returning `(insert_used, len2)`.
+///
+/// INVARIANT: `offset + insert_used + len2 == frag_len` for any `offset <= frag_len`. The
+/// insert comes OUT of the fragment budget, it does not extend it. Letting the fragment grow
+/// by the insert length instead would lengthen every fragment crossing an inserted breakend,
+/// inflating local depth — a coverage artifact at exactly the locus a caller is measuring,
+/// and one no read-content check can see. Split out from `generate_chimeric_pair` so that
+/// invariant is testable without a reference or a `ContigContext`.
+///
+/// A fragment can end INSIDE a long insert: then it carries a prefix of the insert and no
+/// second reference piece at all, which is the ordinary truncation any read sees at a
+/// junction.
+fn bnd_fragment_split(frag_len: usize, offset: usize, insert_len: usize) -> (usize, usize) {
+    let after_junction = frag_len.saturating_sub(offset);
+    let insert_used = insert_len.min(after_junction);
+    let len2 = after_junction - insert_used;
+    (insert_used, len2)
+}
+
+fn bnd_insert_bases(sv: &SvData) -> Vec<Nucleotide> {
+    sv.bnd_insert.chars().map(Nucleotide::from).collect()
 }
 
 fn get_mutated_subseq(
@@ -3652,6 +3712,46 @@ fn intersect_with_bed(
 
 #[cfg(test)]
 mod tests {
+
+    /// The fragment budget is CONSERVED: an inserted breakend sequence comes out of the
+    /// fragment, it does not extend it.
+    ///
+    /// Getting this wrong is invisible to every read-content check — the insert is present,
+    /// adjacent and correctly oriented — while every fragment crossing an inserted breakend
+    /// runs long, inflating depth at exactly the locus a caller measures. Found by mutating
+    /// `len2` back to the un-adjusted value and watching all three end-to-end #498 tests
+    /// still pass.
+    #[test]
+    fn bnd_fragment_split_conserves_the_fragment_length() {
+        for frag_len in [50usize, 151, 300, 301, 1000] {
+            for offset in 0..=frag_len {
+                for insert_len in [0usize, 1, 12, 24, 200, 5000] {
+                    let (used, len2) = bnd_fragment_split(frag_len, offset, insert_len);
+                    assert_eq!(
+                        offset + used + len2,
+                        frag_len,
+                        "frag_len={frag_len} offset={offset} insert_len={insert_len} \
+                         split into {offset}+{used}+{len2}"
+                    );
+                    assert!(used <= insert_len, "used more insert than exists");
+                }
+            }
+        }
+    }
+
+    /// Known answers for the three regimes, so a change that keeps the sum right but moves
+    /// bases between the insert and the second piece still fails.
+    #[test]
+    fn bnd_fragment_split_known_answers() {
+        // Insert fits: it is fully used and the second piece takes the remainder.
+        assert_eq!(bnd_fragment_split(300, 100, 24), (24, 176));
+        // No insert: the second piece takes everything after the junction.
+        assert_eq!(bnd_fragment_split(300, 100, 0), (0, 200));
+        // Insert longer than what is left: truncated, and NO second reference piece.
+        assert_eq!(bnd_fragment_split(300, 100, 500), (200, 0));
+        // Junction at the very end of the fragment: nothing after it at all.
+        assert_eq!(bnd_fragment_split(300, 300, 24), (0, 0));
+    }
     // Junction-suppression tests predate haplotype-aware placement and are written
     // in plain (start, end) spans, which is still the right level for them:
     // suppression is about where a fragment sits, not which haplotype it came from.

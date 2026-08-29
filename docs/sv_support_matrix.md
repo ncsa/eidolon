@@ -124,7 +124,7 @@ BND recovery support a caller/representation limitation rather than a simulator 
 | `<INS>` symbolic | preserved | **identical to no-variant control** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) silent no-op |
 | BND, inter-chromosomal | both records preserved | 30 chimeric reads | ✅ |
 | BND, intra-chromosomal | both records preserved | 30 chimeric reads | ✅ |
-| BND + inserted sequence | preserved **with the insert** | **0 of 30** chimeric reads carry it | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) |
+| BND + inserted sequence | preserved **with the insert** | chimeric reads carry it, spliced between the reference pieces | ✅ fixed, [#498](https://github.com/ncsa/eidolon/issues/498) |
 | BND, mate contig absent | — | — | ✅ hard error (correct) |
 | BND, single/unpaired (`A.`) | preserved | 0 chimeric; **depth 42.4 vs 72.0** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
 | Fragment spanning a whole DUP | — | 60–800 bp blocks all match the derived haplotype | ✅ measured; earlier ❌ was noise |
@@ -141,12 +141,25 @@ background (15 `I`, 20 `D` in the probed window), or chimeric-read counts.
 
 ### The confirmed failures
 
-**[#498] BND with inserted sequence.** VCF 4.2 allows a breakend ALT to carry novel bases
-inserted at the junction — common in real rearrangements, since NHEJ frequently leaves
-sequence at the breakpoint. `parse_bnd_alt` accepts it, but `get_bnd_pieces` rebuilds the
-read from reference pieces only, so the insert never reaches the output. The truth VCF
-keeps it. **A benchmark built from that data asserts an insertion the reads do not
-contain.**
+**[#498] BND with inserted sequence — FIXED.** VCF 4.2 allows a breakend ALT to carry
+novel bases inserted at the junction, common in real rearrangements since NHEJ frequently
+leaves sequence at the breakpoint. `parse_bnd_alt` accepted it while `get_bnd_pieces`
+rebuilt the read from reference pieces only, so the insert never reached the output while
+the truth VCF kept it — a benchmark asserting an insertion the reads did not contain.
+
+`parse_bnd_alt` now returns the inserted bases and `get_stitched_sequence` splices them
+between the two reference pieces. Two details are load-bearing and each has its own test:
+
+* **Which end of the replacement sequence holds the reference base flips with the form** —
+  `t[p[` and `t]p]` start with it, `[p[t` and `]p]t` end with it. Getting it backwards
+  splices the anchor into the read and drops one inserted base.
+* **The insert comes OUT of the fragment budget** (`L1 + insert + L2 == frag_len`), it does
+  not extend it. Letting fragments grow inflates depth at exactly the locus a caller
+  measures, and is invisible to every read-content check — the insert is present, adjacent
+  and correctly oriented. Caught only by mutating the arithmetic.
+
+The insert is never reverse-complemented: it is written in the orientation of the record
+declaring it, while the `rev` flags describe only how each reference piece is read.
 
 **[#500] Symbolic `<INS>` is a silent no-op.** `SVTYPE=INS;SVLEN=60` is preserved in the
 truth VCF, and the reads are behaviourally identical to the no-variant control — same `I`
@@ -593,7 +606,7 @@ real and verified) and is expected to matter for plants.
 | | input | de novo |
 |---|---|---|
 | intra-chromosomal BND | accepted, reads generated | never produced |
-| BND with inserted sequence | accepted but insert dropped (#498) | never produced |
+| BND with inserted sequence | accepted, insert spliced at the junction (#498) | never produced |
 | arbitrary contig pairs | whatever you supply | length-weighted ([#495](https://github.com/ncsa/eidolon/issues/495)) |
 
 These are not inconsistencies to reconcile. Input is "reproduce what I gave you"; de novo
