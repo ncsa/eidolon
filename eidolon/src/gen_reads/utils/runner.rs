@@ -1,7 +1,8 @@
 use eidolon_core::file_tools::block_gz::BlockGzWriter;
 use eidolon_core::file_tools::file_io::create_output_file;
 use eidolon_core::rng::NeatRng;
-use eidolon_core::structs::variants::{Genotype, Provenance, SvType, VariantType};
+use eidolon_core::structs::sv_model::sample_novel_insertion_bases;
+use eidolon_core::structs::variants::{AlternateType, Genotype, Provenance, SvType, VariantType};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -253,6 +254,10 @@ pub fn run_neat(
         // dropouts rather than being filled with fabricated sequence.
         reference_map.insert(name, seq);
     }
+    // Must run AFTER the reference is loaded: realizing a symbolic <INS> needs the local
+    // base composition to draw from, and the anchor base to build the literal ALT.
+    let input_variants = realize_symbolic_insertions(input_variants, &reference_map, rng);
+
     let reference = Arc::new(reference_map);
 
     let bam_context: Option<Arc<BamContext>> = if config.produce_bam {
@@ -3154,10 +3159,108 @@ fn is_no_call(gt: &str) -> bool {
     !alleles.is_empty() && alleles.iter().all(|a| a.trim() == ".")
 }
 
+/// Give a symbolic `<INS>` from an input VCF the novel sequence it needs to reach the reads.
+///
+/// WHY THIS EXISTS: a symbolic `<INS>` carries no sequence, so there was nothing to splice
+/// and the record became a silent no-op — preserved verbatim in the truth VCF while the
+/// reads came out byte-identical in behaviour to a no-variant control, same `I` count, same
+/// `D` count, same depth (#500). A benchmark built from that truth scores a caller as having
+/// missed an insertion that was never in the data.
+///
+/// Realizing it is the biologically honest reading: `<INS>` in a real callset means "an
+/// insertion of about this size, sequence unresolved", and generating reads for it requires
+/// choosing a sequence. The bases are drawn by `sample_novel_insertion_bases` — the SAME
+/// sampler the de novo path uses, so one model does not plant two different kinds of
+/// insertion depending on which door the record came through. #580 tracks making that
+/// sampler mobile-element-aware; when it lands, both paths get it at once.
+///
+/// The record becomes LITERAL, which is what routes the bases through the insertion
+/// machinery, and the truth VCF then states exactly what was planted rather than a size and
+/// a promise. `SVTYPE=INS` beside a literal ALT is what Manta emits for a resolved insertion.
+///
+/// A `<INS>` with no usable `SVLEN` cannot be realized at all — there is no length to
+/// synthesise — so it is dropped with a warning rather than kept as an unachievable truth
+/// record, the same reasoning as #591's REF==ALT arm.
+fn realize_symbolic_insertions(
+    input: Option<HashMap<String, Vec<Variant>>>,
+    reference: &HashMap<String, Vec<Nucleotide>>,
+    rng: &mut NeatRng,
+) -> Option<HashMap<String, Vec<Variant>>> {
+    let mut input = input?;
+    let (mut realized, mut dropped) = (0usize, 0usize);
+
+    for (contig, variants) in input.iter_mut() {
+        let Some(sequence) = reference.get(contig) else {
+            continue; // not a loaded contig; nothing downstream will read it either
+        };
+        let mut kept: Vec<Variant> = Vec::with_capacity(variants.len());
+        for mut v in std::mem::take(variants) {
+            let Some(sv) = v.alternate.as_symbolic() else {
+                kept.push(v);
+                continue;
+            };
+            if sv.sv_type != SvType::Ins {
+                kept.push(v);
+                continue;
+            }
+            let length = match sv.svlen {
+                Some(n) if n > 0 => n as usize,
+                _ => {
+                    dropped += 1;
+                    warn!(
+                        "Skipping symbolic <INS> at {}:{} — no positive INFO/SVLEN, so there \
+                         is no length to synthesise and the record cannot reach the reads. \
+                         Supply an explicit ALT sequence or an SVLEN.",
+                        contig,
+                        v.location + 1
+                    );
+                    continue;
+                }
+            };
+            let anchor_0based = v.location.min(sequence.len().saturating_sub(1));
+            let novel = match sample_novel_insertion_bases(sequence, anchor_0based, length, rng) {
+                Ok(bases) => bases,
+                Err(e) => {
+                    dropped += 1;
+                    warn!(
+                        "Skipping symbolic <INS> at {}:{} — could not draw novel sequence: {e}",
+                        contig,
+                        v.location + 1
+                    );
+                    continue;
+                }
+            };
+            let anchor_base = sequence[anchor_0based];
+            let mut alt_bases = Vec::with_capacity(length + 1);
+            alt_bases.push(anchor_base);
+            alt_bases.extend(novel);
+
+            v.reference = vec![anchor_base];
+            v.alternate = AlternateType::Literal(alt_bases);
+            v.variant_type = VariantType::Insertion;
+            realized += 1;
+            kept.push(v);
+        }
+        *variants = kept;
+    }
+
+    if realized > 0 {
+        info!(
+            "Realized {realized} symbolic <INS> record(s) with synthesised novel sequence \
+             so the reads carry them (#500)"
+        );
+    }
+    if dropped > 0 {
+        warn!("Dropped {dropped} symbolic <INS> record(s) that could not be realized");
+    }
+    Some(input)
+}
+
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
     let (mut n_complex, mut n_null, mut n_nocall, mut n_homref) = (0usize, 0usize, 0usize, 0usize);
     let mut n_partial = 0usize;
+    let mut n_single_bnd = 0usize;
     for (contig, variants) in raw {
         let mut kept = Vec::new();
         for v in variants {
@@ -3178,6 +3281,37 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
                     "Skipping non-variant at {}:{} (ALT is identical to REF, so there is no \
                      alternate allele to generate)",
                     contig, v.location
+                );
+            } else if v
+                .alternate
+                .as_symbolic()
+                .is_some_and(|sv| sv.sv_type == SvType::Bnd && sv.mate_contig.is_none())
+            {
+                // A single breakend (VCF 4.2 §5.4: `A.` / `.A`) declares a junction whose
+                // partner is unknown or absent — a telomeric fusion, or a mate that could
+                // not be resolved. eidolon has no way to build a junction read without a
+                // partner, and the result was worse than ignoring the record: depth at the
+                // locus fell 72.0 -> 42.4, a 41% loss, with ZERO chimeric reads (#500). The
+                // truth declared a breakend, the reads contained no junction, and coverage
+                // was silently destroyed around it — a depth-based caller sees a partial
+                // deletion no record describes.
+                //
+                // Rejected rather than ignored: keeping it in the truth VCF would assert a
+                // breakend the reads do not carry, and corrupting coverage is strictly worse
+                // than refusing the record. Revisit when junction generation can represent
+                // an unresolved partner.
+                n_single_bnd += 1;
+                warn!(
+                    "Skipping single breakend at {}:{} (ALT {}) — a breakend with no mate \
+                     cannot be turned into junction reads, and accepting it destroys local \
+                     coverage without producing a junction. Supply the mate record, or drop \
+                     this one.",
+                    contig,
+                    v.location,
+                    v.alternate
+                        .as_symbolic()
+                        .map(|sv| sv.raw_alt.clone())
+                        .unwrap_or_default()
                 );
             } else if is_hom_ref(&v.genotype_str) {
                 // 0/0 says this sample carries the reference on every allele. Generating the
@@ -3233,11 +3367,12 @@ fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<V
              allele is generated as reference (./1 -> 0/1)"
         );
     }
-    let dropped = n_complex + n_null + n_nocall + n_homref;
+    let dropped = n_complex + n_null + n_nocall + n_homref + n_single_bnd;
     if dropped > 0 {
         warn!(
             "input_vcf: dropped {dropped} record(s) — {n_complex} complex, {n_null} \
-             ALT-equals-REF, {n_nocall} no-call genotype, {n_homref} homozygous-reference"
+             ALT-equals-REF, {n_nocall} no-call genotype, {n_homref} homozygous-reference, \
+             {n_single_bnd} single breakend"
         );
     }
     out
