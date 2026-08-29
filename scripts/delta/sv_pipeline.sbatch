@@ -1718,8 +1718,16 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         END { for (i = 1; i <= m; i++) { k = order[i]
             print chrom[k], pos[k], len[k], nh[k] + 0, np[k], best[k] + 0 } }')"
 
+    # Defaulted, not read bare: this function is extracted and run by
+    # scripts/delta/tests/, where the script-level READ_LEN does not exist, and a bare
+    # reference aborts the whole suite silently under `set -u`. Mirrors READ_LEN's own default.
+    local read_len="${READ_LEN:-151}"
+    local n_long=0
     while IFS=$'\t' read -r c p l nh np best; do
         [[ -n "$c" ]] || continue
+        # An insertion SHORTER than a read was never at risk from #516/#589 — the defect is
+        # that sequence past ~a read length never gets sequenced. Count the ones that are.
+        (( l > read_len )) && n_long=$((n_long + 1))
         if [[ "${nh:-0}" -gt 0 ]]; then
             supported=$((supported + 1))
             printf '    %s:%s  %s bp  %s/%s probes  %s read(s)\n' "$c" "$p" "$l" "$nh" "$np" "$best"
@@ -1735,7 +1743,8 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         return 1
     fi
 
-    echo "  INS read support: $supported of $n_ins planted insertion(s) present in the reads"
+    echo "  INS read support: $supported of $n_ins planted insertion(s) present in the reads" \
+         "($n_long longer than the ${read_len} bp read)"
     INS_UNSUPPORTED="$unsupported"
 
     # Rule 4: a metric over an unknown — or tiny — denominator is not a result. The COSMIC
@@ -1744,13 +1753,22 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
     # resting on four draws. It is not a hard failure — the run's DEL/DUP/INV results are
     # unaffected and the check still catches a real 0/5 — but it must never be quoted as
     # evidence that insertions work at scale.
+    #
+    # The denominator that matters is n_long, NOT n_ins. This used to threshold on the raw
+    # count, which can invert: a run planting 30 insertions all SHORTER than a read would
+    # print no caveat at all while testing nothing, and one planting 11 of which 9 exceed a
+    # read length would be hedged as thin when its at-risk population is nearly the whole
+    # set. Job 21575385 was the second case — the banner said "too few to conclude" about
+    # 11 while 9 were over 151 bp, four of them at 4-6x (#620).
     local min_denom="${INS_MIN_DENOM:-20}"
-    if [[ "$n_ins" -lt "$min_denom" ]]; then
-        INS_DENOM_THIN="$n_ins"
-        echo "  DENOMINATOR TOO SMALL: $n_ins insertion(s) is below $min_denom, so the percentage"
-        echo "    above cannot support a conclusion about insertion realization at scale. A pass"
-        echo "    here means these $n_ins worked, nothing more. Raise SV_RATE_SCALE, use a larger"
-        echo "    reference, or include germline insertions to get a real denominator."
+    if [[ "$n_long" -lt "$min_denom" ]]; then
+        INS_DENOM_THIN="$n_long"
+        echo "  DENOMINATOR TOO SMALL: $n_long insertion(s) longer than the ${read_len} bp read"
+        echo "    is below $min_denom, so the percentage above cannot support a conclusion about"
+        echo "    insertion realization at scale. Insertions shorter than a read were never at"
+        echo "    risk from #516/#589 and do not count towards this. A pass here means those"
+        echo "    $n_long worked, nothing more. Raise SV_RATE_SCALE, use a larger reference, or"
+        echo "    include germline insertions to get a real denominator."
     fi
     if [[ "$unsupported" -gt 0 ]]; then
         # Sparse interior coverage costs a few insertions on any real run; a #516-class
@@ -1962,6 +1980,22 @@ if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
         INS_VERIFY_FAILED=1
     fi
 fi
+# Count SAM records whose CIGAR carries a soft clip of at least `min` bases. Split out from
+# verify_sv_cigar_ops so the parsing is testable without samtools or a BAM.
+count_clipped_reads() {  # <min clip>  < sam records
+    awk -v min="$1" '
+        BEGIN { FS = "\t"; n = 0 }
+        {
+            k = split($6, ops, /[0-9]+/)     # op letters, in order
+            split($6, lens, /[MIDNSHP=X]/)   # lengths, in order
+            for (i = 2; i <= k; i++) {
+                if (ops[i] == "S" && lens[i - 1] + 0 >= min) { n++; break }
+            }
+        }
+        END { print n + 0 }
+    '
+}
+
 
 # Largest CIGAR op of a given kind among SAM records on stdin. Split out so the parsing is
 # testable without samtools or a BAM.
@@ -1990,13 +2024,31 @@ region_mean_depth() {  # <bam> <chrom> <start> <end>
 #
 # WHY THIS EXISTS: #589 was exactly this — an insertion longer than a read appearing in NO
 # read's CIGAR, junction reads recorded as pure M. The truth VCF declared it, the reads half
-# carried it, and the CIGAR said nothing. Nothing in the pipeline looked at a CIGAR op until
-# now, so that defect was invisible here and was caught locally instead.
+# carried it, and the CIGAR said nothing.
 #
-# For each planted INS the reads near the locus must carry an I op; for each DEL, a D op. This
-# is independent of verify_planted_del, which asks whether the junction SEQUENCE is present:
-# a read can carry the junction bases in a soft clip while the aligner still records pure M.
-# Both must hold.
+# WHAT IT ASSERTS, AND WHY NOT AN I/D OP: this used to require a non-zero I op for each INS
+# and D op for each DEL. That was near-vacuous and job 21575385's "87 of 87" meant almost
+# nothing (#624). Aligners do not represent these events as large I/D ops — bwa prefers a
+# CLIPPED alignment. Measured on ecoli, seven insertions from 50 bp to 5 kb, bwa-mem2 2.2.1:
+#
+#     declared    reads clipped >= 20 bp    max soft clip    max I op
+#     50                  31                    100             1
+#     500                 39                    128             2
+#     5000                47                    126             1
+#     control              0                      2             -
+#
+# The largest I op anywhere near ANY of them is 2 bp, while the small-indel mutation model
+# scatters 1-2 bp I ops across the genome — so the old check was reading background noise and
+# would have passed with the insertion entirely absent. Deletions behave the same way past
+# ~50 bp: measured, a 50 bp DEL gives a 50 bp D op and a 100 bp DEL gives none at all.
+#
+# Soft clips are the signal the aligner actually produces, and the one Manta and GRIDSS
+# assemble from. The separation is stark (18-58 against 0), so this compares the locus to
+# FLANKING CONTROL WINDOWS rather than to a fixed threshold — a metric with no denominator is
+# what got us here. The largest I/D op is still printed, as information, not as the assertion.
+#
+# Independent of verify_planted_del, which asks whether the junction SEQUENCE is present: a
+# read can carry junction bases in its clip while the aligner still records pure M elsewhere.
 verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
     local truth="$1" bam="$2" dir="$3"
     [[ "${VERIFY_CIGAR_OPS:-1}" == "1" ]] || { echo "  (CIGAR op verification skipped)"; return 0; }
@@ -2006,6 +2058,9 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
     fi
 
     local svt op recs c p len end n_ev=0 n_missing=0 observed
+    local min_clip="${CIGAR_MIN_CLIP:-20}" ctl_off="${CIGAR_CONTROL_OFFSET:-5000}"
+    local win="${CIGAR_WINDOW:-300}"
+    local at_locus ctl_l ctl_r background sam
     CIGAR_MISSING=0
     for svt in INS DEL; do
         [[ -f "$dir/truth_sv_${svt}.vcf.gz" ]] || continue
@@ -2017,8 +2072,8 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         [[ -n "$recs" ]] || continue
         while IFS=$'\t' read -r c p _r _a end; do
             [[ -n "$c" ]] || continue
-            # Only events big enough that an aligner is expected to record the op at all. A
-            # 10 bp indel can legitimately be absorbed into mismatches.
+            # Only events big enough that an aligner is expected to clip at all. A 10 bp indel
+            # is legitimately absorbed into mismatches.
             if [[ "$svt" == "DEL" ]]; then
                 [[ -z "$end" || "$end" == "." ]] && continue
                 len=$(( end - p ))
@@ -2027,37 +2082,50 @@ verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
             fi
             (( len >= 50 )) || continue
             n_ev=$(( n_ev + 1 ))
-            if ! observed="$(samtools view "$bam" "$c:$(( p > 500 ? p - 500 : 1 ))-$(( p + 500 ))" 2>/dev/null | max_cigar_op "$op")"; then
+
+            fetch_clips() {  # <centre> -> clipped read count, or "" on samtools failure
+                local lo=$(( $1 > win ? $1 - win : 1 ))
+                samtools view "$bam" "$c:$lo-$(( $1 + win ))" 2>/dev/null | count_clipped_reads "$min_clip"
+            }
+            if ! at_locus="$(fetch_clips "$p")"; then
                 echo "ERROR: samtools could not read $c:$p — CIGAR op verification was not evaluated" >&2
                 return 1
             fi
-            if [[ "${observed:-0}" -eq 0 ]]; then
+            # Two flanking controls, placed clear of the event itself. The MINIMUM is the
+            # background: if another SV happens to fall in one window it inflates that side,
+            # and taking the smaller keeps this from failing a good locus for a neighbour's
+            # sake. Background is normally 0, so this reduces to "clipped reads exist here and
+            # not nearby" — which is exactly the measured separation.
+            ctl_l="$(fetch_clips "$(( p > ctl_off + win ? p - ctl_off : 1 ))")"
+            ctl_r="$(fetch_clips "$(( p + len + ctl_off ))")"
+            background="$ctl_l"
+            [[ "${ctl_r:-0}" -lt "${background:-0}" ]] && background="$ctl_r"
+            observed="$(samtools view "$bam" "$c:$(( p > 500 ? p - 500 : 1 ))-$(( p + 500 ))" 2>/dev/null | max_cigar_op "$op")"
+
+            if [[ "${at_locus:-0}" -le "${background:-0}" ]]; then
                 n_missing=$(( n_missing + 1 ))
-                printf '    %s %s:%s  %s bp  NO %s OP IN ANY READ\n' "$svt" "$c" "$p" "$len" "$op" >&2
+                printf '    %s %s:%s  %s bp  NO CLIP SUPPORT (%s clipped here vs %s in flanking control)\n' \
+                    "$svt" "$c" "$p" "$len" "${at_locus:-0}" "${background:-0}" >&2
             else
-                # Report the largest op against the declared length rather than asserting they
-                # match. #607 asked for "largest D op equal to the deletion length", which holds
-                # only while a single read can express the event: past roughly a read length bwa
-                # emits split alignments instead, so a 405 kb deletion legitimately has no 405 kb
-                # D op. Asserting equality would fail every large event; asserting non-zero alone
-                # is near-vacuous, since one error-derived 1 bp op passes. Printing both keeps the
-                # weakness visible instead of hiding it behind a green count — the junction probe
-                # and the depth gate are what actually cover large events.
-                printf '    %s %s:%s  declared %s bp  largest %s op %s bp\n' \
-                    "$svt" "$c" "$p" "$len" "$op" "$observed"
+                # The largest I/D op is INFORMATION, not the assertion — see the note above.
+                # Printing it keeps visible how rarely an aligner uses one for these events.
+                printf '    %s %s:%s  %s bp  %s clipped (control %s)  largest %s op %s bp\n' \
+                    "$svt" "$c" "$p" "$len" "$at_locus" "${background:-0}" "$op" "${observed:-0}"
             fi
         done <<< "$recs"
     done
 
     if [[ "$n_ev" -eq 0 ]]; then
-        echo "  CIGAR op check: no INS/DEL >= 50 bp planted — nothing to verify"
+        echo "  CIGAR clip check: no INS/DEL >= 50 bp planted — nothing to verify"
         return 0
     fi
-    echo "  CIGAR op support: $(( n_ev - n_missing )) of $n_ev planted INS/DEL >= 50 bp carry an I/D op"
+    echo "  CIGAR clip support: $(( n_ev - n_missing )) of $n_ev planted INS/DEL >= 50 bp show" \
+         "clipped reads above their flanking control"
     CIGAR_MISSING="$n_missing"
     if [[ "$n_missing" -gt 0 ]]; then
-        echo "ERROR: $n_missing of $n_ev planted event(s) appear in NO read's CIGAR. That is #589's" >&2
-        echo "  exact signature — the event is declared, and the alignment does not describe it." >&2
+        echo "ERROR: $n_missing of $n_ev planted event(s) produce no more clipped reads than the" >&2
+        echo "  surrounding reference does. That is #589's signature — the event is declared and" >&2
+        echo "  the alignment does not describe it." >&2
     fi
 }
 
@@ -2176,7 +2244,7 @@ elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
 elif [[ "${INS_DENOM_THIN:-0}" -gt 0 ]]; then
     # Passing on a handful of insertions is not evidence that insertions work. Say so in the
     # banner, where it cannot be skipped, rather than only in the INS block above.
-    RUN_STATUS="complete; INS read support passed on only $INS_DENOM_THIN insertion(s) — too few to conclude"
+    RUN_STATUS="complete; INS read support passed on only $INS_DENOM_THIN insertion(s) longer than a read — too few to conclude"
 else
     RUN_STATUS="complete"
 fi
