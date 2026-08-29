@@ -25,7 +25,11 @@ if [[ "${1:-}" == "--mutate" ]]; then
     done <<'MUTATIONS'
 max op reads the wrong CIGAR field@n = split($6, parts, /[0-9]+/)@n = split($10, parts, /[0-9]+/)
 max op ignores the requested op kind@if (parts[i] == want && lens[i - 1] + 0 > max)@if (lens[i - 1] + 0 > max)
-a missing CIGAR op is not counted@n_missing=$(( n_missing + 1 ))@:
+a missing clip is not counted@n_missing=$(( n_missing + 1 ))@:
+clip threshold ignored, any clip counts@if (ops[i] == "S" && lens[i - 1] + 0 >= min)@if (ops[i] == "S")
+hard clips counted as soft@if (ops[i] == "S" && lens[i - 1] + 0 >= min)@if ((ops[i] == "S" || ops[i] == "H") && lens[i - 1] + 0 >= min)
+control window ignored, bare threshold used@if [[ "${at_locus:-0}" -le "${background:-0}" ]]; then@if [[ "${at_locus:-0}" -le 0 ]]; then
+background takes the larger control@[[ "${ctl_r:-0}" -lt "${background:-0}" ]] && background="$ctl_r"@[[ "${ctl_r:-0}" -gt "${background:-0}" ]] && background="$ctl_r"
 dead flank is scored as a good deletion@if awk -v f="$flank" 'BEGIN { exit !(f < 1) }'; then@if false; then
 undeleted span passes the ratio test@-v t="${DEL_DEPTH_MAX_RATIO:-0.95}" 'BEGIN { exit !(x > t) }'@-v t="${DEL_DEPTH_MAX_RATIO:-0.95}" 'BEGIN { exit !(x > 99) }'
 depth measurement failure is swallowed@d="$(samtools depth -a -r "$2:$3-$4" "$1" 2>/dev/null@d="$(samtools depth -a -r "$2:$3-$4" "$1" 2>/dev/null || true
@@ -35,7 +39,7 @@ MUTATIONS
 fi
 
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in max_cigar_op region_mean_depth verify_sv_cigar_ops verify_del_depth; do
+for fn in max_cigar_op count_clipped_reads region_mean_depth verify_sv_cigar_ops verify_del_depth; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn"; exit 2; }
     eval "$src"
@@ -57,30 +61,86 @@ is "soft clip is not an I"    0 "$(sam '50S100M' | max_cigar_op I)"
 is "pure M yields zero"       0 "$(sam '150M' | max_cigar_op I)"
 is "no records yields zero"   0 "$(printf '' | max_cigar_op I)"
 
-echo "=== verify_sv_cigar_ops ==="
+echo "=== count_clipped_reads (known answers) ==="
+is "soft clip at the end counts"        1 "$(sam '100M51S' | count_clipped_reads 20)"
+is "soft clip at the start counts"      1 "$(sam '51S100M' | count_clipped_reads 20)"
+is "clip below the threshold does not"  0 "$(sam '140M11S' | count_clipped_reads 20)"
+is "hard clip is not a soft clip"       0 "$(sam '100M51H' | count_clipped_reads 20)"
+is "an I op is not a clip"              0 "$(sam '50M51I50M' | count_clipped_reads 20)"
+is "pure M is not a clip"               0 "$(sam '151M' | count_clipped_reads 20)"
+is "each read counted once, not twice"  1 "$(sam '30S91M30S' | count_clipped_reads 20)"
+is "no records yields zero"             0 "$(printf '' | count_clipped_reads 20)"
+
+echo "=== verify_sv_cigar_ops: clip support against a flanking control ==="
 mkdir -p "$WORK/d"; : > "$WORK/d/truth_sv_INS.vcf.gz"; : > "$WORK/bam"
+READ_LEN=151
 bcftools() { [[ "${1:-}" == query ]] || return 2; printf 'chr1\t1000\tA\tA%s\t.\n' "$(printf 'C%.0s' {1..200})"; }
+# The locus window is centred on POS=1000; the controls sit ~5 kb away. Keying on the region
+# string lets the stub answer each independently.
 samtools() {
     [[ "${1:-}" == view ]] || return 2
-    case "${CIG_MODE:-ins}" in
-        fail) return 2 ;;
-        ins)  printf 'r\t0\tchr1\t900\t60\t50M200I50M\t*\t0\t0\tACGT\t*\n' ;;
-        pureM) printf 'r\t0\tchr1\t900\t60\t150M\t*\t0\t0\tACGT\t*\n' ;;
+    [[ "${CIG_MODE:-clipped}" == fail ]] && return 2
+    case "$3" in
+        chr1:700-1300)
+            case "${CIG_MODE:-clipped}" in
+                clipped)   for i in 1 2 3 4 5; do sam '100M51S'; done ;;
+                pureM)     for i in 1 2 3 4 5; do sam '151M'; done ;;
+                iop_only)  for i in 1 2 3 4 5; do sam '50M2I99M'; done ;;
+                noisy)     for i in 1 2 3; do sam '100M51S'; done ;;
+                asym)      for i in 1 2 3 4 5; do sam '100M51S'; done ;;
+            esac ;;
+        chr1:1-301)        # LEFT flanking control
+            [[ "${CIG_MODE:-clipped}" == noisy ]] && for i in 1 2 3 4; do sam '100M51S'; done
+            ;;
+        chr1:5900-6500)    # RIGHT flanking control
+            case "${CIG_MODE:-clipped}" in
+                noisy) for i in 1 2 3 4; do sam '100M51S'; done ;;
+                # A neighbouring SV lands in this window only. The clean side is the honest
+                # background, so the minimum is what must be used.
+                asym)  for i in 1 2 3 4 5 6 7 8 9; do sam '100M51S'; done ;;
+            esac
+            ;;
+        *) ;;
     esac
+    return 0
 }
+
 CIGAR_MISSING=0
 verify_sv_cigar_ops x "$WORK/bam" "$WORK/d" > "$WORK/o" 2>&1
-is "insertion with an I op passes" 0 "$?"; is "not counted missing" 0 "$CIGAR_MISSING"
-has "reports the denominator" "$(<"$WORK/o")" "1 of 1 planted"
+is "clipped reads above control passes" 0 "$?"
+is "and are not counted missing"        0 "$CIGAR_MISSING"
+has "reports locus and control counts"  "$(<"$WORK/o")" "5 clipped (control 0)"
 
+# THE #624 REGRESSION: an insertion the aligner represents as pure M must FAIL. Under the old
+# check this passed on any stray 1-2 bp I op from the small-indel model.
 CIGAR_MISSING=0
 CIG_MODE=pureM verify_sv_cigar_ops x "$WORK/bam" "$WORK/d" > "$WORK/o" 2>&1
 is "pure-M insertion is counted missing (#589)" 1 "$CIGAR_MISSING"
-has "names the signature" "$(<"$WORK/o")" "NO I OP IN ANY READ"
+has "says clip support is absent" "$(<"$WORK/o")" "NO CLIP SUPPORT"
+
+# MUST NOT FIRE ON NOISE: a small I op with no excess clipping is background from the
+# mutation model, not evidence of a 200 bp insertion. This is exactly what job 21575385's
+# "87 of 87" was reading.
+CIGAR_MISSING=0
+CIG_MODE=iop_only verify_sv_cigar_ops x "$WORK/bam" "$WORK/d" > "$WORK/o" 2>&1
+is "a stray I op alone does NOT count as support (#624)" 1 "$CIGAR_MISSING"
+
+# MUST NOT FIRE: clipping that is no higher than the surrounding reference is not evidence.
+CIGAR_MISSING=0
+CIG_MODE=noisy verify_sv_cigar_ops x "$WORK/bam" "$WORK/d" > "$WORK/o" 2>&1
+is "clipping at or below the control is not support" 1 "$CIGAR_MISSING"
+has "reports the control it lost to" "$(<"$WORK/o")" "vs 4 in flanking control"
+
+# An SV in ONE control window must not fail a perfectly good locus. Background is the
+# minimum of the two flanks for exactly this reason: 5 clipped here, 0 on the clean side,
+# 9 on the contaminated side. Taking the maximum would report this locus as unsupported.
+CIGAR_MISSING=0
+CIG_MODE=asym verify_sv_cigar_ops x "$WORK/bam" "$WORK/d" > "$WORK/o" 2>&1
+is "a contaminated control flank does not fail a good locus" 0 "$CIGAR_MISSING"
 
 CIG_MODE=fail verify_sv_cigar_ops x "$WORK/bam" "$WORK/d" > "$WORK/o" 2>&1
 is "samtools failure is non-zero" 1 "$?"
-has "failure is not read as missing" "$(<"$WORK/o")" "was not evaluated"
+has "failure is not read as missing support" "$(<"$WORK/o")" "was not evaluated"
 
 echo "=== verify_del_depth ==="
 bcftools() { [[ "${1:-}" == query ]] || return 2; printf 'chr1\t1000\tA\t<DEL>\t1500\n'; }

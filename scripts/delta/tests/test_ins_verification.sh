@@ -35,8 +35,10 @@ only one probe per insertion@for (k = 1; k <= 5; k++) {@for (k = 3; k <= 3; k++)
 support floor never trips@if [[ "$pct" -lt "$min_pct" ]]; then@if false; then
 probes taken from the head@s = int(L * k / 6) - 14@s = 1 + 0 * k
 unsupported insertions are not counted@unsupported=$((unsupported + 1))@unsupported=$((unsupported + 0))
-thin denominator is never flagged@if [[ "$n_ins" -lt "$min_denom" ]]; then@if false; then
-thin denominator is not exported@INS_DENOM_THIN="$n_ins"@INS_DENOM_THIN=0
+thin denominator is never flagged@if [[ "$n_long" -lt "$min_denom" ]]; then@if false; then
+denominator counts every insertion, not the long ones@if [[ "$n_long" -lt "$min_denom" ]]; then@if [[ "$n_ins" -lt "$min_denom" ]]; then
+read-length comparison is inverted@(( l > read_len )) && n_long=$((n_long + 1))@(( l < read_len )) && n_long=$((n_long + 1))
+thin denominator is not exported@INS_DENOM_THIN="$n_long"@INS_DENOM_THIN=0
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -124,6 +126,9 @@ has "samtools failure is not reported as no support" "$out" "verification was no
 INS300="$(awk 'BEGIN{ b="ACGTTGCAAGGCTTACCGGATCAGTCAGGT"; for(i=0;i<10;i++){
     printf "%s%s", substr("ACGT", (i%4)+1, 1) substr("TGCA", (i%4)+1, 1), substr(b, 3) } }')"
 INS300="$(printf '%s' "$INS300" | cut -c1-300)"
+# 100 bp: long enough to carry probes, SHORTER than a 151 bp read, so never at risk from
+# #516/#589 and therefore not part of the denominator that matters (#620).
+INS100="$(printf '%s' "$INS300" | cut -c1-100)"
 bcftools() { [[ "${1:-}" == "query" ]] || return 2; printf 'chr1\t100\tA\tA%s\n' "$INS300"; }
 
 # EXPOSE is the slice(s) of the insertion the stub puts into reads.
@@ -200,8 +205,43 @@ out="$(<"$WORK/out")"
 case "$out" in *"DENOMINATOR TOO SMALL"*) bad "20 insertions are not flagged as too small" "no notice" "$out";; *) ok "20 insertions are not flagged as too small";; esac
 is "a real denominator leaves the flag clear" 0 "$INS_DENOM_THIN"
 
+echo "=== the denominator counts insertions LONGER THAN A READ, not all of them (#620) ==="
+# Insertions shorter than a read were never at risk: the defect is that sequence past ~a read
+# length never gets sequenced. Counting them inverts the guard in BOTH directions — a run
+# planting 20 short insertions would print no caveat while testing nothing, and job 21575385
+# was hedged as "too few to conclude" about 11 when 9 of them exceeded 151 bp.
+bcftools() {
+    [[ "${1:-}" == "query" ]] || return 2
+    local i; for i in $(seq 1 20); do printf 'chr1\t%s\tA\tA%s\n' "$((100 * i))" "$INS100"; done
+}
+READ_LEN=151 EXPOSE="1-300" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0
+verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
+out="$(<"$WORK/out")"
+has "20 SHORT insertions are still flagged as a thin denominator" "$out" "DENOMINATOR TOO SMALL: 0 insertion(s)"
+is "none of them count towards the at-risk denominator" 0 "$INS_DENOM_THIN"
+has "the report separates the two counts" "$out" "(0 longer than the 151 bp read)"
+
+echo "=== a mixed run counts only the long ones ==="
+bcftools() {
+    [[ "${1:-}" == "query" ]] || return 2
+    local i
+    for i in $(seq 1 5);  do printf 'chr1\t%s\tA\tA%s\n' "$((100 * i))" "$INS300"; done
+    for i in $(seq 1 20); do printf 'chr1\t%s\tA\tA%s\n' "$((100 * (i + 10)))" "$INS100"; done
+}
+READ_LEN=151 EXPOSE="1-3000" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0
+verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
+out="$(<"$WORK/out")"
+has "25 planted, 5 at risk, flagged on the 5" "$out" "DENOMINATOR TOO SMALL: 5 insertion(s)"
+is "the exported figure is the at-risk count" 5 "$INS_DENOM_THIN"
+
 echo "=== the minimum denominator is configurable ==="
-EXPOSE="1-300" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0 INS_MIN_DENOM=50
+# Sets its own stub rather than inheriting the previous block's: it needs 20 insertions that
+# all COUNT, i.e. all longer than a read.
+bcftools() {
+    [[ "${1:-}" == "query" ]] || return 2
+    local i; for i in $(seq 1 20); do printf 'chr1\t%s\tA\tA%s\n' "$((100 * i))" "$INS300"; done
+}
+READ_LEN=151 EXPOSE="1-300" SAMTOOLS_MODE=partial INS_UNSUPPORTED=0 INS_DENOM_THIN=0 INS_MIN_DENOM=50
 verify_planted_ins "$truth" "$bam" "$WORK" > "$WORK/out" 2>&1
 out="$(<"$WORK/out")"
 has "raising INS_MIN_DENOM flags 20 as too small" "$out" "DENOMINATOR TOO SMALL: 20 insertion(s)"
