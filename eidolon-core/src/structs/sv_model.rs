@@ -2566,9 +2566,6 @@ mod tests {
         }
     }
 
-    /// Sample BNDs with a NON-degenerate length distribution. `model_with_single_type`
-    /// special-cases BND to `(0.0, 0.0)`, so every existing BND test runs at length 1 and
-    /// cannot see a length-dependent bug.
     // ── Inter-chromosomal translocations ────────────────────────────────────────
     // Each test below maps to one numbered clause of `sample_translocations`'
     // correctness criterion, which was written before the implementation.
