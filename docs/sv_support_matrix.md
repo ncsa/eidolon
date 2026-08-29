@@ -154,9 +154,15 @@ between the two reference pieces. Two details are load-bearing and each has its 
   `t[p[` and `t]p]` start with it, `[p[t` and `]p]t` end with it. Getting it backwards
   splices the anchor into the read and drops one inserted base.
 * **The insert comes OUT of the fragment budget** (`L1 + insert + L2 == frag_len`), it does
-  not extend it. Letting fragments grow inflates depth at exactly the locus a caller
-  measures, and is invisible to every read-content check — the insert is present, adjacent
-  and correctly oriented. Caught only by mutating the arithmetic.
+  not extend it. The inserted bases consume READ bases but no REFERENCE bases, so a correct
+  pair spans *less* reference than the library mean — a reduced insert size is one of the
+  signatures a caller uses to detect an insertion at a junction. Letting the fragment grow
+  keeps the span at the library mean, erases that signature, and puts the mate further into
+  the second piece than the fragment distribution allows: systematically discordant pairs at
+  every inserted junction, and an inferred event size that does not match what was planted.
+  It does *not* change depth — R1 and R2 are `read_len` each however long the fragment is.
+  Invisible to every read-content check, since the insert is present, adjacent and correctly
+  oriented; caught only by mutating the arithmetic.
 
 The insert is never reverse-complemented: it is written in the orientation of the record
 declaring it, while the `rev` flags describe only how each reference piece is read.

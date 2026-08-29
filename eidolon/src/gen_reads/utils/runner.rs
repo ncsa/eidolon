@@ -2321,8 +2321,9 @@ fn generate_chimeric_pair(
     // L2 = frag_len - offset
 
     // Novel sequence at the junction comes out of the fragment budget, it does not extend
-    // it: L1 + |insert| + L2 == frag_len. Letting the fragment grow instead would inflate
-    // depth around every inserted breakend and change the very coverage a caller measures.
+    // it: L1 + |insert| + L2 == frag_len. See `bnd_fragment_split` for why — the short
+    // version is that the insert consumes read bases but no reference bases, so the pair
+    // must span LESS reference than the library mean.
     let insert = bnd_insert_bases(sv);
     let (insert_used, len2) = bnd_fragment_split(frag_len, offset, insert.len());
 
@@ -2971,11 +2972,23 @@ fn get_stitched_sequence(
 /// Divide a fragment across `[piece1 | insert | piece2]`, returning `(insert_used, len2)`.
 ///
 /// INVARIANT: `offset + insert_used + len2 == frag_len` for any `offset <= frag_len`. The
-/// insert comes OUT of the fragment budget, it does not extend it. Letting the fragment grow
-/// by the insert length instead would lengthen every fragment crossing an inserted breakend,
-/// inflating local depth — a coverage artifact at exactly the locus a caller is measuring,
-/// and one no read-content check can see. Split out from `generate_chimeric_pair` so that
-/// invariant is testable without a reference or a `ContigContext`.
+/// insert comes OUT of the fragment budget, it does not extend it.
+///
+/// WHY THAT MATTERS: the inserted bases consume READ bases but no REFERENCE bases, so a
+/// correctly built pair spans LESS reference than the library mean — a reduced insert size
+/// is one of the signatures a caller uses to detect an insertion at a junction. Letting the
+/// fragment grow by the insert length instead keeps the reference span at the library mean
+/// and erases that signature, while placing the mate further into the second piece than the
+/// fragment distribution allows. The result is systematically discordant pairs at every
+/// inserted junction and an inferred event size that does not match what was planted.
+///
+/// (It does NOT inflate depth: R1 and R2 are each `read_len` bases regardless of how long
+/// the fragment is, so the bases emitted per fragment do not change. An earlier version of
+/// this comment claimed otherwise.)
+///
+/// Split out from `generate_chimeric_pair` so the invariant is testable without a reference
+/// or a `ContigContext` — no read-content check can see this, since the insert is still
+/// present, adjacent and correctly oriented.
 ///
 /// A fragment can end INSIDE a long insert: then it carries a prefix of the insert and no
 /// second reference piece at all, which is the ordinary truncation any read sees at a
@@ -3853,9 +3866,10 @@ mod tests {
     ///
     /// Getting this wrong is invisible to every read-content check — the insert is present,
     /// adjacent and correctly oriented — while every fragment crossing an inserted breakend
-    /// runs long, inflating depth at exactly the locus a caller measures. Found by mutating
-    /// `len2` back to the un-adjusted value and watching all three end-to-end #498 tests
-    /// still pass.
+    /// spans the wrong amount of reference, so the mate lands further away than the fragment
+    /// distribution allows and the insertion's reduced-insert-size signature is erased.
+    /// Found by mutating `len2` back to the un-adjusted value and watching all three
+    /// end-to-end #498 tests still pass.
     #[test]
     fn bnd_fragment_split_conserves_the_fragment_length() {
         for frag_len in [50usize, 151, 300, 301, 1000] {
