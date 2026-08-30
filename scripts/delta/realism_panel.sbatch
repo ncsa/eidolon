@@ -72,6 +72,7 @@ echo "[selftest] stderr reaches this log (if this line is missing, diagnostics a
 
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"
+source "$REPO_ROOT/scripts/delta/lib_realism_contig.sh"
 
 REFERENCE="${REFERENCE:-$SCRATCH/neat_data/chr22.fa}"
 REAL_BAM="${REAL_BAM:-}"
@@ -82,6 +83,7 @@ FRAG_MEAN="${FRAG_MEAN:-400}"
 FRAG_SD="${FRAG_SD:-90}"
 N_REGIONS="${N_REGIONS:-10}"
 REGION_BP="${REGION_BP:-400000}"
+CONTIG="${CONTIG:-}"                 # default: first contig with reads that is also in $REFERENCE
 SEED="${SEED:-realism panel}"
 # Cap the simulated depth. 0 = match the real BAM exactly, which is what a real measurement
 # wants. A smoke run does not: real WGS is often 200-300x, and simulating that across a whole
@@ -119,10 +121,20 @@ echo "Thresholds: min_clip=$MIN_CLIP min_support=$MIN_SUPPORT max_tlen=$MAX_TLEN
 # ~8x. `depth_excess` in the panel output is depth-independent and is the number to quote
 # across datasets, but matching anyway keeps every OTHER metric comparable too — clip rates
 # and candidate-breakpoint counts both rise with depth.
-CONTIG="$(samtools idxstats "$REAL_BAM" 2>/dev/null | awk '$3>0 {print $1; exit}')"
-[[ -n "$CONTIG" ]] || { echo "ERROR: could not find a contig with reads in $REAL_BAM (is it indexed?)" >&2; exit 1; }
-CONTIG_LEN="$(samtools idxstats "$REAL_BAM" | awk -v c="$CONTIG" '$1==c {print $2; exit}')"
-echo "Contig:     $CONTIG ($CONTIG_LEN bp)"
+# The contig must carry reads in the real BAM AND exist in the reference at the SAME
+# length. select_contig lives in lib_realism_contig.sh so its tests exercise this exact
+# code; the reasoning for each half of the check is documented there.
+[[ -f "${REFERENCE}.fai" ]] || samtools faidx "$REFERENCE"
+
+samtools idxstats "$REAL_BAM" > "$OUTDIR/real.idxstats" 2>/dev/null \
+    || { echo "ERROR: samtools idxstats failed on $REAL_BAM — is it indexed?" >&2; exit 1; }
+
+# Capture before splitting: `read` inside a pipeline would run in a subshell and lose both
+# variables, and $(...) with `set -e` would swallow the non-zero status.
+CONTIG_PICK="$(select_contig "$REAL_BAM" "${REFERENCE}.fai" "$OUTDIR/real.idxstats" "${CONTIG:-}")" || exit 1
+CONTIG="${CONTIG_PICK%%$'\t'*}"
+CONTIG_LEN="${CONTIG_PICK##*$'\t'}"
+echo "Contig:     $CONTIG ($CONTIG_LEN bp, length agrees between BAM and reference)"
 
 REAL_DEPTH="$(samtools depth -a -r "$CONTIG:1000000-1200000" "$REAL_BAM" \
               | awk '{s+=$3; n++} END{ if(n) printf "%.0f", s/n; else print 0 }')"
