@@ -74,7 +74,15 @@ opening the PR and state the file count in the PR body.
    Put it in `conda-recipe/meta.yaml`, PR to `main`.
 
 8. **Merge back so `develop` has the bump**, or its next release cut starts from a stale
-   version.
+   version. **Then run `cargo check --workspace` and commit whatever it does to
+   `Cargo.lock`** — a workspace member that exists only on `develop` inherits the workspace
+   version but is absent from the branch that bumped it, so the merge leaves its lock entry
+   on the old version and `cargo fetch --locked` refuses the result. Verify with the CI
+   command itself before pushing:
+   ```bash
+   cargo check --workspace && cargo fetch --locked
+   git status --short   # a modified Cargo.lock here means it is not committed yet
+   ```
 
 9. **Report** the tag, the asset count, and anything not verified.
 
