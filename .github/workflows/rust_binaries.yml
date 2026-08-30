@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*.*.*'  # Trigger on version tags like v1.0.0
+  # Manual re-run. Without this, a release build that fails can only be retried by deleting
+  # and re-pushing the tag — which is what v3.2.0 needed when its macOS target failed, and
+  # is a bad thing to have to do to a published release. `ref` should be the tag.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -51,15 +55,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # KNOWN GAP: this asks for @stable and therefore sets RUSTUP_TOOLCHAIN, which overrides
-      # rust-toolchain.toml — so release binaries are built with a FLOATING compiler while
-      # everything else in the repo is pinned. It was left alone deliberately: this workflow
-      # only runs on `v*.*.*` tags, so a change here gets no signal until a release is cut,
-      # and an unverified edit in the release path is worse than a named inconsistency.
-      # Tracked separately; fix it alongside a release where it can actually be observed.
+      # The toolchain version comes from rust-toolchain.toml, read here rather than hardcoded
+      # so there is ONE source of truth.
+      #
+      # WHY THIS SHAPE: `dtolnay/rust-toolchain@stable` sets RUSTUP_TOOLCHAIN=stable and
+      # installs `targets:` into THAT toolchain. rust-toolchain.toml then redirects cargo to
+      # the pinned version, which has no cross-compilation target installed — so the build
+      # dies with "can't find crate for `core`; the x86_64-apple-darwin target may not be
+      # installed". Only the genuine cross-compile is affected; every other target here is
+      # native to its runner, which is why v3.2.0 shipped four binaries and no macOS one.
+      #
+      # Installing the PINNED toolchain and its target together keeps the two agreeing.
+      - name: Read the pinned toolchain
+        id: rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^ *channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -1)
+          [ -n "$channel" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "pinned toolchain: $channel"
+
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - name: Build release binary
