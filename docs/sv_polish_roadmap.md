@@ -3,6 +3,13 @@
 **Status: plan, not results.** Nothing here is verified until the gate it describes has been
 run and its output recorded. Written 2026-08-14 after job 21072620.
 
+**Updated 2026-08-29 (v3.2.0).** Every cell this document listed as broken has since been
+fixed and validated at genome scale — Delta jobs 21575385 and 21603825, chr20+21+22, 30x,
+purity 0.6, both exit 0. The ranking below is kept because the *reasoning* about strength of
+evidence still holds; the verdicts are updated. A stale roadmap is worse than no roadmap: for
+several days this file told readers that deletions were only partially realized while the
+gates were reporting 76 of 76.
+
 ## Why this exists
 
 Two gaps, found together and easily confused:
@@ -33,18 +40,18 @@ position.
 | rank | type | why here |
 |---|---|---|
 | 1 | **literal DEL** | simplest possible mechanism — a reference slice minus bases. `D=49` vs 20 baseline |
-| 2 | **`<DEL>` symbolic** | depth 0.54 het / 0.00 hom exact; whole-genome recall 0.83–0.86. Known ~8% dosage bias ([#499](https://github.com/ncsa/eidolon/issues/499)) |
-| 3 | **`<DUP>`** | 1.61 / 2.17 measured; fragment-spanning separately verified. Same #499 bias; one residual (missing reads would be invisible) |
+| 2 | **`<DEL>` symbolic** | depth 0.54 het / 0.00 hom exact; whole-genome recall 0.83–0.86. The ~8% dosage bias once attributed to [#499](https://github.com/ncsa/eidolon/issues/499) does **not** reproduce at realistic event size — 0.98 +/- 1.9% on a 10 kb event over a 1 Mb reference; the original was a 1.2 kb event on a 13.5 kb fixture where depth noise alone is ~13% sigma. The residual mechanism is [#584](https://github.com/ncsa/eidolon/issues/584) |
+| 3 | **`<DUP>`** | 1.61 / 2.17 measured on H1N1; fragment-spanning separately verified. Those figures carry [#584](https://github.com/ncsa/eidolon/issues/584) — junction reads are emitted **on top of** coverage-multiplied reads, an excess independent of event length and therefore worst on short events. Accurate at 10 kb, biased high at ~1 kb |
 | 4 | **`<INV>`** | interior 1.00, junction dip explained and bounded; homozygous-junction test exists. Dip realism never compared to real data |
 | 5 | **`<CNV>`** | semantics confirmed (CN total, `CN/ploidy`, GT ignored). Depth-only — no junction signature exists to cross-check against |
 | 6 | **BND inter/intra** | 30 chimeric reads; whole-genome geometry clean (50 parsed, 0 unpaired, 0 mispaired). Ranked below CNV **only** for soak time — the geometry was wrong until v3.1.0 |
 | 7 | **literal INS ≤150 bp** | works, but the ceiling is a read length |
-| — | **BND + inserted seq** | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) insert dropped from reads |
-| — | **`<INS>` symbolic** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) silent no-op |
-| — | **BND unpaired `A.`** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
+| — | **BND + inserted seq** | ✅ fixed ([#498](https://github.com/ncsa/eidolon/issues/498)) — spliced between the reference pieces; insert comes out of the fragment budget, not added to it |
+| — | **`<INS>` symbolic** | ✅ fixed ([#500](https://github.com/ncsa/eidolon/issues/500)) — realized with synthesised novel sequence from the same sampler the de novo path uses |
+| — | **BND unpaired `A.`** | ⚠ **rejected**, not supported ([#500](https://github.com/ncsa/eidolon/issues/500)) — no longer destroys coverage, but a legitimate VCF 4.2 call eidolon refuses ([#623](https://github.com/ncsa/eidolon/issues/623)) |
 | — | **literal INS ≳200 bp** | ✅ fixed ([#516](https://github.com/ncsa/eidolon/issues/516)) — 38/38 verified in reads, 62–2127 bp, Delta job 21382756 |
-| — | **literal INS in the golden BAM** | ❌ [#589](https://github.com/ncsa/eidolon/issues/589) an insertion longer than a read appears in no CIGAR |
-| — | **literal DEL ≳ read length** | ❌ [#590](https://github.com/ncsa/eidolon/issues/590) only partially realized (0.70 of flank depth at 500 bp) |
+| — | **literal INS in the golden BAM** | ✅ fixed ([#589](https://github.com/ncsa/eidolon/issues/589)) — 11/11 present in the reads, 9 longer than a 151 bp read, largest 968 bp (job 21603825) |
+| — | **literal DEL ≳ read length** | ✅ fixed ([#590](https://github.com/ncsa/eidolon/issues/590)) — deletions live on the haplotype; **76/76 junction sequence present, 76/76 coverage removed**, flank ratios 0.33–0.77 at purity 0.6 (job 21603825) |
 
 ### De novo
 

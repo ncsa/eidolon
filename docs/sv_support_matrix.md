@@ -117,9 +117,9 @@ BND recovery support a caller/representation limitation rather than a simulator 
 
 | variant | truth VCF | read-level evidence | status |
 |---|---|---|---|
-| `<DEL>` symbolic | preserved | het **0.54** vs 0.50 expected; hom **0.00** exact | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
-| `<DUP>` symbolic | preserved | het **1.61** vs 1.50; hom **2.17** vs 2.00 | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
-| `<CNV>` symbolic | preserved | CN 0/2 exact; CN 1,3,4,6 all **~8% high** | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) |
+| `<DEL>` symbolic | preserved | het **0.54** vs 0.50 expected; hom **0.00** exact | ⚠ [#584](https://github.com/ncsa/eidolon/issues/584) — size-dependent, see note |
+| `<DUP>` symbolic | preserved | het **1.61** vs 1.50; hom **2.17** vs 2.00 (H1N1, 1.2 kb events) | ⚠ [#584](https://github.com/ncsa/eidolon/issues/584) — size-dependent, see note |
+| `<CNV>` symbolic | preserved | CN 0/2 exact; CN 1,3,4,6 **~8% high on H1N1** | ⚠ [#584](https://github.com/ncsa/eidolon/issues/584) — size-dependent, see note |
 | `<INV>` symbolic | preserved | deep interior **1.00**; junction-proximal **0.74–0.82** | ✅ (see note) |
 | `<INS>` symbolic | realized as a literal ALT with synthesised novel sequence | insertions appear above the control background | ✅ fixed, [#500](https://github.com/ncsa/eidolon/issues/500) |
 | BND, inter-chromosomal | both records preserved | 30 chimeric reads | ✅ |
@@ -138,6 +138,20 @@ BND recovery support a caller/representation limitation rather than a simulator 
 Every row above is measured. Read-level evidence is depth against a **separate no-variant
 control run**, or BAM CIGAR `I`/`D` counts against that control's sequencing-error
 background (15 `I`, 20 `D` in the probed window), or chimeric-read counts.
+
+**The "~8% high" figure is size-dependent, and the size it was measured at is not realistic.**
+[#499](https://github.com/ncsa/eidolon/issues/499) measured a 1.2 kb event on the 13.5 kb H1N1
+fixture, a window where depth noise alone is ~13% sigma. Re-measured on a **10 kb event over a
+1 Mb reference**, depth reads **0.98 +/- 1.9%** — accurate. The three rows above therefore
+report a bias that does not survive at realistic event size, and are kept only because they are
+what H1N1 actually shows.
+
+The residual mechanism is real and tracked as [#584](https://github.com/ncsa/eidolon/issues/584):
+junction reads are emitted **on top of** coverage-multiplied reads rather than as part of them
+(+0.52 at multiplier 1.0 on a 300 bp DUP). Their count does not vary with event length, so the
+excess as a *fraction* of the event scales roughly as 1/length — negligible at 10 kb, dominant
+at 1 kb. **Anything calibrating against eidolon depth needs this number at its own event size,
+not this table's.**
 
 ### The confirmed failures
 
