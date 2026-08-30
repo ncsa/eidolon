@@ -1,3 +1,30 @@
+8/30/2026
+=========
+## eidolon v3.2.1 — complete release assets
+
+**The binary is unchanged from v3.2.0.** `eidolon/src`, `eidolon-core/src` and their
+manifests are byte-for-byte identical between the two tags. This release exists solely to
+publish a complete set of platform binaries; nothing in it alters simulator behaviour.
+
+### What was wrong
+
+v3.2.0 shipped without its macOS asset. The release workflow used
+`dtolnay/rust-toolchain@stable`, which sets `RUSTUP_TOOLCHAIN` and silently overrides
+`rust-toolchain.toml` — so it installed the target into *stable* while pointing cargo at the
+pinned 1.98.0, and the macOS build failed with `can't find crate for core`.
+
+The workflow now reads the channel from `rust-toolchain.toml` and installs the target into
+that toolchain. These binaries are therefore built with the pinned compiler, where v3.2.0's
+were built with whatever stable happened to be current — the pin now governs released
+artifacts and not only CI.
+
+### Why a new tag rather than a rebuild
+
+The fix could not be applied to v3.2.0 retroactively. GitHub Actions runs the workflow file
+**from the ref being built**, so re-running that tag re-runs the broken workflow, and
+`workflow_dispatch` does not help either — the tag's own file has no such trigger. A new tag
+was the only route to a corrected build.
+
 8/29/2026
 =========
 ## eidolon v3.2.0 — insertions, and the harness that could see them
