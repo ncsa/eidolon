@@ -9,7 +9,7 @@ source:
   url: https://github.com/ncsa/eidolon/archive/refs/tags/v{{ version }}.tar.gz
   # Update on each release:
   #   curl -sL https://github.com/ncsa/eidolon/archive/refs/tags/v{{ version }}.tar.gz | sha256sum
-  sha256: f891c7eb202f1c44ff06b0f124cc47ad244c894614080d250487341a5e0f8392
+  sha256: e40d62dbe1e6796664351f4cb9d0f6091c90bfe010539a14106a09fbc888cfd0
 
 build:
   number: 0
