@@ -1,3 +1,41 @@
+8/30/2026
+=========
+## eidolon v3.2.1 — complete release assets
+
+**The binary is unchanged from v3.2.0.** `eidolon/src`, `eidolon-core/src`, and their
+manifests are byte-for-byte identical between the two tags. This release exists to publish
+a complete set of platform binaries, and nothing in it alters simulator behaviour.
+
+### Why it was needed
+
+v3.2.0 shipped without its macOS asset. The release workflow used
+`dtolnay/rust-toolchain@stable`, which sets `RUSTUP_TOOLCHAIN` and silently overrides
+`rust-toolchain.toml` — so it installed the target into *stable* while pointing cargo at
+the pinned 1.98.0, and the macOS build failed with `can't find crate for core`.
+
+The workflow now reads the channel from `rust-toolchain.toml` and installs the target into
+that toolchain. As a result these binaries are built with the pinned compiler, where
+v3.2.0's were built with whatever stable was current — the pin now applies to released
+artifacts and not only to CI.
+
+That fix could not be applied to v3.2.0 retroactively: GitHub Actions runs the workflow
+file from the ref being built, so re-running the tag would have re-run the broken workflow.
+A new tag was the only route to a corrected build.
+
+### Also included (neither shipped nor packaged)
+
+- **Realism panel** (`scripts/delta/realism/`) — Delta tooling that measures eidolon's
+  reads against real human data. It is a workspace member, so a workspace `cargo build`
+  compiles it, but the conda recipe installs `--bin eidolon --bin rneat` and never packages
+  it. It adds no third-party dependency: the only `Cargo.lock` addition is the crate itself.
+- **README scope section** — germline simulation is species-agnostic; somatic/cancer is
+  specific to human data, because the models are COSMIC/PCAWG-derived.
+
+### Not verified
+
+The realism panel's components are unit- and mutation-tested locally; the orchestration has
+not yet run on Delta. It produces no released artifact and gates nothing.
+
 8/29/2026
 =========
 ## eidolon v3.2.0 — insertions, and the harness that could see them
