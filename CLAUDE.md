@@ -294,8 +294,17 @@ contig lengths).
   change to it before believing it.
 
 ## Git / GitHub mechanics
-- **`gh pr edit` is broken on this repo** (deprecated Projects-classic GraphQL). Patch a
-  PR with `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=…`. `gh issue edit` works.
+- **`gh pr edit` failing is a STALE CLIENT, not this repo.** Fixed by upgrading gh; verified
+  working on 2.98.0 (2026-08-30). It has nothing to do with any project board.
+  gh <= 2.45 requested `projectCards` unconditionally when fetching a PR, GitHub retired
+  Projects classic for everyone, and gh treated that GraphQL deprecation error as fatal —
+  so it aborted before applying the edit. Current gh gates the field behind feature
+  detection (`ProjectsV1()` returns `Unsupported` for any non-Enterprise host).
+  **Ubuntu/Pop 24.04 ships 2.45.0 and will never move**: LTS freezes upstream versions and
+  backports only security fixes, which is what `2.45.0-1ubuntu0.3` means. That model suits
+  libraries, not clients of a remote API that changes underneath them. Install gh from
+  `cli.github.com/packages`, not the distro archive.
+  Fallback if stuck on an old gh: `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=…`.
 - **`gh pr view --json commits` has served a STALE commit list** — it showed only the first
   commit of a branch while `gh api repos/ncsa/eidolon/pulls/<N>/commits` was correct. When
   checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds

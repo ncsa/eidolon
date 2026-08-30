@@ -90,9 +90,12 @@ Explain **why**, not what — the diff shows what. If a change fixes a defect, s
 produced, because that is what makes the test reviewable. Note explicitly what you did *not*
 verify.
 
-Two mechanics worth knowing: `gh pr edit` is broken on this repo (deprecated Projects-classic
-GraphQL), so patch a PR body with
-`gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=...`. `gh issue edit` works fine.
+Two mechanics worth knowing. If `gh pr edit` fails with a Projects-classic GraphQL error,
+your `gh` is too old — it is not a problem with this repo or with any project board. gh <= 2.45
+asked for `projectCards` on every PR edit and died on GitHub's deprecation error; current gh
+does not request it at all. Ubuntu 24.04 ships 2.45.0 and keeps it for the life of the LTS, so
+install gh from `cli.github.com/packages` rather than the distro archive. Stuck on an old gh?
+Patch the body with `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=...`.
 
 ## Reporting problems
 

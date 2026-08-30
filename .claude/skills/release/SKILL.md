@@ -87,8 +87,9 @@ opening the PR and state the file count in the PR body.
 - **`dtolnay/rust-toolchain@stable` sets `RUSTUP_TOOLCHAIN` and silently overrides
   `rust-toolchain.toml`.** It installs targets into stable while cargo follows the pin —
   which is exactly how v3.2.0 lost its macOS binary (`can't find crate for core`).
-- **`gh pr edit` is broken on this repo** (deprecated Projects-classic GraphQL). Patch a body
-  with `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=…`. `gh issue edit` works.
+- **`gh pr edit` failing on Projects-classic GraphQL means gh is too old**, not that the repo
+  is broken. Upgrade from `cli.github.com/packages` — the distro archive pins 2.45.0 for the
+  life of the LTS. Fallback: `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=…`.
 - **`gh pr view --json commits` has served stale commit lists.** Use
   `gh api repos/ncsa/eidolon/pulls/<N>/commits` to check whether a push landed.
 - **Adding a workspace member changes `THIRDPARTY.yml`'s `root_name`** and turns
