@@ -15,6 +15,7 @@ pub mod gen_gc_bias_model;
 pub mod gen_mut_model;
 pub mod gen_reads;
 pub mod gen_seq_error_model;
+pub mod realism;
 pub mod validate;
 
 use eidolon_core::{self, file_tools::file_io::create_output_file};
