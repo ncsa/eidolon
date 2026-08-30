@@ -1,4 +1,4 @@
-root_name: eidolon, eidolon-core
+root_name: eidolon, eidolon-core, realism-panel
 third_party_libraries:
 - package_name: adler2
   package_version: 2.0.1

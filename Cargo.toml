@@ -3,6 +3,9 @@
 members = [
     "eidolon",
     "eidolon-core",
+    # Delta validation helper, not shipped. See its Cargo.toml for why it is a workspace
+    # member rather than a standalone crate or a shell script.
+    "scripts/delta/realism",
 ]
 
 resolver = "2"

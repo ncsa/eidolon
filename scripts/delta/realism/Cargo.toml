@@ -1,0 +1,26 @@
+# Delta validation helper, NOT part of the shipped tool.
+#
+# The README defines "CLI subcommand names, flags, and configuration-YAML keys" as public API
+# requiring a MAJOR bump, and says eidolon-core "exists to serve the binary". Realism
+# measurement is neither: it is campaign tooling whose metric set is still being decided, and
+# committing it to either surface would be a promise we are not ready to make.
+#
+# It lives here rather than as a shell script because the statistics — skew, variance-to-mean,
+# autocorrelation, clip-boundary clustering — need to be correct and unit-tested, which awk
+# would make painful and unverifiable.
+#
+# A workspace member on purpose: `cargo test`, `cargo clippy` and `cargo fmt` then cover it
+# with no enumerated list to fall out of date, which is the same drift that left
+# truth_sv_BNDinv.vcf.gz unscored and the scorer-calibration suite unwired. The release build
+# copies only `target/<triple>/release/eidolon`, so nothing here ships.
+[package]
+name = "realism-panel"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+noodles = { workspace = true }
+
+[lints]
+workspace = true

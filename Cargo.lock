@@ -1087,6 +1087,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "realism-panel"
+version = "3.2.0"
+dependencies = [
+ "noodles",
+]
+
+[[package]]
 name = "regex"
 version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

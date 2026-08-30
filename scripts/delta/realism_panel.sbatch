@@ -1,0 +1,265 @@
+#!/bin/bash
+# SLURM job: measure how far eidolon's reads sit from REAL human sequencing data.
+#
+# WHY THIS EXISTS. Spot-checked on matched chr22 sequence, real NA12878 against eidolon
+# 3.2.0:
+#
+#     candidate breakpoints / Mb     654.5   vs      0.0
+#     improper pairs                 3.15%   vs     0.00%
+#     soft clip >= 20 bp             0.67%   vs     0.00%
+#     depth excess dispersion       0.1422   vs   0.0012
+#
+# Zero, not "fewer". Across a full simulated megabase with no planted SVs there is not one
+# position where three reads share a clip boundary. A caller tuned on eidolon calibrates
+# every clustering threshold and false-positive filter against an empty background, then
+# meets ~654 candidates per megabase on real data. That is how a simulator produces a tool
+# that works on synthetic data and fails on real data — and it means eidolon-measured
+# PRECISION has never predicted real precision. Recall is a separate question: planted
+# events are real signal.
+#
+# SCOPE. Somatic simulation is human — the models are COSMIC/PCAWG-derived and the tissue
+# types are human — so realism is measured against real human data and nothing else.
+# Germline is species-agnostic, and its correctness is checked a different way: across
+# deliberately varied contig shapes, which is where #625 and #607's H1N1 artifacts were
+# caught. Those are correctness questions, not realism ones, and this job does not touch
+# them.
+#
+# THIS JOB MEASURES. It does not gate, and it fixes nothing. No metric here has a pass
+# threshold, deliberately: locus-to-locus spread in real data is large — VMR across five
+# chr22 loci reads 5.51, 6.87, 7.85, 8.88 and 36.10 — so a threshold set from one regime
+# would be wrong by 4-6x in either direction. That is the mistake #630 already made once.
+# The deliverable is a recorded baseline with its spread; thresholds come after, if at all.
+#
+# The one hard failure is INABILITY TO MEASURE. A region that names an absent contig, or
+# matches no reads, exits non-zero rather than reporting 0.0 artifacts — "no artifacts
+# here" and "nothing was measured here" are indistinguishable in a table, and telling them
+# apart is the entire point (rule 4).
+#
+# Prereqs:
+#   * REAL_BAM — a real human BAM aligned to $REFERENCE. `bash scripts/delta/stage_hg002.sh`
+#     produces one; NA12878 works equally well if you have it staged.
+#   * $REFERENCE — the SAME reference the real BAM was aligned to. Comparing across
+#     references compares the references.
+#   * bwa-mem2 + samtools (bioinf conda env), and a built eidolon + realism-panel.
+#
+# Usage:
+#   # smoke: prove the plumbing cheaply. Capping the depth makes most metrics
+#   # incomparable — the job says so, loudly, in its own output.
+#   REAL_BAM=... MAX_SIM_DEPTH=30 N_REGIONS=4 sbatch scripts/delta/realism_panel.sbatch
+#
+#   # real measurement: depths matched, nothing capped.
+#   REAL_BAM=$SCRATCH/neat_data/hg002/hg002.bam sbatch scripts/delta/realism_panel.sbatch
+
+#SBATCH --job-name=eidolon-realism
+#SBATCH --partition=cpu
+#SBATCH --account=bhrd-delta-cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=240G
+#SBATCH --time=08:00:00
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+
+set -euo pipefail
+
+# Merge stderr into stdout. `exec` with redirections and no command applies them to the
+# shell permanently, which is how index_reference_locked silently discarded every
+# diagnostic in job 21532276 (#583). Here it is deliberate: one stream, in order, so a
+# diagnostic sits next to the step that produced it.
+exec 2>&1
+echo "[selftest] stderr reaches this log (if this line is missing, diagnostics are being lost)"
+
+REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
+source "$REPO_ROOT/scripts/delta/lib_report.sh"
+source "$REPO_ROOT/scripts/delta/lib_realism_contig.sh"
+
+REFERENCE="${REFERENCE:-$SCRATCH/neat_data/chr22.fa}"
+REAL_BAM="${REAL_BAM:-}"
+OUTDIR="${OUTDIR:-$SCRATCH/realism_$SLURM_JOB_ID}"
+THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-64}}"
+READ_LEN="${READ_LEN:-151}"
+FRAG_MEAN="${FRAG_MEAN:-400}"
+FRAG_SD="${FRAG_SD:-90}"
+N_REGIONS="${N_REGIONS:-10}"
+REGION_BP="${REGION_BP:-400000}"
+CONTIG="${CONTIG:-}"                 # default: EVERY contig with reads that is also in $REFERENCE
+SEED="${SEED:-realism panel}"
+# Cap the simulated depth. 0 = match the real BAM exactly, which is what a real measurement
+# wants. A smoke run does not: real WGS is often 200-300x, and simulating that across a whole
+# chromosome is hours. See the caveat printed below when the cap actually bites.
+MAX_SIM_DEPTH="${MAX_SIM_DEPTH:-0}"
+
+# Thresholds. Passed to BOTH sides from one place: a gap measured with different settings
+# on each side would be measuring the settings.
+MIN_CLIP="${MIN_CLIP:-20}"
+MIN_SUPPORT="${MIN_SUPPORT:-3}"
+MAX_TLEN="${MAX_TLEN:-2000}"
+DEPTH_LAG="${DEPTH_LAG:-500}"
+
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRATCH/cargo-target/eidolon}"
+EIDOLON_BIN="$CARGO_TARGET_DIR/release/eidolon"
+PANEL_BIN="$CARGO_TARGET_DIR/release/realism-panel"
+
+[[ -n "$REAL_BAM" ]] || { echo "ERROR: REAL_BAM is required — this job compares against real data, and without it there is nothing to compare to." >&2; exit 1; }
+[[ -f "$REAL_BAM" ]]  || { echo "ERROR: REAL_BAM not found: $REAL_BAM" >&2; exit 1; }
+[[ -f "$REFERENCE" ]] || { echo "ERROR: REFERENCE not found: $REFERENCE" >&2; exit 1; }
+[[ -x "$EIDOLON_BIN" ]] || { echo "ERROR: eidolon not built at $EIDOLON_BIN" >&2; exit 1; }
+[[ -x "$PANEL_BIN" ]]   || { echo "ERROR: realism-panel not built at $PANEL_BIN — cargo build --release builds the whole workspace, including it." >&2; exit 1; }
+
+mkdir -p "$OUTDIR"
+echo "=== eidolon realism panel: $SLURM_JOB_ID ==="
+echo "Real BAM:   $REAL_BAM"
+echo "Reference:  $REFERENCE"
+echo "Outdir:     $OUTDIR"
+echo "Thresholds: min_clip=$MIN_CLIP min_support=$MIN_SUPPORT max_tlen=$MAX_TLEN depth_lag=$DEPTH_LAG"
+
+# ── Depth of the real BAM, so the simulation can match it ────────────────────
+#
+# Matching depth is not cosmetic. VMR scales with the mean for multiplicative coverage
+# noise, so comparing a 30x simulation against a 250x real BAM inflates the apparent gap by
+# ~8x. `depth_excess` in the panel output is depth-independent and is the number to quote
+# across datasets, but matching anyway keeps every OTHER metric comparable too — clip rates
+# and candidate-breakpoint counts both rise with depth.
+# The contig must carry reads in the real BAM AND exist in the reference at the SAME
+# length. select_contig lives in lib_realism_contig.sh so its tests exercise this exact
+# code; the reasoning for each half of the check is documented there.
+[[ -f "${REFERENCE}.fai" ]] || samtools faidx "$REFERENCE"
+
+samtools idxstats "$REAL_BAM" > "$OUTDIR/real.idxstats" 2>/dev/null \
+    || { echo "ERROR: samtools idxstats failed on $REAL_BAM — is it indexed?" >&2; exit 1; }
+
+# Capture to a file, not a pipe: `while read` on the right of a pipeline runs in a
+# subshell and loses everything it accumulated, and $(...) under `set -e` swallows the
+# non-zero status this function uses to refuse an unmeasurable pairing.
+select_contigs "$REAL_BAM" "${REFERENCE}.fai" "$OUTDIR/real.idxstats" "${CONTIG:-}" \
+    > "$OUTDIR/contigs.tsv" || exit 1
+N_CONTIGS="$(wc -l < "$OUTDIR/contigs.tsv")"
+echo "Contigs:    $N_CONTIGS usable (name, length, agreeing between BAM and reference)"
+while IFS=$'\t' read -r c l; do printf '              %-10s %s bp\n' "$c" "$l"; done < "$OUTDIR/contigs.tsv"
+FIRST_CONTIG="$(head -1 "$OUTDIR/contigs.tsv" | cut -f1)"
+
+REAL_DEPTH="$(samtools depth -a -r "$FIRST_CONTIG:1000000-1200000" "$REAL_BAM" \
+              | awk '{s+=$3; n++} END{ if(n) printf "%.0f", s/n; else print 0 }')"
+[[ "${REAL_DEPTH:-0}" -gt 0 ]] || { echo "ERROR: measured 0x depth in the real BAM — nothing to match" >&2; exit 1; }
+SIM_DEPTH="$REAL_DEPTH"
+DEPTH_CAPPED=0
+if [[ "$MAX_SIM_DEPTH" -gt 0 && "$REAL_DEPTH" -gt "$MAX_SIM_DEPTH" ]]; then
+    SIM_DEPTH="$MAX_SIM_DEPTH"
+    DEPTH_CAPPED=1
+fi
+echo "Real depth: ${REAL_DEPTH}x"
+if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
+    echo "Sim depth:  ${SIM_DEPTH}x  ** CAPPED by MAX_SIM_DEPTH **"
+    echo ""
+    echo "  DEPTHS DO NOT MATCH, so most metrics below are NOT comparable between the two"
+    echo "  sides. Coverage noise is largely multiplicative, so VMR scales with the mean;"
+    echo "  clip rates and candidate-breakpoint counts rise with depth as well. At ${REAL_DEPTH}x"
+    echo "  against ${SIM_DEPTH}x those columns compare depth, not realism."
+    echo ""
+    echo "  STILL COMPARABLE:  depth_excess (Poisson floor removed, depth-normalised),"
+    echo "                     ins_skew, and the shape of ins_sd/ins_p99 relative to ins_mean."
+    echo "  NOT COMPARABLE:    depth_vmr, cand_per_mb, clip_pct, improper_pct, mapq0_pct."
+    echo ""
+    echo "  Use a cap for a smoke run that proves the plumbing. Unset it for a number anyone"
+    echo "  is going to quote."
+    echo ""
+else
+    echo "Sim depth:  ${SIM_DEPTH}x (matched)"
+fi
+
+# ── Regions: evenly spaced, across every usable contig ──────────────────────
+#
+# Many loci, never one. Real dispersion varies 4-6x between loci on the same chromosome, so
+# a single region would set any future envelope wrong in whichever direction it landed.
+#
+# Spread across ALL usable contigs rather than piling onto the first. The simulation covers
+# the whole reference regardless of what gets measured, so on a three-chromosome reference
+# measuring one contig pays for three and reads one — and the extra loci come from
+# different GC and repeat contexts, which is the spread the baseline is supposed to record.
+REGIONS="$OUTDIR/regions.bed"
+: > "$REGIONS"
+MARGIN=2000000
+
+# place_regions lives in lib_realism_contig.sh so the distribution arithmetic is tested
+# rather than trusted. It reports contigs too short to host a region instead of dropping
+# them in silence, and refuses to place zero.
+PLACE="$(place_regions "$OUTDIR/contigs.tsv" "$N_REGIONS" "$REGION_BP" "$MARGIN" "$REGIONS")" || exit 1
+N_PLACED="${PLACE%%$'\t'*}"
+N_ELIGIBLE="${PLACE##*$'\t'}"
+echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
+# Rule 4: report the denominator. Asking for 10 and placing 6 is a different measurement,
+# and the median of 6 loci prints just as confidently as the median of 10.
+[[ "$N_PLACED" -eq "$N_REGIONS" ]] \
+    || echo "  NOTE: asked for $N_REGIONS regions, placed $N_PLACED ($SKIPPED contig(s) too short)"
+
+# ── Simulate at matched depth, no variants ───────────────────────────────────
+#
+# sv_rate_scale 0 and no input VCF: every artifact the panel finds on this side is one the
+# simulator produced on its own, which is exactly the background a caller's false-positive
+# filters get calibrated against.
+SIMDIR="$OUTDIR/sim"
+mkdir -p "$SIMDIR"
+cat > "$SIMDIR/config.yml" <<YML
+reference: $REFERENCE
+output_dir: $SIMDIR
+output_filename: sim
+rng_seed: "$SEED"
+num_threads: $THREADS
+coverage: $SIM_DEPTH
+read_len: $READ_LEN
+paired_ended: true
+fragment_mean: $FRAG_MEAN
+fragment_st_dev: $FRAG_SD
+produce_fastq: true
+sv_rate_scale: 0.0
+YML
+echo "[1/3] simulating ${SIM_DEPTH}x with no variants..."
+"$EIDOLON_BIN" gen-reads -c "$SIMDIR/config.yml"
+
+echo "[2/3] aligning the simulated reads..."
+index_reference_locked "$REFERENCE"
+bwa-mem2 mem -t "$THREADS" "$REFERENCE" "$SIMDIR/sim_r1.fastq.gz" "$SIMDIR/sim_r2.fastq.gz" \
+  2> "$SIMDIR/bwa.log" | samtools sort -@ 8 -o "$SIMDIR/sim.bam" -
+samtools index "$SIMDIR/sim.bam"
+
+# ── Measure both sides, identical settings ───────────────────────────────────
+echo "[3/3] measuring..."
+"$PANEL_BIN" --bam "$REAL_BAM" --regions "$REGIONS" --label REAL \
+    --min-clip "$MIN_CLIP" --min-support "$MIN_SUPPORT" \
+    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" > "$OUTDIR/real.tsv"
+"$PANEL_BIN" --bam "$SIMDIR/sim.bam" --regions "$REGIONS" --label SIMULATED \
+    --min-clip "$MIN_CLIP" --min-support "$MIN_SUPPORT" \
+    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" > "$OUTDIR/sim.tsv"
+
+cat "$OUTDIR/real.tsv" > "$OUTDIR/panel.tsv"
+tail -n +2 "$OUTDIR/sim.tsv" >> "$OUTDIR/panel.tsv"
+
+# ── Report ───────────────────────────────────────────────────────────────────
+#
+# Per-metric: median across loci, and the min-max range. The RANGE is not decoration — it
+# is what says whether a gap is a property of the data or of the locus someone happened to
+# pick, and it is what any future threshold has to be derived from.
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
+    echo "REALISM PANEL — $N_PLACED loci across $N_ELIGIBLE contig(s) — REAL ${REAL_DEPTH}x vs SIM ${SIM_DEPTH}x (CAPPED)"
+else
+    echo "REALISM PANEL — $N_PLACED loci across $N_ELIGIBLE contig(s), ${REAL_DEPTH}x both sides"
+fi
+echo ""
+awk -F'\t' -f "$REPO_ROOT/scripts/delta/realism_summarise.awk" "$OUTDIR/panel.tsv"
+echo ""
+echo "Per-locus rows: $OUTDIR/panel.tsv"
+echo ""
+if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
+    echo "DEPTHS WERE NOT MATCHED (${REAL_DEPTH}x vs ${SIM_DEPTH}x). Only depth_excess and the"
+    echo "insert-shape columns are comparable; the rest compare depth. See the note above."
+    echo ""
+fi
+echo "This job MEASURES. Nothing above is a pass or a fail. A ratio is a gap to decide"
+echo "about, and the [min-max] beside each median is how much of it is the locus rather"
+echo "than the data — real dispersion varies several-fold between loci on one chromosome."
+echo "════════════════════════════════════════════════════════════════"
+
+archive_run "realism" "$OUTDIR" "panel.tsv" || true
