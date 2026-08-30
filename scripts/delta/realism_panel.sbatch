@@ -137,17 +137,64 @@ select_contigs "$REAL_BAM" "${REFERENCE}.fai" "$OUTDIR/real.idxstats" "${CONTIG:
 N_CONTIGS="$(wc -l < "$OUTDIR/contigs.tsv")"
 echo "Contigs:    $N_CONTIGS usable (name, length, agreeing between BAM and reference)"
 while IFS=$'\t' read -r c l; do printf '              %-10s %s bp\n' "$c" "$l"; done < "$OUTDIR/contigs.tsv"
-FIRST_CONTIG="$(head -1 "$OUTDIR/contigs.tsv" | cut -f1)"
+# ── Regions: evenly spaced, across every usable contig ──────────────────────
+#
+# Many loci, never one. Real dispersion varies 4-6x between loci on the same chromosome, so
+# a single region would set any future envelope wrong in whichever direction it landed.
+#
+# Spread across ALL usable contigs rather than piling onto the first. The simulation covers
+# the whole reference regardless of what gets measured, so on a three-chromosome reference
+# measuring one contig pays for three and reads one — and the extra loci come from
+# different GC and repeat contexts, which is the spread the baseline is supposed to record.
+REGIONS="$OUTDIR/regions.bed"
+: > "$REGIONS"
+MARGIN=2000000
 
-REAL_DEPTH="$(samtools depth -a -r "$FIRST_CONTIG:1000000-1200000" "$REAL_BAM" \
+# place_regions lives in lib_realism_contig.sh so the distribution arithmetic is tested
+# rather than trusted. It reports contigs too short to host a region instead of dropping
+# them in silence, and refuses to place zero.
+# Where the reference has no sequence. Without this every contig's first window lands at
+# exactly $MARGIN, which on any acrocentric chromosome (13, 14, 15, 21, 22) is inside the
+# p-arm N block — job 21622644 died on chr21:2000000-2400000 for precisely this reason.
+NMASK="$OUTDIR/nmask.bed"
+n_mask "$REFERENCE" "$OUTDIR/contigs.tsv" > "$NMASK" || exit 1
+N_MASKED="$(wc -l < "$NMASK")"
+if [[ "$N_MASKED" -gt 0 ]]; then
+    echo "N blocks:   $N_MASKED region(s) of the reference are unsequenced and will be avoided"
+    awk -F'\t' '{ printf "              %-10s %s-%s (%.1f Mb)\n", $1, $2, $3, ($3-$2)/1e6 }' "$NMASK"
+fi
+
+PLACE="$(place_regions "$OUTDIR/contigs.tsv" "$N_REGIONS" "$REGION_BP" "$MARGIN" "$REGIONS" "$NMASK")" || exit 1
+N_PLACED="${PLACE%%$'\t'*}"
+N_ELIGIBLE="${PLACE##*$'\t'}"
+echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
+# Rule 4: report the denominator. Asking for 10 and placing 6 is a different measurement,
+# and the median of 6 loci prints just as confidently as the median of 10. place_regions
+# has already named each contig that fell short on stderr; this is the total.
+[[ "$N_PLACED" -eq "$N_REGIONS" ]] \
+    || echo "  NOTE: asked for $N_REGIONS regions, placed $N_PLACED — see the notes above"
+
+# ── Depth of the real BAM, measured where we know there is sequence ──────────
+#
+# This probe used to be a fixed $FIRST_CONTIG:1000000-1200000, which is the same bug as the
+# one above: on an acrocentric contig that window is entirely N, the probe reads 0x, and the
+# job aborts with "nothing to match" on a BAM that is perfectly fine. Probing inside the
+# first PLACED region reuses the N check instead of repeating the assumption.
+PROBE="$(head -1 "$REGIONS" | awk -F'\t' '{ printf "%s:%d-%d", $1, $2+1, ($2+200000 < $3 ? $2+200000 : $3) }')"
+REAL_DEPTH="$(samtools depth -a -r "$PROBE" "$REAL_BAM" \
               | awk '{s+=$3; n++} END{ if(n) printf "%.0f", s/n; else print 0 }')"
-[[ "${REAL_DEPTH:-0}" -gt 0 ]] || { echo "ERROR: measured 0x depth in the real BAM — nothing to match" >&2; exit 1; }
+[[ "${REAL_DEPTH:-0}" -gt 0 ]] || {
+    echo "ERROR: measured 0x depth in the real BAM over $PROBE — nothing to match." >&2
+    echo "       That window is real sequence and inside a region carrying reads, so this" >&2
+    echo "       is about the BAM rather than about where it was probed." >&2
+    exit 1; }
 SIM_DEPTH="$REAL_DEPTH"
 DEPTH_CAPPED=0
 if [[ "$MAX_SIM_DEPTH" -gt 0 && "$REAL_DEPTH" -gt "$MAX_SIM_DEPTH" ]]; then
     SIM_DEPTH="$MAX_SIM_DEPTH"
     DEPTH_CAPPED=1
 fi
+echo "Probe:      $PROBE"
 echo "Real depth: ${REAL_DEPTH}x"
 if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
     echo "Sim depth:  ${SIM_DEPTH}x  ** CAPPED by MAX_SIM_DEPTH **"
@@ -168,30 +215,6 @@ else
     echo "Sim depth:  ${SIM_DEPTH}x (matched)"
 fi
 
-# ── Regions: evenly spaced, across every usable contig ──────────────────────
-#
-# Many loci, never one. Real dispersion varies 4-6x between loci on the same chromosome, so
-# a single region would set any future envelope wrong in whichever direction it landed.
-#
-# Spread across ALL usable contigs rather than piling onto the first. The simulation covers
-# the whole reference regardless of what gets measured, so on a three-chromosome reference
-# measuring one contig pays for three and reads one — and the extra loci come from
-# different GC and repeat contexts, which is the spread the baseline is supposed to record.
-REGIONS="$OUTDIR/regions.bed"
-: > "$REGIONS"
-MARGIN=2000000
-
-# place_regions lives in lib_realism_contig.sh so the distribution arithmetic is tested
-# rather than trusted. It reports contigs too short to host a region instead of dropping
-# them in silence, and refuses to place zero.
-PLACE="$(place_regions "$OUTDIR/contigs.tsv" "$N_REGIONS" "$REGION_BP" "$MARGIN" "$REGIONS")" || exit 1
-N_PLACED="${PLACE%%$'\t'*}"
-N_ELIGIBLE="${PLACE##*$'\t'}"
-echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
-# Rule 4: report the denominator. Asking for 10 and placing 6 is a different measurement,
-# and the median of 6 loci prints just as confidently as the median of 10.
-[[ "$N_PLACED" -eq "$N_REGIONS" ]] \
-    || echo "  NOTE: asked for $N_REGIONS regions, placed $N_PLACED ($SKIPPED contig(s) too short)"
 
 # ── Simulate at matched depth, no variants ───────────────────────────────────
 #

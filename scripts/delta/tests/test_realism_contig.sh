@@ -38,6 +38,10 @@ a contig absent from the reference is accepted@    if [[ -z "$ref_len" ]]; then@
 the reference is ignored when auto-picking@($1 in seq) { print $1 }@{ print $1 }
 a contig with no reads is accepted@$1==c && $3>0 {found=1}@$1==c {found=1}
 an empty pick is treated as success@        if [[ -z "$contigs" ]]; then@        if false; then
+the N mask is ignored when placing@if (s < me[i] && e > ms[i]) { bad = 1; break }@if (0) { bad = 1; break }
+an all-N line is not recognised as N@alln = ($0 ~ /^[Nn]+$/)@alln = ($0 !~ /^[Nn]+$/)
+a shortfall is placed anyway rather than reported@                n = (NR < k) ? NR : k@                n = k
+the shortfall is not named@        [[ "$nkept" -lt "$want" ]] && \@        [[ 1 -eq 0 ]] && \
 only the first shared contig is used@($1 in seq) { print $1 }@($1 in seq) { print $1; exit }
 a short contig is silently dropped@            echo "  NOTE: $c ($l bp) is too short@            true "  NOTE: $c ($l bp) is too short
 zero eligible contigs is not fatal@    if [[ "$n_elig" -eq 0 ]]; then@    if false; then
@@ -209,6 +213,81 @@ eq "5 regions on 1 contig places 5" "$res" "$(printf '5\t1')"
 eq "all 5 are distinct start positions" "$(cut -f2 "$WORK/r.bed" | sort -u | wc -l)" "5"
 [[ ! -s "$WORK/err" ]] && ok "a single usable contig emits no diagnostic" \
                        || bad "a single usable contig emits no diagnostic" "got: $(cat "$WORK/err")"
+
+echo "=== N blocks: the reference is read, not assumed ==="
+# A REAL fasta through samtools, not a hand-written mask. The defect being guarded against
+# (job 21622644) was placement disagreeing with what the reference actually contains, and a
+# hand-made mask can agree with a wrong understanding just as easily as the code can.
+#
+# Shaped like an acrocentric chromosome: a leading N block, then sequence. 30000 is exactly
+# 500 lines of 60, so the boundary is checkable to the base despite the line-width scan.
+mkfa() {   # <path> <contig> <n_len> <total_len>
+    local p="$1" c="$2" n="$3" t="$4"
+    { echo ">$c"
+      awk -v n="$n" -v t="$t" 'BEGIN{
+          s=""; for(i=0;i<n;i++) s=s "N"
+          b="ACGT"; for(i=n;i<t;i++) s=s substr(b, (i%4)+1, 1)
+          for(i=1;i<=length(s);i+=60) print substr(s,i,60)
+      }'
+    } > "$p"
+    samtools faidx "$p"
+}
+mkfa "$WORK/acro.fa" acro 30000 100000
+printf 'acro\t100000\n' > "$WORK/acro.tsv"
+
+got="$(n_mask "$WORK/acro.fa" "$WORK/acro.tsv" 500)"
+eq "n_mask finds the leading N block at its exact bounds" "$got" "$(printf 'acro\t0\t30000')"
+
+# Known answer, computed without the code under test: 30000 N's are in the file.
+eq "the fixture really does hold 30000 N (known answer, not the code's opinion)" \
+   "$(grep -v '^>' "$WORK/acro.fa" | tr -d '\n' | tr -cd 'N' | wc -c)" "30000"
+
+eq "a run shorter than min_run is not masked" \
+   "$(n_mask "$WORK/acro.fa" "$WORK/acro.tsv" 40000 | wc -l)" "0"
+
+echo "=== placement avoids the hole ==="
+# Without the mask this is the exact failure from job 21622644: the first windows land
+# inside the N block and the panel refuses the whole run.
+n_mask "$WORK/acro.fa" "$WORK/acro.tsv" 500 > "$WORK/acro.mask"
+res="$(place_regions "$WORK/acro.tsv" 4 1000 5000 "$WORK/nomask.bed" 2>/dev/null)"
+in_n="$(awk -F'\t' '$2 < 30000 {n++} END{print n+0}' "$WORK/nomask.bed")"
+[[ "$in_n" -gt 0 ]] && ok "WITHOUT a mask, windows do land in the N block (the bug reproduces)" \
+                    || bad "WITHOUT a mask, windows do land in the N block" "none did — fixture is wrong"
+
+res="$(place_regions "$WORK/acro.tsv" 4 1000 5000 "$WORK/masked.bed" "$WORK/acro.mask" 2>"$WORK/err")"
+eq "with a mask, all 4 regions are still placed" "$res" "$(printf '4\t1')"
+eq "not one region overlaps the N block" \
+   "$(awk -F'\t' '$2 < 30000 {n++} END{print n+0}' "$WORK/masked.bed")" "0"
+eq "regions still respect the margin and the contig end" \
+   "$(awk -F'\t' '$2 < 5000 || $3 > 100000 - 5000 {n++} END{print n+0}' "$WORK/masked.bed")" "0"
+eq "regions are distinct" "$(cut -f2 "$WORK/masked.bed" | sort -u | wc -l)" "4"
+
+echo "=== the must-not-fire case: a reference with no N must not be perturbed ==="
+# A mask that rejects everything would pass every assertion above.
+mkfa "$WORK/clean.fa" clean 0 100000
+printf 'clean\t100000\n' > "$WORK/clean.tsv"
+eq "n_mask emits nothing for a reference with no N" \
+   "$(n_mask "$WORK/clean.fa" "$WORK/clean.tsv" 500 | wc -l)" "0"
+: > "$WORK/empty.mask"
+res="$(place_regions "$WORK/clean.tsv" 4 1000 5000 "$WORK/clean.bed" "$WORK/empty.mask" 2>"$WORK/err")"
+eq "an empty mask still places the full count" "$res" "$(printf '4\t1')"
+eq "an empty mask discards nothing" "$(grep -c 'discarded' "$WORK/err" || true)" "0"
+
+echo "=== under-delivery is reported, not hidden ==="
+# Rule 4: the median of 2 loci prints just as confidently as the median of 4.
+mkfa "$WORK/mostly.fa" mostly 85000 100000
+printf 'mostly\t100000\n' > "$WORK/mostly.tsv"
+n_mask "$WORK/mostly.fa" "$WORK/mostly.tsv" 500 > "$WORK/mostly.mask"
+res="$(place_regions "$WORK/mostly.tsv" 4 1000 5000 "$WORK/mostly.bed" "$WORK/mostly.mask" 2>"$WORK/err")"
+eq "it places what it can rather than what it was asked for" "${res%%$'\t'*}" \
+   "$(wc -l < "$WORK/mostly.bed" | tr -d ' ')"
+[[ "${res%%$'\t'*}" -lt 4 ]] && ok "a mostly-N contig under-delivers instead of faking the count" \
+                             || bad "a mostly-N contig under-delivers" "got $res"
+grep -q "clear of N" "$WORK/err" \
+  && ok "the shortfall is named on stderr" \
+  || bad "the shortfall is named on stderr" "got: $(cat "$WORK/err")"
+eq "nothing it did place is in the N block" \
+   "$(awk -F'\t' '$2 < 85000 {n++} END{print n+0}' "$WORK/mostly.bed")" "0"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
