@@ -83,7 +83,7 @@ FRAG_MEAN="${FRAG_MEAN:-400}"
 FRAG_SD="${FRAG_SD:-90}"
 N_REGIONS="${N_REGIONS:-10}"
 REGION_BP="${REGION_BP:-400000}"
-CONTIG="${CONTIG:-}"                 # default: first contig with reads that is also in $REFERENCE
+CONTIG="${CONTIG:-}"                 # default: EVERY contig with reads that is also in $REFERENCE
 SEED="${SEED:-realism panel}"
 # Cap the simulated depth. 0 = match the real BAM exactly, which is what a real measurement
 # wants. A smoke run does not: real WGS is often 200-300x, and simulating that across a whole
@@ -129,14 +129,17 @@ echo "Thresholds: min_clip=$MIN_CLIP min_support=$MIN_SUPPORT max_tlen=$MAX_TLEN
 samtools idxstats "$REAL_BAM" > "$OUTDIR/real.idxstats" 2>/dev/null \
     || { echo "ERROR: samtools idxstats failed on $REAL_BAM — is it indexed?" >&2; exit 1; }
 
-# Capture before splitting: `read` inside a pipeline would run in a subshell and lose both
-# variables, and $(...) with `set -e` would swallow the non-zero status.
-CONTIG_PICK="$(select_contig "$REAL_BAM" "${REFERENCE}.fai" "$OUTDIR/real.idxstats" "${CONTIG:-}")" || exit 1
-CONTIG="${CONTIG_PICK%%$'\t'*}"
-CONTIG_LEN="${CONTIG_PICK##*$'\t'}"
-echo "Contig:     $CONTIG ($CONTIG_LEN bp, length agrees between BAM and reference)"
+# Capture to a file, not a pipe: `while read` on the right of a pipeline runs in a
+# subshell and loses everything it accumulated, and $(...) under `set -e` swallows the
+# non-zero status this function uses to refuse an unmeasurable pairing.
+select_contigs "$REAL_BAM" "${REFERENCE}.fai" "$OUTDIR/real.idxstats" "${CONTIG:-}" \
+    > "$OUTDIR/contigs.tsv" || exit 1
+N_CONTIGS="$(wc -l < "$OUTDIR/contigs.tsv")"
+echo "Contigs:    $N_CONTIGS usable (name, length, agreeing between BAM and reference)"
+while IFS=$'\t' read -r c l; do printf '              %-10s %s bp\n' "$c" "$l"; done < "$OUTDIR/contigs.tsv"
+FIRST_CONTIG="$(head -1 "$OUTDIR/contigs.tsv" | cut -f1)"
 
-REAL_DEPTH="$(samtools depth -a -r "$CONTIG:1000000-1200000" "$REAL_BAM" \
+REAL_DEPTH="$(samtools depth -a -r "$FIRST_CONTIG:1000000-1200000" "$REAL_BAM" \
               | awk '{s+=$3; n++} END{ if(n) printf "%.0f", s/n; else print 0 }')"
 [[ "${REAL_DEPTH:-0}" -gt 0 ]] || { echo "ERROR: measured 0x depth in the real BAM — nothing to match" >&2; exit 1; }
 SIM_DEPTH="$REAL_DEPTH"
@@ -165,20 +168,30 @@ else
     echo "Sim depth:  ${SIM_DEPTH}x (matched)"
 fi
 
-# ── Regions: evenly spaced, away from the contig ends ────────────────────────
+# ── Regions: evenly spaced, across every usable contig ──────────────────────
 #
-# Many loci, never one. Real dispersion varies 4-6x between loci on the same chromosome,
-# so a single region would set any future envelope wrong in whichever direction it landed.
+# Many loci, never one. Real dispersion varies 4-6x between loci on the same chromosome, so
+# a single region would set any future envelope wrong in whichever direction it landed.
+#
+# Spread across ALL usable contigs rather than piling onto the first. The simulation covers
+# the whole reference regardless of what gets measured, so on a three-chromosome reference
+# measuring one contig pays for three and reads one — and the extra loci come from
+# different GC and repeat contexts, which is the spread the baseline is supposed to record.
 REGIONS="$OUTDIR/regions.bed"
 : > "$REGIONS"
 MARGIN=2000000
-USABLE=$(( CONTIG_LEN - 2 * MARGIN - REGION_BP ))
-[[ "$USABLE" -gt 0 ]] || { echo "ERROR: $CONTIG is too short for $N_REGIONS x $REGION_BP bp regions" >&2; exit 1; }
-for ((i=0; i<N_REGIONS; i++)); do
-    start=$(( MARGIN + (USABLE / N_REGIONS) * i ))
-    printf '%s\t%d\t%d\n' "$CONTIG" "$start" "$(( start + REGION_BP ))" >> "$REGIONS"
-done
-echo "Regions:    $N_REGIONS x $REGION_BP bp on $CONTIG"
+
+# place_regions lives in lib_realism_contig.sh so the distribution arithmetic is tested
+# rather than trusted. It reports contigs too short to host a region instead of dropping
+# them in silence, and refuses to place zero.
+PLACE="$(place_regions "$OUTDIR/contigs.tsv" "$N_REGIONS" "$REGION_BP" "$MARGIN" "$REGIONS")" || exit 1
+N_PLACED="${PLACE%%$'\t'*}"
+N_ELIGIBLE="${PLACE##*$'\t'}"
+echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
+# Rule 4: report the denominator. Asking for 10 and placing 6 is a different measurement,
+# and the median of 6 loci prints just as confidently as the median of 10.
+[[ "$N_PLACED" -eq "$N_REGIONS" ]] \
+    || echo "  NOTE: asked for $N_REGIONS regions, placed $N_PLACED ($SKIPPED contig(s) too short)"
 
 # ── Simulate at matched depth, no variants ───────────────────────────────────
 #
@@ -230,9 +243,9 @@ tail -n +2 "$OUTDIR/sim.tsv" >> "$OUTDIR/panel.tsv"
 echo ""
 echo "════════════════════════════════════════════════════════════════"
 if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
-    echo "REALISM PANEL — $N_REGIONS loci on $CONTIG — REAL ${REAL_DEPTH}x vs SIM ${SIM_DEPTH}x (CAPPED)"
+    echo "REALISM PANEL — $N_PLACED loci across $N_ELIGIBLE contig(s) — REAL ${REAL_DEPTH}x vs SIM ${SIM_DEPTH}x (CAPPED)"
 else
-    echo "REALISM PANEL — $N_REGIONS loci on $CONTIG, ${REAL_DEPTH}x both sides"
+    echo "REALISM PANEL — $N_PLACED loci across $N_ELIGIBLE contig(s), ${REAL_DEPTH}x both sides"
 fi
 echo ""
 awk -F'\t' -f "$REPO_ROOT/scripts/delta/realism_summarise.awk" "$OUTDIR/panel.tsv"
