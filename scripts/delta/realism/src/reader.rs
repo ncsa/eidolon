@@ -10,7 +10,7 @@
 //! on noodles decoding what I think it does — so `tests/realism_reader.rs` cross-checks it
 //! against `samtools view` on the same file rather than against my expectations.
 
-use crate::realism::metrics::{
+use crate::metrics::{
     AlnRecord, RegionMetrics, candidate_breakpoints, depth_stats, depth_track, insert_stats,
 };
 use noodles::bam;

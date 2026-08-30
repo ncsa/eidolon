@@ -140,6 +140,32 @@ pub struct DepthStats {
     pub autocorr_500: f64,
 }
 
+impl DepthStats {
+    /// Dispersion in EXCESS of Poisson, normalized by depth: `(vmr - 1) / mean`.
+    ///
+    /// VMR alone is not comparable between datasets at different depths. Coverage noise is
+    /// largely multiplicative — depth is the mean times a local factor from GC, mappability
+    /// and library prep — so variance grows with the square of the mean and VMR grows with the
+    /// mean. Measured: real NA12878 chr22 at 247x reads VMR 36.1 against eidolon's 1.04 at
+    /// 30x, which looks like a 35x gap and is not one; the depths differ by 8x.
+    ///
+    /// Subtracting 1 removes the Poisson floor (a pure counting process has VMR 1 at any
+    /// depth) and dividing by the mean removes the depth scaling, leaving the squared
+    /// coefficient of variation of the underlying modulation. On the same pair that is 0.142
+    /// against 0.0012 — a **118x** gap, and it says something stronger: eidolon's dispersion
+    /// is almost entirely Poisson counting noise (1/30 = 0.033 of its 0.035 CV^2), meaning
+    /// there is essentially no coverage modulation at all.
+    ///
+    /// This is the number to compare across datasets. `vmr` is kept because it is what the
+    /// literature quotes and what a depth caller experiences at ITS depth.
+    pub fn excess_dispersion(&self) -> f64 {
+        if self.mean <= 0.0 {
+            return 0.0;
+        }
+        (self.vmr - 1.0) / self.mean
+    }
+}
+
 /// A position where at least `min_support` reads share a soft-clip boundary.
 ///
 /// Clip boundaries, not clipped reads: a caller clusters *positions*, and scattered clipping
@@ -427,6 +453,74 @@ mod tests {
             a.autocorr_500.abs() < 0.1,
             "independent noise correlated {}",
             a.autocorr_500
+        );
+    }
+
+    #[test]
+    fn excess_dispersion_is_comparable_across_depths_and_vmr_is_not() {
+        // The same multiplicative modulation at two depths, WITH counting noise on top.
+        //
+        // The counting noise is not decoration. `(vmr - 1) / mean` subtracts a Poisson floor,
+        // so a fixture without one is over-corrected by exactly 1/mean — which at 30x and
+        // 240x is 0.033 against 0.004 and looks like depth dependence in the statistic when it
+        // is really depth dependence in the fixture. A first version of this test had no
+        // counting noise and failed for that reason. The statistic is built for a process that
+        // has both components, so the fixture must have both.
+        let factors = [0.7f64, 1.0, 1.3, 0.85, 1.15];
+        let track = |mean: f64| -> Vec<u32> {
+            let mut x: u64 = 4242;
+            (0..20_000)
+                .map(|i| {
+                    let target = mean * factors[(i / 1000) % factors.len()];
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    // Uniform[-1,1] scaled to unit variance, times sqrt(target): variance ~
+                    // target, i.e. Poisson-like counting noise around the modulated mean.
+                    let u = ((x >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0;
+                    (target + u * 3f64.sqrt() * target.sqrt()).round().max(0.0) as u32
+                })
+                .collect()
+        };
+        let shallow = depth_stats(&track(30.0), 500).unwrap();
+        let deep = depth_stats(&track(240.0), 500).unwrap();
+
+        // VMR is NOT comparable: 8x the depth, ~8x the VMR, same underlying modulation.
+        let vmr_ratio = deep.vmr / shallow.vmr;
+        assert!(
+            vmr_ratio > 5.0,
+            "VMR should scale with depth for multiplicative noise; ratio was {vmr_ratio}"
+        );
+
+        // Excess dispersion IS comparable: the same modulation reads the same at both depths.
+        let a = shallow.excess_dispersion();
+        let b = deep.excess_dispersion();
+        assert!(
+            (a - b).abs() / a < 0.15,
+            "excess dispersion should be depth-independent: {a} vs {b}"
+        );
+    }
+
+    #[test]
+    fn pure_poisson_like_depth_has_near_zero_excess_dispersion() {
+        // A track whose only variation is counting noise must report ~0 excess, whatever its
+        // depth — that is what "no coverage modulation at all" looks like, and it is what
+        // eidolon currently produces.
+        let mut x: u64 = 99;
+        let mut t = Vec::new();
+        for _ in 0..20_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // mean 30, variance ~30: crude but Poisson-like in the only way that matters here
+            let noise = ((x >> 33) % 21) as i64 - 10;
+            t.push((30 + noise).max(0) as u32);
+        }
+        let d = depth_stats(&t, 500).unwrap();
+        assert!(
+            d.excess_dispersion().abs() < 0.02,
+            "counting noise alone should leave ~0 excess, got {}",
+            d.excess_dispersion()
         );
     }
 
