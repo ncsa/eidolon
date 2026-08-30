@@ -306,7 +306,11 @@ contig lengths).
   `cli.github.com/packages`, not the distro archive.
   Fallback if stuck on an old gh: `gh api -X PATCH repos/ncsa/eidolon/pulls/<N> -f body=…`.
 - **`gh pr view --json commits` has served a STALE commit list** — it showed only the first
-  commit of a branch while `gh api repos/ncsa/eidolon/pulls/<N>/commits` was correct. When
+  commit of a branch while `gh api repos/ncsa/eidolon/pulls/<N>/commits` was correct.
+  Retested on gh 2.98.0 (2026-08-30): the two agreed on PR #640. That is ONE PR, not proof
+  the bug is gone — it was never characterised well enough to know if it was timing-dependent
+  — but it is consistent with the same stale-client cause as the `gh pr edit` failure above.
+  Keep using the API when it matters. When
   checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds
   the missed-merge hazard above: both the "did it land" checks can lie in the same direction.)
 - End commit messages with `Co-Authored-By: Claude <noreply@anthropic.com>`.
