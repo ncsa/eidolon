@@ -105,5 +105,19 @@ echo "=== metrics with no gap still appear ==="
 # still be printed: a metric that vanishes when it agrees hides the fact that it was checked.
 has "depth_mean is reported even though it matches" "$out" "depth_mean"
 
+echo "=== the depth cap says which columns it invalidates ==="
+# A capped run is cheap and mostly incomparable. If it reported a gap table with no caveat,
+# a smoke number would get quoted as a measurement — which is exactly how the "~8% high"
+# figure from a 1.2 kb event on H1N1 ended up in a summary table for two weeks.
+cap="$(sed -n '/DEPTH_CAPPED" -eq 1 /,/^fi$/p' "$PIPELINE" | head -40)"
+has "the cap names depth_excess as still comparable" "$cap" "depth_excess"
+has "the cap names depth_vmr as NOT comparable" "$cap" "NOT COMPARABLE"
+has "the cap names the artifact rates it invalidates" "$cap" "cand_per_mb"
+has "the cap says what it is for" "$cap" "smoke run"
+
+echo "=== the cap is off by default ==="
+# Defaulting to capped would make every run cheap and every number unquotable.
+has "MAX_SIM_DEPTH defaults to 0" "$(grep -o 'MAX_SIM_DEPTH:-[0-9]*' "$PIPELINE" | head -1)" "MAX_SIM_DEPTH:-0"
+
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -43,8 +43,12 @@
 #   * bwa-mem2 + samtools (bioinf conda env), and a built eidolon + realism-panel.
 #
 # Usage:
+#   # smoke: prove the plumbing cheaply. Capping the depth makes most metrics
+#   # incomparable — the job says so, loudly, in its own output.
+#   REAL_BAM=... MAX_SIM_DEPTH=30 N_REGIONS=4 sbatch scripts/delta/realism_panel.sbatch
+#
+#   # real measurement: depths matched, nothing capped.
 #   REAL_BAM=$SCRATCH/neat_data/hg002/hg002.bam sbatch scripts/delta/realism_panel.sbatch
-#   REAL_BAM=... N_REGIONS=12 REGION_BP=400000 sbatch scripts/delta/realism_panel.sbatch
 
 #SBATCH --job-name=eidolon-realism
 #SBATCH --partition=cpu
@@ -79,6 +83,10 @@ FRAG_SD="${FRAG_SD:-90}"
 N_REGIONS="${N_REGIONS:-10}"
 REGION_BP="${REGION_BP:-400000}"
 SEED="${SEED:-realism panel}"
+# Cap the simulated depth. 0 = match the real BAM exactly, which is what a real measurement
+# wants. A smoke run does not: real WGS is often 200-300x, and simulating that across a whole
+# chromosome is hours. See the caveat printed below when the cap actually bites.
+MAX_SIM_DEPTH="${MAX_SIM_DEPTH:-0}"
 
 # Thresholds. Passed to BOTH sides from one place: a gap measured with different settings
 # on each side would be measuring the settings.
@@ -119,7 +127,31 @@ echo "Contig:     $CONTIG ($CONTIG_LEN bp)"
 REAL_DEPTH="$(samtools depth -a -r "$CONTIG:1000000-1200000" "$REAL_BAM" \
               | awk '{s+=$3; n++} END{ if(n) printf "%.0f", s/n; else print 0 }')"
 [[ "${REAL_DEPTH:-0}" -gt 0 ]] || { echo "ERROR: measured 0x depth in the real BAM — nothing to match" >&2; exit 1; }
-echo "Real depth: ${REAL_DEPTH}x (simulation will match it)"
+SIM_DEPTH="$REAL_DEPTH"
+DEPTH_CAPPED=0
+if [[ "$MAX_SIM_DEPTH" -gt 0 && "$REAL_DEPTH" -gt "$MAX_SIM_DEPTH" ]]; then
+    SIM_DEPTH="$MAX_SIM_DEPTH"
+    DEPTH_CAPPED=1
+fi
+echo "Real depth: ${REAL_DEPTH}x"
+if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
+    echo "Sim depth:  ${SIM_DEPTH}x  ** CAPPED by MAX_SIM_DEPTH **"
+    echo ""
+    echo "  DEPTHS DO NOT MATCH, so most metrics below are NOT comparable between the two"
+    echo "  sides. Coverage noise is largely multiplicative, so VMR scales with the mean;"
+    echo "  clip rates and candidate-breakpoint counts rise with depth as well. At ${REAL_DEPTH}x"
+    echo "  against ${SIM_DEPTH}x those columns compare depth, not realism."
+    echo ""
+    echo "  STILL COMPARABLE:  depth_excess (Poisson floor removed, depth-normalised),"
+    echo "                     ins_skew, and the shape of ins_sd/ins_p99 relative to ins_mean."
+    echo "  NOT COMPARABLE:    depth_vmr, cand_per_mb, clip_pct, improper_pct, mapq0_pct."
+    echo ""
+    echo "  Use a cap for a smoke run that proves the plumbing. Unset it for a number anyone"
+    echo "  is going to quote."
+    echo ""
+else
+    echo "Sim depth:  ${SIM_DEPTH}x (matched)"
+fi
 
 # ── Regions: evenly spaced, away from the contig ends ────────────────────────
 #
@@ -149,7 +181,7 @@ output_dir: $SIMDIR
 output_filename: sim
 rng_seed: "$SEED"
 num_threads: $THREADS
-coverage: $REAL_DEPTH
+coverage: $SIM_DEPTH
 read_len: $READ_LEN
 paired_ended: true
 fragment_mean: $FRAG_MEAN
@@ -157,7 +189,7 @@ fragment_st_dev: $FRAG_SD
 produce_fastq: true
 sv_rate_scale: 0.0
 YML
-echo "[1/3] simulating ${REAL_DEPTH}x with no variants..."
+echo "[1/3] simulating ${SIM_DEPTH}x with no variants..."
 "$EIDOLON_BIN" gen-reads -c "$SIMDIR/config.yml"
 
 echo "[2/3] aligning the simulated reads..."
@@ -185,12 +217,21 @@ tail -n +2 "$OUTDIR/sim.tsv" >> "$OUTDIR/panel.tsv"
 # pick, and it is what any future threshold has to be derived from.
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "REALISM PANEL — $N_REGIONS loci on $CONTIG, ${REAL_DEPTH}x both sides"
+if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
+    echo "REALISM PANEL — $N_REGIONS loci on $CONTIG — REAL ${REAL_DEPTH}x vs SIM ${SIM_DEPTH}x (CAPPED)"
+else
+    echo "REALISM PANEL — $N_REGIONS loci on $CONTIG, ${REAL_DEPTH}x both sides"
+fi
 echo ""
 awk -F'\t' -f "$REPO_ROOT/scripts/delta/realism_summarise.awk" "$OUTDIR/panel.tsv"
 echo ""
 echo "Per-locus rows: $OUTDIR/panel.tsv"
 echo ""
+if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
+    echo "DEPTHS WERE NOT MATCHED (${REAL_DEPTH}x vs ${SIM_DEPTH}x). Only depth_excess and the"
+    echo "insert-shape columns are comparable; the rest compare depth. See the note above."
+    echo ""
+fi
 echo "This job MEASURES. Nothing above is a pass or a fail. A ratio is a gap to decide"
 echo "about, and the [min-max] beside each median is how much of it is the locus rather"
 echo "than the data — real dispersion varies several-fold between loci on one chromosome."
