@@ -1002,7 +1002,9 @@ gc_bias_normalize_coverage: true
 
 Generating a Fragment Length Model
 ====================
-`eidolon` can learn a fragment length model from real paired-end alignment data using the `eidolon gen-frag-length-model` subcommand. It reads a BAM or SAM file, collects the template lengths (TLEN) of confidently-mapped concordant read pairs, filters out rare and extreme-outlier lengths, then fits a normal distribution to the result and writes a `FragmentLengthModel` that `gen-reads` can use.
+`eidolon` can learn a fragment length model from real paired-end alignment data using the `eidolon gen-frag-length-model` subcommand. It reads a BAM or SAM file, collects the template lengths (TLEN) of confidently-mapped concordant read pairs, trims extreme outliers, and writes a `FragmentLengthModel` that `gen-reads` can use.
+
+**Since v3.3.0 the model keeps the observed shape by default.** Real size-selected libraries are right-skewed — a steep left edge from size selection, and a long tail of larger fragments that escaped it. A normal distribution is symmetric by construction and cannot hold that tail, and the tail is exactly what a paired-end SV caller thresholds against when it decides an insert is "larger than expected". The builder therefore fits a *discrete* (empirical) distribution over the observed lengths. Sparse histograms are smoothed so the support has no holes in it, and a model too sparse to have a shape is refused rather than written. Set `distribution: normal` for the pre-v3.3.0 two-parameter fit, which is still the right choice for small or targeted BAMs (exome, amplicon) where there is not enough data to estimate a shape.
 
 ```bash
 $ eidolon gen-frag-length-model -c gen_frag_length_model_config.yml
@@ -1020,9 +1022,16 @@ input_file: /path/to/aligned.bam
 # required: output path for the generated model; should end in .json.gz
 output_file: /path/to/fragment_length_model.json.gz
 
-# optional: minimum number of reads for a fragment length to be included in the model
+# optional: `discrete` (default) keeps the measured shape, including the right tail.
+# `normal` collapses it to mean + standard deviation, which is the pre-v3.3.0 behaviour
+# and is the right choice for sparse input (exome, amplicon, a small targeted BAM).
+distribution: discrete
+
+# optional: floor on the TOTAL number of observations, below which the model is refused.
 # Default is 2 to handle smaller datasets. Set to 0 to disable filtering entirely.
-# For larger datasets (e.g. whole-genome), try 100 and adjust from there.
+# NOTE: before v3.3.0 this also DELETED any individual length seen fewer than min_reads
+# times, which punched holes in the distribution — hardest in the tail, where counts are
+# lowest. Sparse lengths are now handled by smoothing instead.
 min_reads: 2
 
 # optional: set to true to overwrite an existing output file (default: false)

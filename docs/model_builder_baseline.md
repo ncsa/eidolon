@@ -60,7 +60,8 @@ links (all are real, runnable tests, not assertions on paper):
 | model → output | evidence |
 |----------------|----------|
 | explicit `fragment_mean` → BAM insert size (TLEN) | `gen_reads … test_paired_ended_insert_size_matches_model` |
-| **built `fragment_model` file → BAM insert size** | `tests/model_fragment_fidelity.rs` — fit on a 200 bp-mean BAM, simulate with the file, output insert mean = **199.8 bp** (fitted 200.0) |
+| **built `fragment_model` file → BAM insert size** | `tests/model_fragment_fidelity.rs` — fit on a 200 bp-mean BAM, simulate with the file, output insert mean = **199.7 bp** (fitted 200.0) |
+| **built `fragment_model` SHAPE → BAM insert size** | `tests/model_fragment_fidelity.rs::a_built_discrete_model_carries_the_right_tail_all_the_way_to_the_reads` — right-skewed input, measured on ecoli: input skew **0.684** → model **0.684** → generated reads **0.681**. The mean-only assertion above passed for years while a Normal fit discarded the entire shape, which is why this one exists. |
 | **built `sequence_error_model` file → read qualities** | `tests/model_output_fidelity.rs` — train on a uniform-Phred-35 FASTQ, simulate, output mean quality = **35.0** |
 | **built `mutation_model` file → output variant count** | `tests/model_output_fidelity.rs` — a 139× rate difference between two fitted models yields 0 vs **405** output variants (405 ≈ rate 3.17e-2 × 13,133 bp) |
 | **built `gc_bias_model` file → which regions get sequenced** | `tests/model_output_fidelity.rs` — train on a BAM covering a 20%-GC contig but not an 80%-GC one (fitted `w[20]=1.98`, `w[80]=0.02`), simulate: output is **506 low-GC reads / 0 high-GC** |

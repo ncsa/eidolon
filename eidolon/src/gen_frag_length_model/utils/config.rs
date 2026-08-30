@@ -1,4 +1,5 @@
 use crate::gen_frag_length_model::errors::GenFragLengthModelError;
+use crate::gen_frag_length_model::utils::runner::DistributionKind;
 use eidolon_core::file_tools::file_io::check_overwrite;
 use serde_yml::Value;
 use std::collections::HashMap;
@@ -17,6 +18,9 @@ pub struct RunConfiguration {
     /// Default is 2 to handle smaller datasets. Set to 0 to disable filtering.
     /// For larger datasets, try 100 and adjust from there.
     pub min_reads: usize,
+    /// `discrete` (default) keeps the measured shape; `normal` collapses it to mean +
+    /// st_dev, which is the pre-v3.3.0 behaviour and is right for sparse inputs.
+    pub distribution: DistributionKind,
 }
 
 impl RunConfiguration {
@@ -71,11 +75,21 @@ impl RunConfiguration {
             .and_then(|v| v.as_u64())
             .unwrap_or(2) as usize;
 
+        let distribution = match scrape_config.get("distribution").and_then(|v| v.as_str()) {
+            None => DistributionKind::default(),
+            Some(raw) => DistributionKind::parse(raw).ok_or_else(|| {
+                GenFragLengthModelError::ConfigurationError(format!(
+                    "distribution must be `discrete` or `normal`, got `{raw}`"
+                ))
+            })?,
+        };
+
         Ok(RunConfiguration {
             input_file,
             output_file,
             overwrite_output,
             min_reads,
+            distribution,
         })
     }
 }
