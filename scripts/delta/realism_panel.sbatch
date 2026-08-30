@@ -49,6 +49,18 @@
 #
 #   # real measurement: depths matched, nothing capped.
 #   REAL_BAM=$SCRATCH/neat_data/hg002/hg002.bam sbatch scripts/delta/realism_panel.sbatch
+#
+#   # AS SHIPPED vs TRAINED. With no model set the job measures eidolon out of the box,
+#   # which is a real question but not the same one as "what is left after training on
+#   # this sample". Build models from the SAME BAM and pass them in:
+#   #   eidolon gen-bam-models -c cfg.yml     # frag_length + gc_bias in one BAM walk
+#   REAL_BAM=... GC_BIAS_MODEL=$D/gc.json.gz FRAGMENT_MODEL=$D/frag.json.gz \
+#     ALIGN_TLEN=1 sbatch scripts/delta/realism_panel.sbatch
+#
+#   # ALIGN_TLEN=1 measures both sides over the fragment model's own range. Without it the
+#   # panel measures real inserts out to MAX_TLEN while the simulator is capped at the
+#   # model's ceiling, and the difference reads as an insert-shape gap that is really the
+#   # two filters disagreeing.
 
 #SBATCH --job-name=eidolon-realism
 #SBATCH --partition=cpu
@@ -73,6 +85,7 @@ echo "[selftest] stderr reaches this log (if this line is missing, diagnostics a
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"
 source "$REPO_ROOT/scripts/delta/lib_realism_contig.sh"
+source "$REPO_ROOT/scripts/delta/lib_realism_config.sh"
 
 REFERENCE="${REFERENCE:-$SCRATCH/neat_data/chr22.fa}"
 REAL_BAM="${REAL_BAM:-}"
@@ -90,6 +103,26 @@ SEED="${SEED:-realism panel}"
 # chromosome is hours. See the caveat printed below when the cap actually bites.
 MAX_SIM_DEPTH="${MAX_SIM_DEPTH:-0}"
 
+# ── Trained models. Unset = eidolon's built-in defaults ─────────────────────
+#
+# WHY THIS EXISTS. Job 21623108 measured a 16.2x depth_excess gap and a 10.7x insert-skew
+# gap and reported them as properties of the simulator. They were properties of a
+# CONFIGURATION: gen-reads accepts seven realism inputs and the panel set none of them, so
+# the run measured eidolon with GC bias disabled and a hardcoded Gaussian fragment length
+# against real human data. That is a legitimate measurement -- it is what a user gets out of
+# the box -- but it is not "how close can eidolon get", and the output did not say which of
+# the two it was. It does now: every run prints the models it used, defaults included.
+#
+# Build them from the SAME BAM you are comparing against:
+#   eidolon gen-bam-models -c cfg.yml     # frag_length + gc_bias in one BAM walk
+#   eidolon gen-seq-error-model -c cfg.yml
+GC_BIAS_MODEL="${GC_BIAS_MODEL:-}"
+FRAGMENT_MODEL="${FRAGMENT_MODEL:-}"
+SEQ_ERROR_MODEL="${SEQ_ERROR_MODEL:-}"
+QUALITY_MODEL="${QUALITY_MODEL:-}"
+MUTATION_MODEL="${MUTATION_MODEL:-}"
+GC_NORMALIZE="${GC_NORMALIZE:-}"     # gc_bias_normalize_coverage; unset = eidolon's default
+
 # Thresholds. Passed to BOTH sides from one place: a gap measured with different settings
 # on each side would be measuring the settings.
 MIN_CLIP="${MIN_CLIP:-20}"
@@ -105,6 +138,18 @@ PANEL_BIN="$CARGO_TARGET_DIR/release/realism-panel"
 [[ -f "$REAL_BAM" ]]  || { echo "ERROR: REAL_BAM not found: $REAL_BAM" >&2; exit 1; }
 [[ -f "$REFERENCE" ]] || { echo "ERROR: REFERENCE not found: $REFERENCE" >&2; exit 1; }
 [[ -x "$EIDOLON_BIN" ]] || { echo "ERROR: eidolon not built at $EIDOLON_BIN" >&2; exit 1; }
+for pair in "GC_BIAS_MODEL:$GC_BIAS_MODEL" "FRAGMENT_MODEL:$FRAGMENT_MODEL" \
+            "SEQ_ERROR_MODEL:$SEQ_ERROR_MODEL" "QUALITY_MODEL:$QUALITY_MODEL" \
+            "MUTATION_MODEL:$MUTATION_MODEL"; do
+    name="${pair%%:*}"; path="${pair#*:}"
+    [[ -z "$path" || -f "$path" ]] || {
+        echo "ERROR: $name is set to '$path', which does not exist." >&2
+        echo "       Refusing rather than silently falling back to the default -- a run that" >&2
+        echo "       quietly measured defaults while reporting a trained model is worse than" >&2
+        echo "       no run at all." >&2
+        exit 1; }
+done
+
 [[ -x "$PANEL_BIN" ]]   || { echo "ERROR: realism-panel not built at $PANEL_BIN — cargo build --release builds the whole workspace, including it." >&2; exit 1; }
 
 mkdir -p "$OUTDIR"
@@ -113,6 +158,74 @@ echo "Real BAM:   $REAL_BAM"
 echo "Reference:  $REFERENCE"
 echo "Outdir:     $OUTDIR"
 echo "Thresholds: min_clip=$MIN_CLIP min_support=$MIN_SUPPORT max_tlen=$MAX_TLEN depth_lag=$DEPTH_LAG"
+
+# ── Provenance: the table below is about a CONFIGURATION, so name it ────────
+#
+# Rule 4 applied to settings rather than to counts. Every number this job prints is
+# conditional on which models were loaded, and a run with everything defaulted looks
+# identical in the output to a fully trained one unless it says so.
+N_TRAINED=0
+echo "Models:"
+for pair in "gc_bias:$GC_BIAS_MODEL" "fragment:$FRAGMENT_MODEL" \
+            "sequence_error:$SEQ_ERROR_MODEL" "quality_score:$QUALITY_MODEL" \
+            "mutation:$MUTATION_MODEL"; do
+    name="${pair%%:*}"; path="${pair#*:}"
+    if [[ -n "$path" ]]; then
+        printf '              %-16s %s\n' "$name" "$path"
+        N_TRAINED=$((N_TRAINED + 1))
+    else
+        printf '              %-16s (eidolon default)\n' "$name"
+    fi
+done
+if [[ -z "$FRAGMENT_MODEL" ]]; then
+    printf '              %-16s Normal(%s, %s) -- OVERRIDES the shipped empirical distribution\n' \
+           "  fragment via" "$FRAG_MEAN" "$FRAG_SD"
+fi
+if [[ "$N_TRAINED" -eq 0 ]]; then
+    echo ""
+    echo "  NO TRAINED MODELS. This measures eidolon AS SHIPPED against real data, which is"
+    echo "  what a user gets out of the box -- but it is NOT the gap that remains after"
+    echo "  training on this sample. GC bias is off, so depth_vmr/depth_excess/depth_acf"
+    echo "  compare a Poisson simulation against real coverage; the fragment length is a"
+    echo "  Gaussian, so ins_skew compares a symmetric distribution against a real one."
+    echo "  Build models with gen-bam-models and pass GC_BIAS_MODEL/FRAGMENT_MODEL to"
+    echo "  measure what is left after that."
+fi
+
+# ── The fragment model's ceiling vs what the panel MEASURES ─────────────────
+#
+# A fragment model has a hard maximum: the builder trims outliers, so on HCC1395 normal it
+# came out at 1094 bp while MAX_TLEN defaults to 2000. The simulator then CANNOT emit an
+# insert above 1094, the panel happily measures real inserts out to 2000, and the leftover
+# difference gets reported as an insert-shape gap. It is not -- it is the two filters
+# disagreeing. Measuring your own ceiling and calling it realism is the same error that
+# made the first frag-model validation read 99.92% off.
+if [[ -n "$FRAGMENT_MODEL" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+        FRAG_MAX="$(frag_model_ceiling "$FRAGMENT_MODEL" || true)"
+        if [[ -n "${FRAG_MAX:-}" && "$FRAG_MAX" != "null" ]]; then
+            echo ""
+            echo "Frag ceiling: the model tops out at ${FRAG_MAX} bp; panel MAX_TLEN is ${MAX_TLEN} bp"
+            if [[ "$FRAG_MAX" -lt "$MAX_TLEN" ]]; then
+                if [[ "${ALIGN_TLEN:-0}" != "0" ]]; then
+                    MAX_TLEN="$FRAG_MAX"
+                    echo "  ALIGN_TLEN set: lowering MAX_TLEN to ${MAX_TLEN} so both sides are measured"
+                    echo "  over the same range. The real side now excludes inserts above ${MAX_TLEN},"
+                    echo "  which the simulator could not have produced anyway."
+                else
+                    echo "  WARNING: the simulator cannot produce an insert above ${FRAG_MAX}, but the"
+                    echo "  panel measures real inserts up to ${MAX_TLEN}. Part of any ins_sd / ins_p99 /"
+                    echo "  ins_skew gap below is that ceiling rather than the simulator's behaviour."
+                    echo "  Set ALIGN_TLEN=1 to measure both sides over the model's own range instead."
+                fi
+            fi
+        fi
+    else
+        echo "  NOTE: jq unavailable, so the fragment model's ceiling was not checked against"
+        echo "        MAX_TLEN=${MAX_TLEN}. If the model tops out lower, the insert columns will"
+        echo "        overstate the gap."
+    fi
+fi
 
 # ── Depth of the real BAM, so the simulation can match it ────────────────────
 #
@@ -223,20 +336,9 @@ fi
 # filters get calibrated against.
 SIMDIR="$OUTDIR/sim"
 mkdir -p "$SIMDIR"
-cat > "$SIMDIR/config.yml" <<YML
-reference: $REFERENCE
-output_dir: $SIMDIR
-output_filename: sim
-rng_seed: "$SEED"
-num_threads: $THREADS
-coverage: $SIM_DEPTH
-read_len: $READ_LEN
-paired_ended: true
-fragment_mean: $FRAG_MEAN
-fragment_st_dev: $FRAG_SD
-produce_fastq: true
-sv_rate_scale: 0.0
-YML
+write_sim_config "$SIMDIR/config.yml" "$REFERENCE" "$SIMDIR" "$SEED" "$THREADS" \
+                 "$SIM_DEPTH" "$READ_LEN" "$FRAG_MEAN" "$FRAG_SD"
+
 echo "[1/3] simulating ${SIM_DEPTH}x with no variants..."
 "$EIDOLON_BIN" gen-reads -c "$SIMDIR/config.yml"
 
