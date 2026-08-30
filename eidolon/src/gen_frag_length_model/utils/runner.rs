@@ -414,6 +414,54 @@ mod tests {
         v
     }
 
+    /// The mirror image: a tail running DOWN from a dense mode.
+    fn left_skewed() -> Vec<usize> {
+        right_skewed().into_iter().map(|l| 1200 - l).collect()
+    }
+
+    /// A clean symmetric triangle.
+    fn symmetric() -> Vec<usize> {
+        (300..=700)
+            .flat_map(|l| {
+                let d = (l as i64 - 500).unsigned_abs() as usize;
+                std::iter::repeat_n(l, 200usize.saturating_sub(d).max(1))
+            })
+            .collect()
+    }
+
+    /// Two modes with a LOW valley between them, not an empty one.
+    ///
+    /// No two-parameter family reproduces this at all, which is the case that makes the
+    /// argument for keeping the measured shape. The valley is deliberately non-zero: a
+    /// hard 200 bp hole in the middle of a fragment distribution does not occur in a real
+    /// library, and testing against one measures the smoother bridging an artificial gap
+    /// rather than the builder preserving a real shape. A double-size-selected library
+    /// has a thin population between its peaks, not none.
+    fn bimodal() -> Vec<usize> {
+        let mut v = Vec::new();
+        for l in 300..=700 {
+            let c = if l <= 400 {
+                300usize.saturating_sub((l as i64 - 350).unsigned_abs() as usize * 4)
+            } else if l >= 600 {
+                200usize.saturating_sub((l as i64 - 650).unsigned_abs() as usize * 3)
+            } else {
+                0
+            };
+            v.extend(std::iter::repeat_n(l, c.max(6)));
+        }
+        v
+    }
+
+    /// Build a discrete model from raw lengths and report its skew, the way the runner does.
+    fn model_skew(data: &[usize]) -> (f64, f64) {
+        let h = trim(histogram(data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+        (skew(&expand(&h)), weighted_skew(&values, &weights))
+    }
+
     // ── the histogram math reproduces the per-read math exactly ──────────────
 
     #[test]
@@ -586,6 +634,142 @@ mod tests {
             }
             _ => panic!("new_normal must produce a Normal"),
         }
+    }
+
+    #[test]
+    fn the_builder_reproduces_whatever_shape_it_is_given() {
+        // Not "a right-skewed input comes out right-skewed" -- code that only handled that
+        // one shape would pass such a test. The claim is that the builder is a PASS-THROUGH
+        // for shape, so it is checked against four distinct ones, including a bimodal
+        // distribution that no two-parameter family reproduces at all.
+        let cases: [(&str, Vec<usize>); 4] = [
+            ("right-skewed", right_skewed()),
+            ("left-skewed", left_skewed()),
+            ("symmetric", symmetric()),
+            ("bimodal", bimodal()),
+        ];
+
+        let mut observed = Vec::new();
+        for (name, data) in &cases {
+            let (input, model) = model_skew(data);
+            assert!(
+                (model - input).abs() < 0.01,
+                "{name}: model skew {model:.3} does not match its input {input:.3}"
+            );
+            observed.push((*name, input));
+        }
+
+        // Must-not-fire: the four fixtures have to be genuinely different, or "reproduces
+        // the input" is satisfied by any code that returns a constant. A left tail and a
+        // right tail must land on opposite sides of zero, and the symmetric one near it.
+        let get = |n: &str| observed.iter().find(|(k, _)| *k == n).unwrap().1;
+        assert!(
+            get("right-skewed") > 0.4,
+            "right fixture is not right-skewed"
+        );
+        assert!(get("left-skewed") < -0.4, "left fixture is not left-skewed");
+        assert!(get("symmetric").abs() < 0.1, "symmetric fixture is skewed");
+        assert!(
+            get("right-skewed") - get("left-skewed") > 1.0,
+            "the two tailed fixtures are not distinguishable from each other"
+        );
+    }
+
+    #[test]
+    fn a_bimodal_distribution_survives_as_two_modes() {
+        // The strongest case for keeping the histogram: a Normal fitted to this puts its
+        // peak in the VALLEY between the two modes, where the real library has almost no
+        // fragments at all.
+        let data = bimodal();
+        let h = trim(histogram(&data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+
+        let at = |target: usize| {
+            values
+                .iter()
+                .position(|&v| v == target)
+                .map(|i| weights[i])
+                .unwrap_or(0.0)
+        };
+        let (peak_a, valley, peak_b) = (at(350), at(500), at(650));
+        assert!(
+            peak_a > valley * 5.0 && peak_b > valley * 5.0,
+            "both modes must survive as modes: 350={peak_a:.1}, 500={valley:.1}, 650={peak_b:.1}"
+        );
+        // And the mean -- which is what a Normal would centre on -- sits in the valley.
+        assert!(
+            (450.0..550.0).contains(&mean),
+            "mean {mean:.1} should fall between the modes, which is the point"
+        );
+    }
+
+    #[test]
+    fn smoothing_fills_gaps_without_washing_out_the_shape() {
+        // The decision the smoother makes is HOW MUCH to smooth, and nothing tested it:
+        // the bandwidth is only reached when there are gaps, and every other fixture here
+        // is contiguous after trimming, so `h` was dead code in all of them. A fixed
+        // bandwidth of 40 passed the entire suite before this test existed. Measured: the
+        // Silverman bandwidth here is 8.0 and moves the skew by 0.009; a fixed 40 moves it
+        // by 0.101 and inflates the standard deviation 4.9%. That is the gap this asserts.
+        //
+        // The comparison is the gappy input against ITS OWN shape, not against the dense
+        // fixture it was thinned from. Thinning to every third length is a subsample and
+        // legitimately shifts the skew by ~0.03 on its own; measuring against the dense
+        // original spends that budget on something smoothing did not do, and leaves too
+        // little headroom to see a bandwidth four times too wide.
+        let dense = right_skewed();
+        let gappy: Vec<usize> = dense.iter().copied().filter(|l| l % 3 == 0).collect();
+
+        let h = trim(histogram(&gappy), 2);
+        let holes = {
+            let lo = h[0].0;
+            let hi = h[h.len() - 1].0;
+            (hi - lo + 1) - h.len()
+        };
+        assert!(
+            holes > 100,
+            "the fixture must actually be gappy, got {holes} holes"
+        );
+
+        let before_skew = skew(&expand(&h));
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+
+        assert!(weights.iter().all(|&w| w > 0.0), "gaps must be filled");
+
+        let after_skew = weighted_skew(&values, &weights);
+        assert!(
+            (after_skew - before_skew).abs() < 0.03,
+            "smoothing washed out the shape: {before_skew:.4} -> {after_skew:.4}. A bandwidth \
+             wide enough to bridge the gaps must still be narrow enough to keep the tail."
+        );
+
+        // An over-wide kernel also smears mass outward, inflating the spread.
+        let after_sd = {
+            let tot: f64 = weights.iter().sum();
+            let m: f64 = values
+                .iter()
+                .zip(&weights)
+                .map(|(&v, &w)| v as f64 * w)
+                .sum::<f64>()
+                / tot;
+            (values
+                .iter()
+                .zip(&weights)
+                .map(|(&v, &w)| (v as f64 - m).powi(2) * w)
+                .sum::<f64>()
+                / tot)
+                .sqrt()
+        };
+        assert!(
+            (after_sd - sd).abs() / sd < 0.02,
+            "smoothing inflated the spread: {sd:.2} -> {after_sd:.2}"
+        );
     }
 
     #[test]
