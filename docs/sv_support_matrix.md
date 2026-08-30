@@ -117,20 +117,20 @@ BND recovery support a caller/representation limitation rather than a simulator 
 
 | variant | truth VCF | read-level evidence | status |
 |---|---|---|---|
-| `<DEL>` symbolic | preserved | het **0.54** vs 0.50 expected; hom **0.00** exact | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
-| `<DUP>` symbolic | preserved | het **1.61** vs 1.50; hom **2.17** vs 2.00 | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) ~8% high |
-| `<CNV>` symbolic | preserved | CN 0/2 exact; CN 1,3,4,6 all **~8% high** | ⚠ [#499](https://github.com/ncsa/eidolon/issues/499) |
+| `<DEL>` symbolic | preserved | het **0.54** vs 0.50 expected; hom **0.00** exact | ⚠ [#584](https://github.com/ncsa/eidolon/issues/584) — size-dependent, see note |
+| `<DUP>` symbolic | preserved | het **1.61** vs 1.50; hom **2.17** vs 2.00 (H1N1, 1.2 kb events) | ⚠ [#584](https://github.com/ncsa/eidolon/issues/584) — size-dependent, see note |
+| `<CNV>` symbolic | preserved | CN 0/2 exact; CN 1,3,4,6 **~8% high on H1N1** | ⚠ [#584](https://github.com/ncsa/eidolon/issues/584) — size-dependent, see note |
 | `<INV>` symbolic | preserved | deep interior **1.00**; junction-proximal **0.74–0.82** | ✅ (see note) |
-| `<INS>` symbolic | preserved | **identical to no-variant control** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) silent no-op |
+| `<INS>` symbolic | realized as a literal ALT with synthesised novel sequence | insertions appear above the control background | ✅ fixed, [#500](https://github.com/ncsa/eidolon/issues/500) |
 | BND, inter-chromosomal | both records preserved | 30 chimeric reads | ✅ |
 | BND, intra-chromosomal | both records preserved | 30 chimeric reads | ✅ |
-| BND + inserted sequence | preserved **with the insert** | **0 of 30** chimeric reads carry it | ❌ [#498](https://github.com/ncsa/eidolon/issues/498) |
+| BND + inserted sequence | preserved **with the insert** | chimeric reads carry it, spliced between the reference pieces | ✅ fixed, [#498](https://github.com/ncsa/eidolon/issues/498) |
 | BND, mate contig absent | — | — | ✅ hard error (correct) |
-| BND, single/unpaired (`A.`) | preserved | 0 chimeric; **depth 42.4 vs 72.0** | ❌ [#500](https://github.com/ncsa/eidolon/issues/500) destroys coverage |
+| BND, single/unpaired (`A.`) | **rejected** with a warning | 0 chimeric; depth unchanged | ✅ fixed, [#500](https://github.com/ncsa/eidolon/issues/500) rejected, not silently corrupting |
 | Fragment spanning a whole DUP | — | 60–800 bp blocks all match the derived haplotype | ✅ measured; earlier ❌ was noise |
 | Two junctions within one fragment | all 4 preserved | 60 chimeric; depth matches derived haplotype | ✅ |
 | Literal INS, ≤ ~150 bp | preserved | inserted bases present in reads | ✅ |
-| Literal INS, ≳ 200 bp | preserved **with full SVLEN** | **head only** — interior and far end in 0 reads | ❌ [#516](https://github.com/ncsa/eidolon/issues/516) partial |
+| Literal INS, ≳ 200 bp | preserved **with full SVLEN** | interior and tail both present (600 bp: 25 head / 19 middle / 16 tail) | ✅ [#516](https://github.com/ncsa/eidolon/issues/516) fixed |
 | Literal DEL (`TTTT…`→`A`) | preserved | **D=49** vs 20 baseline | ✅ |
 
 ### Untested cells: none remain
@@ -139,20 +139,66 @@ Every row above is measured. Read-level evidence is depth against a **separate n
 control run**, or BAM CIGAR `I`/`D` counts against that control's sequencing-error
 background (15 `I`, 20 `D` in the probed window), or chimeric-read counts.
 
+**The "~8% high" figure is size-dependent, and the size it was measured at is not realistic.**
+[#499](https://github.com/ncsa/eidolon/issues/499) measured a 1.2 kb event on the 13.5 kb H1N1
+fixture, a window where depth noise alone is ~13% sigma. Re-measured on a **10 kb event over a
+1 Mb reference**, depth reads **0.98 +/- 1.9%** — accurate. The three rows above therefore
+report a bias that does not survive at realistic event size, and are kept only because they are
+what H1N1 actually shows.
+
+The residual mechanism is real and tracked as [#584](https://github.com/ncsa/eidolon/issues/584):
+junction reads are emitted **on top of** coverage-multiplied reads rather than as part of them
+(+0.52 at multiplier 1.0 on a 300 bp DUP). Their count does not vary with event length, so the
+excess as a *fraction* of the event scales roughly as 1/length — negligible at 10 kb, dominant
+at 1 kb. **Anything calibrating against eidolon depth needs this number at its own event size,
+not this table's.**
+
 ### The confirmed failures
 
-**[#498] BND with inserted sequence.** VCF 4.2 allows a breakend ALT to carry novel bases
-inserted at the junction — common in real rearrangements, since NHEJ frequently leaves
-sequence at the breakpoint. `parse_bnd_alt` accepts it, but `get_bnd_pieces` rebuilds the
-read from reference pieces only, so the insert never reaches the output. The truth VCF
-keeps it. **A benchmark built from that data asserts an insertion the reads do not
-contain.**
+**[#498] BND with inserted sequence — FIXED.** VCF 4.2 allows a breakend ALT to carry
+novel bases inserted at the junction, common in real rearrangements since NHEJ frequently
+leaves sequence at the breakpoint. `parse_bnd_alt` accepted it while `get_bnd_pieces`
+rebuilt the read from reference pieces only, so the insert never reached the output while
+the truth VCF kept it — a benchmark asserting an insertion the reads did not contain.
 
-**[#500] Symbolic `<INS>` is a silent no-op.** `SVTYPE=INS;SVLEN=60` is preserved in the
-truth VCF, and the reads are behaviourally identical to the no-variant control — same `I`
-count, same `D` count, same depth. A 60 bp insertion was requested and nothing inserted.
-The de novo path *does* synthesise novel sequence for INS, so the capability exists; it is
-simply not reached from `input_vcf`. That last sentence was an assertion when first written
+`parse_bnd_alt` now returns the inserted bases and `get_stitched_sequence` splices them
+between the two reference pieces. Two details are load-bearing and each has its own test:
+
+* **Which end of the replacement sequence holds the reference base flips with the form** —
+  `t[p[` and `t]p]` start with it, `[p[t` and `]p]t` end with it. Getting it backwards
+  splices the anchor into the read and drops one inserted base.
+* **The insert comes OUT of the fragment budget** (`L1 + insert + L2 == frag_len`), it does
+  not extend it. The inserted bases consume READ bases but no REFERENCE bases, so a correct
+  pair spans *less* reference than the library mean — a reduced insert size is one of the
+  signatures a caller uses to detect an insertion at a junction. Letting the fragment grow
+  keeps the span at the library mean, erases that signature, and puts the mate further into
+  the second piece than the fragment distribution allows: systematically discordant pairs at
+  every inserted junction, and an inferred event size that does not match what was planted.
+  It does *not* change depth — R1 and R2 are `read_len` each however long the fragment is.
+  Invisible to every read-content check, since the insert is present, adjacent and correctly
+  oriented; caught only by mutating the arithmetic.
+
+The insert is never reverse-complemented: it is written in the orientation of the record
+declaring it, while the `rev` flags describe only how each reference piece is read.
+
+**[#500] Symbolic `<INS>` — FIXED.** `SVTYPE=INS;SVLEN=60` used to be preserved in the
+truth VCF while the reads came out behaviourally identical to the no-variant control — same
+`I` count, same `D` count, same depth. A 60 bp insertion was requested and nothing was
+inserted, so a benchmark built from that truth scored a caller as having missed an insertion
+that was never in the data.
+
+A symbolic `<INS>` from `input_vcf` is now realized: `SVLEN` novel bases are drawn by the
+**same** `sample_novel_insertion_bases` the de novo path uses — one model must not plant two
+different kinds of insertion depending on which door the record came through — and the record
+becomes a literal ALT, which is what routes the bases through the insertion machinery. The
+truth VCF then states what was actually planted rather than a size and a promise.
+[#580](https://github.com/ncsa/eidolon/issues/580) tracks making that sampler
+mobile-element-aware; both paths inherit it at once. A `<INS>` with no usable `SVLEN` has no
+length to synthesise and is dropped with a warning rather than kept as an unachievable truth
+record.
+
+The de novo path *did* synthesise novel sequence for INS all along, so the capability
+existed; it was simply not reached from `input_vcf`. That last sentence was an assertion when first written
 and is now **measured**: jobs 20885875/20892075 planted 4 insertions of 296–2500 bp whose
 novel bases are present in the truth VCF, at a rate consistent with the model's
 `Ins = 0.0279` (4 observed against ~5.2 expected-visible). It was nearly retracted as false
@@ -160,26 +206,46 @@ in 2026-08 on the strength of `truth INS: 0` in the SV harness — which turned 
 measuring the harness's own selector, not the generator. See §"De novo generation" below and
 `docs/claude_engineering_audit.md` §5.3.
 
-**[#516] Large insertions are only PARTIALLY realized, which is worse than not at all.** An
-insertion longer than roughly one read is spliced into the haplotype, but only its first
-~100–150 bases are ever sequenced. Measured on the H1N1 fixture at `read_len=100`,
-`fragment_mean=250`, counting reads containing a 30-mer from the head / middle / far end of the
-inserted sequence:
+**[#516] Large insertions were only PARTIALLY realized — FIXED.** Kept here because the
+defect's shape is the most instructive one in this repo: the head was always present while the
+interior collapsed to zero, so any probe near the insertion's start said it worked, which is
+where a casual check looks. The truth VCF meanwhile declared the full `SVLEN`.
 
-| insert | head | middle | tail |
+Measured on the H1N1 fixture at `read_len=100`, `fragment_mean=250`, `GT 0/1`, counting reads
+containing a 30-mer from the head / middle / far end of the inserted sequence. Identical
+fixture and config before and after, so the columns are directly comparable:
+
+| insert | head (was → now) | middle (was → now) | tail (was → now) |
 |---|---|---|---|
-| 50 bp | 16 | 13 | 8 |
-| 150 bp | 21 | 5 | 0 |
-| 200 bp | 25 | **0** | **0** |
-| 600 bp | 27 | **0** | **0** |
+| 50 bp | 16 → 22 | 13 → 15 | 8 → 15 |
+| 150 bp | 21 → 19 | 5 → **20** | **0 → 22** |
+| 200 bp | 25 → 20 | **0 → 15** | **0 → 15** |
+| 600 bp | 27 → 25 | **0 → 19** | **0 → 16** |
 
-The head is always present while the interior collapses to zero — so any probe near the
-insertion's start says it works, which is where a casual check looks. The truth VCF meanwhile
-declares the full `SVLEN`.
+The fix samples fragments in *altered-haplotype* coordinates, where an insertion has real
+width, so fragments begin inside it. `eidolon/tests/long_insertion_rework.rs` pins eight
+criteria on eidolon's own FASTQ, and `eidolon/tests/gate2_realigned_ins.rs` pins the same
+insertion through **bwa-mem2**: a homozygous 600 bp insertion at 60x yields 5/5 interior
+probes against 0/5 in a same-seed no-variant control, 96 breakpoint clips against 0, and 51
+reads unmapped-with-mapped-mate against 0.
 
-**Located mechanism.** Fragments and read windows are chosen purely in *reference* offsets
+At genome scale, de novo on a 5 Mb chr22 window (default germline model, `sv_rate_scale=8`):
+**427 of 440** insertions ≥200 bp have their middle sequence in the reads, with zero
+fallbacks. The remaining 13 are thinly covered rather than absent — mean interior depth 3.96
+against 6.77 for the rest, still 68% of their length covered. Interior coverage of a
+heterozygous insertion runs at ~half the flanking reference (7.0 vs 13.0 reads per 30-mer),
+which is the correct ratio, not a shortfall.
+
+**What is NOT yet established:** Delta job 21378484 (chr22, `SV_RATE_SCALE=30`, COSMIC
+pancancer somatic) verified 4 of 4 planted insertions at 5/5 interior probes including one of
+2127 bp — real evidence, but a denominator of four. `verify_planted_ins` now refuses to let a
+run that small read as validation. A larger-denominator campaign is outstanding.
+
+**The historical mechanism**, kept because it explains why the defect was invisible:
+
+Fragments and read windows were chosen purely in *reference* offsets
 (`cover_dataset`, `generate_fragments.rs:323`), and an insertion has zero reference width, so no
-read window can ever *begin* inside one. Reads are assembled per-read by walking a reference
+read window could ever *begin* inside one. Reads are assembled per-read by walking a reference
 slice and expanding variants inline, bounded by `bases_written < read_length`
 (`fastq_tools.rs:429`) with a `break 'outer` at `:555` that discards the rest of the insert
 silently — no log, no counter. Hence:
@@ -203,25 +269,27 @@ That is not primarily a caller limitation. Manta documents a *fully assembled* c
 insertions from a breakend signature alone, as `IMPRECISE <INS>` with
 `LEFT_SVINSSEQ`/`RIGHT_SVINSSEQ`. Most of the planted set was inside that range, and Manta
 reported nothing within 2 kb of any of them — because the evidence for the declared length was
-not in the reads. **INS recall figures are invalid above ~a read length; DEL/DUP/INV/BND/CNV
-are unaffected.**
+not in the reads. **INS recall figures from campaigns before the fix are invalid above ~a
+read length and must not be re-quoted; DEL/DUP/INV/BND/CNV from those runs are unaffected.**
+Job 21378484 is the first post-fix counter-example: Manta's single INS call was an exact
+position-and-size match to a planted 93 bp insertion, dropped only by `--passonly` as
+`MinSomaticScore`, while the three larger insertions it did not call were all confirmed
+present in the reads at 5/5 interior probes. Evidence present, caller declined — which is a
+different finding from evidence absent, and the read-level probe is what separates them.
 
-Suspected mechanism, same family as #498: fragments are placed against *reference*
-coordinates and the insert is spliced in afterwards, so a fragment can reach into the start of
-an insertion but none ever *begins* inside it — nothing samples the interior.
+**The interim `read_len - 1` cap on de novo insertions has been REMOVED.** While #516 was
+open, `gen-reads` refused to plant a de novo insertion whose novel sequence exceeded what a
+read could carry, rather than emit a truth record the reads could not support. That truncated
+the model's own distribution — the bundled default puts `Ins` at log-normal (5.7, 1.0),
+median ~299 bp, so at `read_len=150` roughly three quarters of INS draws were refused.
 
-**De novo insertions are now CAPPED at `read_len - 1` (interim, pending #516).** Rather than
-emit a truth record the reads cannot support, `gen-reads` refuses to plant a de novo insertion
-whose novel sequence exceeds what a read can carry, logging the count dropped. Two consequences,
-both intended:
-
-- **The realized INS rate is below the model's `Ins` probability.** The bundled default puts
-  `Ins` at log-normal (5.7, 1.0) — median ~299 bp — so at `read_len=150` roughly three quarters
-  of INS draws are refused. The truth VCF is now self-consistent; the *distribution* is
-  deliberately truncated and no longer matches the source corpus at the upper tail.
-- **`input_vcf` insertions are NOT capped.** Input fidelity is the stronger contract — what you
-  supply comes out — and silently discarding a user-supplied variant is worse than rendering it
-  partially. A large insertion supplied via `input_vcf` still behaves as the #516 row describes.
+With insertions sampled in altered-haplotype coordinates the cap is unnecessary, and its
+removal is pinned by `eidolon/tests/multi_sv_integration.rs`, which now asserts the opposite
+of what it once did: a de novo insertion MAY declare more novel bases than `read_len - 1`.
+Reinstating the cap, or unwiring the sampler, fails that assertion while every other
+assertion in the file stays green — which is the specific regression it exists to catch.
+De novo insertion sizes now follow the model rather than the read length; measured largest
+realized on a 5 Mb chr22 window is 9,093 bp.
 
 Pinned by `runner.rs`'s `unrealizable_insertions_are_dropped_at_exactly_the_boundary` and
 `the_insertion_cap_does_not_touch_other_variant_types` (a must-not-fire: dropping large
@@ -232,11 +300,17 @@ assertion in `multi_sv_integration.rs` that no de novo INS in the truth VCF exce
 This is an interim measure. It removes the false-truth problem, not the capability gap: eidolon
 still cannot simulate insertions longer than a read.
 
-**[#500] A single breakend (`A.`) destroys coverage.** VCF 4.2 allows an unresolved
-partner. `parse_bnd_alt` returns no mate, and the result is worse than being ignored:
-depth falls **72.0 → 42.4** (−41%) with **zero** chimeric reads. The truth declares a
-breakend, the reads contain no junction, and a depth caller sees a partial deletion no
-record describes.
+**[#500] A single breakend (`A.`) — FIXED by rejecting it.** VCF 4.2 allows an unresolved
+partner. `parse_bnd_alt` returns no mate, and accepting the record anyway was worse than
+ignoring it: depth fell **72.0 → 42.4** (−41%) with **zero** chimeric reads. The truth
+declared a breakend, the reads contained no junction, and a depth caller saw a partial
+deletion no record described.
+
+It is now rejected during `input_vcf` filtering, with a warning naming the record. That keeps
+it out of the truth VCF *and* leaves coverage alone — the regression test asserts both, and
+the depth ratio it checks is the old failing threshold inverted (0.59 measured then, > 0.85
+required now). Rejection rather than realization because eidolon has no way to build a
+junction read without a partner; revisit if junction generation ever represents one.
 
 **Fragment spanning a whole DUP — retracted, it was never broken.** This cell previously read
 ❌, citing a three-piece stitch (`left + block + right`) that `get_dup_pieces` cannot express,
@@ -473,9 +547,13 @@ previously an argument from two callers agreeing; it is now a measurement.
 
 ### INS: one planted, one verified present, zero found
 
-`truth INS: 1` (65 bp) is the #516 cap working as designed, and the drop log proves it rather
+`truth INS: 1` (65 bp) was the #516 cap working as designed, and the drop log proved it rather
 than implying it: 2 insertions dropped (chr2, chr19) + 1 kept = 3 draws, against ~3.5 expected
 from `Ins = 0.0279` over ~130 SVs, of which ~0.9 were expected to survive the 150 bp cap.
+
+**That cap no longer exists** (#516 fixed, 2026-08-24). Every draw is now realized, so a
+run's INS count is the model's own rate rather than the rate times a survival fraction —
+which is why the numbers in this section cannot be compared to a post-fix run.
 
 `INS read support: 1 of 1` — 7 reads carry a 30-mer from the **middle** of the inserted
 sequence. This is the first campaign to check that the reads contained what the truth declared
@@ -490,8 +568,9 @@ sequence. This is the first campaign to check that the reads contained what the 
 > replicate archived as a clean result ([#540](https://github.com/ncsa/eidolon/issues/540)).
 >
 > The `1 of 1` above came through the same code path. It did print its detail line, so it is
-> probably a true pass, but **treat the #516 cap as unverified in production** until #540 is
-> fixed and both replicates are re-checked.
+> probably a true pass, but **treated the #516 cap as unverified in production** until #540 is
+> fixed and both replicates are re-checked. Moot for the cap itself, which is gone; the #540
+> concern about a replicate archiving a clean result without printing its detail line stands.
 
 Neither caller found it. Manta's only INS call was a false positive on another chromosome
 (`chr11:99348945`, 58 bp, non-PASS); nothing was called within 2 kb of the planted event. Delly
@@ -566,7 +645,7 @@ real and verified) and is expected to matter for plants.
 | | input | de novo |
 |---|---|---|
 | intra-chromosomal BND | accepted, reads generated | never produced |
-| BND with inserted sequence | accepted but insert dropped (#498) | never produced |
+| BND with inserted sequence | accepted, insert spliced at the junction (#498) | never produced |
 | arbitrary contig pairs | whatever you supply | length-weighted ([#495](https://github.com/ncsa/eidolon/issues/495)) |
 
 These are not inconsistencies to reconcile. Input is "reproduce what I gave you"; de novo

@@ -323,7 +323,7 @@ impl SnpTrinucModel {
         let mut snp_weights: Vec<f64> = Vec::with_capacity(16);
         let mut trinuc_distros: HashMap<TrinucFrame, TransitionMatrix> = HashMap::new();
         let all_contexts = ALL_CONTEXTS.clone();
-        debug!("All contexts: {:?}", &all_contexts);
+        debug!("All contexts: {:?}", all_contexts);
         for frame in &all_contexts {
             trinuc_distros.insert(*frame, TransitionMatrix::default()?);
             snp_weights.push(1.0);

@@ -1,0 +1,34 @@
+# Pin the Rust toolchain so a workstation and CI compile with the SAME compiler.
+#
+# WHY: the repo had three different notions of "the toolchain" and none of them agreed.
+# `eidolon-tests.yml` used whatever Rust the GitHub runner image happened to ship,
+# `rust_binaries.yml` and `thirdparty-licenses.yml` asked for `@stable`, and a developer had
+# whatever `rustup` last installed. That is not academic: clippy is a BLOCKING gate (#616),
+# and three separate PRs passed `cargo clippy -D warnings` locally and then failed on the
+# runner — #618 (`useless_borrows_in_formatting`, 23 sites), #621, #626 (`byte_char_slices`).
+# In each case the local toolchain simply did not have the lint. A gate whose verdict depends
+# on which machine ran it teaches people to re-run until green.
+#
+# This is the same argument `thirdparty-licenses.yml` already makes for pinning
+# cargo-bundle-licenses: "license detection can differ between versions, so a floating
+# version could flip the subset check." A compiler is a bigger dependency than that tool.
+#
+# WHAT THIS COSTS: new clippy lints and new compiler diagnostics now arrive when someone
+# bumps this file, not on the day GitHub refreshes its image. That is the point — a toolchain
+# change becomes a reviewed commit with its own CI run, rather than an unrelated PR suddenly
+# going red. It also means we are NOT getting newer compiler warnings for free, so bump
+# deliberately and reasonably often rather than letting this rot.
+#
+# HOW TO BUMP: change `channel` here, then run `cargo clippy --workspace --all-targets --
+# -D warnings` and `cargo fmt --check`. Expect new lints; fix them or add them to the
+# `[workspace.lints.clippy]` allow-list in Cargo.toml with a note, per #617. Do it in its own
+# PR so the diff is legible.
+#
+# 1.98.0 (2026-08-18) is what the runner was already using when this was pinned, and both
+# `develop` and the open branches were verified clippy-clean and fmt-clean against it, so the
+# pin changed no verdict on the day it landed.
+[toolchain]
+channel = "1.98.0"
+# rustfmt and clippy are CI gates, so they must come with the toolchain rather than being
+# assumed present. `rustup` installs these automatically when it honours this file.
+components = ["rustfmt", "clippy"]

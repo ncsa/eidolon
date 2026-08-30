@@ -81,27 +81,46 @@ fn gate2_dup_produces_the_three_signatures_a_caller_needs() {
 
     // ── Signature 1: depth rises over the duplicated span ─────────────────────────────
     // Homozygous DUP without CN means one extra copy per haplotype, so the multiplier is 2.0.
-    // Asserted as a ratio against the same run's own flank, which cancels any coverage
-    // difference between the two runs.
-    let dup_ratio = dup.depth_inside / dup.depth_outside.max(1e-9);
+    //
+    // The denominator is THE SAME WINDOW IN A SEPARATE NO-VARIANT CONTROL RUN, not this run's
+    // own flank. #499's closing note prescribes exactly that, and #582 is what ignoring it
+    // costs: dividing by the in-run flank, this gate read 2.553 before the fragment-placement
+    // rewrite and 1.739 after, and failed. The duplication had not regressed — measured
+    // against the control run the same two builds give 2.671 and 1.970, so the dosage
+    // actually moved from 34% over-delivered to within 1.5% of physical expectation. What
+    // changed was the denominator: placement went from an artificially uniform tiler (depth
+    // VMR 0.226) to genuine Poisson (~1.0), and a 400 bp flank window is small enough to
+    // scatter. An in-run flank is not a control; it is another sample of the same run.
+    //
+    // The `ratio ~= multiplier + 0.53` offset described above is NOT simply gone. Measured
+    // at multiplier 2.0 the ratio is 1.970, so no excess is visible there — but a mutation
+    // run forcing the homozygous multiplier to 1.0 lands at 1.520, i.e. +0.52, exactly the
+    // documented offset. So the junction reads are still emitted in addition to the
+    // multiplied ones; whatever cancels them at 2.0 is not understood, and #499 should not
+    // be considered closed on the strength of the 1.970 alone.
+    let dup_ratio = dup.depth_inside / ctl.depth_inside.max(1e-9);
     let ctl_ratio = ctl.depth_inside / ctl.depth_outside.max(1e-9);
-    // Threshold is 1.9, just under the physically expected 2.0, NOT under the observed 2.55.
-    // The first version used 1.5 and a mutation setting the multiplier to 1.0 landed at 1.519 --
-    // surviving by 0.019. Anchor a threshold to what the value SHOULD be, never to a margin
-    // below what it happens to be.
-    assert!(
-        dup_ratio > 1.9,
-        "depth over a homozygous duplication should roughly double; interior/flank was \
-         {dup_ratio:.3} (inside {:.1}x, outside {:.1}x)",
-        dup.depth_inside,
-        dup.depth_outside
+    println!(
+        "  interior/control-interior = {dup_ratio:.3}  (in-run flank ratio would be {:.3})",
+        dup.depth_inside / dup.depth_outside.max(1e-9)
     );
-    // MUST-NOT-FIRE: the control has no duplication, so the same window must be flat. Without
-    // this, a window that happens to be over-covered would satisfy the assertion above.
+    // A BAND around the physically expected 2.0, not a one-sided floor. Anchored to what the
+    // value should be, never to a margin below what it happens to be — and two-sided so an
+    // over-delivering multiplier fails too, which a `> 1.9` floor would have waved through at
+    // the 2.671 this gate used to see.
+    assert!(
+        (1.8..2.2).contains(&dup_ratio),
+        "depth over a homozygous duplication should double; interior vs the control run's \
+         same window was {dup_ratio:.3} (dup {:.1}x, control {:.1}x), outside 1.8-2.2",
+        dup.depth_inside,
+        ctl.depth_inside
+    );
+    // MUST-NOT-FIRE: the control has no duplication, so its own interior and flank must
+    // agree. If they do not, the window is unreliable and the ratio above proves nothing.
     assert!(
         (0.8..1.2).contains(&ctl_ratio),
-        "control has no duplication, yet the same window reads {ctl_ratio:.3} — the window is \
-         unreliable, so signature 1 proves nothing"
+        "control has no duplication, yet its interior/flank reads {ctl_ratio:.3} — the window \
+         is unreliable, so signature 1 proves nothing"
     );
 
     // ── Signature 2: split reads at the junction ──────────────────────────────────────

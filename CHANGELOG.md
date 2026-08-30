@@ -1,3 +1,111 @@
+8/29/2026
+=========
+## eidolon v3.2.0 — insertions, and the harness that could see them
+
+v3.1.0 shipped with insertion limitations listed as known and documented. This release
+closes them, together with the wider defect they belonged to: **records that reached the
+truth VCF and never reached the reads.** Seven issues turned out to be one shape.
+
+Validated on NCSA Delta at genome scale (jobs 21575385 and 21603825, chr20+21+22, 30x,
+purity 0.6, `SV_RATE_SCALE=30`, exit 0). Every claim below states the evidence behind it.
+
+### Insertions now reach the reads, the CIGAR, and the truth
+
+- **Symbolic `<INS>` is realized** (#500). `SVTYPE=INS;SVLEN=60` from `input_vcf` used to be
+  preserved verbatim while the reads came out behaviourally identical to a no-variant
+  control — same `I` count, same `D` count, same depth. A benchmark built on that truth
+  scored a caller as missing an insertion that was never in the data. `SVLEN` novel bases are
+  now drawn and the record becomes a literal ALT, which is what routes them through the
+  insertion machinery. The bases come from the **same sampler the de novo path uses**, so one
+  model cannot plant two kinds of insertion depending which door a record came through. A
+  `<INS>` with no usable `SVLEN` is dropped with a warning rather than kept as an
+  unachievable truth record.
+- **BND junction inserted sequence is spliced** (#498). VCF 4.2 §5.4 lets a breakend ALT
+  carry novel bases at the junction, common in NHEJ. They were parsed and then dropped: 20
+  chimeric reads at a junction, none carrying the insert. Two details are load-bearing and
+  each has its own test — which end of the replacement sequence holds the REF base flips with
+  the bracket form, and the insert comes OUT of the fragment budget rather than extending it.
+  The second matters because the inserted bases consume read bases but no reference bases, so
+  a correct pair spans *less* reference than the library mean; that reduced insert size is a
+  signature callers use, and growing the fragment erases it.
+- **Golden BAM CIGARs describe long insertions** (#589), and **long insertions are sequenced
+  end to end** (#516). Measured: 11 of 11 planted insertions present in the reads, nine of
+  them longer than the 151 bp read, the largest 968 bp (6.4x).
+
+### Deletions
+
+- **Literal deletions live on the haplotype** (#590), so they remove coverage rather than
+  being partially applied. Measured: 76 of 76 with junction sequence present, 76 of 76 with
+  coverage removed, flank ratios 0.33–0.77 as purity 0.6 het somatic predicts.
+- **One large deletion no longer silences the rest of the contig** (#625). `min_region` was
+  `read_len + 2 * max_del_len` with a CONTIG-WIDE maximum, so a single 5 kb deletion raised
+  the floor everywhere and every sub-region under it produced zero reads: 205 of 356
+  sub-regions dropped on ecoli, **22.3% of the contig**, a 100 bp deletion sitting inside a
+  27,446 bp hole. The term turned out to be redundant since #590 — `write_block_fastq`
+  already supplies deletion slack, drawn from the whole sequence block — so it was deleted
+  rather than scoped. Verified byte-identical output on two fixtures, including one built
+  specifically to stress dense sub-read-length deletions.
+
+### Input VCF handling
+
+- **Single breakends are rejected** rather than silently destroying 41% of local coverage
+  (#500). They are a legitimate VCF 4.2 call that GRIDSS emits, so this is a stopgap and a
+  capability gap, tracked in #623.
+- **`REF == ALT` and no-call genotypes** are refused or normalized instead of generating an
+  allele the record does not assert (#591).
+- **Supplied SVs come out of the de novo budget** instead of adding to it (#603).
+
+### Determinism
+
+- **Chimeric read generation is deterministic again** (#599). `HashMap` iteration order drove
+  a shared RNG; contigs are now iterated in reference order. Measured byte-identical FASTQ
+  across repeated runs and across `num_threads` 1/4/8, with 38 SVs planted.
+
+### Validation harness
+
+Most of the defects above were found by the harness, and several harness defects were found
+by disagreement between its own gates. Recorded because the harness is now the reason to
+believe any number in this release:
+
+- Read-level evidence gates for insertions, deletion junctions, deletion coverage and CIGAR
+  clipping, all run per campaign before BAMs are pruned.
+- `exec 8<>lock 2>/dev/null` in `index_reference_locked` had been discarding **every** `>&2`
+  in the job from the bwa step onward (#583). A failing run exited 1 with its diagnostics
+  written into nothing.
+- The DEL junction probe and the CIGAR clip gate each searched only the anchor breakpoint and
+  reported good deletions as broken (#613, #630). Evidence for a two-breakpoint event can
+  anchor at either breakpoint.
+- The CIGAR gate asserted a non-zero `I`/`D` op, which aligners do not produce for these
+  events — it was reading background 1–2 bp indels and would have passed with the insertion
+  absent (#624). It now compares soft-clipped reads against flanking controls.
+- The INS denominator counted all insertions when the at-risk population is those longer than
+  a read (#620).
+
+### Known limitations
+
+- **Insertion sequence is random, not mobile-element** (#580). Composition-weighted novel
+  sequence is unique in the genome by construction, so every insertion-supporting read maps
+  at MAPQ >= 30. Real Alu (~10^6 copies) and L1 (~10^5) map ambiguously, and MAPQ 0 is the
+  normal case. **INS recall measured against eidolon insertions is therefore optimistic**,
+  and by a margin that grows with how repetitive the real event class is. Fine for asking
+  whether a read carried what the truth declared; wrong for predicting recall on real data.
+- **INS denominators remain thin at these settings.** Both validated campaigns planted 11
+  insertions, 9 longer than a read, against a floor of 20. The runs say those 9 worked; they
+  do not establish insertion realization at scale.
+- **Single breakends are refused, not supported** (#623).
+- **The CIGAR clip gate sits near its detection floor for somatic deletions** (#630). Its
+  thresholds were calibrated on homozygous 30x data where 18–58 clipped reads per locus are
+  expected; at purity 0.6 heterozygous the expectation is 1–3.
+
+### Infrastructure
+
+- Clippy is a blocking CI gate, with pre-existing findings allow-listed in `Cargo.toml` and
+  paid down by deleting entries (#616, #617).
+- The Rust toolchain is pinned in `rust-toolchain.toml`. Three PRs had passed clippy locally
+  and failed on the runner purely because the workstation was four minor versions behind.
+- `release-gates.yml` fires on PRs to `develop`, and the bwa-mem2 kernel is selected by what
+  actually runs rather than by its dispatcher, which was failing at random on runner hardware.
+
 8/19/2026
 =========
 ## eidolon v3.1.0 — correctness and validation release

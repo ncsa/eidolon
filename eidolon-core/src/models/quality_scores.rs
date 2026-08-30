@@ -1,25 +1,33 @@
 //! Walking through Zac Stephens original algorithm, to try to make sure I replicate it correctly.
-//!   * For position 1, there is a vector of weights for each score, extracted from data.
-//!   * For each position in the read length after that
-//!         * For each possible quality score, a distribution is constructed with weights and
-//!            scores, as determined by a matrix of weights
-//!   * For read length N and # possible quality scores Q, this creates a vector with length N
-//!         * first element is a 1-D vector of weights with length Q
-//!         * each subsequent element is a vector of length Q,
-//!           each element of which is a vector of length N.
+//!
+//! * For position 1, there is a vector of weights for each score, extracted from data.
+//! * For each position in the read length after that
+//!   * For each possible quality score, a distribution is constructed with weights and
+//!     scores, as determined by a matrix of weights
+//! * For read length N and # possible quality scores Q, this creates a vector with length N
+//!   * first element is a 1-D vector of weights with length Q
+//!   * each subsequent element is a vector of length Q,
+//!     each element of which is a vector of length N.
+//!
 //! To generate quality scores, they follow the following procedure:
-//!   * Sample the first element (1D vector) for initial quality score.
-//!   * For next position, the previous Q score determines which N-length set of weights to use to
-//!     determine the next quality score
+//!
+//! * Sample the first element (1D vector) for initial quality score.
+//! * For next position, the previous Q score determines which N-length set of weights to use to
+//!   determine the next quality score
+//!
 //! Advantages of this approach:
-//!   * Does a fairly effective job of modeling shapes of the quality scores for a set read length
+//!
+//! * Does a fairly effective job of modeling shapes of the quality scores for a set read length
+//!
 //! Disadvantages of this approach:
-//!   * The fact that we're working with a matrix with a different first element is
-//!     extremely confusing
-//!   * In addition to the difficulty keeping track of indexes, I'm not sure how well this will
-//!     translate to Rust. May need a custom data structure. Like seed + subsequent.
-//!   * Assumes a fixed read length, meaning you have to extrapolate for longer read lengths.
-//!   * In Python, at least, this was slow, although in retrospect it didn't eat up much memory.
+//!
+//! * The fact that we're working with a matrix with a different first element is
+//!   extremely confusing
+//! * In addition to the difficulty keeping track of indexes, I'm not sure how well this will
+//!   translate to Rust. May need a custom data structure. Like seed + subsequent.
+//! * Assumes a fixed read length, meaning you have to extrapolate for longer read lengths.
+//! * In Python, at least, this was slow, although in retrospect it didn't eat up much memory.
+
 use crate::rng::{NeatRng, NeatRngError};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};

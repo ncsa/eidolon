@@ -245,13 +245,13 @@ fn check_sorted(v: &Vcf) -> Vec<String> {
     let mut p = Vec::new();
     let mut last: HashMap<&str, usize> = HashMap::new();
     for r in &v.records {
-        if let Some(&prev) = last.get(r.chrom.as_str()) {
-            if r.pos < prev {
-                p.push(format!(
-                    "line {}: POS {} < previous {} on {} (tabix needs sorted input)",
-                    r.line_no, r.pos, prev, r.chrom
-                ));
-            }
+        if let Some(&prev) = last.get(r.chrom.as_str())
+            && r.pos < prev
+        {
+            p.push(format!(
+                "line {}: POS {} < previous {} on {} (tabix needs sorted input)",
+                r.line_no, r.pos, prev, r.chrom
+            ));
         }
         last.insert(r.chrom.as_str(), r.pos);
     }

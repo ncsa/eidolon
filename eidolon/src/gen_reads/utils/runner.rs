@@ -1,7 +1,8 @@
 use eidolon_core::file_tools::block_gz::BlockGzWriter;
 use eidolon_core::file_tools::file_io::create_output_file;
 use eidolon_core::rng::NeatRng;
-use eidolon_core::structs::variants::{Genotype, Provenance, SvType, VariantType};
+use eidolon_core::structs::sv_model::sample_novel_insertion_bases;
+use eidolon_core::structs::variants::{AlternateType, Genotype, Provenance, SvType, VariantType};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -17,8 +18,8 @@ use crate::{
             bed_reader::read_bed,
             fasta_stream::{FastaStream, map_buffer, resolve_iupac_bases},
             fastq_tools::{
-                Strand, combine_temp_fastqs, generate_read, reverse_complement, write_block_fastq,
-                write_read_to_fastq,
+                HaplotypeContext, PlacedFragment, Strand, combine_temp_fastqs, generate_read,
+                reverse_complement, write_block_fastq, write_read_to_fastq,
             },
             file_io::{VectorBuffer, append_to_file},
             vcf_tools::{read_vcf, write_vcf},
@@ -29,10 +30,12 @@ use crate::{
         },
         structs::{
             bed_record::BedRecord,
+            haplotype_map::InsertionCoordinateMap,
             mutated_map::{AdCounter, MutatedMap},
             nucleotides::Nucleotide,
             read_record::ReadRecord,
             sequence_block::{RegionType, SequenceBlock, SequenceMap},
+            sv_model::MIN_SV_LENGTH_BP,
             variants::{SvData, Variant},
         },
     },
@@ -68,7 +71,12 @@ struct ContigContext<'a> {
     bam_context: Option<Arc<BamContext>>,
     reference: Arc<HashMap<String, Vec<Nucleotide>>>,
     mutated_maps: Arc<HashMap<String, MutatedMap>>,
-    max_del_lens: HashMap<String, usize>,
+    // Contigs in REFERENCE FILE order. `mutated_maps` and `reference` are HashMaps, whose
+    // iteration order Rust randomizes per process; anything that walks them while drawing
+    // from a shared RNG becomes nondeterministic run to run. That is #599: chimeric read
+    // generation iterated `mutated_maps` directly and produced a different read set every
+    // run at a fixed seed, single-threaded. Iterate this instead and look the map up.
+    contig_order: Arc<Vec<String>>,
 }
 
 pub fn run_neat(
@@ -208,7 +216,7 @@ pub fn run_neat(
         input_variants
     };
 
-    info!("Reading fasta file: {}", &config.reference.display());
+    info!("Reading fasta file: {}", config.reference.display());
     let mut reference_map = HashMap::new();
     let mut contig_order_in_file = Vec::new();
     let fasta = FastaStream::open(&config.reference)?;
@@ -245,6 +253,10 @@ pub fn run_neat(
         // dropouts rather than being filled with fabricated sequence.
         reference_map.insert(name, seq);
     }
+    // Must run AFTER the reference is loaded: realizing a symbolic <INS> needs the local
+    // base composition to draw from, and the anchor base to build the literal ALT.
+    let input_variants = realize_symbolic_insertions(input_variants, &reference_map, rng);
+
     let reference = Arc::new(reference_map);
 
     let bam_context: Option<Arc<BamContext>> = if config.produce_bam {
@@ -306,7 +318,6 @@ pub fn run_neat(
     // Phase 1: Generate MutatedMaps for all contigs
     info!("Generating mutations for all contigs");
     let mut all_mutated_maps = HashMap::new();
-    let mut max_del_lens = HashMap::new();
     for (m_idx, name) in contig_order_in_file.iter().enumerate() {
         // Skip contigs whose sequence wasn't loaded (non-target under
         // target_bed). m_idx stays the original file position, so the loaded
@@ -315,7 +326,7 @@ pub fn run_neat(
             continue;
         };
         let m_rng = rng.derive_child((m_idx + 1000000) as u64);
-        let (m_map, max_del) = generate_mutated_map(
+        let m_map = generate_mutated_map(
             name,
             seq,
             config,
@@ -328,7 +339,6 @@ pub fn run_neat(
             m_rng,
         )?;
         all_mutated_maps.insert(name.clone(), m_map);
-        max_del_lens.insert(name.clone(), max_del);
     }
     let shared_mutated_maps = Arc::new(all_mutated_maps);
 
@@ -346,7 +356,7 @@ pub fn run_neat(
         bam_context,
         reference,
         mutated_maps: shared_mutated_maps,
-        max_del_lens,
+        contig_order: Arc::new(contig_order_in_file.clone()),
     };
 
     let mut mutated_maps: HashMap<String, Vec<MutatedMap>> = HashMap::new();
@@ -523,16 +533,16 @@ pub fn run_neat(
     let mut files_written = Vec::new();
     if config.paired_ended {
         if let Some(filename1) = &config.output_fastq_1 {
-            info!("Successfully wrote fastq file: {:?}", &filename1);
+            info!("Successfully wrote fastq file: {:?}", filename1);
             files_written.push(filename1.clone());
             if let Some(filename2) = &config.output_fastq_2 {
-                info!("Successfully wrote fastq file: {:?}", &filename2);
+                info!("Successfully wrote fastq file: {:?}", filename2);
                 files_written.push(filename2.clone());
             }
         }
     } else {
         if let Some(filename1) = &config.output_fastq_1 {
-            info!("Successfully wrote fastq file: {:?}", &filename1);
+            info!("Successfully wrote fastq file: {:?}", filename1);
             files_written.push(filename1.clone());
         }
     }
@@ -807,15 +817,18 @@ fn process_chunk(
             format!("MutatedMap for {} not found", contig_name),
         ))
     })?;
-    let max_del_len = *ctx.max_del_lens.get(&contig_name).unwrap_or(&0);
 
     // Keep short inserts when adapters are on (readthrough pads them) OR when the
     // adapter-free short-insert control is requested. Drives both fragment retention
     // (below) and the insert-length read cap in write_block_fastq.
     let keep_short = ctx.config.adapters.enabled || ctx.config.keep_short_fragments;
 
-    let block_fragments: Vec<(usize, usize)> = {
-        let mut block_frags = Vec::new();
+    // Altered haplotypes for long literal insertions in this chunk. Handed to
+    // write_block_fastq alongside the fragments so ONE writer serves both
+    // coordinate spaces (#516).
+    let mut haplotypes: Vec<HaplotypeContext> = Vec::new();
+    let block_fragments: Vec<PlacedFragment> = {
+        let mut block_frags: Vec<PlacedFragment> = Vec::new();
         // SV coverage multipliers are needed here to scale fragment counts.
         // Even though they are also in MutatedMap, we need them as intervals.
         let sv_variants: Vec<Variant> = mutated_map.sv_records.iter().cloned().collect();
@@ -867,12 +880,192 @@ fn process_chunk(
                     .map(|&(_, ne)| ne)
                     .unwrap_or(contig_len);
                 let extension_budget = materializable_end.saturating_sub(sub_end);
+
+                // A long literal insertion gives this sub-region a SECOND, longer
+                // molecule to sample from. Model it that way rather than patching
+                // reference-sampled reads afterwards: draw the alt haplotype's share
+                // of coverage in haplotype coordinates (where the inserted sequence
+                // has width, so fragments can begin inside it -- the whole of #516)
+                // and the rest from the reference. Zygosity then falls out of the
+                // sampling instead of needing a per-read coin, which is what the
+                // reverted attempt got wrong: it emitted every insertion at full
+                // depth regardless of genotype (measured het/hom ratio 1.02).
+                //
+                // Only insertions at least a read long need this. Shorter ones are
+                // already fully realized by inline variant application, and routing
+                // them here would change output for no benefit.
+                let long_ins: Vec<&Variant> = mutated_map
+                    .variant_map
+                    .values()
+                    .filter(|v| {
+                        v.variant_type == VariantType::Insertion
+                            && v.location >= sub_start
+                            && v.location < sub_end
+                            && v.alternate
+                                .as_literal()
+                                .and_then(|a| a.len().checked_sub(v.reference.len()))
+                                .is_some_and(|novel| novel >= ctx.config.read_len)
+                    })
+                    .collect();
+
+                // Build ONE alt haplotype carrying every long insertion in this
+                // sub-region. An earlier version handled a single insertion and fell
+                // back to the pre-#516 head-only behaviour for the rest; because
+                // sub-regions are large (a whole contig, split only by coverage
+                // multipliers), that caught the ordinary case of planting a size range
+                // at once via input_vcf -- measured on 200/600/1200bp sharing a contig:
+                // middle and tail both zero for all three.
+                //
+                // Insertions are grouped by their alt fraction. Two insertions at the
+                // same fraction belong on the same molecule; two at different fractions
+                // (a het and a hom, say) do not, and giving each group its own haplotype
+                // keeps each event's dosage independent rather than averaging them.
+                // SV-scale literal deletions belong on a haplotype for the mirror-image
+                // reason (#590). The per-base path can only SKIP deleted bases while
+                // rendering a read; it cannot stop fragments being PLACED across a span
+                // that, on this molecule, does not exist. Measured on a homozygous
+                // deletion against a no-variant control, depth inside the deleted span
+                // as a fraction of flank: 0.42 at 120 bp and 0.70 at 500 bp, where the
+                // identical event written as symbolic <DEL> gives 0.00.
+                //
+                // MIN_SV_LENGTH_BP is the codebase's own SV threshold, and the line is
+                // drawn there rather than at read_len (as insertions are) because the
+                // per-base path fails well before a read length. Below it the residual
+                // is small (measured 0.09 of flank at 30 bp) and routing every
+                // indel-model deletion through a materialized haplotype would change
+                // every run for no measurable gain.
+                let sv_dels: Vec<&Variant> = mutated_map
+                    .variant_map
+                    .values()
+                    .filter(|v| {
+                        v.location >= sub_start
+                            && v.location < sub_end
+                            && v.alternate.as_literal().is_some_and(|alt| {
+                                v.reference.len().saturating_sub(alt.len()) >= MIN_SV_LENGTH_BP
+                            })
+                    })
+                    .collect();
+
+                let mut ref_cov = scaled;
+                let mut alt_plans: Vec<(usize, usize)> = Vec::new(); // (hap_idx, alt_cov)
+                if !long_ins.is_empty() || !sv_dels.is_empty() {
+                    // Mirror the allele semantics generate_read uses for a literal
+                    // variant, so haplotype sampling and inline application agree: an
+                    // explicit allele_fraction wins, otherwise homozygous is always alt
+                    // and heterozygous is a half-and-half split.
+                    let fraction_of = |v: &Variant| -> f64 {
+                        match v.allele_fraction {
+                            Some(f) => f.clamp(0.0, 1.0),
+                            None => match v.genotype {
+                                Genotype::Homozygous => 1.0,
+                                Genotype::Heterozygous => 0.5,
+                            },
+                        }
+                    };
+                    // Group by fraction, keyed to the nearest thousandth so ordinary
+                    // float noise does not split a group that is conceptually one.
+                    let mut groups: std::collections::BTreeMap<u64, Vec<&Variant>> =
+                        std::collections::BTreeMap::new();
+                    // Insertions and deletions share the grouping: two events at the same
+                    // alt fraction belong on the SAME molecule, whichever kind they are.
+                    for v in long_ins.iter().chain(sv_dels.iter()) {
+                        let key = (fraction_of(v) * 1000.0).round() as u64;
+                        groups.entry(key).or_default().push(v);
+                    }
+                    let mut spent = 0usize;
+                    for (key, members) in groups {
+                        let f = key as f64 / 1000.0;
+                        let mut ins_entries: Vec<(usize, Vec<Nucleotide>)> = Vec::new();
+                        let mut del_entries: Vec<(usize, usize)> = Vec::new();
+                        for v in &members {
+                            let Some(alt) = v.alternate.as_literal() else {
+                                continue;
+                            };
+                            if alt.len() > v.reference.len() {
+                                if let Some(novel) = alt.get(v.reference.len()..) {
+                                    ins_entries.push((v.location, novel.to_vec()));
+                                }
+                            } else if v.reference.len() > alt.len() {
+                                del_entries.push((v.location, v.reference.len() - alt.len()));
+                            }
+                        }
+                        let Some(map) = InsertionCoordinateMap::with_deletions(
+                            contig_len,
+                            ins_entries,
+                            del_entries,
+                        ) else {
+                            // Refused only for genuinely ambiguous input (two insertions
+                            // anchored at the same base, an anchor off the contig). Say
+                            // so: these events keep the pre-#516 head-only behaviour and
+                            // must not be mistaken for working ones.
+                            warn!(
+                                "{contig_name}: could not build a haplotype for {} long \
+                                 insertion(s) in [{sub_start},{sub_end}) — they keep the \
+                                 pre-#516 head-only behaviour (#516)",
+                                members.len()
+                            );
+                            continue;
+                        };
+                        let alt_cov = scale_coverage(scaled, f);
+                        if alt_cov == 0 {
+                            continue;
+                        }
+                        spent += alt_cov;
+                        haplotypes.push(HaplotypeContext { map });
+                        alt_plans.push((haplotypes.len() - 1, alt_cov));
+                    }
+                    ref_cov = scaled.saturating_sub(spent);
+                }
+
+                for (hap_idx, alt_cov) in alt_plans {
+                    // The same sub-region expressed on the alt haplotype. Ask the map
+                    // to project both boundaries rather than computing the shift by
+                    // hand: with several insertions the span grows by however many of
+                    // them fall inside, and that arithmetic is exactly what the map
+                    // exists to get right. The extra width is what lets a fragment
+                    // BEGIN inside inserted sequence, which reference coordinates
+                    // cannot express at all.
+                    let h = &haplotypes[hap_idx];
+                    let hap_start = h
+                        .map
+                        .reference_base_to_haplotype(sub_start)
+                        .unwrap_or(sub_start);
+                    // sub_end is exclusive, so project the last included base and add
+                    // one; projecting sub_end itself would fall off the contig end.
+                    let hap_end = h
+                        .map
+                        .reference_base_to_haplotype(sub_end.saturating_sub(1))
+                        .map(|p| p + 1)
+                        .unwrap_or_else(|| h.map.haplotype_len());
+                    let hap_span = hap_end.saturating_sub(hap_start);
+                    let alt_frags = generate_fragments(
+                        extension_budget,
+                        hap_span,
+                        ctx.config.read_len,
+                        hap_start,
+                        alt_cov,
+                        ctx.config.paired_ended,
+                        ctx.config.long_reads,
+                        keep_short,
+                        ctx.fragment_length_model,
+                        &mut rng,
+                    )?;
+                    block_frags.extend(alt_frags.into_iter().map(|(s, e)| PlacedFragment {
+                        start: s,
+                        end: e,
+                        haplotype: Some(hap_idx),
+                    }));
+                }
+
+                let scaled = ref_cov;
+                if scaled == 0 {
+                    continue;
+                }
                 let frags = if ctx.gc_bias_model.is_uniform() {
                     generate_fragments(
                         extension_budget,
                         sub_end - sub_start,
                         ctx.config.read_len,
-                        max_del_len,
                         sub_start,
                         scaled,
                         ctx.config.paired_ended,
@@ -888,7 +1081,6 @@ fn process_chunk(
                         sub_start,
                         sub_end,
                         ctx.config.read_len,
-                        max_del_len,
                         scaled,
                         ctx.gc_bias_model,
                         ctx.fragment_length_model,
@@ -900,7 +1092,7 @@ fn process_chunk(
                     )?
                 };
                 if !frags.is_empty() {
-                    block_frags.extend_from_slice(&frags);
+                    block_frags.extend(frags.into_iter().map(PlacedFragment::from));
                 }
             }
         }
@@ -994,7 +1186,8 @@ fn process_chunk(
             let mut buffer2 = BlockGzWriter::new(writer2);
             debug!("Writing paired-ended contig fastq files");
             write_block_fastq(
-                block_fragments,
+                block_fragments.into_iter().map(Into::into).collect(),
+                &haplotypes,
                 mutated_map,
                 current_block,
                 true,
@@ -1019,7 +1212,8 @@ fn process_chunk(
             let dummy_data: VectorBuffer = VectorBuffer::new();
             let mut buffer2 = GzEncoder::new(dummy_data, Compression::default());
             write_block_fastq(
-                block_fragments,
+                block_fragments.into_iter().map(Into::into).collect(),
+                &haplotypes,
                 mutated_map,
                 current_block,
                 false,
@@ -1051,7 +1245,8 @@ fn process_chunk(
         let mut buf2 = std::io::sink();
         debug!("BAM-only: generating reads for {}", contig_name);
         write_block_fastq(
-            block_fragments,
+            block_fragments.into_iter().map(Into::into).collect(),
+            &haplotypes,
             mutated_map,
             current_block,
             ctx.config.paired_ended,
@@ -1214,13 +1409,10 @@ fn generate_mutated_map(
     mutation_model: &MutationModel,
     default_run_mutation_rate: f64,
     mut rng: NeatRng,
-) -> Result<(MutatedMap, usize), GenerateReadsError> {
+) -> Result<MutatedMap, GenerateReadsError> {
     let contig_len = sequence.len();
     if contig_len == 0 {
-        return Ok((
-            MutatedMap::from_interval(0, 0, vec![]).map_err(GenerateReadsError::from)?,
-            0,
-        ));
+        return MutatedMap::from_interval(0, 0, vec![]).map_err(GenerateReadsError::from);
     }
 
     let sequence_map = map_buffer(sequence);
@@ -1241,10 +1433,7 @@ fn generate_mutated_map(
     };
 
     if regions_of_interest.is_empty() {
-        return Ok((
-            MutatedMap::from_interval(0, contig_len, vec![]).map_err(GenerateReadsError::from)?,
-            0,
-        ));
+        return MutatedMap::from_interval(0, contig_len, vec![]).map_err(GenerateReadsError::from);
     }
 
     let mut rate_segments: Vec<(usize, usize, f64)> = regions_of_interest
@@ -1320,28 +1509,26 @@ fn generate_mutated_map(
             config.sv_max_length_fraction,
             &mut rng,
         );
-        // #516: refuse to PLANT an insertion the engine cannot render. Reads carry at most
-        // `read_len - 1` of an insertion's novel bases (fragments are placed in reference
-        // offsets, so none can begin inside a zero-reference-width event), while the truth VCF
-        // declares the full SVLEN — a benchmark built from that asserts insertions the reads
-        // cannot support. Until the fragment sampler can place reads in haplotype coordinates,
-        // not emitting the record is strictly better than emitting a false one.
+        // The #516 interim cap that used to sit here is GONE. It dropped every de novo
+        // insertion longer than `read_len - 1` on the grounds that "reads carry at most
+        // read_len - 1 of an insertion's novel bases (fragments are placed in reference
+        // offsets, so none can begin inside a zero-reference-width event)", and it said
+        // it would stand "until the fragment sampler can place reads in haplotype
+        // coordinates". That is now exactly what happens: a long insertion is sampled on
+        // its own altered haplotype, where the inserted sequence has width and fragments
+        // begin inside it. Keeping the cap would leave the de novo path unable to reach
+        // the fix at all — it was the reason a de novo campaign could never plant a long
+        // insertion no matter what the model asked for.
         //
-        // De novo ONLY. An `input_vcf` insertion is kept regardless, because input fidelity is
-        // the stronger contract ("what you put in comes out") and silently discarding a
-        // user-supplied variant would be worse than rendering it partially; that case stays
-        // documented in docs/sv_support_matrix.md.
-        let (mut de_novo, dropped) =
-            drop_unrealizable_insertions(de_novo, config.read_len.saturating_sub(1));
-        if dropped > 0 {
-            warn!(
-                "{contig_name}: dropped {dropped} de novo insertion(s) longer than {} bp — \
-                 reads cannot carry more than that of an insertion's novel sequence (#516), so \
-                 planting them would put a length in the truth VCF that the reads do not \
-                 support. The realized INS rate is therefore below the model's Ins probability.",
-                config.read_len.saturating_sub(1)
-            );
-        }
+        // The cap's own argument is what retires it, so it is removed rather than
+        // raised: there is no longer a length beyond which the reads cannot support the
+        // declared SVLEN. `drop_unrealizable_insertions` and its tests are deleted with
+        // it — an unused guard kept behind an allow(dead_code) is the "silently
+        // disabled" shape this repo's deny-warnings policy exists to catch. The distinct
+        // question of an insertion too large to MATERIALIZE is already handled generally
+        // by `sv_max_length_fraction`, which bounds de novo SV length to a fraction of
+        // the contig (default 0.25).
+        let mut de_novo = de_novo;
         apply_sv_subclone_model(
             &mut de_novo,
             config.subclone_model.as_ref(),
@@ -1370,13 +1557,6 @@ fn generate_mutated_map(
             .iter()
             .map(|&(s, e, r)| (e - s) as f64 * r)
             .sum();
-    }
-
-    let mut max_del_len = 0;
-    for v in &block_variants {
-        if v.variant_type == VariantType::Deletion && v.reference.len() > 1 {
-            max_del_len = max_del_len.max(v.reference.len() - 1);
-        }
     }
 
     let num_mutations = num_mutations_sum.trunc() as usize;
@@ -1416,11 +1596,6 @@ fn generate_mutated_map(
                         append_info_tag(&mut variant.info, format!("EIDOLON_VAF={:.4}", p * af));
                     }
                 }
-                if variant.variant_type == VariantType::Deletion
-                    && variant.reference.len() - 1 > max_del_len
-                {
-                    max_del_len = variant.reference.len() - 1;
-                }
                 block_variants.push(variant);
             }
         }
@@ -1429,7 +1604,7 @@ fn generate_mutated_map(
     block_variants.extend(sv_variants);
     let mutated_map = MutatedMap::from_interval(0, contig_len, block_variants)
         .map_err(GenerateReadsError::from)?;
-    Ok((mutated_map, max_del_len))
+    Ok(mutated_map)
 }
 
 fn process_chimeric_variants(
@@ -1439,7 +1614,14 @@ fn process_chimeric_variants(
     let mut all_reads = Vec::new();
     let mut processed_ids = HashSet::new();
 
-    for (contig_name, m_map) in ctx.mutated_maps.iter() {
+    // Reference-file order, NOT HashMap order — see `ContigContext::contig_order` (#599).
+    // A single `rng` is threaded through this whole loop, so the order in which contigs
+    // are visited decides which draws each junction gets; a randomized order changed the
+    // emitted read set, and even its size, on every run.
+    for contig_name in ctx.contig_order.iter() {
+        let Some(m_map) = ctx.mutated_maps.get(contig_name) else {
+            continue;
+        };
         for sv_rec in &m_map.sv_records {
             let sv = match sv_rec.alternate.as_symbolic() {
                 Some(s) => s,
@@ -2112,10 +2294,29 @@ fn generate_chimeric_pair(
     // L1 = offset
     // L2 = frag_len - offset
 
-    let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
-        get_bnd_pieces(contig, pos, sv, offset, frag_len - offset, &ctx.reference)?;
+    // Novel sequence at the junction comes out of the fragment budget, it does not extend
+    // it: L1 + |insert| + L2 == frag_len. See `bnd_fragment_split` for why — the short
+    // version is that the insert consumes read bases but no reference bases, so the pair
+    // must span LESS reference than the library mean.
+    let insert = bnd_insert_bases(sv);
+    let (insert_used, len2) = bnd_fragment_split(frag_len, offset, insert.len());
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
+        get_bnd_pieces(contig, pos, sv, offset, len2, &ctx.reference)?;
+
+    let seq1 = get_stitched_sequence(
+        ctx,
+        &c1,
+        s1,
+        e1,
+        rev1,
+        &c2,
+        s2,
+        e2,
+        rev2,
+        &insert[..insert_used],
+        rng,
+    )?;
 
     let read_len = ctx.config.read_len;
     // The trailing 16-hex `frag_idx` matches the uniqueness-tag pattern that
@@ -2143,6 +2344,10 @@ fn generate_chimeric_pair(
     let mut throwaway_ad = AdCounter::new();
     let r1 = generate_read(
         &seq1,
+        // BND junction reads are stitched from reference pieces: every base is 'M', and
+        // no haplotype deletion applies.
+        None,
+        None,
         &[], // Mutations already applied in get_stitched_sequence
         &HashMap::new(),
         read_len,
@@ -2169,6 +2374,9 @@ fn generate_chimeric_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2213,7 +2421,7 @@ fn generate_inv_pair(
         ctx,
     )?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     // The trailing 16-hex `frag_idx` matches the uniqueness-tag pattern that
@@ -2243,6 +2451,10 @@ fn generate_inv_pair(
 
     let r1 = generate_read(
         &seq1,
+        // Reference-derived bases only: no haplotype insertion mask, no haplotype
+        // deletion.
+        None,
+        None,
         &[],
         &HashMap::new(),
         read_len,
@@ -2269,6 +2481,9 @@ fn generate_inv_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2313,7 +2528,7 @@ fn generate_del_pair(
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
         get_del_pieces(contig, location, end, offset, frag_len - offset, ctx)?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     // QNAME format mirrors BND/INV's `EIDOLON_chimeric_*` scheme so the
@@ -2342,6 +2557,10 @@ fn generate_del_pair(
 
     let r1 = generate_read(
         &seq1,
+        // Reference-derived bases only: no haplotype insertion mask, no haplotype
+        // deletion.
+        None,
+        None,
         &[],
         &HashMap::new(),
         read_len,
@@ -2368,6 +2587,9 @@ fn generate_del_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2444,7 +2666,7 @@ fn generate_dup_pair(
     let ((c1, s1, e1, rev1), (c2, s2, e2, rev2)) =
         get_dup_pieces(contig, location, end, offset, frag_len - offset, ctx)?;
 
-    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, rng)?;
+    let seq1 = get_stitched_sequence(ctx, &c1, s1, e1, rev1, &c2, s2, e2, rev2, &[], rng)?;
 
     let read_len = ctx.config.read_len;
     let base_name = format!(
@@ -2463,6 +2685,10 @@ fn generate_dup_pair(
 
     let r1 = generate_read(
         &seq1,
+        // Reference-derived bases only: no haplotype insertion mask, no haplotype
+        // deletion.
+        None,
+        None,
         &[],
         &HashMap::new(),
         read_len,
@@ -2489,6 +2715,9 @@ fn generate_dup_pair(
             .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
+            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_len,
@@ -2671,6 +2900,16 @@ fn get_bnd_pieces(
     })
 }
 
+/// Stitch the two reference pieces of a breakend, splicing any inserted sequence between
+/// them.
+///
+/// `insert` is the novel sequence the BND ALT declares at the junction (VCF 4.2 §5.4). It
+/// goes between the pieces in every one of the four bracket forms and is NEVER
+/// reverse-complemented: it is written in the orientation of the record that declares it,
+/// while `rev1`/`rev2` describe only how each REFERENCE piece is read. Reverse-complementing
+/// it would put real bases in the read in an order the truth VCF does not claim — the same
+/// silent truth/reads disagreement as omitting it (#498).
+#[allow(clippy::too_many_arguments)]
 fn get_stitched_sequence(
     ctx: &ContigContext,
     c1: &str,
@@ -2681,6 +2920,7 @@ fn get_stitched_sequence(
     s2: usize,
     e2: usize,
     rev2: bool,
+    insert: &[Nucleotide],
     rng: &mut NeatRng,
 ) -> Result<Vec<Nucleotide>, GenerateReadsError> {
     let mut seq1 = get_mutated_subseq(ctx, c1, s1, e1, rng)?;
@@ -2691,8 +2931,51 @@ fn get_stitched_sequence(
     if rev2 {
         seq2 = reverse_complement(seq2);
     }
+    seq1.extend_from_slice(insert);
     seq1.extend(seq2);
     Ok(seq1)
+}
+
+/// The inserted bases a breakend declares, as nucleotides.
+///
+/// Every character is kept. `Nucleotide::from(char)` maps anything that is not a base to
+/// `N`, which is deliberate here: callers size the fragment against this length, so dropping
+/// an unreadable character would make the spliced sequence shorter than the budget reserved
+/// for it and shift the junction. An `N` in the read is a visible "we could not read this
+/// base"; a length mismatch is silent.
+/// Divide a fragment across `[piece1 | insert | piece2]`, returning `(insert_used, len2)`.
+///
+/// INVARIANT: `offset + insert_used + len2 == frag_len` for any `offset <= frag_len`. The
+/// insert comes OUT of the fragment budget, it does not extend it.
+///
+/// WHY THAT MATTERS: the inserted bases consume READ bases but no REFERENCE bases, so a
+/// correctly built pair spans LESS reference than the library mean — a reduced insert size
+/// is one of the signatures a caller uses to detect an insertion at a junction. Letting the
+/// fragment grow by the insert length instead keeps the reference span at the library mean
+/// and erases that signature, while placing the mate further into the second piece than the
+/// fragment distribution allows. The result is systematically discordant pairs at every
+/// inserted junction and an inferred event size that does not match what was planted.
+///
+/// (It does NOT inflate depth: R1 and R2 are each `read_len` bases regardless of how long
+/// the fragment is, so the bases emitted per fragment do not change. An earlier version of
+/// this comment claimed otherwise.)
+///
+/// Split out from `generate_chimeric_pair` so the invariant is testable without a reference
+/// or a `ContigContext` — no read-content check can see this, since the insert is still
+/// present, adjacent and correctly oriented.
+///
+/// A fragment can end INSIDE a long insert: then it carries a prefix of the insert and no
+/// second reference piece at all, which is the ordinary truncation any read sees at a
+/// junction.
+fn bnd_fragment_split(frag_len: usize, offset: usize, insert_len: usize) -> (usize, usize) {
+    let after_junction = frag_len.saturating_sub(offset);
+    let insert_used = insert_len.min(after_junction);
+    let len2 = after_junction - insert_used;
+    (insert_used, len2)
+}
+
+fn bnd_insert_bases(sv: &SvData) -> Vec<Nucleotide> {
+    sv.bnd_insert.chars().map(Nucleotide::from).collect()
 }
 
 fn get_mutated_subseq(
@@ -2798,24 +3081,286 @@ fn append_info_tag(info: &mut Option<String>, tag: String) {
     });
 }
 
+/// Split a GT into its allele tokens, handling both `/` and `|` separators.
+fn gt_alleles(gt: &str) -> Vec<&str> {
+    if gt.contains('/') {
+        gt.split('/').collect()
+    } else {
+        gt.split('|').collect()
+    }
+}
+
+/// True when a GT calls the reference on every allele (`0/0`, `0|0`, `0`).
+///
+/// Such a record says this sample does NOT carry the alt — it is common in cohort VCFs,
+/// where a site is present because some other sample has it. `gt_from_str` maps it to
+/// `Heterozygous` (it sees a zero allele and stops), so the alt was generated at ~0.5
+/// while the truth VCF carried `GT=0/0` beside `AF=0.4857` (#591).
+fn is_hom_ref(gt: &str) -> bool {
+    let alleles = gt_alleles(gt);
+    !alleles.is_empty() && alleles.iter().all(|a| a.trim() == "0")
+}
+
+/// Rewrite each no-call allele in a PARTIAL no-call as a reference allele: `./1` -> `0/1`,
+/// `././1` -> `0/0/1`. Returns `None` when nothing changed.
+///
+/// Two reasons, and the downstream one decides it. **Semantically**, `./1` tells us about
+/// exactly one alternate allele; generating `1/1` invents a second we were never given,
+/// while `0/1` asserts precisely what the input said and nothing more.
+///
+/// **Downstream**, `bcftools` classifies a partial no-call as neither het nor hom —
+/// measured, `GT="het"` selects only `0/1` and `GT="hom"` only `1/1`, while `./1` appears
+/// solely under `GT="mis"`. A `./1` truth record therefore drops out of *any*
+/// zygosity-stratified analysis without a word. `0/1` is understood everywhere.
+///
+/// This also fixes the allele fraction for free: `dosage_fraction` skips `.` alleles, so
+/// `./1` scored alt=1 of total=1 = 1.0 and the variant was generated as fully homozygous
+/// (#591). `0/1` scores 1 of 2 = 0.5 with no special case, and generalises to any ploidy.
+fn normalize_partial_no_call(gt: &str) -> Option<String> {
+    if !gt.contains('.') {
+        return None;
+    }
+    let sep = if gt.contains('/') { '/' } else { '|' };
+    let out: Vec<String> = gt
+        .split(sep)
+        .map(|a| {
+            if a.trim() == "." {
+                "0".to_string()
+            } else {
+                a.trim().to_string()
+            }
+        })
+        .collect();
+    let joined = out.join(&sep.to_string());
+    if joined == gt { None } else { Some(joined) }
+}
+
+/// True when every allele of a GT is `.` — a no-call.
+///
+/// `gt_from_str` cannot express this: it skips `.` alleles, never sets `found_zero`, and
+/// falls through to `Homozygous`. So a `./.` record silently becomes homozygous ALT and
+/// the truth VCF then carries `GT=./.` next to `AF=1.0000` — a record contradicting
+/// itself (#591). Detect it on the raw string, before that lossy conversion.
+fn is_no_call(gt: &str) -> bool {
+    let alleles = gt_alleles(gt);
+    !alleles.is_empty() && alleles.iter().all(|a| a.trim() == ".")
+}
+
+/// Give a symbolic `<INS>` from an input VCF the novel sequence it needs to reach the reads.
+///
+/// WHY THIS EXISTS: a symbolic `<INS>` carries no sequence, so there was nothing to splice
+/// and the record became a silent no-op — preserved verbatim in the truth VCF while the
+/// reads came out byte-identical in behaviour to a no-variant control, same `I` count, same
+/// `D` count, same depth (#500). A benchmark built from that truth scores a caller as having
+/// missed an insertion that was never in the data.
+///
+/// Realizing it is the biologically honest reading: `<INS>` in a real callset means "an
+/// insertion of about this size, sequence unresolved", and generating reads for it requires
+/// choosing a sequence. The bases are drawn by `sample_novel_insertion_bases` — the SAME
+/// sampler the de novo path uses, so one model does not plant two different kinds of
+/// insertion depending on which door the record came through. #580 tracks making that
+/// sampler mobile-element-aware; when it lands, both paths get it at once.
+///
+/// The record becomes LITERAL, which is what routes the bases through the insertion
+/// machinery, and the truth VCF then states exactly what was planted rather than a size and
+/// a promise. `SVTYPE=INS` beside a literal ALT is what Manta emits for a resolved insertion.
+///
+/// A `<INS>` with no usable `SVLEN` cannot be realized at all — there is no length to
+/// synthesise — so it is dropped with a warning rather than kept as an unachievable truth
+/// record, the same reasoning as #591's REF==ALT arm.
+fn realize_symbolic_insertions(
+    input: Option<HashMap<String, Vec<Variant>>>,
+    reference: &HashMap<String, Vec<Nucleotide>>,
+    rng: &mut NeatRng,
+) -> Option<HashMap<String, Vec<Variant>>> {
+    let mut input = input?;
+    let (mut realized, mut dropped) = (0usize, 0usize);
+
+    for (contig, variants) in input.iter_mut() {
+        let Some(sequence) = reference.get(contig) else {
+            continue; // not a loaded contig; nothing downstream will read it either
+        };
+        let mut kept: Vec<Variant> = Vec::with_capacity(variants.len());
+        for mut v in std::mem::take(variants) {
+            let Some(sv) = v.alternate.as_symbolic() else {
+                kept.push(v);
+                continue;
+            };
+            if sv.sv_type != SvType::Ins {
+                kept.push(v);
+                continue;
+            }
+            let length = match sv.svlen {
+                Some(n) if n > 0 => n as usize,
+                _ => {
+                    dropped += 1;
+                    warn!(
+                        "Skipping symbolic <INS> at {}:{} — no positive INFO/SVLEN, so there \
+                         is no length to synthesise and the record cannot reach the reads. \
+                         Supply an explicit ALT sequence or an SVLEN.",
+                        contig,
+                        v.location + 1
+                    );
+                    continue;
+                }
+            };
+            let anchor_0based = v.location.min(sequence.len().saturating_sub(1));
+            let novel = match sample_novel_insertion_bases(sequence, anchor_0based, length, rng) {
+                Ok(bases) => bases,
+                Err(e) => {
+                    dropped += 1;
+                    warn!(
+                        "Skipping symbolic <INS> at {}:{} — could not draw novel sequence: {e}",
+                        contig,
+                        v.location + 1
+                    );
+                    continue;
+                }
+            };
+            let anchor_base = sequence[anchor_0based];
+            let mut alt_bases = Vec::with_capacity(length + 1);
+            alt_bases.push(anchor_base);
+            alt_bases.extend(novel);
+
+            v.reference = vec![anchor_base];
+            v.alternate = AlternateType::Literal(alt_bases);
+            v.variant_type = VariantType::Insertion;
+            realized += 1;
+            kept.push(v);
+        }
+        *variants = kept;
+    }
+
+    if realized > 0 {
+        info!(
+            "Realized {realized} symbolic <INS> record(s) with synthesised novel sequence \
+             so the reads carry them (#500)"
+        );
+    }
+    if dropped > 0 {
+        warn!("Dropped {dropped} symbolic <INS> record(s) that could not be realized");
+    }
+    Some(input)
+}
+
 fn filter_input_vcf(raw: HashMap<String, Vec<Variant>>) -> HashMap<String, Vec<Variant>> {
     let mut out: HashMap<String, Vec<Variant>> = HashMap::new();
+    let (mut n_complex, mut n_null, mut n_nocall, mut n_homref) = (0usize, 0usize, 0usize, 0usize);
+    let mut n_partial = 0usize;
+    let mut n_single_bnd = 0usize;
     for (contig, variants) in raw {
         let mut kept = Vec::new();
         for v in variants {
+            // Order matters only for which warning a doubly-bad record gets; each arm drops.
             if v.variant_type == VariantType::Complex && v.alternate.is_literal() {
+                n_complex += 1;
                 warn!(
                     "Skipping complex variant at {}:{} (multi-base REF and ALT that is not \
                      a simple indel) — not yet supported",
                     contig, v.location
                 );
+            } else if v.alternate.as_literal() == Some(v.reference.as_slice()) {
+                // REF == ALT is not a variant: there is no alternate allele to carry. Keeping
+                // it would put an unachievable record in the truth VCF, where it becomes a
+                // false negative for every caller and inflates the recall denominator (#591).
+                n_null += 1;
+                warn!(
+                    "Skipping non-variant at {}:{} (ALT is identical to REF, so there is no \
+                     alternate allele to generate)",
+                    contig, v.location
+                );
+            } else if v
+                .alternate
+                .as_symbolic()
+                .is_some_and(|sv| sv.sv_type == SvType::Bnd && sv.mate_contig.is_none())
+            {
+                // A single breakend (VCF 4.2 §5.4: `A.` / `.A`) declares a junction whose
+                // partner is unknown or absent — a telomeric fusion, or a mate that could
+                // not be resolved. eidolon has no way to build a junction read without a
+                // partner, and the result was worse than ignoring the record: depth at the
+                // locus fell 72.0 -> 42.4, a 41% loss, with ZERO chimeric reads (#500). The
+                // truth declared a breakend, the reads contained no junction, and coverage
+                // was silently destroyed around it — a depth-based caller sees a partial
+                // deletion no record describes.
+                //
+                // Rejected rather than ignored: keeping it in the truth VCF would assert a
+                // breakend the reads do not carry, and corrupting coverage is strictly worse
+                // than refusing the record. Revisit when junction generation can represent
+                // an unresolved partner.
+                n_single_bnd += 1;
+                warn!(
+                    "Skipping single breakend at {}:{} (ALT {}) — a breakend with no mate \
+                     cannot be turned into junction reads, and accepting it destroys local \
+                     coverage without producing a junction. Supply the mate record, or drop \
+                     this one.",
+                    contig,
+                    v.location,
+                    v.alternate
+                        .as_symbolic()
+                        .map(|sv| sv.raw_alt.clone())
+                        .unwrap_or_default()
+                );
+            } else if is_hom_ref(&v.genotype_str) {
+                // 0/0 says this sample carries the reference on every allele. Generating the
+                // ALT anyway produced AF~0.49 beside GT=0/0 (#591). Common in cohort VCFs,
+                // where the site exists because a DIFFERENT sample carries it.
+                n_homref += 1;
+                warn!(
+                    "Skipping homozygous-reference record at {}:{} (GT={}) — this sample \
+                     does not carry the alternate allele",
+                    contig, v.location, v.genotype_str
+                );
+            } else if is_no_call(&v.genotype_str) {
+                // A no-call says nothing about what to generate. Applying it as homozygous
+                // ALT — which is what the genotype parser does by default — asserts a
+                // variant the GT explicitly declines to call (#591).
+                n_nocall += 1;
+                warn!(
+                    "Skipping no-call genotype at {}:{} (GT={}) — a no-call carries no \
+                     instruction about what to generate",
+                    contig, v.location, v.genotype_str
+                );
             } else {
+                // A PARTIAL no-call is a real call on at least one allele, so it is kept —
+                // but the `.` is rewritten to `0` first. Done after the full-no-call and
+                // hom-ref arms above so those keep their own, clearer warnings.
+                let mut v = v;
+                if let Some(fixed) = normalize_partial_no_call(&v.genotype_str) {
+                    n_partial += 1;
+                    debug!(
+                        "Normalizing partial no-call at {}:{}: GT={} -> {} (an uncalled \
+                         allele is generated as reference, not as a second alt)",
+                        contig, v.location, v.genotype_str, fixed
+                    );
+                    v.genotype_str = fixed;
+                    // Normalization replaced at least one `.` with `0`, so the result
+                    // carries a reference allele by construction and the coarse label is
+                    // Heterozygous. The precise per-copy dosage comes from
+                    // `dosage_fraction()` reading the string, which now counts that `0`.
+                    v.genotype = Genotype::Heterozygous;
+                }
                 kept.push(v);
             }
         }
         if !kept.is_empty() {
             out.insert(contig, kept);
         }
+    }
+    // A step that drops input deliberately has to say how much, or a shrunken truth set
+    // looks like a small one.
+    if n_partial > 0 {
+        info!(
+            "input_vcf: normalized {n_partial} partial no-call genotype(s) — an uncalled \
+             allele is generated as reference (./1 -> 0/1)"
+        );
+    }
+    let dropped = n_complex + n_null + n_nocall + n_homref + n_single_bnd;
+    if dropped > 0 {
+        warn!(
+            "input_vcf: dropped {dropped} record(s) — {n_complex} complex, {n_null} \
+             ALT-equals-REF, {n_nocall} no-call genotype, {n_homref} homozygous-reference, \
+             {n_single_bnd} single breakend"
+        );
     }
     out
 }
@@ -2861,39 +3406,6 @@ fn rate_at(segments: &[(usize, usize, f64)], pos: usize) -> f64 {
 
 /// Splits segments to remove individual excluded positions (e.g. positions already
 /// occupied by input variants). `excluded` must be sorted.
-/// Novel-base count of a LITERAL insertion, or `None` for anything else.
-///
-/// A literal insertion is `REF=<anchor>`, `ALT=<anchor><novel…>`, so the novel length is
-/// `ALT.len() - REF.len()`. Returns `None` for symbolic SVs (whose length lives in INFO, not in
-/// the ALT) and for deletions (where the subtraction underflows) — both must be left alone.
-fn literal_insertion_novel_len(v: &Variant) -> Option<usize> {
-    if v.variant_type != VariantType::Insertion {
-        return None;
-    }
-    let alt = v.alternate.as_literal()?;
-    alt.len().checked_sub(v.reference.len()).filter(|&n| n > 0)
-}
-
-/// Drop de novo insertions longer than `max_novel_bp`; returns the survivors and the count
-/// dropped. See the call site for why (#516).
-///
-/// REJECTS rather than clamps. Clamping the upper tail to exactly `max_novel_bp` would pile
-/// every large draw at one length and produce a spike that reads as a real size distribution.
-/// Rejection just thins the tail, which is the honest statement: eidolon does not currently
-/// simulate insertions longer than a read.
-fn drop_unrealizable_insertions(vars: Vec<Variant>, max_novel_bp: usize) -> (Vec<Variant>, usize) {
-    let before = vars.len();
-    let kept: Vec<Variant> = vars
-        .into_iter()
-        .filter(|v| match literal_insertion_novel_len(v) {
-            Some(n) => n <= max_novel_bp,
-            None => true,
-        })
-        .collect();
-    let dropped = before - kept.len();
-    (kept, dropped)
-}
-
 fn exclude_positions(
     segments: Vec<(usize, usize, f64)>,
     excluded: &[usize],
@@ -3025,21 +3537,22 @@ fn max_broken_fraction_in_window(
 /// (no RNG drawn), so non-SV and DUP/CNV-gain-only runs are byte-for-byte
 /// unaffected.
 fn suppress_junction_double_count(
-    fragments: Vec<(usize, usize)>,
+    fragments: Vec<PlacedFragment>,
     sv_records: &[Variant],
     ploidy: usize,
     read_len: usize,
     paired_ended: bool,
     use_subclone: bool,
     rng: &mut NeatRng,
-) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
+) -> Result<Vec<PlacedFragment>, GenerateReadsError> {
     let junctions = collect_suppressible_junctions(sv_records, ploidy, use_subclone);
     if junctions.is_empty() {
         return Ok(fragments);
     }
     let positions: Vec<usize> = junctions.iter().map(|&(p, _)| p).collect();
-    let mut kept: Vec<(usize, usize)> = Vec::with_capacity(fragments.len());
-    for (start, end) in fragments {
+    let mut kept: Vec<PlacedFragment> = Vec::with_capacity(fragments.len());
+    for placed in fragments {
+        let (start, end) = (placed.start, placed.end);
         let mut bf = max_broken_fraction_in_window(&junctions, &positions, start, start + read_len);
         if paired_ended && end > read_len {
             bf = bf.max(max_broken_fraction_in_window(
@@ -3050,11 +3563,11 @@ fn suppress_junction_double_count(
             ));
         }
         if bf <= 0.0 {
-            kept.push((start, end)); // crosses no junction
+            kept.push(placed); // crosses no junction
         } else if bf >= 1.0 {
             continue; // homozygous: every allele broken — drop, no RNG draw
         } else if rng.random()? >= bf {
-            kept.push((start, end)); // heterozygous: survived the drop coin
+            kept.push(placed); // heterozygous: survived the drop coin
         }
         // else: heterozygous and dropped
     }
@@ -3321,6 +3834,58 @@ fn intersect_with_bed(
 
 #[cfg(test)]
 mod tests {
+
+    /// The fragment budget is CONSERVED: an inserted breakend sequence comes out of the
+    /// fragment, it does not extend it.
+    ///
+    /// Getting this wrong is invisible to every read-content check — the insert is present,
+    /// adjacent and correctly oriented — while every fragment crossing an inserted breakend
+    /// spans the wrong amount of reference, so the mate lands further away than the fragment
+    /// distribution allows and the insertion's reduced-insert-size signature is erased.
+    /// Found by mutating `len2` back to the un-adjusted value and watching all three
+    /// end-to-end #498 tests still pass.
+    #[test]
+    fn bnd_fragment_split_conserves_the_fragment_length() {
+        for frag_len in [50usize, 151, 300, 301, 1000] {
+            for offset in 0..=frag_len {
+                for insert_len in [0usize, 1, 12, 24, 200, 5000] {
+                    let (used, len2) = bnd_fragment_split(frag_len, offset, insert_len);
+                    assert_eq!(
+                        offset + used + len2,
+                        frag_len,
+                        "frag_len={frag_len} offset={offset} insert_len={insert_len} \
+                         split into {offset}+{used}+{len2}"
+                    );
+                    assert!(used <= insert_len, "used more insert than exists");
+                }
+            }
+        }
+    }
+
+    /// Known answers for the three regimes, so a change that keeps the sum right but moves
+    /// bases between the insert and the second piece still fails.
+    #[test]
+    fn bnd_fragment_split_known_answers() {
+        // Insert fits: it is fully used and the second piece takes the remainder.
+        assert_eq!(bnd_fragment_split(300, 100, 24), (24, 176));
+        // No insert: the second piece takes everything after the junction.
+        assert_eq!(bnd_fragment_split(300, 100, 0), (0, 200));
+        // Insert longer than what is left: truncated, and NO second reference piece.
+        assert_eq!(bnd_fragment_split(300, 100, 500), (200, 0));
+        // Junction at the very end of the fragment: nothing after it at all.
+        assert_eq!(bnd_fragment_split(300, 300, 24), (0, 0));
+    }
+    // Junction-suppression tests predate haplotype-aware placement and are written
+    // in plain (start, end) spans, which is still the right level for them:
+    // suppression is about where a fragment sits, not which haplotype it came from.
+    // Convert at the boundary rather than rewriting the cases.
+    fn placed(v: Vec<(usize, usize)>) -> Vec<PlacedFragment> {
+        v.into_iter().map(PlacedFragment::from).collect()
+    }
+    fn spans(v: &[PlacedFragment]) -> Vec<(usize, usize)> {
+        v.iter().map(|f| (f.start, f.end)).collect()
+    }
+
     use super::*;
     use eidolon_core::structs::bed_record::BedRecord;
     use eidolon_core::structs::sequence_block::{RegionType, SequenceMap};
@@ -3527,6 +4092,160 @@ mod tests {
         assert_eq!(result2[1].end, 350); // global 1350 - 1000
     }
 
+    /// #591: an input record that asserts no alternate allele must not become one.
+    ///
+    /// Three shapes, all of which used to be silently GENERATED and then written into the
+    /// truth VCF contradicting themselves. Measured on H1N1 before the fix:
+    ///
+    ///   REF==ALT   ->  GT=1/1  AD=0,42  AF=1.0000   (there is no alt allele at all)
+    ///   GT=./.     ->  GT=./.  AD=0,44  AF=1.0000   (the GT declines to call it)
+    ///   GT=0/0     ->  GT=0/0  AD=18,17 AF=0.4857   (the GT calls reference twice)
+    ///
+    /// Each is a false negative for every caller scored against that truth, and inflates
+    /// the recall denominator by a record no caller could ever produce.
+    #[test]
+    fn input_records_that_assert_no_alternate_allele_are_dropped() {
+        let mk = |location: usize,
+                  reference: Vec<Nucleotide>,
+                  alt: Vec<Nucleotide>,
+                  gt: &str,
+                  vt: VariantType| Variant {
+            location,
+            reference,
+            alternate: AlternateType::Literal(alt),
+            variant_type: vt,
+            genotype: Genotype::Homozygous,
+            allele_fraction: None,
+            genotype_str: gt.to_string(),
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: vec![],
+            sample: vec![],
+            provenance: Provenance::InputVcf,
+        };
+        use Nucleotide::{A, C, T};
+
+        let raw = HashMap::from([(
+            "chr1".to_string(),
+            vec![
+                // dropped: no alternate allele exists
+                mk(100, vec![A], vec![A], "1/1", VariantType::SNP),
+                // dropped: the genotype declines to call
+                mk(200, vec![A], vec![T], "./.", VariantType::SNP),
+                mk(250, vec![A], vec![T], ".|.", VariantType::SNP),
+                // dropped: the genotype calls reference on every allele
+                mk(300, vec![A], vec![T], "0/0", VariantType::SNP),
+                mk(350, vec![A], vec![T], "0|0", VariantType::SNP),
+                // MUST NOT FIRE — every one of these is a real variant call
+                mk(400, vec![A], vec![T], "1/1", VariantType::SNP),
+                mk(500, vec![A], vec![T], "0/1", VariantType::SNP),
+                mk(600, vec![A], vec![T], "1|0", VariantType::SNP),
+                // a PARTIAL no-call still calls one alt allele, so it is a variant
+                mk(700, vec![A], vec![T], "./1", VariantType::SNP),
+                // REF and ALT differ in length: an indel, not a null variant
+                mk(800, vec![A, C], vec![A], "1/1", VariantType::Deletion),
+            ],
+        )]);
+
+        let kept = filter_input_vcf(raw);
+        let mut locs: Vec<usize> = kept
+            .get("chr1")
+            .map(|v| v.iter().map(|x| x.location).collect())
+            .unwrap_or_default();
+        locs.sort_unstable();
+        assert_eq!(
+            locs,
+            vec![400, 500, 600, 700, 800],
+            "expected only the records that actually assert an alternate allele to survive; \
+             dropping a real call here would silently shrink the truth set"
+        );
+    }
+
+    /// A partial no-call is kept, but its `.` becomes `0` — #591 follow-up.
+    ///
+    /// Before: `./1` was written to the truth VCF verbatim and generated at AF 1.0000,
+    /// because `dosage_fraction` skips `.` alleles and scored it alt=1 of total=1.
+    /// Two things were wrong with that. It invents a second alt allele the input never
+    /// mentioned, and — measured with bcftools — `./1` is classified as neither het nor
+    /// hom: `GT="het"` selects only `0/1`, `GT="hom"` only `1/1`, and `./1` appears solely
+    /// under `GT="mis"`. A truth record like that drops out of any zygosity-stratified
+    /// analysis silently.
+    #[test]
+    fn a_partial_no_call_is_normalized_to_a_reference_allele() {
+        assert_eq!(normalize_partial_no_call("./1").as_deref(), Some("0/1"));
+        assert_eq!(normalize_partial_no_call("1/.").as_deref(), Some("1/0"));
+        assert_eq!(normalize_partial_no_call(".|1").as_deref(), Some("0|1"));
+        // generalises past diploid: one called alt of three copies
+        assert_eq!(normalize_partial_no_call("././1").as_deref(), Some("0/0/1"));
+
+        // MUST NOT FIRE: nothing to normalize, so nothing is rewritten.
+        for gt in ["0/1", "1/1", "1|0", "0/0/1", "0"] {
+            assert_eq!(
+                normalize_partial_no_call(gt),
+                None,
+                "{gt} has no uncalled allele and must be left exactly as supplied"
+            );
+        }
+    }
+
+    /// The normalized record must reach the kept set carrying the rewritten GT — a unit
+    /// test on the helper alone would pass even if it were never wired in.
+    #[test]
+    fn the_normalized_partial_no_call_is_what_gets_kept() {
+        let v = Variant {
+            location: 700,
+            reference: vec![Nucleotide::A],
+            alternate: AlternateType::Literal(vec![Nucleotide::T]),
+            variant_type: VariantType::SNP,
+            genotype: Genotype::Homozygous,
+            allele_fraction: None,
+            genotype_str: "./1".to_string(),
+            id: None,
+            quality_score: None,
+            filter: None,
+            info: None,
+            format: vec![],
+            sample: vec![],
+            provenance: Provenance::InputVcf,
+        };
+        let kept = filter_input_vcf(HashMap::from([("chr1".to_string(), vec![v])]));
+        let got = &kept.get("chr1").expect("record kept")[0];
+        assert_eq!(got.genotype_str, "0/1", "the `.` must be rewritten to `0`");
+        assert_eq!(
+            got.genotype,
+            Genotype::Heterozygous,
+            "one alt of two copies is heterozygous, not homozygous"
+        );
+        // 1 of 2 copies, not 1 of 1 — this is the AF that reaches read generation.
+        assert!(
+            (got.dosage_fraction() - 0.5).abs() < 1e-9,
+            "expected dosage 0.5, got {}",
+            got.dosage_fraction()
+        );
+    }
+
+    #[test]
+    fn no_call_and_hom_ref_genotypes_are_recognised_on_the_raw_string() {
+        // gt_from_str cannot express either: it skips '.' alleles (so "./." falls through to
+        // Homozygous) and stops at the first '0' (so "0/0" reads as Heterozygous). Both have
+        // to be caught before that conversion.
+        for gt in ["./.", ".|.", ".", "./././."] {
+            assert!(is_no_call(gt), "{gt} is a no-call");
+            assert!(!is_hom_ref(gt), "{gt} is not homozygous reference");
+        }
+        for gt in ["0/0", "0|0", "0", "0/0/0"] {
+            assert!(is_hom_ref(gt), "{gt} is homozygous reference");
+            assert!(!is_no_call(gt), "{gt} is not a no-call");
+        }
+        // MUST NOT FIRE: each of these calls at least one alternate allele.
+        for gt in ["0/1", "1/1", "1|0", "./1", "1/.", "0/2"] {
+            assert!(!is_no_call(gt), "{gt} calls an allele and is not a no-call");
+            assert!(!is_hom_ref(gt), "{gt} carries an alt and is not hom-ref");
+        }
+    }
+
     #[test]
     fn test_filter_input_vcf() {
         use crate::eidolon_core::structs::variants::{Genotype, Provenance, VariantType};
@@ -3593,88 +4312,6 @@ mod tests {
         let locs: Vec<usize> = filtered["chr1"].iter().map(|v| v.location).collect();
         assert!(locs.contains(&100));
         assert!(locs.contains(&500));
-    }
-
-    /// Build a LITERAL insertion of `novel` novel bases: REF=A, ALT=A + novel*'C'.
-    fn literal_ins(novel: usize) -> Variant {
-        use eidolon_core::structs::nucleotides::Nucleotide;
-        let mut alt = vec![Nucleotide::A];
-        alt.extend(std::iter::repeat_n(Nucleotide::C, novel));
-        Variant {
-            variant_type: VariantType::Insertion,
-            location: 1000,
-            reference: vec![Nucleotide::A],
-            alternate: AlternateType::Literal(alt),
-            genotype_str: "0/1".to_string(),
-            genotype: Genotype::Heterozygous,
-            allele_fraction: None,
-            id: None,
-            quality_score: None,
-            filter: None,
-            info: None,
-            format: vec!["GT".to_string()],
-            sample: vec!["0/1".to_string()],
-            provenance: Provenance::Denovo,
-        }
-    }
-
-    /// #516: an insertion longer than a read is only partially realized, so it must not be
-    /// planted. KNOWN ANSWER: the boundary is exactly `max_novel_bp` — kept at the boundary,
-    /// dropped one past it.
-    #[test]
-    fn unrealizable_insertions_are_dropped_at_exactly_the_boundary() {
-        let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(99)], 99);
-        assert_eq!((kept.len(), dropped), (1, 0), "99bp must be KEPT at max=99");
-
-        let (kept, dropped) = drop_unrealizable_insertions(vec![literal_ins(100)], 99);
-        assert_eq!(
-            (kept.len(), dropped),
-            (0, 1),
-            "100bp must be DROPPED at max=99"
-        );
-
-        // Count is over the whole batch, not just the first offender.
-        let batch = vec![
-            literal_ins(50),
-            literal_ins(500),
-            literal_ins(99),
-            literal_ins(2155),
-        ];
-        let (kept, dropped) = drop_unrealizable_insertions(batch, 99);
-        assert_eq!((kept.len(), dropped), (2, 2));
-        for v in &kept {
-            assert!(literal_insertion_novel_len(v).unwrap() <= 99);
-        }
-    }
-
-    /// MUST NOT FIRE. The cap is about insertions only: a symbolic SV carries its length in
-    /// INFO rather than the ALT, and a literal DELETION has a longer REF than ALT. Dropping
-    /// either would silently delete large DELs/DUPs/INVs from every de novo run — a far worse
-    /// bug than the one being worked around.
-    #[test]
-    fn the_insertion_cap_does_not_touch_other_variant_types() {
-        use eidolon_core::structs::nucleotides::Nucleotide;
-        let huge_dup =
-            sv_variant_with_span(1000, 900_000, SvType::Dup, Genotype::Heterozygous, None);
-        let huge_del =
-            sv_variant_with_span(1000, 900_000, SvType::Del, Genotype::Heterozygous, None);
-        let mut literal_del = literal_ins(0);
-        // REF spans the deleted bases, ALT is the anchor alone — the reverse of an insertion.
-        literal_del.variant_type = VariantType::Deletion;
-        literal_del.reference = std::iter::repeat_n(Nucleotide::T, 400).collect();
-        literal_del.alternate = AlternateType::Literal(vec![Nucleotide::T]);
-
-        assert_eq!(literal_insertion_novel_len(&huge_dup), None);
-        assert_eq!(literal_insertion_novel_len(&huge_del), None);
-        assert_eq!(literal_insertion_novel_len(&literal_del), None);
-
-        let (kept, dropped) =
-            drop_unrealizable_insertions(vec![huge_dup, huge_del, literal_del], 99);
-        assert_eq!(
-            (kept.len(), dropped),
-            (3, 0),
-            "no non-insertion may be dropped by the insertion cap"
-        );
     }
 
     fn sv_variant_with_span(
@@ -3842,8 +4479,9 @@ mod tests {
         ];
         let mut rng = NeatRng::new_from_seed(&vec!["bp".to_string()]).unwrap();
         let kept =
-            suppress_junction_double_count(frags, &[bnd], 2, 100, false, false, &mut rng).unwrap();
-        assert_eq!(kept, vec![(300, 400), (600, 700)]);
+            suppress_junction_double_count(placed(frags), &[bnd], 2, 100, false, false, &mut rng)
+                .unwrap();
+        assert_eq!(spans(&kept), vec![(300, 400), (600, 700)]);
     }
 
     #[test]
@@ -3851,10 +4489,17 @@ mod tests {
         // No BND/INV → input returned verbatim, no RNG consumed.
         let frags = vec![(0, 100), (200, 300)];
         let mut rng = NeatRng::new_from_seed(&vec!["bp".to_string()]).unwrap();
-        let kept =
-            suppress_junction_double_count(frags.clone(), &[], 2, 100, false, false, &mut rng)
-                .unwrap();
-        assert_eq!(kept, frags);
+        let kept = suppress_junction_double_count(
+            placed(frags.clone()),
+            &[],
+            2,
+            100,
+            false,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(spans(&kept), frags);
     }
 
     #[test]
@@ -3864,7 +4509,7 @@ mod tests {
         let in_gap = sv_variant_with_span(550, 0, SvType::Bnd, Genotype::Homozygous, None);
         let mut rng = NeatRng::new_from_seed(&vec!["bp".to_string()]).unwrap();
         let kept = suppress_junction_double_count(
-            vec![(400, 700)],
+            placed(vec![(400, 700)]),
             &[in_gap],
             2,
             100,
@@ -3873,11 +4518,15 @@ mod tests {
             &mut rng,
         )
         .unwrap();
-        assert_eq!(kept, vec![(400, 700)], "gap junction must not suppress");
+        assert_eq!(
+            spans(&kept),
+            vec![(400, 700)],
+            "gap junction must not suppress"
+        );
         // A junction at 450 sits in R1 → crossed → dropped.
         let in_r1 = sv_variant_with_span(450, 0, SvType::Bnd, Genotype::Homozygous, None);
         let kept2 = suppress_junction_double_count(
-            vec![(400, 700)],
+            placed(vec![(400, 700)]),
             &[in_r1],
             2,
             100,
@@ -3897,7 +4546,8 @@ mod tests {
         let frags: Vec<(usize, usize)> = vec![(450usize, 550usize); 1000];
         let mut rng = NeatRng::new_from_seed(&vec!["bp het".to_string()]).unwrap();
         let kept =
-            suppress_junction_double_count(frags, &[het], 2, 100, false, false, &mut rng).unwrap();
+            suppress_junction_double_count(placed(frags), &[het], 2, 100, false, false, &mut rng)
+                .unwrap();
         assert!(
             (300..700).contains(&kept.len()),
             "expected ~50% of 1000 het-crossing pairs kept, got {}",

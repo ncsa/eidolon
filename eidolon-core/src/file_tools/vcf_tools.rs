@@ -65,7 +65,7 @@ pub fn write_vcf(
     writeln!(&mut buffer, "##reference={}", reference_path.display())?;
     for contig in contig_order {
         let length = fasta_lengths[contig];
-        writeln!(&mut buffer, "##contig=<ID={},length={}>", &contig, length)?;
+        writeln!(&mut buffer, "##contig=<ID={},length={}>", contig, length)?;
     }
     // VCF spec §1.4.1: meta-information lines must be KEY=VALUE. #207.
     writeln!(
@@ -1842,6 +1842,7 @@ chr1\t100\t.\tN\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=500\n";
     /// BGZF-defining markers directly:
     ///   - The first 4 bytes have FLG.FEXTRA=1 (gzip magic + 0x04 flag byte)
     ///   - The "BC" subfield identifier appears in the gzip extra field
+    ///
     /// Plain gzip has FLG=0x00 and no extra field, so this test fails loudly
     /// if anyone swaps the writer back.
     #[test]

@@ -29,8 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      # No toolchain step on purpose. `dtolnay/rust-toolchain@stable` sets
+      # RUSTUP_TOOLCHAIN, which OVERRIDES rust-toolchain.toml — so asking for @stable here
+      # would have silently ignored the pin. ubuntu-latest ships rustup, which reads
+      # rust-toolchain.toml and installs the pinned toolchain on the first cargo invocation.
 
       - name: Cache cargo registry
         uses: actions/cache@v4

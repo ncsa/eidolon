@@ -60,6 +60,10 @@ decoy always passes@if awk -v r="$r" 'BEGIN{exit !(r < 0.001)}'; then@if true; t
 decoy tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: decoy control for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=0; if false; then echo "ERROR: decoy control for $label DID NOT RUN
 selftest tolerates a control that did not run@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        echo "ERROR: scorer selftest for $label DID NOT RUN@    if ! r=$(truvari_metric "$out/summary.json" recall); then\n        r=1.0; if false; then echo "ERROR: scorer selftest for $label DID NOT RUN
 decoy match is only a warning@echo "ERROR: decoy control for $label matched@return 0; echo "ERROR: decoy control for $label matched
+decoy ignores the contig bound@if (bound && L > 0 && newpos + span > L) {@if (0) {
+decoy keeps colliding records@if (newpos <= te[k, i] + collide && newend >= tp[k, i] - collide) { collided++; next }@if (0) { collided++; next }
+decoy tolerates a control that shed everything@if [[ "$d_kept" -lt 1 ]] || [[ "$d_total" -gt 0 && $(( d_kept * 100 / d_total )) -lt 50 ]]; then@if false; then
+decoy hides what it dropped@if [[ "$d_dropped" -gt 0 || "$d_collided" -gt 0 ]]; then@if false; then
 empty stratum silently dropped (pre-fix)@TYPES_UNMEASURED+=("$svt")@:
 coverage-hole summary never printed@echo "  SV types with an EMPTY denominator@echo "  suppressed
 empty stratum reported for every type@if [[ "$n" -eq 0 ]]; then@if [[ "$n" -ge 0 ]]; then
@@ -84,11 +88,33 @@ unknown reference size reads as small@        if (bp <= 0 || cov <= 0) { print 2
 reference_bp ignores the .fai@    if [[ -s "$ref.fai" ]]; then@    if false; then
 probe matcher ignores the reverse strand@{ for (i = 1; i <= n; i++) if (index($0, fwd[i]) || index($0, rev[i])) hits[i]++ }@{ for (i = 1; i <= n; i++) if (index($0, fwd[i])) hits[i]++ }
 probe matcher drops zero-support probes@END { for (i = 1; i <= n; i++) print chrom[i], pos[i], len[i], hits[i] }@END { for (i = 1; i <= n; i++) if (hits[i] > 0) print chrom[i], pos[i], len[i], hits[i] }
+all-calls pass still filters (#541)@        filter_args=()@        filter_args=(--passonly)
+only one scoring pass happens (#541)@    TRUVARI_ALL_CALLS=1 run_truvari "$@"@    :
+all-calls overwrites the PASS-only result (#541)@        suffix="_allcalls"@        suffix=""
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
     exit $?
 fi
+
+# Prerequisites. Unlike the other two suites, this one drives REAL bcftools and bgzip —
+# truvari is stubbed, the VCF handling is not. A missing tool otherwise surfaces as
+# "is in a format that cannot be usefully indexed" thirty lines later, which reads like a
+# bad fixture rather than a missing package. On Ubuntu bgzip ships in `tabix`, NOT in
+# `bcftools`; that cost one red CI run.
+missing=
+for tool in bcftools bgzip; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "FATAL: this suite needs real VCF tooling and is missing:$missing" >&2
+    echo "  Ubuntu/Debian:  sudo apt-get install -y bcftools tabix   (bgzip is in tabix)" >&2
+    echo "  conda:          conda install -c bioconda bcftools htslib" >&2
+    echo "  Refusing to run: a calibration suite that cannot build a VCF would report" >&2
+    echo "  failures about its own fixtures, not about the code under test." >&2
+    exit 2
+fi
+
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
@@ -139,6 +165,50 @@ truvari() {
             mkdir -p "$out"
             printf '{"recall": %s, "precision": 1.0, "f1": 1.0, "TP-base": %s, "FN": %s, "FP": 0}\n' \
                 "$STUB_RECALL" "${STUB_TPBASE:-0}" "${STUB_FN:-0}" > "$out/summary.json"
+            return 0 ;;
+        # A stub that actually HONOURS --passonly. The `json` mode above returns a fixed
+        # verdict, so it can prove the two scoring passes are wired up but cannot prove they
+        # measure different things — which is the whole of #541. This one matches comp to
+        # truth on CHROM+POS, drops non-PASS comp records when --passonly is present, and
+        # writes a real summary.json. It is deliberately dumber than truvari: we are testing
+        # OUR filter wiring, not truvari's matching.
+        filter)
+            local b="" c="" passonly=0 prev2=""
+            for a in "$@"; do
+                [[ "$prev2" == "-b" ]] && b="$a"
+                [[ "$prev2" == "-c" ]] && c="$a"
+                [[ "$a" == "--passonly" ]] && passonly=1
+                prev2="$a"
+            done
+            mkdir -p "$out"
+            python3 - "$b" "$c" "$passonly" "$out/summary.json" <<'PYSTUB'
+import gzip, io, json, sys
+def load(path):
+    op = gzip.open if path.endswith(".gz") else open
+    rows = []
+    with op(path, "rt") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 7:
+                rows.append((f[0], f[1], f[6]))
+    return rows
+truth, comp, passonly, outp = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+t = load(truth)
+c = load(comp)
+if passonly:
+    c = [r for r in c if r[2] in ("PASS", ".")]
+tk = {(x[0], x[1]) for x in t}
+ck = {(x[0], x[1]) for x in c}
+tp = len(tk & ck)
+fn = len(tk) - tp
+fp = len(ck - tk)
+recall = tp / len(tk) if tk else None
+prec = tp / len(ck) if ck else None
+json.dump({"recall": recall, "precision": prec,
+           "f1": None, "TP-base": tp, "FN": fn, "FP": fp}, open(outp, "w"))
+PYSTUB
             return 0 ;;
     esac
 }
@@ -524,6 +594,139 @@ rm -f "$WORK/r.fa.fai"
 head -c 10000 /dev/zero > "$WORK/r.fa"
 is "falls back to ~0.98x the FASTA bytes" 9800 "$(reference_bp "$WORK/r.fa")"
 is "a missing reference reports 0 (-> worst case)" 0 "$(reference_bp "$WORK/nope.fa")"
+
+echo "── decoy is bounded by the contig and avoids colliding with the truth (job 21382756) ──"
+# Job 21382756 exposed two ways this control misreported ITSELF: 20 of 481 records ran off a
+# contig end and vanished with no mention (truvari saw "base cnt 481, comp cnt 461"), and 7
+# displaced records landed on top of a DIFFERENT truth record at ~5 SVs/Mb and matched it,
+# giving recall=0.0146 against a threshold that means "zero matches allowed". Neither was a
+# scorer defect. Both now have to be handled and counted.
+SAVED_REF="$REFERENCE"
+REFERENCE="$WORK/ref2.fa"
+: > "$REFERENCE"
+printf 'c2\t10000000\t0\t60\t61\nc3\t1000000\t0\t60\t61\nc4\t100000000\t0\t60\t61\n' > "$REFERENCE.fai"
+{ printf '##fileformat=VCFv4.2\n'
+  printf '##contig=<ID=c2,length=10000000>\n##contig=<ID=c3,length=1000000>\n##contig=<ID=c4,length=100000000>\n'
+  printf '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="t">\n'
+  printf '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="l">\n'
+  printf '##INFO=<ID=END,Number=1,Type=Integer,Description="e">\n'
+  printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+  # +2Mb would end past c2's 10Mb end -> must mirror to 7000000 instead of vanishing
+  printf 'c2\t9000000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-1000;END=9001000\n'
+  # c3 is 1Mb: neither +2Mb nor -2Mb fits, so this one is genuinely unplaceable
+  printf 'c3\t500000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-1000;END=501000\n'
+  # +2Mb lands at 3000000-3003000, overlapping the next record's span (same SVTYPE)
+  printf 'c4\t1000000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=3000;END=1003000\n'
+  printf 'c4\t3000500\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=3000;END=3003500\n'
+  printf 'c4\t20000000\t.\tG\t<INV>\t60\tPASS\tSVTYPE=INV;SVLEN=800;END=20000800\n'
+  printf 'c4\t30000000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=30000500\n'
+  # JOB 21387104's geometry: +2Mb puts this 900kb DUP at 42.0-42.9Mb, which OVERLAPS the
+  # next record's span while starting 500kb away from it. A start-proximity test misses
+  # that completely, and truvari matched exactly this shape — a decoy DUP 900kb from a
+  # truth DUP — because it matches large symbolic SVs on size and overlap, not refdist.
+  printf 'c4\t40000000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=900000;END=40900000\n'
+  printf 'c4\t42500000\t.\tG\t<DUP>\t60\tPASS\tSVTYPE=DUP;SVLEN=900000;END=43400000\n'
+} > "$WORK/truth2.vcf"
+bgzip -f -c "$WORK/truth2.vcf" > "$WORK/truth2.vcf.gz"
+bcftools index -f -t "$WORK/truth2.vcf.gz"
+
+STUB_MODE=json; STUB_RECALL=0.0
+dout="$(decoy_truvari "$WORK/truth2.vcf.gz" bound 2>&1)"
+D2="$WORK/.decoy_bound.vcf.gz"
+p2() { bcftools query -f '%CHROM\t%POS\n' "$D2" 2>/dev/null | awk -F'\t' -v c="$1" -v p="$2" '$1==c && $2==p' | wc -l; }
+
+is "a record that would overrun the contig is mirrored, not lost" 1 "$(p2 c2 7000000)"
+is "and it is NOT placed past the contig end"                     0 "$(p2 c2 11000000)"
+is "a record that fits neither direction is dropped"              0 "$(p2 c3 2500000)"
+is "a displaced record landing on another truth record is excluded" 0 "$(p2 c4 3000000)"
+is "a non-colliding record is still displaced"                    1 "$(p2 c4 5000500)"
+is "a displaced span that OVERLAPS a truth record 500kb away is excluded" 0 "$(p2 c4 42000000)"
+is "a displaced span that overlaps nothing is kept"  1 "$(p2 c4 44500000)"
+is "the surviving decoy holds exactly the placeable, non-colliding records" 5 \
+   "$(bcftools view -H "$D2" 2>/dev/null | wc -l)"
+has "the unplaceable record is reported, not silent" "$dout" "1 unplaceable"
+has "the collisions are reported, not silent"        "$dout" "2 overlapping"
+
+echo "── a decoy that has shed most of its records is not a control ──"
+{ printf '##fileformat=VCFv4.2\n##contig=<ID=c3,length=1000000>\n'
+  printf '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="t">\n'
+  printf '##INFO=<ID=SVLEN,Number=.,Type=Integer,Description="l">\n'
+  printf '##INFO=<ID=END,Number=1,Type=Integer,Description="e">\n'
+  printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+  printf 'c3\t100000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=100500\n'
+  printf 'c3\t400000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=400500\n'
+  printf 'c3\t700000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;SVLEN=-500;END=700500\n'
+} > "$WORK/truth3.vcf"
+bgzip -f -c "$WORK/truth3.vcf" > "$WORK/truth3.vcf.gz"
+bcftools index -f -t "$WORK/truth3.vcf.gz"
+out="$(decoy_truvari "$WORK/truth3.vcf.gz" thin 2>&1)"; rc=$?
+is "an all-unplaceable decoy FAILS rather than reporting zero" 1 "$rc"
+has "and says how thin"  "$out" "kept only 0 of 3 record(s)"
+has "and says why it matters" "$out" "calibrate anything"
+case "$out" in *"PASS"*) bad "a thin decoy never claims PASS" "no PASS" "$out";; *) ok "a thin decoy never claims PASS";; esac
+
+echo "── without a .fai the control still runs, and says it is unbounded ──"
+rm -f "$REFERENCE.fai"
+out="$(decoy_truvari "$WORK/truth2.vcf.gz" nofai 2>&1)"; rc=$?
+is "a missing .fai does not skip the control" 0 "$rc"
+has "a missing .fai is called out"            "$out" "NOT bounded by contig length"
+has "and the control still reaches a verdict" "$out" "PASS"
+REFERENCE="$SAVED_REF"
+
+
+echo "── #541: the two recalls must DIFFER by exactly what --passonly removed ──"
+# run_truvari_both scores every stratum twice. That wiring is asserted above; what was
+# never asserted is that the two passes MEASURE DIFFERENT THINGS. #541's evidence: job
+# 21072620 scored a perfect Manta DUP call as a false negative purely because
+# --passonly dropped it, and recall=0.875 was an underestimate nobody could quantify.
+#
+# Uses the `filter` stub, which honours --passonly against a real VCF.
+mk_vcf() {  # <path> <FILTER for the 4th record>
+    { printf '##fileformat=VCFv4.2\n##contig=<ID=c1,length=100000000>\n'
+      printf '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="t">\n'
+      printf '##INFO=<ID=END,Number=1,Type=Integer,Description="e">\n'
+      printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+      printf 'c1\t1000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=1500\n'
+      printf 'c1\t20000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=23000\n'
+      printf 'c1\t50000\t.\tG\t<DEL>\t60\tPASS\tSVTYPE=DEL;END=50800\n'
+      printf 'c1\t70000\t.\tG\t<DEL>\t60\t%s\tSVTYPE=DEL;END=70900\n' "$2"
+    } > "${1%.gz}"
+    bgzip -f -c "${1%.gz}" > "$1"; bcftools index -f -t "$1"
+}
+T541="$WORK/t541.vcf.gz"; mk_vcf "$T541" PASS      # truth: 4 records
+recall_of() { python3 -c "
+import json,sys
+s=json.load(open(sys.argv[1]))
+print('' if s.get('recall') is None else '%.6f' % s['recall'])" "$1"; }
+
+echo "  -- every call PASS: the two recalls MUST be identical (must-not-fire) --"
+Q_ALLPASS="$WORK/q541_allpass.vcf.gz"; mk_vcf "$Q_ALLPASS" PASS
+STUB_MODE=filter run_truvari_both "$T541" f541_allpass "$Q_ALLPASS" >/dev/null 2>&1
+r_pass="$(recall_of "$OUTDIR/truvari_f541_allpass/summary.json")"
+r_all="$(recall_of "$OUTDIR/truvari_f541_allpass_allcalls/summary.json")"
+is "all-PASS query: PASS-only recall is 1.0"  "1.000000" "$r_pass"
+is "all-PASS query: all-calls recall matches" "$r_pass"  "$r_all"
+
+echo "  -- one matching call non-PASS: PASS-only must be lower by exactly that record --"
+Q_ONEFILT="$WORK/q541_onefilt.vcf.gz"; mk_vcf "$Q_ONEFILT" MinSomaticScore
+STUB_MODE=filter run_truvari_both "$T541" f541_onefilt "$Q_ONEFILT" >/dev/null 2>&1
+p_json="$OUTDIR/truvari_f541_onefilt/summary.json"
+a_json="$OUTDIR/truvari_f541_onefilt_allcalls/summary.json"
+r_pass="$(recall_of "$p_json")"; r_all="$(recall_of "$a_json")"
+tp_pass="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['TP-base'])" "$p_json")"
+tp_all="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['TP-base'])" "$a_json")"
+is "filtered call: all-calls recovers all 4"        4 "$tp_all"
+is "filtered call: PASS-only recovers only 3"       3 "$tp_pass"
+is "filtered call: all-calls recall is 1.0"         "1.000000" "$r_all"
+is "filtered call: PASS-only recall is 3/4"         "0.750000" "$r_pass"
+# The number #541 exists to expose: the gap is OUR filter, not the caller.
+gap="$(python3 -c "print('%.6f' % (float('$r_all') - float('$r_pass')))")"
+is "the gap equals exactly one record of four" "0.250000" "$gap"
+
+echo "  -- and both filters reach the recall report, labelled --"
+has "report carries the PASS-only row" "$(cat "$OUTDIR/scorer_recall.tsv")" "f541_onefilt	PASS-only"
+has "report carries the all-calls row" "$(cat "$OUTDIR/scorer_recall.tsv")" "f541_onefilt	all-calls"
+
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

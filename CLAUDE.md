@@ -209,6 +209,46 @@ contig lengths).
   is where #516 was finally caught, after being chased through three multi-hour campaigns.
   Ask "can a local test answer this?" before submitting anything long.
 
+- **But H1N1 answers "does the machinery work", never "what is the number".** It is 13.5 kb
+  across EIGHT contigs, longest 2280 bp — a shape no real genome has, and four separate
+  defects in one day (2026-08-26/27) came from measuring on it and believing the result:
+  - **A guard that cannot fire at scale fired constantly.** `generate_fragments` refuses a
+    region smaller than `read_length + max_del_len * 2`. With a 500 bp deletion that is
+    1150 bp, so splitting a 2280 bp contig left both halves under it and **every read on the
+    contig vanished** — silently, via `debug!`. On a real chromosome that guard never fires.
+  - **A 2280 bp contig saturates.** At `sv_rate_scale=40` it packs ~33 SVs of up to 570 bp,
+    so overlap rejection dominates and #603's budget change was invisible (33.12 → 29.62,
+    inside noise). It only became measurable at an unsaturated rate.
+  - **Small windows are almost all noise.** A 201 bp window at 30x holds ~60 independent
+    reads: sigma ~13%. #499's "+8% over-delivery" was measured on a 1200 bp event, squarely
+    in that regime, and does not reproduce — a 10 kb event on a 1 Mb reference gives 0.98
+    at every multiplier with sigma ~1.9%.
+  - **Eight contigs in 13.5 kb make cross-contig contamination trivial.** Painting every
+    contig's reads into one depth array read 415x against a configured 60x, and reported a
+    working deletion as 0.98 of control. Hit twice in one day, in two different tests.
+
+  **So H1N1 is a smoke fixture, and for SV work it is ONLY that.** Its longest contig is
+  shorter than the guards, comparable to the fragments, and saturates at any interesting SV
+  rate, so an SV number measured there is not a weak measurement — it is not a measurement.
+
+  **Use `eidolon/test_data/references/ecoli.fa` for SV tests.** It is already in the repo,
+  4.6 Mb in one contig, and no SV test currently uses it. Measured on the #590 deletion
+  fixture, same assertion, 17 s per run at 30x:
+
+  | | H1N1 (2280 bp contig) | ecoli (4.6 Mb contig) |
+  |---|---|---|
+  | deleted-span ratio | 0.00 | 0.000 |
+  | largest `D` op | 500 | 500 |
+  | must-not-fire tolerance needed | **±20%** | **1.0017** |
+
+  That last row is the whole argument: on H1N1 the "coverage outside the event is unchanged"
+  guard needed a 20% tolerance to survive window noise, which is loose enough to miss a real
+  regression. On ecoli the same guard reads 0.17%. The single contig means BND still needs
+  H1N1 (>= 2 contigs) or Delta — that is the one thing H1N1 is genuinely better at.
+
+  Anything that will be **quoted** still needs Delta (#607). A local pass says "the mechanism
+  works"; it is not the number.
+
 - **Evaluate the BAMs before pruning them.** `prune_bams` reclaims ~98 GB per replicate, and
   for three campaigns the pipeline produced BAMs, scored VCF-against-VCF, and deleted them
   without ever asking whether the reads contained what the truth VCF declared. That is exactly
@@ -237,6 +277,14 @@ contig lengths).
 - **Model fidelity** (built model file actually shapes gen-reads output) is covered by
   `model_fragment_fidelity.rs` and `model_output_fidelity.rs`; `docs/model_builder_baseline.md`
   records the Delta resource envelope and the fidelity status.
+- **The toolchain is pinned** in `rust-toolchain.toml`, so `cargo clippy -D warnings` here
+  gives the same verdict CI does. It was not always so: three PRs passed clippy locally and
+  failed on the runner (#618 `useless_borrows_in_formatting`, 23 sites; #621; #626
+  `byte_char_slices`) purely because the workstation was four minor versions behind. If you
+  see a lint you cannot reproduce, check `rustup show` before believing it is flaky.
+  Bump the pin deliberately and in its own PR — new lints are a feature, not an ambush.
+  **`dtolnay/rust-toolchain@stable` sets `RUSTUP_TOOLCHAIN` and silently overrides the pin**;
+  `rust_binaries.yml` still does this (tag-only, so a change there gets no PR-time signal).
 
 ## Git / GitHub mechanics
 - **`gh pr edit` is broken on this repo** (deprecated Projects-classic GraphQL). Patch a

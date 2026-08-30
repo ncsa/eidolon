@@ -31,7 +31,6 @@ pub fn generate_fragments(
     extension_budget: usize,
     sequence_length: usize,
     read_length: usize,
-    max_del_len: usize,
     start: usize,
     coverage: usize,
     paired_ended: bool,
@@ -58,9 +57,9 @@ pub fn generate_fragments(
     // For long-read paired-end mode the region only needs deletion padding; for all other
     // modes the full read_length must fit.
     let min_region = if long_reads && paired_ended {
-        max_del_len * 2
+        0
     } else {
-        read_length + max_del_len * 2
+        read_length
     };
     if sequence_length <= min_region {
         debug!("Sequence length was too short, maybe because of a small bed region.");
@@ -270,7 +269,6 @@ pub fn generate_weighted_fragments(
     region_start: usize,
     region_end: usize,
     read_length: usize,
-    max_del_len: usize,
     coverage: usize,
     gc_bias_model: &GcBiasModel,
     fragment_model: &FragmentLengthModel,
@@ -284,11 +282,7 @@ pub fn generate_weighted_fragments(
     const MAX_COVERAGE_MULTIPLIER: usize = 100;
 
     let region_len = region_end.saturating_sub(region_start);
-    let min_region = if long_reads {
-        max_del_len * 2
-    } else {
-        read_length + max_del_len * 2
-    };
+    let min_region = if long_reads { 0 } else { read_length };
     if region_len <= min_region {
         debug!("Region too short for weighted fragment generation.");
         return Ok(Vec::new());
@@ -476,6 +470,56 @@ fn cover_dataset(
     Ok(fragment_set)
 }
 
+/// Prototype helper for #516: produce read windows whose coordinate system is
+/// the inserted haplotype sequence rather than the reference contig.
+///
+/// This is deliberately not wired into production read generation yet. The
+/// current writer still needs a mapping from these haplotype coordinates back
+/// to reference/BAM coordinates. Keeping that mapping separate lets us test
+/// the geometric requirement first: long insertions must have fragments whose
+/// R1/R2 windows begin in the insertion interior, not only at its anchor.
+#[cfg(test)]
+pub(crate) fn prototype_insertion_read_windows(
+    insertion_len: usize,
+    read_length: usize,
+    target_count: usize,
+    fragment_pool: Vec<usize>,
+    rng: &mut NeatRng,
+) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
+    if insertion_len == 0 || read_length == 0 || target_count == 0 {
+        return Ok(Vec::new());
+    }
+    let fragments = cover_dataset(
+        // extension_budget = 0: this prototype samples the inserted sequence as a
+        // self-contained span, and its test asserts every window satisfies
+        // `end <= insertion_len`. Whether a real insertion's far edge is a terminus
+        // or continues into reference sequence is precisely the question the #516
+        // rework has to answer when this is wired up for real -- it is deliberately
+        // not decided here.
+        0,
+        insertion_len,
+        read_length,
+        target_count,
+        0,
+        fragment_pool,
+        rng,
+    )?;
+    let mut windows = Vec::with_capacity(fragments.len() * 2);
+    for (start, end) in fragments {
+        let r1_end = (start + read_length).min(end);
+        if r1_end > start {
+            windows.push((start, r1_end));
+        }
+        let r2_start = end.saturating_sub(read_length).max(start);
+        if end > r2_start {
+            windows.push((r2_start, end));
+        }
+    }
+    windows.sort_unstable();
+    windows.dedup();
+    Ok(windows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,7 +623,6 @@ mod tests {
             2000,
             read_length,
             0,
-            0,
             coverage,
             false,
             false,
@@ -610,7 +653,6 @@ mod tests {
             sequence.len(),
             read_length,
             0,
-            0,
             coverage,
             false,
             false,
@@ -632,7 +674,6 @@ mod tests {
             0,
             sequence.len(),
             read_length,
-            0,
             0,
             coverage,
             false,
@@ -662,7 +703,6 @@ mod tests {
             0,
             seq_len,
             read_length,
-            0,
             0,
             coverage,
             true,
@@ -704,7 +744,6 @@ mod tests {
             seq_len,
             read_length,
             0,
-            0,
             coverage,
             true,
             false,
@@ -738,7 +777,6 @@ mod tests {
             0,
             50,
             30,
-            10,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -772,7 +810,6 @@ mod tests {
             0,
             500,
             10,
-            0,
             5,
             &model,
             &fragment_model,
@@ -803,7 +840,6 @@ mod tests {
             0,
             2000,
             100,
-            0,
             10,
             &GcBiasModel::default(),
             &fragment_model,
@@ -835,7 +871,6 @@ mod tests {
             region_start,
             region_end,
             100,
-            0,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -876,7 +911,6 @@ mod tests {
             0,
             2000,
             100,
-            0,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -895,7 +929,6 @@ mod tests {
             0,
             2000,
             100,
-            0,
             5,
             &GcBiasModel::default(),
             &fragment_model,
@@ -928,7 +961,6 @@ mod tests {
             0,
             10000,
             100,
-            0,
             10,
             &model,
             &fragment_model,
@@ -947,7 +979,6 @@ mod tests {
             0,
             10000,
             100,
-            0,
             10,
             &model,
             &fragment_model,
@@ -988,7 +1019,6 @@ mod tests {
             0,
             sequence_block.sequence.len(),
             read_len,
-            0,
             target_coverage,
             &model,
             &fragment_model,
@@ -1032,7 +1062,6 @@ mod tests {
             region_start,
             region_end,
             read_length,
-            0,
             coverage,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1080,6 +1109,28 @@ mod tests {
         assert!(
             result.is_empty(),
             "No fragments should be placed when all exceed span"
+        );
+    }
+
+    #[test]
+    fn prototype_insertion_windows_cover_interior_and_tail() {
+        let mut rng = make_rng();
+        let windows =
+            prototype_insertion_read_windows(600, 100, 12, vec![250; 12], &mut rng).unwrap();
+
+        assert!(!windows.is_empty());
+        assert!(
+            windows.iter().any(|&(start, _)| start >= 200),
+            "prototype must place a read window inside a long insertion"
+        );
+        assert!(
+            windows.iter().any(|&(_, end)| end >= 570),
+            "prototype must reach the far end of a long insertion"
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|&(start, end)| { end > start && end - start <= 100 && end <= 600 })
         );
     }
 
@@ -1183,7 +1234,6 @@ mod tests {
             span_length,
             read_length,
             0,
-            0,
             coverage,
             true,  // paired_ended
             false, // long_reads
@@ -1238,7 +1288,6 @@ mod tests {
             0,
             span_length,
             read_length,
-            0,
             coverage,
             &gc_bias_model,
             &fragment_model,
@@ -1295,7 +1344,6 @@ mod tests {
             0,
             span_length,
             read_length,
-            0,
             coverage,
             &gc_bias_model,
             &fragment_model,
@@ -1670,7 +1718,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             60, // coverage
             &GcBiasModel::default(),
             &fragment_model,
@@ -1715,7 +1762,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             60,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1752,7 +1798,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             30,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1903,7 +1948,6 @@ mod tests {
             0,
             span,
             read_length,
-            0,
             60,
             &GcBiasModel::default(),
             &fragment_model,
@@ -1949,7 +1993,6 @@ mod tests {
                 0,
                 span,
                 read_length,
-                0,
                 60,
                 &GcBiasModel::default(),
                 &fragment_model,

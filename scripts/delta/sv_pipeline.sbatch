@@ -60,6 +60,28 @@
 
 set -euo pipefail
 
+# Send this script's stderr to the SAME place as its stdout.
+#
+# Defence in depth, not the fix. The actual defect was `exec 8<>lock 2>/dev/null` in
+# lib_report.sh's index_reference_locked: `exec` with redirections and no command applies
+# them to the CURRENT SHELL permanently, so that 2>/dev/null — meant to suppress one failed
+# open — sent every subsequent >&2 in the job to /dev/null. Job 21532276 ran ten more
+# minutes and exited 1 with its .err frozen at 127 bytes; all three read-evidence gates and
+# the entire failure gate wrote into nothing, and the three loci the run named existed
+# nowhere on disk. That is fixed at source.
+#
+# This stays because the same class of mistake is one character away at all times, and
+# because a diagnostic belongs NEXT TO the step that produced it. Two files with no ordering
+# between them is why stage 3b's comment has to repeat its warning 900 lines later.
+#
+# SLURM-level errors (prolog, OOM kill, node failure) still reach .err — they come from
+# outside this script.
+exec 2>&1
+
+# Prove the redirect took, at the top, where it is cheap to notice. A harness whose failure
+# diagnostics are invisible reports every failure as silence (#583).
+echo "[selftest] stderr reaches this log (if this line is missing, diagnostics are being lost)" >&2
+
 # ── Parameters ───────────────────────────────────────────────────────────
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"   # archive_run() + Delta path resolution
@@ -146,20 +168,6 @@ check_outdir_version "$EIDOLON_BIN" "$OUTDIR" || exit 1
 # stamp to compare against, so a stale binary runs silently and its results are
 # indistinguishable from a current one. Job 20682989 reproduced job 20675480's caller
 # numbers exactly and the log could not answer "was the fix even in this build?".
-#
-# A second, distinct way to get the same silence: `$SCRATCH` itself resolving to
-# something other than what a manual `cargo build --release` just verified. Anyone
-# juggling more than one Delta project has a reason NOT to export `$SCRATCH`
-# unconditionally in their shell rc (it would make the two projects' env vars fight
-# each other), so it's set manually per session -- and a plain (non-exported)
-# assignment doesn't reach a child `sbatch` job at all. The job then falls back to
-# whatever Delta's own platform default `$SCRATCH` is, which is a valid path (so
-# nothing here fails loudly) but not the one that was just built into. Job 21367013
-# built and verified `+29f29a9` by hand immediately before submitting and still ran
-# `+4a3ea4a` -- a stale binary from an unrelated old build sitting at the platform
-# default. Printing `$SCRATCH` here, next to the binary path it produced, is what
-# makes that mismatch visible without having to reason through the full path by hand.
-echo "SCRATCH:        ${SCRATCH:-unset}"
 echo "eidolon binary: $EIDOLON_BIN"
 echo "eidolon version: ${EIDOLON_VERSION:-unknown}"
 echo "repo HEAD:      $(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
@@ -1220,19 +1228,95 @@ decoy_truvari() {  # <truth.vcf.gz> <label> [extra args...]
     # while its warning text claimed the latter.
     # A breakend has no SVLEN and END==POS, so it falls back to the 2 Mb floor, which
     # displaces a point event completely.
+    # Two ways this control lied about itself before, both measured on job 21382756
+    # (3 contigs, SV_RATE_SCALE=100, 481 scoreable records):
+    #
+    #   1. A record shifted past the end of its contig silently VANISHED. truvari reported
+    #      "base cnt 481, comp cnt 461" — 20 records, 4% of the control's own denominator,
+    #      gone with no mention. A control that quietly shrinks is rule 4 inside the
+    #      calibration step.
+    #   2. At ~5 SVs/Mb a displaced record can land within truvari's refdist of a DIFFERENT
+    #      truth record and match it. Seven did, giving recall=0.0146 against a threshold of
+    #      0.001 — which, over 481 records, means "exactly zero matches allowed". The scorer
+    #      was fine; coincidence is not a scorer defect, and at high density it is guaranteed.
+    #
+    # So: shift within the contig (backwards when forward will not fit), drop what cannot be
+    # placed at all, drop what lands near a same-type truth record, and REPORT all three
+    # counts. Only then does a surviving match mean the scorer is loose.
+    local body="$OUTDIR/.decoy_${label}.body" fai="$REFERENCE.fai" bound=1
+    if [[ ! -s "$fai" ]]; then
+        # Never a silent skip: "could not bound the control" must not read as
+        # "the control passed" — that is this file's whole thesis.
+        bound=0
+        echo "  decoy $label: no $fai — displacement is NOT bounded by contig length, so a" >&2
+        echo "    record can run off a contig end and shrink this control silently." >&2
+    fi
+    bcftools view -H "$truth" > "$body" || { echo "  decoy $label: could not read truth (skipped)"; return 0; }
+
+    local stats="$OUTDIR/.decoy_${label}.stats"
     { bcftools view -h "$truth"
-      bcftools view -H "$truth" | awk -F'\t' 'BEGIN{OFS="\t"}
-        { len=0
-          if (match($8, /SVLEN=-?[0-9]+/)) { len=substr($8, RSTART+6, RLENGTH-6); if (len<0) len=-len }
+      awk -F'\t' -v faif="$fai" -v bodyf="$body" -v collide=1000 -v statf="$stats" -v bound="$bound" '
+        BEGIN{ OFS="\t"
+            if (bound) { while ((getline l < faif) > 0) { split(l, f, "\t"); clen[f[1]] = f[2] } }
+            # Index every truth record by contig+type so a displaced copy can be checked
+            # against the ones it might collide with.
+            while ((getline l < bodyf) > 0) {
+                split(l, f, "\t")
+                t = "."; if (match(f[8], /SVTYPE=[A-Z]+/)) t = substr(f[8], RSTART+7, RLENGTH-7)
+                e = f[2]; if (match(f[8], /END=[0-9]+/)) e = substr(f[8], RSTART+4, RLENGTH-4)
+                k = f[1] SUBSEP t; n[k]++; tp[k, n[k]] = f[2]; te[k, n[k]] = e
+            }
+        }
+        { len = 0
+          if (match($8, /SVLEN=-?[0-9]+/)) { len = substr($8, RSTART+6, RLENGTH-6); if (len < 0) len = -len }
+          end = $2; if (match($8, /END=[0-9]+/)) end = substr($8, RSTART+4, RLENGTH-4)
+          span = end - $2; if (span < 0) span = 0
           shift_by = 2000000; if (2*len > shift_by) shift_by = 2*len
-          $2 = $2 + shift_by
-          # END must move with POS or the record describes a span it no longer occupies.
+          L = clen[$1] + 0
+          newpos = $2 + shift_by
+          # Forward if the whole span still fits; otherwise mirror the displacement.
+          # Without a .fai there is no contig length to check, so forward is all there is.
+          if (bound && L > 0 && newpos + span > L) {
+              newpos = $2 - shift_by
+              if (newpos < 1) { dropped++; next }   # neither direction fits this contig
+          }
+          t = "."; if (match($8, /SVTYPE=[A-Z]+/)) t = substr($8, RSTART+7, RLENGTH-7)
+          k = $1 SUBSEP t
+          newend = newpos + span
+          # SPAN OVERLAP, not start proximity. truvari matches a large symbolic SV on size
+          # similarity and overlap rather than on refdist, and a displacement preserves size
+          # exactly, so pctsize is satisfied for free. Job 21387104 matched a decoy DEL 4.5 kb
+          # from a truth DEL and a decoy DUP 900 kb from a truth DUP — both far outside any
+          # sane point-proximity window, both overlapping spans. A start-distance test models
+          # the wrong matching rule; a decoy must simply not overlap a same-type truth record.
+          for (i = 1; i <= n[k]; i++) {
+              if (newpos <= te[k, i] + collide && newend >= tp[k, i] - collide) { collided++; next }
+          }
+          delta = newpos - $2
+          $2 = newpos
           if (match($8, /END=[0-9]+/)) {
-              e = substr($8, RSTART+4, RLENGTH-4) + shift_by
+              e = substr($8, RSTART+4, RLENGTH-4) + delta
               $8 = substr($8, 1, RSTART-1) "END=" e substr($8, RSTART+RLENGTH)
           }
-          print }'; } \
+          kept++
+          print
+        }
+        END { printf "%d\t%d\t%d\n", kept+0, dropped+0, collided+0 > statf }' "$body"; } \
       | bcftools sort -O z -o "$decoy" 2>/dev/null || { echo "  decoy $label: could not build (skipped)"; return 0; }
+
+    local d_kept=0 d_dropped=0 d_collided=0
+    if [[ -s "$stats" ]]; then IFS=$'\t' read -r d_kept d_dropped d_collided < "$stats"; fi
+    local d_total=$(( d_kept + d_dropped + d_collided ))
+    if [[ "$d_dropped" -gt 0 || "$d_collided" -gt 0 ]]; then
+        echo "  decoy    $label: displaced $d_kept of $d_total; $d_dropped unplaceable on their contig," \
+             "$d_collided overlapping a truth record of the same type (both excluded)"
+    fi
+    # A control that has shed most of its records is not a control any more.
+    if [[ "$d_kept" -lt 1 ]] || [[ "$d_total" -gt 0 && $(( d_kept * 100 / d_total )) -lt 50 ]]; then
+        echo "ERROR: decoy control for $label kept only $d_kept of $d_total record(s) — too few to" >&2
+        echo "  calibrate anything. A recall of 0 from a control this thin is not evidence." >&2
+        return 1
+    fi
     bcftools index -f -t "$decoy" 2>/dev/null || true
     rm -rf "$out"
     local err="$OUTDIR/.decoy_${label}.stderr"
@@ -1536,21 +1620,41 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
 
     local probes="$dir/.ins_probes.tsv"
     # ALT is anchor+novel for a literal insertion, so the inserted bases are ALT past REF's
-    # length. A 30-mer from the MIDDLE is the probe: it cannot come from the reference
-    # (~4^-30 by chance), and the middle is the part #516 showed is missing while the head
-    # is present — probing the head would report success on a partially-realized insertion.
+    # length. Each probe is a 30-mer of that novel sequence: it cannot come from the
+    # reference (~4^-30 by chance). Probe the INTERIOR, never the head — a partially
+    # realized insertion has a perfectly good head, which is how #516 hid.
+    #
+    # Five probes, not one. A single midpoint 30-mer is a fragile test of a real property:
+    # measured on a 5 Mb de novo run, interior coverage of a heterozygous insertion is
+    # ~half the flank's, so ordinary dropout leaves ~3% of insertions with no read over any
+    # one chosen base while 68-96% of their length is covered. That is sparse coverage, not
+    # a missing insertion, and failing the run on it would cry wolf every time. Requiring
+    # only that SOME interior probe is seen keeps the #516 signature (no interior at all)
+    # a hard failure while tolerating a thin subclonal insertion.
     if ! bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' -i 'INFO/SVTYPE="INS"' "$truth" 2>/dev/null \
       | awk -F'\t' 'BEGIN{OFS="\t"} {
             ins = substr($4, length($3) + 1); L = length(ins)
             if (L < 30) next
-            s = int(L / 2) - 14; if (s < 1) s = 1
-            print $1, $2, L, substr(ins, s, 30)
+            delete seen
+            for (k = 1; k <= 5; k++) {
+                s = int(L * k / 6) - 14
+                if (s < 1) s = 1
+                if (s > L - 29) s = L - 29
+                if (s in seen) continue
+                seen[s] = 1
+                print $1, $2, L, substr(ins, s, 30)
+            }
         }' > "$probes"; then
         echo "ERROR: could not extract literal INS probes from $truth — verification was not evaluated" >&2
         return 1
     fi
 
     local n_probes; n_probes=$(wc -l < "$probes" 2>/dev/null || echo 0)
+    local n_ins; n_ins=$(cut -f1,2 "$probes" 2>/dev/null | sort -u | wc -l)
+    if [[ "$n_probes" -gt 0 && "${n_ins:-0}" -le 0 ]]; then
+        echo "ERROR: $n_probes probe(s) collapsed to no insertion — verification was not evaluated" >&2
+        return 1
+    fi
     if [[ "$n_probes" -eq 0 ]]; then
         echo "  INS read check: no INS record carries >=30bp of novel sequence — nothing to verify"
         return 0
@@ -1558,14 +1662,24 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
 
     local seqs="$dir/.ins_seqs.txt"
     : > "$seqs"
-    while IFS=$'\t' read -r c p _ _; do
+    # One fetch per insertion, not per probe — the five probes of an insertion share a locus.
+    # Materialized first, not piped in via <(...): a process substitution that dies is
+    # invisible to set -e and would silently run zero iterations.
+    local loci
+    if ! loci="$(cut -f1,2 "$probes" | sort -u)"; then
+        echo "ERROR: could not enumerate INS loci — verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+    while IFS=$'\t' read -r c p; do
+        [[ -n "$c" ]] || continue
         local lo=$(( p > 1000 ? p - 1000 : 1 ))
         if ! samtools view "$bam" "$c:$lo-$((p + 1000))" 2>/dev/null | cut -f10 >> "$seqs"; then
             echo "ERROR: samtools could not read the INS locus $c:$p — verification was not evaluated" >&2
             rm -f "$seqs"
             return 1
         fi
-    done < "$probes"
+    done <<< "$loci"
     # A read lying wholly inside a large insertion has no reference home, so it lands here.
     if ! samtools view -@ 4 -f 4 "$bam" 2>/dev/null | cut -f10 >> "$seqs"; then
         echo "ERROR: samtools could not read unmapped tumor reads — verification was not evaluated" >&2
@@ -1573,7 +1687,7 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         return 1
     fi
 
-    echo "  INS read-level support (30-mer from the MIDDLE of each inserted sequence):"
+    echo "  INS read-level support (5 interior 30-mers per inserted sequence):"
     local supported=0 unsupported=0
     local hit_rows
     if ! hit_rows="$(count_probe_hits "$probes" < "$seqs")"; then
@@ -1592,37 +1706,533 @@ verify_planted_ins() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
         return 1
     fi
 
-    while IFS=$'\t' read -r c p l h; do
-        if [[ "${h:-0}" -gt 0 ]]; then
+    # Collapse the per-probe rows to one verdict per insertion, keyed on chrom+pos.
+    local per_ins
+    per_ins="$(printf '%s\n' "$hit_rows" | awk -F'\t' 'BEGIN{OFS="\t"}
+        {
+            k = $1 SUBSEP $2
+            if (!(k in seen)) { seen[k] = 1; order[++m] = k; chrom[k] = $1; pos[k] = $2; len[k] = $3 }
+            np[k]++
+            if ($4 > 0) { nh[k]++; if ($4 > best[k]) best[k] = $4 }
+        }
+        END { for (i = 1; i <= m; i++) { k = order[i]
+            print chrom[k], pos[k], len[k], nh[k] + 0, np[k], best[k] + 0 } }')"
+
+    # Defaulted, not read bare: this function is extracted and run by
+    # scripts/delta/tests/, where the script-level READ_LEN does not exist, and a bare
+    # reference aborts the whole suite silently under `set -u`. Mirrors READ_LEN's own default.
+    local read_len="${READ_LEN:-151}"
+    local n_long=0
+    while IFS=$'\t' read -r c p l nh np best; do
+        [[ -n "$c" ]] || continue
+        # An insertion SHORTER than a read was never at risk from #516/#589 — the defect is
+        # that sequence past ~a read length never gets sequenced. Count the ones that are.
+        (( l > read_len )) && n_long=$((n_long + 1))
+        if [[ "${nh:-0}" -gt 0 ]]; then
             supported=$((supported + 1))
-            printf '    %s:%s  %s bp  %s read(s)\n' "$c" "$p" "$l" "$h"
+            printf '    %s:%s  %s bp  %s/%s probes  %s read(s)\n' "$c" "$p" "$l" "$nh" "$np" "$best"
         else
             unsupported=$((unsupported + 1))
-            printf '    %s:%s  %s bp  NO READ SUPPORT\n' "$c" "$p" "$l" >&2
+            printf '    %s:%s  %s bp  NO READ SUPPORT (0/%s interior probes)\n' "$c" "$p" "$l" "$np" >&2
         fi
-    done <<< "$hit_rows"
+    done <<< "$per_ins"
 
-    if [[ $((supported + unsupported)) -ne "$n_probes" ]]; then
-        echo "ERROR: probe result accounting covered $((supported + unsupported)) of $n_probes probes" >&2
+    if [[ $((supported + unsupported)) -ne "$n_ins" ]]; then
+        echo "ERROR: probe result accounting covered $((supported + unsupported)) of $n_ins insertion(s)" >&2
         rm -f "$seqs"
         return 1
     fi
 
-    echo "  INS read support: $supported of $n_probes planted insertion(s) present in the reads"
+    echo "  INS read support: $supported of $n_ins planted insertion(s) present in the reads" \
+         "($n_long longer than the ${read_len} bp read)"
     INS_UNSUPPORTED="$unsupported"
+
+    # Rule 4: a metric over an unknown — or tiny — denominator is not a result. The COSMIC
+    # somatic model plants very few insertions on a single chromosome (job 21378484: FOUR, on
+    # chr22 at SV_RATE_SCALE=30), and "4 of 4, 100%" reads exactly like "validated" while
+    # resting on four draws. It is not a hard failure — the run's DEL/DUP/INV results are
+    # unaffected and the check still catches a real 0/5 — but it must never be quoted as
+    # evidence that insertions work at scale.
+    #
+    # The denominator that matters is n_long, NOT n_ins. This used to threshold on the raw
+    # count, which can invert: a run planting 30 insertions all SHORTER than a read would
+    # print no caveat at all while testing nothing, and one planting 11 of which 9 exceed a
+    # read length would be hedged as thin when its at-risk population is nearly the whole
+    # set. Job 21575385 was the second case — the banner said "too few to conclude" about
+    # 11 while 9 were over 151 bp, four of them at 4-6x (#620).
+    local min_denom="${INS_MIN_DENOM:-20}"
+    if [[ "$n_long" -lt "$min_denom" ]]; then
+        INS_DENOM_THIN="$n_long"
+        echo "  DENOMINATOR TOO SMALL: $n_long insertion(s) longer than the ${read_len} bp read"
+        echo "    is below $min_denom, so the percentage above cannot support a conclusion about"
+        echo "    insertion realization at scale. Insertions shorter than a read were never at"
+        echo "    risk from #516/#589 and do not count towards this. A pass here means those"
+        echo "    $n_long worked, nothing more. Raise SV_RATE_SCALE, use a larger reference, or"
+        echo "    include germline insertions to get a real denominator."
+    fi
     if [[ "$unsupported" -gt 0 ]]; then
-        echo "ERROR: $unsupported of $n_probes planted insertion(s) have NO read evidence for" >&2
-        echo "  their declared length. Any INS recall reported above is a statement about our" >&2
-        echo "  own read generation, not about the caller — see #516. DEL/DUP/INV/BND/CNV are" >&2
-        echo "  unaffected." >&2
+        # Sparse interior coverage costs a few insertions on any real run; a #516-class
+        # regression costs nearly all of them. Only the latter invalidates INS recall.
+        local min_pct="${INS_SUPPORT_MIN_PCT:-95}"
+        local pct=$(( supported * 100 / n_ins ))
+        echo "  INS read support: ${pct}% (floor ${min_pct}%, set INS_SUPPORT_MIN_PCT to change)"
+        if [[ "$pct" -lt "$min_pct" ]]; then
+            echo "ERROR: only ${pct}% of planted insertion(s) have interior read evidence for" >&2
+            echo "  their declared length, below the ${min_pct}% floor. Any INS recall reported" >&2
+            echo "  above is a statement about our own read generation, not about the caller —" >&2
+            echo "  see #516. DEL/DUP/INV/BND/CNV are unaffected." >&2
+        else
+            echo "  ($unsupported thinly-covered insertion(s) above the floor — reported, not fatal)"
+            INS_UNSUPPORTED=0
+        fi
     fi
     rm -f "$seqs"
 }
+# Derive DEL junction probes from the REFERENCE. Emits two 4-column TSVs in the layout
+# count_probe_hits already consumes (chrom, pos, len, probe), so the matcher is reused
+# unmodified rather than forked.
+#
+# JUNCTION probe: 15 bp ending at the anchor POS, joined to 15 bp starting after END. On a
+# haplotype that took the deletion those two flanks are adjacent, so a spanning read carries
+# the 30-mer contiguously; in the reference they are `dlen` bases apart, so it cannot occur
+# by construction (~4^-30 by chance). Built from the reference FASTA, NOT from the VCF's ALT
+# or from anything eidolon emitted — a known answer independent of the code under test.
+#
+# CONTROL probe: the same left flank joined to the FIRST 15 DELETED bases, i.e. the reference
+# reading straight through the deletion start. It is present exactly when the locus is covered
+# by reads that did not take the deletion. Without it, "junction count 0" at an uncovered locus
+# is indistinguishable from a deletion that was never realized — a metric over an unknown
+# denominator (rule 4). DEL_SKIPPED counts records that could not be probed at all.
+build_del_probes() {  # <truth_sv.vcf.gz> <reference.fa> <junction.tsv> <control.tsv>
+    local truth="$1" ref="$2" jout="$3" cout="$4"
+    local recs
+    if ! recs="$(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/END\n' -i 'INFO/SVTYPE="DEL"' "$truth" 2>/dev/null)"; then
+        return 1
+    fi
+    : > "$jout"
+    : > "$cout"
+    DEL_SKIPPED=0
+    [[ -n "$recs" ]] || return 0
+    local c p r a e end dlen seqs left right delhead
+    while IFS=$'\t' read -r c p r a e; do
+        [[ -n "$c" ]] || continue
+        # Symbolic <DEL> carries END; a literal one does not, and its deleted bases are REF
+        # past the anchor. Deleted span is POS+1..END either way.
+        if [[ -z "$e" || "$e" == "." ]]; then end=$(( p + ${#r} - 1 )); else end="$e"; fi
+        dlen=$(( end - p ))
+        # Below 15 the control's right half would run past END into post-deletion sequence and
+        # the two probes would converge, so the control would stop discriminating. Anchors
+        # within 15 bp of a contig start have no left flank.
+        if (( dlen < 15 || p < 15 )); then
+            DEL_SKIPPED=$(( DEL_SKIPPED + 1 ))
+            continue
+        fi
+        if ! seqs="$(samtools faidx "$ref" "$c:$(( p - 14 ))-$p" "$c:$(( end + 1 ))-$(( end + 15 ))" "$c:$(( p + 1 ))-$(( p + 15 ))" 2>/dev/null \
+             | awk '/^>/ { i++; next } { gsub(/[^ACGTNacgtn]/, ""); s[i] = s[i] toupper($0) }
+                    END { print s[1] "\t" s[2] "\t" s[3] }')"; then
+            return 1
+        fi
+        IFS=$'\t' read -r left right delhead <<< "$seqs"
+        # A short fetch means the region ran off the contig end. Dropping it is correct;
+        # dropping it SILENTLY is how a denominator shrinks without anyone noticing.
+        if [[ ${#left} -ne 15 || ${#right} -ne 15 || ${#delhead} -ne 15 ]]; then
+            DEL_SKIPPED=$(( DEL_SKIPPED + 1 ))
+            continue
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$c" "$p" "$dlen" "$left$right"   >> "$jout"
+        printf '%s\t%s\t%s\t%s\n' "$c" "$p" "$dlen" "$left$delhead" >> "$cout"
+    done <<< "$recs"
+    return 0
+}
+
+# READ-LEVEL verification of planted DELETIONS — the DEL analogue of verify_planted_ins, and
+# the check that was missing when #590 was vetted (#607).
+#
+# WHY THIS EXISTS: #516's lesson generalizes past INS. The truth VCF declares an event; if the
+# reads do not carry it, every VCF-against-VCF recall printed above describes our own read
+# generation rather than the caller. #590 routed literal deletions through the haplotype map
+# so that reads would reflect them, and that was vetted on a 13.5 kb viral fixture and nowhere
+# else. This is where it meets real coverage.
+#
+# The assertion is deliberately NOT "the deleted bases are absent from the reads". At VAF < 1
+# the reference haplotype still carries them and so does the normal sample, so absence is
+# unassertable. Presence of the novel junction is assertable; see build_del_probes.
+#
+# Set VERIFY_DEL_READS=0 to skip.
+verify_planted_del() {  # <truth_sv.vcf.gz> <tumor.bam> <reference.fa> <outdir>
+    local truth="$1" bam="$2" ref="$3" dir="$4"
+    [[ "${VERIFY_DEL_READS:-1}" == "1" ]] || { echo "  (DEL read verification skipped)"; return 0; }
+    if [[ ! -f "$bam" ]]; then
+        echo "ERROR: $bam is missing — DEL read verification was not evaluated" >&2
+        return 1
+    fi
+    if [[ ! -f "$ref" ]]; then
+        echo "ERROR: reference $ref is missing — DEL read verification was not evaluated" >&2
+        return 1
+    fi
+
+    local jprobes="$dir/.del_junction_probes.tsv" cprobes="$dir/.del_control_probes.tsv"
+    DEL_SKIPPED=0
+    if ! build_del_probes "$truth" "$ref" "$jprobes" "$cprobes"; then
+        echo "ERROR: could not build DEL junction probes from $truth — verification was not evaluated" >&2
+        return 1
+    fi
+
+    local n_probes; n_probes=$(wc -l < "$jprobes" 2>/dev/null || echo 0)
+    if [[ "$n_probes" -eq 0 ]]; then
+        echo "  DEL read check: no DEL record could be probed (${DEL_SKIPPED} skipped) — nothing to verify"
+        return 0
+    fi
+
+    local seqs="$dir/.del_seqs.txt"
+    : > "$seqs"
+    local c p dlen _q lo end
+    while IFS=$'\t' read -r c p dlen _q; do
+        # BOTH breakpoint neighbourhoods, not just the anchor.
+        #
+        # This used to search POS +/- 1000 only, on the premise that "a junction read spans the
+        # anchor regardless of how far away END is". Job 21532276 disproved it: three large
+        # deletions (405 kb, 54 kb, 30 kb) reported NO JUNCTION with zero hits at POS and 2, 6
+        # and 2 hits at END. Past roughly a read length there is no spanning read — bwa emits
+        # split alignments, and the record carrying the junction bases in its soft clip can be
+        # anchored on either side. The depth gate said all 76 deletions removed coverage and
+        # disagreed with this probe; the probe was wrong, not the simulator (#590).
+        for lo in "$p" "$(( p + dlen ))"; do
+            end=$(( lo + 1000 ))
+            (( lo > 1000 )) && lo=$(( lo - 1000 )) || lo=1
+            if ! samtools view "$bam" "$c:$lo-$end" 2>/dev/null | cut -f10 >> "$seqs"; then
+                echo "ERROR: samtools could not read the DEL locus $c:$p — verification was not evaluated" >&2
+                rm -f "$seqs"
+                return 1
+            fi
+        done
+    done < "$jprobes"
+
+    local jrows crows
+    if ! jrows="$(count_probe_hits "$jprobes" < "$seqs")" || ! crows="$(count_probe_hits "$cprobes" < "$seqs")"; then
+        echo "ERROR: probe matching failed — DEL read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    local jn cn
+    jn="$(printf '%s\n' "$jrows" | awk -F'\t' '$4 ~ /^[0-9]+$/ { n++ } END { print n + 0 }')"
+    cn="$(printf '%s\n' "$crows" | awk -F'\t' '$4 ~ /^[0-9]+$/ { n++ } END { print n + 0 }')"
+    if [[ "$jn" -ne "$n_probes" || "$cn" -ne "$n_probes" ]]; then
+        echo "ERROR: probe matcher evaluated $jn/$cn of $n_probes probes — DEL read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    # Pair the two hit lists by POSITION, not by trusting that two independent matcher runs
+    # emitted rows in the same order. If they ever disagree the comparison below is comparing
+    # unrelated loci, and it would do so silently.
+    local merged
+    merged="$(paste <(printf '%s\n' "$jrows") <(printf '%s\n' "$crows"))"
+    local misaligned
+    misaligned="$(printf '%s\n' "$merged" | awk -F'\t' '($1 != $5 || $2 != $6) { n++ } END { print n + 0 }')"
+    if [[ "$misaligned" -ne 0 ]]; then
+        echo "ERROR: $misaligned junction/control probe row(s) describe different loci —" >&2
+        echo "  DEL read verification was not evaluated" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    echo "  DEL read-level support (30-mer spanning the junction, built from the reference):"
+    local realized=0 unrealized=0 uncovered=0 c p jl jhits chits
+    while IFS=$'\t' read -r c p jl jhits _ _ _ chits; do
+        if [[ "${jhits:-0}" -gt 0 ]]; then
+            realized=$(( realized + 1 ))
+            printf '    %s:%s  %s bp  %s junction read(s)\n' "$c" "$p" "$jl" "$jhits"
+        elif [[ "${chits:-0}" -eq 0 ]]; then
+            # Neither probe matched: nothing spans this locus at all. That is not evidence
+            # either way, and must not be scored as a failure.
+            uncovered=$(( uncovered + 1 ))
+            printf '    %s:%s  %s bp  NO SPANNING READS (uninterpretable, not counted)\n' "$c" "$p" "$jl"
+        else
+            unrealized=$(( unrealized + 1 ))
+            printf '    %s:%s  %s bp  NO JUNCTION, %s read(s) read THROUGH the deletion\n' "$c" "$p" "$jl" "$chits" >&2
+        fi
+    done <<< "$merged"
+
+    if [[ $(( realized + unrealized + uncovered )) -ne "$n_probes" ]]; then
+        echo "ERROR: DEL result accounting covered $(( realized + unrealized + uncovered )) of $n_probes probes" >&2
+        rm -f "$seqs"
+        return 1
+    fi
+
+    echo "  DEL read support: $realized realized, $unrealized NOT realized, $uncovered uncovered, $DEL_SKIPPED unprobeable"
+    DEL_UNREALIZED="$unrealized"
+    if [[ "$unrealized" -gt 0 ]]; then
+        echo "ERROR: $unrealized of $n_probes planted deletion(s) have reads reading straight" >&2
+        echo "  THROUGH them and no junction evidence. The deletion was declared in the truth" >&2
+        echo "  VCF but not realized in the reads — any DEL recall above describes our own read" >&2
+        echo "  generation, not the caller. See #516 for the INS precedent and #590." >&2
+    fi
+    rm -f "$seqs"
+}
+
 INS_UNSUPPORTED=0
 INS_VERIFY_FAILED=0
+INS_DENOM_THIN=0
 if [[ -f "$OUTDIR/truth_sv_INS.vcf.gz" ]]; then
     if ! verify_planted_ins "$OUTDIR/truth_sv_INS.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
         INS_VERIFY_FAILED=1
+    fi
+fi
+# Count SAM records whose CIGAR carries a soft clip of at least `min` bases. Split out from
+# verify_sv_cigar_ops so the parsing is testable without samtools or a BAM.
+count_clipped_reads() {  # <min clip>  < sam records
+    awk -v min="$1" '
+        BEGIN { FS = "\t"; n = 0 }
+        {
+            k = split($6, ops, /[0-9]+/)     # op letters, in order
+            split($6, lens, /[MIDNSHP=X]/)   # lengths, in order
+            for (i = 2; i <= k; i++) {
+                if (ops[i] == "S" && lens[i - 1] + 0 >= min) { n++; break }
+            }
+        }
+        END { print n + 0 }
+    '
+}
+
+
+# Largest CIGAR op of a given kind among SAM records on stdin. Split out so the parsing is
+# testable without samtools or a BAM.
+max_cigar_op() {  # <op char>  < sam records
+    awk -v want="$1" '
+        BEGIN { FS = "\t"; max = 0 }
+        {
+            n = split($6, parts, /[0-9]+/)       # ops, in order
+            split($6, lens, /[MIDNSHP=X]/)       # lengths, in order
+            for (i = 2; i <= n; i++) if (parts[i] == want && lens[i - 1] + 0 > max) max = lens[i - 1] + 0
+        }
+        END { print max + 0 }
+    '
+}
+
+# Mean depth over a region, or "." when samtools cannot read it. Kept separate so callers can
+# tell "zero coverage" (a real measurement) from "could not measure" (not a measurement).
+region_mean_depth() {  # <bam> <chrom> <start> <end>
+    local d
+    d="$(samtools depth -a -r "$2:$3-$4" "$1" 2>/dev/null | awk '{ s += $3; n++ } END { if (n) printf "%.4f", s / n; else print "0" }')" || return 1
+    [[ -n "$d" ]] || return 1
+    printf '%s' "$d"
+}
+
+# CIGAR-level evidence that planted SVs reached the alignment (#589, #590).
+#
+# WHY THIS EXISTS: #589 was exactly this — an insertion longer than a read appearing in NO
+# read's CIGAR, junction reads recorded as pure M. The truth VCF declared it, the reads half
+# carried it, and the CIGAR said nothing.
+#
+# WHAT IT ASSERTS, AND WHY NOT AN I/D OP: this used to require a non-zero I op for each INS
+# and D op for each DEL. That was near-vacuous and job 21575385's "87 of 87" meant almost
+# nothing (#624). Aligners do not represent these events as large I/D ops — bwa prefers a
+# CLIPPED alignment. Measured on ecoli, seven insertions from 50 bp to 5 kb, bwa-mem2 2.2.1:
+#
+#     declared    reads clipped >= 20 bp    max soft clip    max I op
+#     50                  31                    100             1
+#     500                 39                    128             2
+#     5000                47                    126             1
+#     control              0                      2             -
+#
+# The largest I op anywhere near ANY of them is 2 bp, while the small-indel mutation model
+# scatters 1-2 bp I ops across the genome — so the old check was reading background noise and
+# would have passed with the insertion entirely absent. Deletions behave the same way past
+# ~50 bp: measured, a 50 bp DEL gives a 50 bp D op and a 100 bp DEL gives none at all.
+#
+# Soft clips are the signal the aligner actually produces, and the one Manta and GRIDSS
+# assemble from. The separation is stark (18-58 against 0), so this compares the locus to
+# FLANKING CONTROL WINDOWS rather than to a fixed threshold — a metric with no denominator is
+# what got us here. The largest I/D op is still printed, as information, not as the assertion.
+#
+# Independent of verify_planted_del, which asks whether the junction SEQUENCE is present: a
+# read can carry junction bases in its clip while the aligner still records pure M elsewhere.
+verify_sv_cigar_ops() {  # <truth_sv.vcf.gz> <tumor.bam> <outdir>
+    local truth="$1" bam="$2" dir="$3"
+    [[ "${VERIFY_CIGAR_OPS:-1}" == "1" ]] || { echo "  (CIGAR op verification skipped)"; return 0; }
+    if [[ ! -f "$bam" ]]; then
+        echo "ERROR: $bam is missing — CIGAR op verification was not evaluated" >&2
+        return 1
+    fi
+
+    local svt op recs c p len end n_ev=0 n_missing=0 n_uninterp=0 observed
+    local min_clip="${CIGAR_MIN_CLIP:-20}" ctl_off="${CIGAR_CONTROL_OFFSET:-5000}"
+    local win="${CIGAR_WINDOW:-300}"
+    local at_locus ctl_l ctl_r background sam
+    CIGAR_MISSING=0
+    for svt in INS DEL; do
+        [[ -f "$dir/truth_sv_${svt}.vcf.gz" ]] || continue
+        op="I"; [[ "$svt" == "DEL" ]] && op="D"
+        if ! recs="$(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/END\n' "$dir/truth_sv_${svt}.vcf.gz" 2>/dev/null)"; then
+            echo "ERROR: could not read $dir/truth_sv_${svt}.vcf.gz — CIGAR op verification was not evaluated" >&2
+            return 1
+        fi
+        [[ -n "$recs" ]] || continue
+        while IFS=$'\t' read -r c p _r _a end; do
+            [[ -n "$c" ]] || continue
+            # Only events big enough that an aligner is expected to clip at all. A 10 bp indel
+            # is legitimately absorbed into mismatches.
+            if [[ "$svt" == "DEL" ]]; then
+                [[ -z "$end" || "$end" == "." ]] && continue
+                len=$(( end - p ))
+            else
+                len=$(( ${#_a} - ${#_r} ))
+            fi
+            (( len >= 50 )) || continue
+            n_ev=$(( n_ev + 1 ))
+
+            fetch_clips() {  # <centre> -> clipped read count, or "" on samtools failure
+                local lo=$(( $1 > win ? $1 - win : 1 ))
+                samtools view "$bam" "$c:$lo-$(( $1 + win ))" 2>/dev/null | count_clipped_reads "$min_clip"
+            }
+            # BOTH breakpoints, not just the anchor. A junction-clipped read anchors on
+            # whichever side the aligner could place, and for a deletion that is frequently
+            # the far one: job 21600878 failed chr22:32540349 (489 bp) with ZERO clips at POS
+            # and EIGHT at its END, and chr20:28029319 (405 kb) with 0 and 1. Both deletions
+            # were fine — the junction probe and the depth gate passed all 76.
+            #
+            # This is #613 exactly, in a gate written three days after it was fixed there.
+            # `verify_planted_del` already searches both windows for the same reason.
+            local far="$p"
+            [[ "$svt" == "DEL" ]] && far="$end"
+            local at_pos at_far
+            if ! at_pos="$(fetch_clips "$p")" || ! at_far="$(fetch_clips "$far")"; then
+                echo "ERROR: samtools could not read $c:$p — CIGAR op verification was not evaluated" >&2
+                return 1
+            fi
+            # MAX, not sum: for a short deletion the two windows overlap and summing would
+            # double-count the same reads. Either breakpoint carrying the signal is enough.
+            at_locus="$at_pos"
+            [[ "${at_far:-0}" -gt "${at_locus:-0}" ]] && at_locus="$at_far"
+            # Two flanking controls, placed clear of the event itself. The MINIMUM is the
+            # background: if another SV happens to fall in one window it inflates that side,
+            # and taking the smaller keeps this from failing a good locus for a neighbour's
+            # sake. Background is normally 0, so this reduces to "clipped reads exist here and
+            # not nearby" — which is exactly the measured separation.
+            ctl_l="$(fetch_clips "$(( p > ctl_off + win ? p - ctl_off : 1 ))")"
+            ctl_r="$(fetch_clips "$(( far + ctl_off ))")"
+            background="$ctl_l"
+            [[ "${ctl_r:-0}" -lt "${background:-0}" ]] && background="$ctl_r"
+            observed="$(samtools view "$bam" "$c:$(( p > 500 ? p - 500 : 1 ))-$(( p + 500 ))" 2>/dev/null | max_cigar_op "$op")"
+
+            if [[ "${at_locus:-0}" -eq 0 && "${background:-0}" -eq 0 ]]; then
+                # NOTHING is clipped anywhere near here, control included. That is not
+                # evidence the event is missing, it is evidence there is no clipping signal
+                # in this neighbourhood to measure — an unmappable region, or an event whose
+                # allele fraction is too low to put a clipped read at the breakpoint. Scoring
+                # it as a failure is the mistake `verify_planted_del` already avoids with its
+                # third "uncovered" outcome, and this gate was missing it (#630).
+                n_uninterp=$(( n_uninterp + 1 ))
+                printf '    %s %s:%s  %s bp  NO CLIPPING NEARBY AT ALL (uninterpretable, not counted)\n' \
+                    "$svt" "$c" "$p" "$len"
+            elif [[ "${at_locus:-0}" -le "${background:-0}" ]]; then
+                n_missing=$(( n_missing + 1 ))
+                printf '    %s %s:%s  %s bp  NO CLIP SUPPORT (%s clipped at POS/%s at END vs %s in flanking control)\n' \
+                    "$svt" "$c" "$p" "$len" "${at_pos:-0}" "${at_far:-0}" "${background:-0}" >&2
+            else
+                # The largest I/D op is INFORMATION, not the assertion — see the note above.
+                # Printing it keeps visible how rarely an aligner uses one for these events.
+                printf '    %s %s:%s  %s bp  %s clipped (control %s)  largest %s op %s bp\n' \
+                    "$svt" "$c" "$p" "$len" "$at_locus" "${background:-0}" "$op" "${observed:-0}"
+            fi
+        done <<< "$recs"
+    done
+
+    if [[ "$n_ev" -eq 0 ]]; then
+        echo "  CIGAR clip check: no INS/DEL >= 50 bp planted — nothing to verify"
+        return 0
+    fi
+    echo "  CIGAR clip support: $(( n_ev - n_missing - n_uninterp )) of $n_ev planted" \
+         "INS/DEL >= 50 bp show clipped reads above their flanking control;" \
+         "$n_uninterp had no clipping nearby at all (uninterpretable)"
+    CIGAR_MISSING="$n_missing"
+    if [[ "$n_missing" -gt 0 ]]; then
+        echo "ERROR: $n_missing of $n_ev planted event(s) produce no more clipped reads than the" >&2
+        echo "  surrounding reference does. That is #589's signature — the event is declared and" >&2
+        echo "  the alignment does not describe it." >&2
+    fi
+}
+
+# Depth evidence that planted deletions actually removed coverage (#590, #221).
+#
+# Compares mean depth INSIDE each deleted span against equal-sized flanks just outside it. The
+# flanks are the control, so this needs no second run and no normal BAM. #607 asks for exactly
+# this plus the must-not-fire half: coverage OUTSIDE the span must be unchanged. The first #590
+# attempt looked like a success (deleted span read 0.00) while the whole contig was empty —
+# the flank ratio is what makes that distinguishable.
+verify_del_depth() {  # <truth_sv_DEL.vcf.gz> <tumor.bam> <outdir>
+    local truth="$1" bam="$2" dir="$3"
+    [[ "${VERIFY_DEL_DEPTH:-1}" == "1" ]] || { echo "  (DEL depth verification skipped)"; return 0; }
+    local recs
+    if ! recs="$(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/END\n' "$truth" 2>/dev/null)"; then
+        echo "ERROR: could not read $truth — DEL depth verification was not evaluated" >&2
+        return 1
+    fi
+    DEL_DEPTH_BAD=0
+    DEL_DEPTH_DEAD=0
+    local n=0 c p end len inside lflank rflank flank ratio
+    while IFS=$'\t' read -r c p _r _a end; do
+        [[ -n "$c" ]] || continue
+        [[ -z "$end" || "$end" == "." ]] && continue
+        len=$(( end - p ))
+        (( len >= 50 )) || continue
+        (( p - len >= 1 )) || continue
+        inside="$(region_mean_depth "$bam" "$c" "$(( p + 1 ))" "$end")" || {
+            echo "ERROR: could not measure depth at $c:$p — DEL depth verification was not evaluated" >&2; return 1; }
+        lflank="$(region_mean_depth "$bam" "$c" "$(( p - len ))" "$p")" || {
+            echo "ERROR: could not measure left flank at $c:$p — DEL depth verification was not evaluated" >&2; return 1; }
+        rflank="$(region_mean_depth "$bam" "$c" "$(( end + 1 ))" "$(( end + len ))")" || {
+            echo "ERROR: could not measure right flank at $c:$p — DEL depth verification was not evaluated" >&2; return 1; }
+        n=$(( n + 1 ))
+        read -r flank ratio <<< "$(awk -v l="$lflank" -v r="$rflank" -v i="$inside" \
+            'BEGIN { f = (l + r) / 2; printf "%.4f %.4f", f, (f > 0 ? i / f : -1) }')"
+        # A dead flank means there is no local baseline, so the inside value means nothing.
+        # Reporting it as a successful deletion is how the first #590 attempt passed.
+        if awk -v f="$flank" 'BEGIN { exit !(f < 1) }'; then
+            DEL_DEPTH_DEAD=$(( DEL_DEPTH_DEAD + 1 ))
+            printf '    %s:%s  %s bp  FLANK DEPTH %s — no local baseline, inside depth is uninterpretable\n' \
+                "$c" "$p" "$len" "$flank" >&2
+        elif awk -v x="$ratio" -v t="${DEL_DEPTH_MAX_RATIO:-0.95}" 'BEGIN { exit !(x > t) }'; then
+            DEL_DEPTH_BAD=$(( DEL_DEPTH_BAD + 1 ))
+            printf '    %s:%s  %s bp  inside/flank %s — coverage NOT removed\n' "$c" "$p" "$len" "$ratio" >&2
+        else
+            printf '    %s:%s  %s bp  inside/flank %s (flank %s)\n' "$c" "$p" "$len" "$ratio" "$flank"
+        fi
+    done <<< "$recs"
+
+    if [[ "$n" -eq 0 ]]; then
+        echo "  DEL depth check: no symbolic DEL >= 50 bp with usable flanks — nothing to verify"
+        return 0
+    fi
+    echo "  DEL depth: $(( n - DEL_DEPTH_BAD - DEL_DEPTH_DEAD )) of $n deletion(s) removed coverage; $DEL_DEPTH_BAD did not, $DEL_DEPTH_DEAD had a dead flank"
+    if [[ "$DEL_DEPTH_BAD" -gt 0 || "$DEL_DEPTH_DEAD" -gt 0 ]]; then
+        echo "ERROR: DEL coverage evidence is missing or uninterpretable. See #590 and #221." >&2
+    fi
+}
+
+DEL_UNREALIZED=0
+DEL_VERIFY_FAILED=0
+DEL_SKIPPED=0
+if [[ -f "$OUTDIR/truth_sv_DEL.vcf.gz" ]]; then
+    if ! verify_planted_del "$OUTDIR/truth_sv_DEL.vcf.gz" "$TUMOR_BAM" "$REFERENCE" "$OUTDIR"; then
+        DEL_VERIFY_FAILED=1
+    fi
+fi
+
+CIGAR_MISSING=0
+CIGAR_VERIFY_FAILED=0
+if ! verify_sv_cigar_ops "$OUTDIR/truth_sv_scoreable.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
+    CIGAR_VERIFY_FAILED=1
+fi
+
+DEL_DEPTH_BAD=0
+DEL_DEPTH_DEAD=0
+DEL_DEPTH_FAILED=0
+if [[ -f "$OUTDIR/truth_sv_DEL.vcf.gz" ]]; then
+    if ! verify_del_depth "$OUTDIR/truth_sv_DEL.vcf.gz" "$TUMOR_BAM" "$OUTDIR"; then
+        DEL_DEPTH_FAILED=1
     fi
 fi
 
@@ -1636,11 +2246,31 @@ elif [[ "$SCORE_COVERAGE_FAIL" -gt 0 ]]; then
     RUN_STATUS="FAILED ($SCORE_COVERAGE_FAIL comparison(s) scored a SUBSET of the truth)"
 elif [[ "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
     RUN_STATUS="FAILED (INS read verification was not evaluated)"
+elif [[ "${DEL_VERIFY_FAILED:-0}" -ne 0 ]]; then
+    RUN_STATUS="FAILED (DEL read verification was not evaluated)"
+elif [[ "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+    # Unlike INS below, this IS a hard failure. The two have different epistemic status:
+    # #516 is a known-open defect, so failing every campaign that plants a long insertion
+    # would block unrelated DEL/DUP/INV work. #590 by contrast claims deletions ARE realized
+    # in the reads, and this run is what validates that claim (#607). A green exit over a
+    # result that contradicts a shipped fix is precisely the "shipped green" failure this
+    # pipeline exists to prevent.
+    RUN_STATUS="FAILED (DEL INVALID — $DEL_UNREALIZED deletion(s) not realized in the reads; #590)"
+elif [[ "${CIGAR_VERIFY_FAILED:-0}" -ne 0 || "${DEL_DEPTH_FAILED:-0}" -ne 0 ]]; then
+    RUN_STATUS="FAILED (CIGAR/depth verification was not evaluated)"
+elif [[ "${CIGAR_MISSING:-0}" -gt 0 ]]; then
+    RUN_STATUS="FAILED ($CIGAR_MISSING planted event(s) appear in no read CIGAR — #589)"
+elif [[ "${DEL_DEPTH_BAD:-0}" -gt 0 || "${DEL_DEPTH_DEAD:-0}" -gt 0 ]]; then
+    RUN_STATUS="FAILED (DEL coverage not removed or flank dead — #590/#221)"
 elif [[ "${INS_UNSUPPORTED:-0}" -gt 0 ]]; then
     # Deliberately not a hard failure while #516 is open: every campaign planting insertions
     # above ~a read length would fail, which would block DEL/DUP/INV work that is unaffected.
     # It is a distinct, visible status instead — the numbers are usable EXCEPT for INS.
     RUN_STATUS="complete, but INS INVALID ($INS_UNSUPPORTED insertion(s) absent from the reads — #516)"
+elif [[ "${INS_DENOM_THIN:-0}" -gt 0 ]]; then
+    # Passing on a handful of insertions is not evidence that insertions work. Say so in the
+    # banner, where it cannot be skipped, rather than only in the INS block above.
+    RUN_STATUS="complete; INS read support passed on only $INS_DENOM_THIN insertion(s) longer than a read — too few to conclude"
 else
     RUN_STATUS="complete"
 fi
@@ -1742,6 +2372,16 @@ prune_bams() {  # <outdir>
         echo "[prune] KEEPING BAMs: INS read verification failed before evaluating every probe" >&2
         return 0
     fi
+    if [[ "${CIGAR_MISSING:-0}" -gt 0 || "${CIGAR_VERIFY_FAILED:-0}" -ne 0 \
+          || "${DEL_DEPTH_BAD:-0}" -gt 0 || "${DEL_DEPTH_DEAD:-0}" -gt 0 || "${DEL_DEPTH_FAILED:-0}" -ne 0 ]]; then
+        echo "[prune] KEEPING BAMs: CIGAR or depth evidence is missing or unevaluated." >&2
+        return 0
+    fi
+    if [[ "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+        echo "[prune] KEEPING BAMs: DEL read evidence is missing or unevaluated — the BAM is" >&2
+        echo "  the only artifact that can show what the reads actually carry at those loci." >&2
+        return 0
+    fi
     # MUST NOT FIRE without a completed score. Deleting the BAMs of a run that died before
     # stage 5 destroys the only artifact that makes it re-callable, and the FASTQ is already
     # gone by this point, so there is no way back.
@@ -1768,7 +2408,10 @@ archive_run sv "$OUTDIR" truvari_manta_overall/summary.json scorer_recall.tsv
 # exit non-zero — because a run that published recalls over a subset of the truth, or
 # scored with an uncalibrated scorer, must not look successful to whoever reads the
 # SLURM exit status.
-if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:-0}" -ne 0 ]]; then
+if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:-0}" -ne 0 \
+      || "${DEL_VERIFY_FAILED:-0}" -ne 0 || "${DEL_UNREALIZED:-0}" -gt 0 \
+      || "${CIGAR_VERIFY_FAILED:-0}" -ne 0 || "${CIGAR_MISSING:-0}" -gt 0 \
+      || "${DEL_DEPTH_FAILED:-0}" -ne 0 || "${DEL_DEPTH_BAD:-0}" -gt 0 || "${DEL_DEPTH_DEAD:-0}" -gt 0 ]]; then
     echo "" >&2
     [[ "$CAL_FAIL" -ne 0 ]] && \
         echo "FAILED: scorer calibration (Rule 0) — no caller results were produced." >&2
@@ -1780,5 +2423,18 @@ if [[ "$CAL_FAIL" -ne 0 || "$SCORE_COVERAGE_FAIL" -gt 0 || "${INS_VERIFY_FAILED:
     fi
     [[ "${INS_VERIFY_FAILED:-0}" -eq 0 ]] || \
         echo "FAILED: INS read verification did not evaluate every probe; BAMs were kept for diagnosis." >&2
+    [[ "${DEL_VERIFY_FAILED:-0}" -eq 0 ]] || \
+        echo "FAILED: DEL read verification did not evaluate every probe; BAMs were kept for diagnosis." >&2
+    if [[ "${DEL_UNREALIZED:-0}" -gt 0 ]]; then
+        echo "FAILED: $DEL_UNREALIZED planted deletion(s) are absent from the reads while reads" >&2
+        echo "  read straight through them. Any DEL recall above measures our read generation," >&2
+        echo "  not the caller. BAMs were kept. See #590 and #607." >&2
+    fi
+    [[ "${CIGAR_MISSING:-0}" -eq 0 ]] || \
+        echo "FAILED: $CIGAR_MISSING planted event(s) appear in no read's CIGAR (#589)." >&2
+    [[ "${DEL_DEPTH_BAD:-0}" -eq 0 ]] || \
+        echo "FAILED: $DEL_DEPTH_BAD deletion(s) did not remove coverage (#590)." >&2
+    [[ "${DEL_DEPTH_DEAD:-0}" -eq 0 ]] || \
+        echo "FAILED: $DEL_DEPTH_DEAD deletion(s) had a dead flank; inside depth is uninterpretable." >&2
     exit 1
 fi

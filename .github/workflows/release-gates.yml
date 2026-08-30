@@ -1,0 +1,143 @@
+# Pre-release gate: run the tests CI cannot normally reach.
+#
+# WHY THIS EXISTS: six tests in this repo are `#[ignore]`d because they need external
+# tools — bwa-mem2 for the realigned SV gates, samtools/bcftools for the validate
+# differential. `cargo test` skips them, CI reports green, and nobody notices when one
+# breaks. `gate2_realigned_dup` was red on develop AND main through an entire release
+# before anyone ran it by hand (#582). An ignored test that nothing ever runs is not a
+# test, it is a comment.
+#
+# Deliberately NOT nightly and NOT on every PR. The realigned gates are the strongest
+# correctness evidence this repo has — they ask whether a real aligner, given eidolon's
+# FASTQ, produces the evidence a caller keys on — and that question is worth asking when
+# a release is proposed, not on every push to a topic branch.
+#
+# Triggers: any PR into develop or main, or manually via the Actions tab.
+#
+# Firing on develop is what actually EXERCISES this workflow. A gate that only runs when a
+# release is cut is a gate nobody has seen work, and `delta-harness` proved that costs a red
+# CI run to discover (bgzip lives in `tabix`, not `bcftools`). Running the realigned gates on
+# every PR into develop is ~30 s of tests plus a tarball download, against the DUP gate having
+# sat red on develop AND main through an entire release because nothing ran it.
+#
+# The release-blocker check is the exception and stays main-only, via an `if` on the job:
+# develop is ALLOWED to carry work that is not yet validated on real data — that is the normal
+# state between a fix and its Delta campaign. Only cutting a release is not allowed to.
+
+name: release-gates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "develop", "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+
+  # Some work cannot be validated by any amount of CI: it needs a real reference on Delta.
+  # #607 is the current example — five SV fixes measured only on a 13.5 kb viral fixture
+  # whose longest contig is shorter than the guards being exercised. Merging develop into
+  # main is this repo's release point, so that is where the question has to be asked.
+  #
+  # The TRACKER is the source of truth, deliberately: a checklist committed to docs/ goes
+  # stale the moment someone forgets to tick it, and then reads as "validated" forever.
+  # An open `release-blocker` issue cannot rot in that direction.
+  release-blockers:
+
+    # main only. Blocking every develop PR on an open Delta-validation issue would stop all
+    # day-to-day work for exactly the reason the issue exists.
+    if: github.base_ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Refuse to release with open release-blocker issues
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        open=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                 --label release-blocker --state open \
+                 --json number,title --jq '.[] | "  #\(.number) \(.title)"')
+        if [ -n "$open" ]; then
+          echo "::error::develop carries work that is not validated on real data yet."
+          echo ""
+          echo "Open release-blocker issue(s):"
+          echo "$open"
+          echo ""
+          echo "These are NOT things CI can check. Resolve or de-label them, then re-run."
+          exit 1
+        fi
+        echo "No open release-blocker issues."
+
+  realigned-gates:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ubuntu-latest-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ubuntu-latest-cargo-
+
+    # Upstream ships a prebuilt static x86_64 build; bwa-mem2 is not in the Ubuntu
+    # archive (`bwa` is, and is a different tool the gates do not use). The tarball
+    # carries per-ISA kernels plus a dispatcher.
+    #
+    # Do NOT trust that dispatcher. Its CPU probe is coarser than what the kernels
+    # actually require: on a runner with AVX512F but not the full BW/VL/DQ/CLWB set it
+    # launches bwa-mem2.avx512bw, which refuses to start with "Please verify that both
+    # the operating system and the processor support ... AVX512BW ...". GitHub allocates
+    # runner hardware per job, so this failed AT RANDOM — the same job passed at 01:27
+    # and failed at 03:27 with no change to this workflow. A release gate that flips on
+    # which machine it landed on is worse than no gate; it teaches people to re-run until
+    # green. Pick the newest kernel that actually RUNS here instead.
+    - name: Install bwa-mem2
+      run: |
+        set -euo pipefail
+        curl -fsSL https://github.com/bwa-mem2/bwa-mem2/releases/download/v2.2.1/bwa-mem2-2.2.1_x64-linux.tar.bz2 \
+          | sudo tar xj -C /opt
+        D=/opt/bwa-mem2-2.2.1_x64-linux
+        picked=""
+        for k in avx512bw avx2 sse42 sse41; do
+          if [ -x "$D/bwa-mem2.$k" ] && "$D/bwa-mem2.$k" version >/dev/null 2>&1; then
+            picked="$k"; break
+          fi
+        done
+        if [ -z "$picked" ]; then
+          echo "no bwa-mem2 kernel runs on this runner:" >&2
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -c '^avx512' || true
+          exit 1
+        fi
+        echo "selected bwa-mem2.$picked"
+        sudo ln -sf "$D/bwa-mem2.$picked" "$D/bwa-mem2"
+        echo "$D" >> "$GITHUB_PATH"
+
+    - name: Install samtools and bcftools
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq samtools bcftools
+
+    # Fail loudly here rather than inside a test. A gate that cannot find its aligner
+    # must not be mistaken for a gate that ran.
+    - name: Confirm the tools are really on PATH
+      run: |
+        bwa-mem2 version
+        samtools --version | head -1
+        bcftools --version | head -1
+
+    # --ignored runs ONLY the ignored tests: the five realigned SV gates and the
+    # validate differential. --no-fail-fast so one failing gate does not conceal the rest.
+    - name: Run the ignored tests (realigned SV gates + validate differential)
+      run: cargo test --workspace --no-fail-fast -- --ignored --nocapture

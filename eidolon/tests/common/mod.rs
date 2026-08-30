@@ -265,6 +265,55 @@ pub fn read_file_bytes(path: &Path) -> Vec<u8> {
 
 // ── working-directory helper ────────────────────────────────────────────────
 
+// ── synthetic insertion sequence ─────────────────────────────────────────────
+
+/// Deterministic novel sequence for a planted insertion.
+///
+/// A 30-mer of this has a ~4^-30 chance of occurring in the reference by accident, so a
+/// probe hit is proof the inserted bases reached the output rather than something spliced
+/// from the fixture. Issue #580 tracks replacing random sequence with mobile-element
+/// consensus; that would break this evidence property, which is why #516 deliberately keeps
+/// random sequence.
+///
+/// Shared rather than copied: `long_insertion_rework.rs` probes eidolon's own FASTQ with it
+/// and `gate2_realigned_ins.rs` probes a realigned SAM with it. Two copies of the generator
+/// could drift and the two tests would silently stop describing the same insertion.
+pub fn synthetic_insert(n: usize) -> String {
+    let mut s = String::with_capacity(n);
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..n {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        s.push(match (x >> 33) & 3 {
+            0 => 'A',
+            1 => 'C',
+            2 => 'G',
+            _ => 'T',
+        });
+    }
+    s
+}
+
+/// Reverse complement. A read carrying an insertion probe may be sequenced from either
+/// strand, so every probe search has to try both.
+pub fn revcomp(s: &str) -> String {
+    s.chars()
+        .rev()
+        .map(|c| match c {
+            'A' => 'T',
+            'C' => 'G',
+            'G' => 'C',
+            'T' => 'A',
+            'a' => 't',
+            'c' => 'g',
+            'g' => 'c',
+            't' => 'a',
+            other => other,
+        })
+        .collect()
+}
+
 /// Convenience wrapper: a tempdir plus a couple of paths inside it. Returned as a
 /// tuple so callers can keep the `TempDir` alive for the duration of the test.
 pub fn fresh_workdir() -> (TempDir, PathBuf) {

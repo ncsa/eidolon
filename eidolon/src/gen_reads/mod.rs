@@ -13,7 +13,7 @@ pub fn main(config: &PathBuf) -> Result<(), GenerateReadsError> {
     // set up the config struct based on whether there was an input config. Input config
     // overrides any other inputs.
     let config = if !config.display().to_string().is_empty() {
-        info!("Using Configuration file input: {:?}", &config);
+        info!("Using Configuration file input: {:?}", config);
         RunConfiguration::from_yaml_file(config)
             .expect("Error generating run configuration from input yaml")
     } else {

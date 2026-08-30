@@ -17,6 +17,7 @@ use crate::models::quality_scores::QualityScoreModel;
 use crate::models::sequencing_error_model::{
     SeqModelError, SequencingErrorModel, SequencingErrorType,
 };
+use crate::structs::haplotype_map::InsertionCoordinateMap;
 use crate::structs::mutated_map::{AdCounter, MutatedMap, MutatedMapError};
 use crate::structs::nucleotides::Nucleotide;
 use crate::structs::nucleotides::Nucleotide::N;
@@ -58,6 +59,8 @@ pub enum FastqToolsError {
     MalformedReverseRead,
     #[error("BAM write error: {0}")]
     BamError(String),
+    #[error("Haplotype baseline CIGAR does not match read sequence length")]
+    HaplotypeCigarMismatch,
 }
 
 pub enum Strand {
@@ -109,8 +112,53 @@ fn set_observed_template_lengths(r1: &mut ReadRecord, r2: &mut ReadRecord) {
     }
 }
 
+/// One fragment to be written, expressed in the coordinate space named by
+/// `haplotype`: reference coordinates when `None`, altered-haplotype coordinates
+/// when `Some`.
+///
+/// This exists so long insertions can be sampled in a coordinate space that has
+/// width where the reference has none, WITHOUT a second writer. The previous #516
+/// attempt added a parallel writer for exactly this and silently lost everything
+/// `write_block_fastq` does along the way — the heterozygous coin, allelic-depth
+/// counting, the #210 position-keyed read name, adapter readthrough, and the
+/// pair-desync guard. Routing both kinds of fragment through one function is what
+/// makes those impossible to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedFragment {
+    pub start: usize,
+    pub end: usize,
+    /// Index into the `haplotypes` slice passed alongside.
+    pub haplotype: Option<usize>,
+}
+
+impl From<(usize, usize)> for PlacedFragment {
+    /// A fragment sampled straight from the reference — the overwhelmingly common
+    /// case, and what every caller produced before insertions needed their own
+    /// coordinate space.
+    fn from((start, end): (usize, usize)) -> Self {
+        Self {
+            start,
+            end,
+            haplotype: None,
+        }
+    }
+}
+
+/// An altered haplotype that fragments in this block may have been sampled from:
+/// one literal insertion spliced into the reference.
+#[derive(Debug, Clone)]
+pub struct HaplotypeContext {
+    /// Describes every insertion on this haplotype and owns their novel bases, so
+    /// an interval spanning more than one materializes without the caller
+    /// tracking which sequence belongs to which anchor.
+    pub map: InsertionCoordinateMap,
+}
+
 pub fn write_block_fastq<B1: Write, B2: Write>(
-    block_fragments: Vec<(usize, usize)>,
+    block_fragments: Vec<PlacedFragment>,
+    // Altered haplotypes referenced by `PlacedFragment::haplotype`. Empty for a
+    // block with no long insertions, which is the common case.
+    haplotypes: &[HaplotypeContext],
     block_map: &MutatedMap,
     sequence_block: &SequenceBlock,
     paired_ended: bool,
@@ -149,12 +197,74 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     //     coordinates — the R2 window still starts at `end - effective_read_len`.
     let seq_len = sequence_block.sequence.len();
     let frag_pad = if paired_ended { read_length } else { 32 };
-    for (frag_idx, (start, end)) in block_fragments.into_iter().enumerate() {
-        let padded_end = (end + frag_pad).min(seq_len);
-        // Zero-copy: the fragment is only read (R1 reads it, R2 reads a suffix),
-        // never stored or mutated, so borrow it instead of allocating + copying
-        // a Vec per fragment. Borrows sequence_block for the iteration.
-        let fragment = sequence_block.get_subseq_slice(start, padded_end)?;
+    for (frag_idx, placed) in block_fragments.into_iter().enumerate() {
+        let (start, end) = (placed.start, placed.end);
+        // An index the caller supplied but did not provide a context for is a
+        // programming error, not data-dependent: say which, rather than panicking
+        // with a bare out-of-bounds. (Hit exactly once while wiring this up, when
+        // the runner built its contexts but still passed an empty slice.)
+        let hap = match placed.haplotype {
+            None => None,
+            Some(i) => Some(haplotypes.get(i).ok_or_else(|| {
+                FastqToolsError::BamError(format!(
+                    "fragment references haplotype {i} but only {} were supplied",
+                    haplotypes.len()
+                ))
+            })?),
+        };
+        // The span a fragment may be materialized over. For a reference fragment
+        // that is the contig; for a haplotype fragment it is the contig plus the
+        // inserted bases, which is exactly the extra width the insertion has.
+        let materializable_len = match hap {
+            None => seq_len,
+            Some(h) => h.map.haplotype_len(),
+        };
+        let padded_end = (end + frag_pad).min(materializable_len);
+        // Zero-copy for the common case: the fragment is only read (R1 reads it,
+        // R2 reads a suffix), never stored or mutated, so borrow it instead of
+        // allocating + copying a Vec per fragment. A haplotype fragment has to be
+        // built (its bases do not exist contiguously in the reference), so that
+        // path owns a buffer and borrows from it.
+        let hap_materialized;
+        // `frag_ops` is produced by the same match as `fragment` so the borrow lives in the
+        // arm that initializes the buffer — the two must stay index-parallel.
+        let (fragment, frag_ops, frag_dels): (
+            &[Nucleotide],
+            Option<&[char]>,
+            Option<&[(usize, usize)]>,
+        ) = match hap {
+            None => (
+                sequence_block.get_subseq_slice(start, padded_end)?,
+                None,
+                None,
+            ),
+            Some(h) => {
+                let Some((bases, segments)) =
+                    h.map
+                        .materialize_interval(&sequence_block.sequence, start, padded_end)
+                else {
+                    // The map disagrees with the sequence it was built for, or the
+                    // interval is degenerate. Skipping is right (the alternative is
+                    // emitting reads from a coordinate space that does not exist),
+                    // but it must not be silent -- a region that quietly stops
+                    // producing reads is the failure shape this project keeps hitting.
+                    debug!(
+                        "haplotype fragment [{start},{padded_end}) could not be materialized; skipping"
+                    );
+                    continue;
+                };
+                hap_materialized = (
+                    bases,
+                    InsertionCoordinateMap::cigar_ops_for_segments(&segments),
+                    InsertionCoordinateMap::deletion_runs_for_segments(&segments),
+                );
+                (
+                    &hap_materialized.0,
+                    Some(&hap_materialized.1[..]),
+                    Some(&hap_materialized.2[..]),
+                )
+            }
+        };
         // In long-read mode a fragment may be shorter than read_length; truncate the read
         // to the actual fragment length rather than discarding it.
         // With adapters on, a short insert generates an insert-length read here, then the
@@ -192,13 +302,59 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // full-map scan made this O(fragments × variants) — pathological with
         // dense models (~220k SNVs on chr22 from the COSMIC tumor rate).
         let flagged = &block_map.flagged_positions;
+        // A variant whose allele is decided by HAPLOTYPE SAMPLING must not also be
+        // applied inline here, or it would be applied twice on the alt haplotype
+        // (once materialized, once by the per-variant coin) and, worse, applied at
+        // all on the reference haplotype — where by construction it is absent.
+        // Deciding it once, per fragment, is the whole point of sampling haplotypes
+        // rather than flipping a coin per read: it is what makes a heterozygous
+        // insertion actually come out at ~half depth.
+        // A variant expressed by haplotype sampling must NOT also be applied inline, or
+        // it is applied twice. Deletions count as much as insertions here (#590):
+        // whether a fragment carries the event is decided by which haplotype it was
+        // drawn from, so a reference fragment correctly shows no event and an alt
+        // fragment already has it built into its coordinates.
+        let hap_anchor = |pos: usize| {
+            haplotypes.iter().any(|h| {
+                h.map.anchors().any(|a| a == pos) || h.map.deletion_anchors().any(|a| a == pos)
+            })
+        };
         // R1 window: [start, start + effective_read_len); var offset = pos - start.
-        let r1_lo = flagged.partition_point(|&p| p < start);
-        let r1_hi = flagged.partition_point(|&p| p < start + effective_read_len);
+        // For a haplotype fragment these are HAPLOTYPE offsets, so a reference
+        // variant position has to be projected before it can be located in the read.
+        let project = |pos: usize| -> Option<usize> {
+            match hap {
+                None => Some(pos),
+                Some(h) => h.map.reference_base_to_haplotype(pos),
+            }
+        };
+        // Project the read WINDOW back to reference coordinates rather than
+        // projecting every variant forward. The map is monotonic, so a haplotype
+        // window corresponds to a contiguous reference range -- which keeps the
+        // binary search over the sorted flagged positions. Scanning the whole
+        // variant map per fragment would be O(fragments x variants), the exact
+        // pathology the binary search was introduced to fix (~220k SNVs on chr22
+        // under the COSMIC tumor rate).
+        let ref_window = |lo: usize, hi: usize| -> (usize, usize) {
+            match hap {
+                None => (lo, hi),
+                Some(h) => (h.map.reference_floor(lo), h.map.reference_floor(hi)),
+            }
+        };
+        let (r1_ref_lo, r1_ref_hi) = ref_window(start, start + effective_read_len);
+        let r1_lo = flagged.partition_point(|&p| p < r1_ref_lo);
+        let r1_hi = flagged.partition_point(|&p| p < r1_ref_hi);
         for &pos in &flagged[r1_lo..r1_hi] {
-            let var_pos = pos - start;
-            read1_variants.insert(var_pos, &block_map.variant_map[&pos]);
-            reads1_flagged.push(var_pos);
+            if hap_anchor(pos) {
+                continue;
+            }
+            // Forward-project the handful of hits to locate them within the read.
+            let Some(proj) = project(pos) else { continue };
+            if proj >= start && proj < start + effective_read_len {
+                let var_pos = proj - start;
+                read1_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                reads1_flagged.push(var_pos);
+            }
         }
         // R2 window: [end - effective_read_len, end). R2 is generated in FORWARD
         // orientation over this right-end window (then the whole record is
@@ -207,16 +363,58 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // window start doesn't underflow.
         if paired_ended && end > effective_read_len {
             let w_lo = end - effective_read_len;
-            let r2_lo = flagged.partition_point(|&p| p < w_lo);
-            let r2_hi = flagged.partition_point(|&p| p < end);
+            let (r2_ref_lo, r2_ref_hi) = ref_window(w_lo, end);
+            let r2_lo = flagged.partition_point(|&p| p < r2_ref_lo);
+            let r2_hi = flagged.partition_point(|&p| p < r2_ref_hi);
             for &pos in &flagged[r2_lo..r2_hi] {
-                let var_pos = pos - w_lo;
-                read2_variants.insert(var_pos, &block_map.variant_map[&pos]);
-                reads2_flagged.push(var_pos);
+                if hap_anchor(pos) {
+                    continue;
+                }
+                let Some(proj) = project(pos) else { continue };
+                if proj >= w_lo && proj < end {
+                    let var_pos = proj - w_lo;
+                    read2_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                    reads2_flagged.push(var_pos);
+                }
             }
         }
 
         let ref_start = sequence_block.ref_start;
+        // Reference-space coordinates for the BAM record. For a reference fragment
+        // these are just the fragment's own coordinates offset by the block start.
+        // For a haplotype fragment they are the PROJECTION back to the reference:
+        // the inserted bases have no reference coordinate at all, so a read window
+        // beginning inside them projects to `None` and the record is emitted
+        // unmapped rather than being placed at the anchor with an all-insertion
+        // CIGAR (which is not a valid alignment -- it consumes no reference).
+        //
+        // The golden BAM is an answer key, not a prediction of aligner output
+        // (see #449), so an unmapped record still records where the read really
+        // came from via a provenance tag rather than discarding that.
+        let (r1_ref_pos, r2_ref_pos, tlen_span) = match hap {
+            None => (
+                Some(start + ref_start),
+                Some(end.saturating_sub(effective_read_len) + ref_start),
+                Some(end - start),
+            ),
+            Some(h) => {
+                let r1 = h
+                    .map
+                    .haplotype_base_to_reference(start)
+                    .map(|p| p + ref_start);
+                let r2_window = end.saturating_sub(effective_read_len);
+                let r2 = h
+                    .map
+                    .haplotype_base_to_reference(r2_window)
+                    .map(|p| p + ref_start);
+                // TLEN is only meaningful when both mates have a reference span.
+                let span = match (r1, r2) {
+                    (Some(a), Some(b)) => Some((b + effective_read_len).saturating_sub(a)),
+                    _ => None,
+                };
+                (r1, r2, span)
+            }
+        };
         let abs_start = start + ref_start;
         let abs_end = end + ref_start;
         // Per-fragment uniqueness tag in the read name. Without this, two
@@ -234,13 +432,28 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             read_name_prefix, abs_start, abs_end, frag_idx,
         );
 
+        // SAM convention: an unmapped read with a mapped mate still carries the
+        // mate's RNAME/POS, so the pair sorts together and the unmapped read stays
+        // located at the event it came from. Falling back to the insertion anchor
+        // covers the (rare) case where BOTH mates lie inside the inserted sequence.
+        let anchor_fallback = match hap {
+            Some(h) => h.map.anchors().next().unwrap_or(start) + ref_start,
+            None => abs_start,
+        };
+        let r1_pos = r1_ref_pos.or(r2_ref_pos).unwrap_or(anchor_fallback);
+        // Identical to the previous expression whenever `hap` is None: the
+        // projection of a reference fragment is the fragment itself.
         let r2_start = if paired_ended && abs_end >= effective_read_len {
-            abs_end - effective_read_len
+            r2_ref_pos
+                .or(r1_ref_pos)
+                .unwrap_or(abs_end - effective_read_len)
         } else {
             0
         };
         let tlen = if paired_ended {
-            (abs_end - abs_start) as i32
+            // A template length is only meaningful when both mates have a reference
+            // span; an unmapped mate leaves it 0, as SAM requires.
+            tlen_span.unwrap_or(0) as i32
         } else {
             0
         };
@@ -249,6 +462,8 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             quality_score_model.generate_quality_scores(effective_read_len, rng)?;
         let mut r1_record = match generate_read(
             fragment,
+            frag_ops,
+            frag_dels,
             &reads1_flagged,
             &read1_variants,
             effective_read_len,
@@ -258,7 +473,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             sequencing_error_model,
             rng,
             sequence_block.contig.clone(),
-            abs_start,
+            r1_pos,
             sequence_block.contig.clone(),
             r2_start,
             tlen,
@@ -272,6 +487,19 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             }
             Err(e) => return Err(e),
         };
+        // No reference position => the read lies wholly inside inserted sequence.
+        // Emit it unmapped with an empty CIGAR rather than placing it at the anchor
+        // with an all-insertion CIGAR, which consumes no reference and is not a
+        // valid alignment. The bases still reach the FASTQ — they are real reads.
+        if r1_ref_pos.is_none() {
+            r1_record.is_unmapped = true;
+            // Soft-clip the whole read rather than emptying the CIGAR: `S` consumes
+            // query but not reference, which is exactly "these bases exist, none of
+            // them align". An empty CIGAR is what SAM writes as `*`, but this
+            // writer's encoder turns an empty op list into `1M`, and noodles then
+            // rejects the record for a read-length/sequence-length mismatch.
+            r1_record.cigar_ops = vec!['S'; r1_record.sequence.len()];
+        }
         // R1 adapter readthrough: pad a short-insert read to read_length at its 3' end.
         if adapters_on {
             r1_record = append_adapter_readthrough(
@@ -295,8 +523,10 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut r2_record = if paired_ended {
             let quality_scores_2 =
                 quality_score_model.generate_quality_scores(effective_read_len, rng)?;
-            let r2_pos = abs_end.saturating_sub(effective_read_len);
-            let tlen_r2 = -((abs_end - abs_start) as i32);
+            let r2_pos = r2_ref_pos
+                .or(r1_ref_pos)
+                .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
+            let tlen_r2 = -(tlen_span.unwrap_or(0) as i32);
             // R2 covers the fragment's right end. Generate it FORWARD over that
             // window — so SNP/insertion/deletion handling is identical to R1 and
             // correct — then reverse-complement the whole record into a reverse
@@ -312,8 +542,36 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 // orphaned R1 (matches the TruncatedRead handling below).
                 None => continue,
             };
+            // The mask is sliced by the SAME offset as r2_sub, so index i of one lines up
+            // with index i of the other. R2 is generated forward over this window and the
+            // record (CIGAR included) is reverse-complemented afterwards, so no reversal
+            // of the mask is needed here.
+            let r2_ops: Option<&[char]> =
+                match (frag_ops, (end - start).checked_sub(effective_read_len)) {
+                    (Some(ops), Some(off)) if off <= ops.len() => Some(&ops[off..]),
+                    _ => None,
+                };
+            // Rebased to the R2 window the same way `r2_ops` is sliced. A deletion
+            // sitting before the window is not crossed by R2 and must not contribute a
+            // D; one at offset 0 is flush against the window's left edge and is not
+            // spanned either.
+            let r2_del_buf: Vec<(usize, usize)>;
+            let r2_dels: Option<&[(usize, usize)]> =
+                match (frag_dels, (end - start).checked_sub(effective_read_len)) {
+                    (Some(runs), Some(off)) => {
+                        r2_del_buf = runs
+                            .iter()
+                            .filter(|(at, _)| *at > off)
+                            .map(|(at, len)| (at - off, *len))
+                            .collect();
+                        Some(&r2_del_buf[..])
+                    }
+                    _ => None,
+                };
             match generate_read(
                 r2_sub,
+                r2_ops,
+                r2_dels,
                 &reads2_flagged,
                 &read2_variants,
                 effective_read_len,
@@ -325,12 +583,16 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 sequence_block.contig.clone(),
                 r2_pos,
                 sequence_block.contig.clone(),
-                abs_start,
+                r1_pos,
                 tlen_r2,
                 true,
                 ad_counter,
             ) {
-                Ok(record) => {
+                Ok(mut record) => {
+                    if r2_ref_pos.is_none() {
+                        record.is_unmapped = true;
+                        record.cigar_ops = vec!['S'; record.sequence.len()];
+                    }
                     // Flip to the reverse mate FIRST, then append the R2 adapter at
                     // the (now 3') end — so R2 carries the R2 adapter in read
                     // orientation, exactly as a trimmer expects.
@@ -357,6 +619,37 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         } else {
             None
         };
+
+        // Allelic depth for a haplotype-sampled insertion. `generate_read` no
+        // longer sees these variants (their allele is decided per fragment, not
+        // per read), so nothing else would count them and the golden VCF would
+        // report DP=0 for the event -- which is exactly what the reverted attempt
+        // shipped. Count each fragment once, against the anchor it covers, on
+        // whichever haplotype it was drawn from.
+        for h in haplotypes {
+            for anchor in h.map.anchors() {
+                // Is this fragment drawn from the very haplotype carrying this
+                // insertion? If so its coordinates are in that haplotype's space
+                // and the anchor has to be projected before it can be located.
+                let on_this_haplotype = hap.is_some_and(|active| std::ptr::eq(active, h));
+                let covers_anchor = if on_this_haplotype {
+                    h.map
+                        .reference_base_to_haplotype(anchor)
+                        .is_some_and(|a| a >= start && a < end)
+                } else {
+                    anchor >= start && anchor < end
+                };
+                if !covers_anchor {
+                    continue;
+                }
+                let entry = ad_counter.entry(anchor + ref_start).or_insert((0, 0));
+                if on_this_haplotype {
+                    entry.1 += 1;
+                } else {
+                    entry.0 += 1;
+                }
+            }
+        }
 
         if let Some(r2_record) = r2_record.as_mut() {
             // Both realized CIGARs are available only here, before either mate
@@ -386,6 +679,165 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         }
     }
     Ok(())
+}
+
+/// Write single-ended reads whose sequence was materialized in haplotype
+/// coordinates. Each item contains the read sequence, one baseline CIGAR
+/// operation per sequence base, and its reference-anchored position. This
+/// opt-in path is intentionally separate from `write_block_fastq` until the
+/// paired-end fragment ownership and mate-coordinate rules are finalized.
+pub fn write_haplotype_fragments<W: Write>(
+    fragments: impl IntoIterator<Item = (Vec<Nucleotide>, Vec<char>, usize)>,
+    buffer: &mut W,
+    read_length: usize,
+    read_name_prefix: &str,
+    quality_score_model: &QualityScoreModel,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+) -> Result<usize, FastqToolsError> {
+    let mut written = 0;
+    for (sequence, baseline_ops, position) in fragments {
+        if sequence.len() != read_length || baseline_ops.len() != read_length {
+            return Err(FastqToolsError::HaplotypeCigarMismatch);
+        }
+        let quality_scores = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let mut ad_counter = AdCounter::new();
+        let mut record = generate_read(
+            &sequence,
+            // Chimeric reads are stitched from reference pieces: every base is 'M', and
+            // no haplotype deletion applies.
+            None,
+            None,
+            &[],
+            &HashMap::new(),
+            read_length,
+            format!("{}_{}", read_name_prefix, written),
+            Strand::Forward,
+            quality_scores,
+            sequencing_error_model,
+            rng,
+            "".to_string(),
+            position,
+            "".to_string(),
+            0,
+            0,
+            false,
+            &mut ad_counter,
+        )?;
+        apply_haplotype_baseline_cigar(&mut record, &baseline_ops)?;
+        write_read_to_fastq(&record, buffer)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+pub struct HaplotypePairedFragment {
+    pub r1_sequence: Vec<Nucleotide>,
+    pub r1_baseline_ops: Vec<char>,
+    pub r1_position: usize,
+    pub r2_sequence: Vec<Nucleotide>,
+    pub r2_baseline_ops: Vec<char>,
+    pub r2_position: usize,
+    pub template_length: i32,
+}
+
+/// Write paired-end reads from expanded-coordinate haplotype windows. R2 is
+/// generated in forward orientation, annotated with its baseline operations,
+/// then reverse-complemented so the two records share the same construction
+/// path as the existing paired-end writer.
+pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
+    fragments: impl IntoIterator<Item = HaplotypePairedFragment>,
+    buffer1: &mut B1,
+    buffer2: &mut B2,
+    read_length: usize,
+    read_name_prefix: &str,
+    contig_name: &str,
+    quality_score_model: &QualityScoreModel,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+    mut bam_writer: Option<&mut dyn BamRecordStager>,
+) -> Result<usize, FastqToolsError> {
+    let mut written = 0;
+    for fragment in fragments {
+        if fragment.r1_sequence.len() != read_length
+            || fragment.r2_sequence.len() != read_length
+            || fragment.r1_baseline_ops.len() != read_length
+            || fragment.r2_baseline_ops.len() != read_length
+        {
+            return Err(FastqToolsError::HaplotypeCigarMismatch);
+        }
+        let name = format!("{}_{}", read_name_prefix, written);
+        let mut ad_counter = AdCounter::new();
+        let r1_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let mut r1 = match generate_read(
+            &fragment.r1_sequence,
+            // Chimeric reads are stitched from reference pieces: every base is 'M', and
+            // no haplotype deletion applies.
+            None,
+            None,
+            &[],
+            &HashMap::new(),
+            read_length,
+            format!("{name}/1"),
+            Strand::Forward,
+            r1_quality,
+            sequencing_error_model,
+            rng,
+            contig_name.to_string(),
+            fragment.r1_position,
+            contig_name.to_string(),
+            fragment.r2_position,
+            fragment.template_length,
+            true,
+            &mut ad_counter,
+        ) {
+            Ok(record) => record,
+            Err(FastqToolsError::TruncatedRead(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
+
+        let r2_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let mut r2 = match generate_read(
+            &fragment.r2_sequence,
+            // Chimeric reads are stitched from reference pieces: every base is 'M', and
+            // no haplotype deletion applies.
+            None,
+            None,
+            &[],
+            &HashMap::new(),
+            read_length,
+            format!("{name}/2"),
+            Strand::Forward,
+            r2_quality,
+            sequencing_error_model,
+            rng,
+            contig_name.to_string(),
+            fragment.r2_position,
+            contig_name.to_string(),
+            fragment.r1_position,
+            -fragment.template_length,
+            true,
+            &mut ad_counter,
+        ) {
+            Ok(record) => record,
+            Err(FastqToolsError::TruncatedRead(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        apply_haplotype_baseline_cigar(&mut r2, &fragment.r2_baseline_ops)?;
+        r2 = reverse_complement_record(r2);
+
+        write_read_to_fastq(&r1, buffer1)?;
+        write_read_to_fastq(&r2, buffer2)?;
+        if let Some(bam) = bam_writer.as_deref_mut() {
+            bam.stage_read_record(&r1)
+                .map_err(|e| FastqToolsError::BamError(e.to_string()))?;
+            bam.stage_read_record(&r2)
+                .map_err(|e| FastqToolsError::BamError(e.to_string()))?;
+        }
+        written += 1;
+    }
+    Ok(written)
 }
 
 pub fn combine_temp_fastqs(
@@ -429,6 +881,27 @@ fn stream_gzip_files(files: &[PathBuf], output: &PathBuf) -> Result<(), FastqToo
 #[allow(clippy::same_item_push)]
 pub fn generate_read(
     sequence: &[Nucleotide],
+    // Baseline CIGAR op per base of `sequence`, from
+    // `InsertionCoordinateMap::cigar_ops_for_segments`: 'M' where the base came from the
+    // reference, 'I' where it came from inserted sequence that has no reference position.
+    // `None` for a plain reference fragment, where every base is 'M'.
+    //
+    // Without this the CIGAR cannot describe a haplotype fragment. The bases of a long
+    // insertion ARE in the fragment (#516), but nothing downstream could tell them from
+    // reference, so a read crossing the anchor was recorded as pure M and claimed inserted
+    // bases as reference matches — 108M42I written as 150M (#589).
+    hap_ops: Option<&[char]>,
+    // Deletions carried by the haplotype, as `(query offset, reference bases removed)`
+    // relative to the start of `sequence`. A `D` consumes reference WITHOUT consuming
+    // query, so it cannot live in `hap_ops` — see
+    // `InsertionCoordinateMap::deletion_runs_for_segments`.
+    //
+    // Without these a junction-spanning read is recorded as unbroken `M` from its own
+    // start, which paints its post-junction bases straight across the span the deletion
+    // removed — so the coverage never collapses even though no fragment was placed
+    // there (#590). Measured that way: a homozygous 500 bp deletion still read 0.14 of
+    // flank depth with the placement already correct.
+    hap_dels: Option<&[(usize, usize)]>,
     flagged_positions: &[usize],
     variant_map: &HashMap<usize, &Variant>,
     read_length: usize,
@@ -587,7 +1060,14 @@ pub fn generate_read(
             out_seq.push(base.into());
             bases_written += 1;
             if is_first_base {
-                cigar_ops.push('M');
+                // 'I' when this fragment base is inserted sequence; sequencing-error
+                // insertions below still layer their own 'I' on top of whichever it is.
+                cigar_ops.push(
+                    hap_ops
+                        .and_then(|ops| ops.get(fragment_position))
+                        .copied()
+                        .unwrap_or('M'),
+                );
                 is_first_base = false;
             } else {
                 cigar_ops.push('I');
@@ -602,6 +1082,17 @@ pub fn generate_read(
             cigar_ops.push('D');
         }
 
+        // 'D' ops for a deletion the HAPLOTYPE carries. The map reports these by query
+        // offset, so they land once exactly that many bases have been written — which
+        // also means a read truncated before the junction correctly emits none.
+        if let Some(runs) = hap_dels {
+            for &(at, len) in runs {
+                if at == bases_written {
+                    cigar_ops.extend(std::iter::repeat_n('D', len));
+                }
+            }
+        }
+
         seq_index += 1;
         quality_index += 1;
     }
@@ -611,6 +1102,7 @@ pub fn generate_read(
     }
 
     Ok(ReadRecord {
+        is_unmapped: false,
         name,
         sequence: out_seq,
         quality_scores,
@@ -623,6 +1115,33 @@ pub fn generate_read(
         mate_position,
         template_length,
     })
+}
+
+/// Apply baseline alignment operations from a materialized haplotype interval
+/// to a generated read. Deletion operations do not consume query sequence and
+/// are left untouched; reference `M` operations can be relabeled as insertion
+/// `I` operations. Existing sequencing-error insertions remain `I`.
+pub fn apply_haplotype_baseline_cigar(
+    record: &mut ReadRecord,
+    baseline_ops: &[char],
+) -> Result<(), FastqToolsError> {
+    let mut query_index = 0;
+    for op in &mut record.cigar_ops {
+        if matches!(*op, 'D' | 'N') {
+            continue;
+        }
+        let baseline = baseline_ops
+            .get(query_index)
+            .ok_or(FastqToolsError::HaplotypeCigarMismatch)?;
+        if matches!(*op, 'M' | '=' | 'X') {
+            *op = *baseline;
+        }
+        query_index += 1;
+    }
+    if query_index != baseline_ops.len() || query_index != record.sequence.len() {
+        return Err(FastqToolsError::HaplotypeCigarMismatch);
+    }
+    Ok(())
 }
 
 /// Turn a forward-generated read into its reverse-strand mate: reverse-complement
@@ -665,6 +1184,7 @@ fn reverse_complement_record(mut record: ReadRecord) -> ReadRecord {
 ///   - take quality scores from the same quality model,
 ///   - are soft-clipped (`'S'`) in the golden BAM — they are not reference-aligned,
 ///   - carry no variants (adapter is not reference-derived).
+///
 /// Pass the R1 adapter for R1, and the R2 adapter for the post-flip R2 read.
 /// (The end-to-end fastp/cutadapt trim check is an integration step — see #125.)
 fn append_adapter_readthrough(
@@ -722,7 +1242,7 @@ pub fn quality_scores_to_char_vec(array: &[usize]) -> Result<Vec<u8>, FastqTools
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_tools::bam_writer::{BamRecordStager, BamWriter};
+    use crate::file_tools::bam_writer::{BamRecordStager, BamWriter, BamWriterError};
     use crate::file_tools::file_io::{VectorBuffer, create_output_file, read_gzip_lines};
     use crate::structs::nucleotides::Nucleotide::*;
     use crate::structs::sequence_block::{RegionType, SequenceMap};
@@ -730,6 +1250,33 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
+
+    #[derive(Default)]
+    struct CapturedPairedReads(Vec<ReadRecord>);
+
+    impl BamRecordStager for CapturedPairedReads {
+        fn stage_read_record(&mut self, record: &ReadRecord) -> Result<(), BamWriterError> {
+            self.0.push(ReadRecord {
+                is_unmapped: false,
+                name: record.name.clone(),
+                sequence: record.sequence.clone(),
+                quality_scores: record.quality_scores.clone(),
+                cigar_ops: record.cigar_ops.clone(),
+                is_paired: record.is_paired,
+                is_reverse: record.is_reverse,
+                contig: record.contig.clone(),
+                position: record.position,
+                mate_contig: record.mate_contig.clone(),
+                mate_position: record.mate_position,
+                template_length: record.template_length,
+            });
+            Ok(())
+        }
+
+        fn flush_up_to(&mut self, _flush_pos: usize) -> Result<(), BamWriterError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_combine_temp_fastqs() {
@@ -764,6 +1311,201 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_haplotype_baseline_cigar_marks_inserted_bases() {
+        let mut record = ReadRecord {
+            is_unmapped: false,
+            name: "read".to_string(),
+            sequence: "ACCCCCAAAAAAAAAAAAAAAAAAA".to_string(),
+            quality_scores: vec![30; 25],
+            cigar_ops: vec!['M'; 25],
+            is_paired: false,
+            is_reverse: false,
+            contig: "chr1".to_string(),
+            position: 100,
+            mate_contig: "chr1".to_string(),
+            mate_position: 0,
+            template_length: 0,
+        };
+        let mut baseline = vec!['M'; 25];
+        baseline[1..6].fill('I');
+        apply_haplotype_baseline_cigar(&mut record, &baseline).unwrap();
+        assert_eq!(record.cigar_ops[0], 'M');
+        assert_eq!(&record.cigar_ops[1..6], &['I'; 5]);
+        assert_eq!(&record.cigar_ops[6..], &['M'; 19]);
+    }
+
+    #[test]
+    fn test_generated_read_accepts_haplotype_baseline_cigar() {
+        let sequence = vec![A, C, C, C, C, C]
+            .into_iter()
+            .chain(vec![A; 19])
+            .collect::<Vec<_>>();
+        let model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["haplotype-read".to_string()]).unwrap();
+        let mut record = generate_read(
+            &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
+            &[],
+            &HashMap::new(),
+            sequence.len(),
+            "hap/1".to_string(),
+            Strand::Forward,
+            vec![40; sequence.len()],
+            &model,
+            &mut rng,
+            "chr1".to_string(),
+            100,
+            "chr1".to_string(),
+            0,
+            0,
+            false,
+            &mut AdCounter::new(),
+        )
+        .unwrap();
+        let mut baseline = vec!['M'; sequence.len()];
+        baseline[1..6].fill('I');
+        apply_haplotype_baseline_cigar(&mut record, &baseline).unwrap();
+        assert_eq!(record.sequence.len(), sequence.len());
+        assert!(record.cigar_ops[1..6].iter().all(|&op| op == 'I'));
+    }
+
+    #[test]
+    fn test_write_haplotype_fragments_emits_single_ended_records() {
+        let sequence = vec![A, C, C, C, C, C]
+            .into_iter()
+            .chain(vec![A; 19])
+            .collect::<Vec<_>>();
+        let baseline = vec!['M'; 1]
+            .into_iter()
+            .chain(vec!['I'; 5])
+            .chain(vec!['M'; 19])
+            .collect::<Vec<_>>();
+        let quality_model = QualityScoreModel::default().unwrap();
+        let error_model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["haplotype-writer".to_string()]).unwrap();
+        let mut output = Vec::new();
+        let written = write_haplotype_fragments(
+            vec![(sequence, baseline, 100)],
+            &mut output,
+            25,
+            "hap",
+            &quality_model,
+            &error_model,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(written, 1);
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.starts_with("@hap_0\n"));
+    }
+
+    #[test]
+    fn test_write_haplotype_paired_fragments_emits_mates() {
+        let sequence = vec![A, C, C, C, C, C]
+            .into_iter()
+            .chain(vec![A; 19])
+            .collect::<Vec<_>>();
+        let baseline = vec!['M'; 1]
+            .into_iter()
+            .chain(vec!['I'; 5])
+            .chain(vec!['M'; 19])
+            .collect::<Vec<_>>();
+        let quality_model = QualityScoreModel::default().unwrap();
+        let error_model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["haplotype-paired-writer".to_string()]).unwrap();
+        let mut r1_output = Vec::new();
+        let mut r2_output = Vec::new();
+        let written = write_haplotype_paired_fragments(
+            vec![HaplotypePairedFragment {
+                r1_sequence: sequence.clone(),
+                r1_baseline_ops: baseline.clone(),
+                r1_position: 100,
+                r2_sequence: sequence,
+                r2_baseline_ops: baseline,
+                r2_position: 250,
+                template_length: 175,
+            }],
+            &mut r1_output,
+            &mut r2_output,
+            25,
+            "hap",
+            "chr1",
+            &quality_model,
+            &error_model,
+            &mut rng,
+            None,
+        )
+        .unwrap();
+        assert_eq!(written, 1);
+        assert!(
+            String::from_utf8(r1_output)
+                .unwrap()
+                .starts_with("@hap_0/1\n")
+        );
+        assert!(
+            String::from_utf8(r2_output)
+                .unwrap()
+                .starts_with("@hap_0/2\n")
+        );
+    }
+
+    #[test]
+    fn test_write_haplotype_paired_fragments_preserves_orientation_and_mates() {
+        let r1_sequence = vec![A, C, G, T].into_iter().chain(vec![A; 21]).collect();
+        let r2_sequence = vec![T, G, C, A].into_iter().chain(vec![C; 21]).collect();
+        let mut r2_baseline = vec!['M'; 25];
+        r2_baseline[..4].fill('I');
+        let quality_model = QualityScoreModel::default().unwrap();
+        let error_model =
+            SequencingErrorModel::from_raw_data(0.0, quality_model.clone(), None).unwrap();
+        let mut rng =
+            NeatRng::new_from_seed(&vec!["haplotype-paired-orientation".to_string()]).unwrap();
+        let mut r1_output = Vec::new();
+        let mut r2_output = Vec::new();
+        let mut captured = CapturedPairedReads::default();
+        assert_eq!(
+            write_haplotype_paired_fragments(
+                vec![HaplotypePairedFragment {
+                    r1_sequence,
+                    r1_baseline_ops: vec!['M'; 25],
+                    r1_position: 100,
+                    r2_sequence,
+                    r2_baseline_ops: r2_baseline,
+                    r2_position: 250,
+                    template_length: 175,
+                }],
+                &mut r1_output,
+                &mut r2_output,
+                25,
+                "hap",
+                "chr1",
+                &quality_model,
+                &error_model,
+                &mut rng,
+                Some(&mut captured),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(captured.0.len(), 2);
+        let r1 = &captured.0[0];
+        let r2 = &captured.0[1];
+        assert!(r1.is_paired && !r1.is_reverse);
+        assert!(r2.is_paired && r2.is_reverse);
+        assert_eq!((r1.name.as_str(), r2.name.as_str()), ("hap_0/1", "hap_0/2"));
+        assert_eq!((r1.position, r2.position), (100, 250));
+        assert_eq!((r1.mate_position, r2.mate_position), (250, 100));
+        assert_eq!((r1.template_length, r2.template_length), (175, -175));
+        assert_eq!(&r2.cigar_ops[21..], &['I'; 4]);
+        assert_eq!(r1.contig, "chr1");
+        assert_eq!(r2.mate_contig, "chr1");
+    }
+
+    #[test]
     fn test_write_reverse() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut temp_file = PathBuf::from(temp_dir.path());
@@ -787,6 +1529,10 @@ mod tests {
         .unwrap();
         let record = generate_read(
             &rev_comp_seq,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &flagged_positions,
             &variant_map,
             read_len,
@@ -871,6 +1617,7 @@ mod tests {
     // --- adapter readthrough (#125) ---
     fn adapter_rec(seq: &str, paired: bool, reverse: bool) -> ReadRecord {
         ReadRecord {
+            is_unmapped: false,
             name: "frag/1".to_string(),
             sequence: seq.to_string(),
             quality_scores: vec![30; seq.len()],
@@ -1004,7 +1751,8 @@ mod tests {
         let quality_model = QualityScoreModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["test".to_string()]).unwrap();
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             false,
@@ -1099,7 +1847,8 @@ mod tests {
         let quality_model = QualityScoreModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["uniq-name".to_string()]).unwrap();
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             false,
@@ -1192,7 +1941,8 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["zero-insert".to_string()]).unwrap();
         let adapter: Vec<Nucleotide> = vec![A, G, A, T, C, G, G, A, A, G, A, G, C];
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             true, // paired_ended
@@ -1288,7 +2038,8 @@ mod tests {
         let quality_model = QualityScoreModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["keep-short".to_string()]).unwrap();
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             &block,
             false, // single-ended (simplest) — R1 only
@@ -1359,6 +2110,10 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["no_error".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_length,
@@ -1395,6 +2150,10 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["invariant".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_length,
@@ -1441,6 +2200,9 @@ mod tests {
         for i in 0..50 {
             let _ = generate_read(
                 &sequence,
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
+                None,
                 &[5],
                 &variant_map,
                 read_length,
@@ -1485,6 +2247,9 @@ mod tests {
         for i in 0..50 {
             let _ = generate_read(
                 &sequence,
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
+                None,
                 &[5],
                 &variant_map,
                 read_length,
@@ -1521,6 +2286,7 @@ mod tests {
     #[test]
     fn test_reverse_complement_record() {
         let rec = ReadRecord {
+            is_unmapped: false,
             name: "frag/2".to_string(),
             sequence: "AACGT".to_string(),
             quality_scores: vec![1, 2, 3, 4, 5],
@@ -1563,6 +2329,9 @@ mod tests {
         for i in 0..n {
             let _ = generate_read(
                 &sequence,
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
+                None,
                 &[5],
                 &variant_map,
                 read_length,
@@ -1614,6 +2383,9 @@ mod tests {
         for i in 0..n {
             let _ = generate_read(
                 &sequence,
+                // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+                None,
+                None,
                 &[5],
                 &variant_map,
                 read_length,
@@ -1657,6 +2429,10 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["snp_cigar".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &[3],
             &variant_map,
             read_length,
@@ -1701,6 +2477,10 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["ins_variant".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &[3],
             &variant_map,
             read_length,
@@ -1740,6 +2520,10 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["error_indel".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_length,
@@ -1783,6 +2567,10 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["del_len".to_string()]).unwrap();
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &[],
             &HashMap::new(),
             read_length,
@@ -1850,6 +2638,10 @@ mod tests {
 
         let record = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &flagged_positions,
             &variant_map,
             read_length,
@@ -1926,6 +2718,10 @@ mod tests {
         .unwrap();
         let result = generate_read(
             &sequence,
+            // Reference-derived bases only: no haplotype insertion mask, no haplotype
+            // deletion.
+            None,
+            None,
             &flagged_positions,
             &variant_map,
             8,
@@ -1980,7 +2776,8 @@ mod tests {
         let mut buf2 = GzEncoder::new(VectorBuffer::new(), Compression::default());
         let stager: Option<&mut dyn BamRecordStager> = Some(bam_writer);
         write_block_fastq(
-            fragments,
+            fragments.into_iter().map(Into::into).collect(),
+            &[],
             &mutated_map,
             block,
             paired_ended,

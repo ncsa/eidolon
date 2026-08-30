@@ -200,6 +200,11 @@ pub struct SvData {
     pub bnd_join_after: bool,
     /// For BND: true if the mate piece extends to the right ([p[).
     pub bnd_mate_extends_right: bool,
+    /// For BND: novel sequence inserted at the junction (VCF 4.2 §5.4), empty when the
+    /// ALT carries only the anchor base. Reads spanning the junction must contain these
+    /// bases between the two reference pieces, or the truth VCF asserts an insertion the
+    /// reads do not have (#498).
+    pub bnd_insert: String,
 }
 
 impl SvData {
@@ -217,6 +222,7 @@ impl SvData {
             mate_pos: None,
             bnd_join_after: false,
             bnd_mate_extends_right: false,
+            bnd_insert: String::new(),
         }
     }
 
@@ -616,11 +622,13 @@ fn parse_alt_payload(
             sv_data.svlen = parsed_info.svlen;
             sv_data.copy_number = parsed_info.copy_number;
             if matches!(sv_type, SvType::Bnd) {
-                let (m_contig, m_pos, j_after, m_extends_right) = parse_bnd_alt(&sv_data.raw_alt);
+                let (m_contig, m_pos, j_after, m_extends_right, insert) =
+                    parse_bnd_alt(&sv_data.raw_alt);
                 sv_data.mate_contig = m_contig;
                 sv_data.mate_pos = m_pos;
                 sv_data.bnd_join_after = j_after;
                 sv_data.bnd_mate_extends_right = m_extends_right;
+                sv_data.bnd_insert = insert;
             }
             // BND (breakend) variants are classified with VariantType::BND
             // to allow downstream code to specifically handle them.
@@ -769,10 +777,43 @@ fn sv_type_matches_svtype(sv_type: SvType, svtype_str: &str) -> bool {
 /// Test-only re-export: lets the read generator's tests assert that the geometry an ALT
 /// declares is the geometry the reads are built from, without duplicating the parser.
 pub fn parse_bnd_alt_for_test(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
-    parse_bnd_alt(alt)
+    let p = parse_bnd_alt(alt);
+    (p.0, p.1, p.2, p.3)
 }
 
-pub(crate) fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, bool) {
+/// Novel sequence inserted at a breakend junction, per VCF 4.2 §5.4.
+///
+/// The replacement sequence `t` in the ALT carries the reference base plus any inserted
+/// bases, and WHICH END holds the reference base depends on the form:
+///
+/// * `t[p[` and `t]p]` — `t` STARTS with the reference base, so the insert is `t[1..]`
+/// * `[p[t` and `]p]t` — `t` ENDS with the reference base, so the insert is `t[..len-1]`
+///
+/// Returns the inserted bases verbatim, empty when the ALT carries only the anchor.
+fn bnd_inserted_sequence(
+    alt: &str,
+    bracket_start: usize,
+    bracket_end: usize,
+    join_after: bool,
+) -> String {
+    let t = if join_after {
+        &alt[..bracket_start]
+    } else {
+        &alt[bracket_end + 1..]
+    };
+    if t.chars().count() <= 1 {
+        return String::new();
+    }
+    let mut cs: Vec<char> = t.chars().collect();
+    if join_after {
+        cs.remove(0);
+    } else {
+        cs.pop();
+    }
+    cs.into_iter().collect()
+}
+
+pub(crate) fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, bool, String) {
     // VCF 4.2 breakend notation (Section 1.4.2)
     // 4 possible forms involving brackets:
     // 1. t[p[  2. t]p]  3. ]p]t  4. [p[t
@@ -780,26 +821,27 @@ pub(crate) fn parse_bnd_alt(alt: &str) -> (Option<String>, Option<usize>, bool, 
     let bracket_start = alt.find('[').or_else(|| alt.find(']'));
     let bracket_end = alt.rfind('[').or_else(|| alt.rfind(']'));
 
-    if let (Some(s), Some(e)) = (bracket_start, bracket_end) {
-        if s < e {
-            let p = &alt[s + 1..e];
-            let join_after = s > 0;
-            let bracket = alt.chars().nth(s).unwrap();
-            let mate_extends_right = bracket == '[';
+    if let (Some(s), Some(e)) = (bracket_start, bracket_end)
+        && s < e
+    {
+        let p = &alt[s + 1..e];
+        let join_after = s > 0;
+        let bracket = alt.chars().nth(s).unwrap();
+        let mate_extends_right = bracket == '[';
 
-            if let Some((contig, pos_str)) = p.split_once(':') {
-                if let Ok(pos) = pos_str.parse::<usize>() {
-                    return (
-                        Some(contig.to_string()),
-                        Some(pos),
-                        join_after,
-                        mate_extends_right,
-                    );
-                }
-            }
+        if let Some((contig, pos_str)) = p.split_once(':')
+            && let Ok(pos) = pos_str.parse::<usize>()
+        {
+            return (
+                Some(contig.to_string()),
+                Some(pos),
+                join_after,
+                mate_extends_right,
+                bnd_inserted_sequence(alt, s, e, join_after),
+            );
         }
     }
-    (None, None, false, false)
+    (None, None, false, false, String::new())
 }
 
 fn genotype_to_string(genotype: &mut Vec<usize>) -> Result<String, VariantError> {
@@ -1168,24 +1210,72 @@ mod tests {
     #[test]
     fn parse_bnd_alt_extracts_mate_info() {
         assert_eq!(
-            parse_bnd_alt("G]17:198982]"),
+            parse_bnd_alt_for_test("G]17:198982]"),
             (Some("17".to_string()), Some(198982), true, false)
         );
         assert_eq!(
-            parse_bnd_alt("[chrX:123[A"),
+            parse_bnd_alt_for_test("[chrX:123[A"),
             (Some("chrX".to_string()), Some(123), false, true)
         );
         assert_eq!(
-            parse_bnd_alt("]2:500]T"),
+            parse_bnd_alt_for_test("]2:500]T"),
             (Some("2".to_string()), Some(500), false, false)
         );
         assert_eq!(
-            parse_bnd_alt("A[1:100["),
+            parse_bnd_alt_for_test("A[1:100["),
             (Some("1".to_string()), Some(100), true, true)
         );
         // Single breakends have no mate info in brackets
-        assert_eq!(parse_bnd_alt("G."), (None, None, false, false));
-        assert_eq!(parse_bnd_alt(".A"), (None, None, false, false));
+        assert_eq!(parse_bnd_alt_for_test("G."), (None, None, false, false));
+        assert_eq!(parse_bnd_alt_for_test(".A"), (None, None, false, false));
+    }
+
+    /// A malformed ALT with a SINGLE bracket must parse to "not a breakend", not panic.
+    ///
+    /// `s` and `e` are the FIRST and LAST bracket, so one bracket means `s == e` and the
+    /// slice `&alt[s + 1..e]` is a reversed range — an index panic on user input. The
+    /// `s < e` guard is the only thing preventing it, and nothing tested that: relaxing it
+    /// to `s <= e` passed all 403 lib tests while panicking here. Found by mutating the
+    /// condition while collapsing this `if` (#617).
+    #[test]
+    fn malformed_single_bracket_bnd_alt_does_not_panic() {
+        assert_eq!(
+            parse_bnd_alt("G["),
+            (None, None, false, false, String::new())
+        );
+        assert_eq!(
+            parse_bnd_alt("]G"),
+            (None, None, false, false, String::new())
+        );
+        assert_eq!(
+            parse_bnd_alt("["),
+            (None, None, false, false, String::new())
+        );
+    }
+
+    /// VCF 4.2 §5.4 lets a breakend ALT carry novel sequence inserted at the junction, and
+    /// which END of the replacement sequence holds the reference base flips with the form.
+    /// Getting that backwards silently splices the anchor into the read and drops one
+    /// inserted base, which no count-based check would notice (#498).
+    #[test]
+    fn parse_bnd_alt_extracts_inserted_sequence() {
+        // t[p[ and t]p]: `t` STARTS with the reference base, insert is everything after.
+        assert_eq!(parse_bnd_alt("ACGTACGTACGTA[chr2:900[").4, "CGTACGTACGTA");
+        assert_eq!(parse_bnd_alt("ATTT]chr2:900]").4, "TTT");
+        // [p[t and ]p]t: `t` ENDS with the reference base, insert is everything before.
+        assert_eq!(parse_bnd_alt("]chr1:600]CGTACGTACGTAC").4, "CGTACGTACGTA");
+        assert_eq!(parse_bnd_alt("[chr1:600[TTTA").4, "TTT");
+    }
+
+    /// The overwhelmingly common case: a breakend with no inserted sequence must report an
+    /// EMPTY insert, not the anchor base. If this returned "G" the anchor would be spliced
+    /// into every junction read, duplicating one reference base at every breakend.
+    #[test]
+    fn parse_bnd_alt_reports_no_insert_when_alt_is_bare() {
+        assert_eq!(parse_bnd_alt("G]17:198982]").4, "");
+        assert_eq!(parse_bnd_alt("[chrX:123[A").4, "");
+        assert_eq!(parse_bnd_alt("]2:500]T").4, "");
+        assert_eq!(parse_bnd_alt("A[1:100[").4, "");
     }
 
     #[test]

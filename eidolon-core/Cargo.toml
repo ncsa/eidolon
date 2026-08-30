@@ -33,3 +33,7 @@ libdeflater = "1.25.2"
 
 [dev-dependencies]
 proptest = "1"
+
+# Inherit the workspace clippy gate (#616); the allow-list lives in the root Cargo.toml.
+[lints]
+workspace = true
