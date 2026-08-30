@@ -283,8 +283,15 @@ contig lengths).
   `byte_char_slices`) purely because the workstation was four minor versions behind. If you
   see a lint you cannot reproduce, check `rustup show` before believing it is flaky.
   Bump the pin deliberately and in its own PR — new lints are a feature, not an ambush.
-  **`dtolnay/rust-toolchain@stable` sets `RUSTUP_TOOLCHAIN` and silently overrides the pin**;
-  `rust_binaries.yml` still does this (tag-only, so a change there gets no PR-time signal).
+  **`dtolnay/rust-toolchain@stable` sets `RUSTUP_TOOLCHAIN` and silently overrides the pin.**
+  That broke the v3.2.0 release build: the action installed `targets:` into *stable* while
+  `rust-toolchain.toml` pointed cargo at the pinned version, which had no cross target — so
+  `x86_64-apple-darwin` died with "can't find crate for `core`" and the release shipped four
+  binaries instead of five. Only genuine cross-compiles are affected; native targets do not
+  need `target add` at all, which is why the other four passed. `rust_binaries.yml` now reads
+  the channel out of `rust-toolchain.toml` and installs that toolchain with its target.
+  It is **tag-only**, so it gets no PR-time signal — use its `workflow_dispatch` to test any
+  change to it before believing it.
 
 ## Git / GitHub mechanics
 - **`gh pr edit` is broken on this repo** (deprecated Projects-classic GraphQL). Patch a
