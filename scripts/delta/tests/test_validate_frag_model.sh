@@ -73,7 +73,13 @@ mk_discrete() {  # <out.json.gz> <lo> <hi> [shift]
         }' | gzip > "$out"
 }
 mk_discrete "$WORK/good.json.gz" 300 700
-mk_discrete "$WORK/wrong.json.gz" 300 700 400      # same shape, shifted 400 bp
+# Shifted 100 bp: the supports still OVERLAP substantially, so this tests "the model is
+# wrong" rather than "the supports barely intersect". A 400 bp shift leaves 3 pairs of 8262
+# inside the model's range, and a percentage over that denominator is not a measurement --
+# it was a division by zero, which one awk prints as "inf" and another treats as fatal. The
+# same fixture reached opposite verdicts locally and on CI because of it.
+mk_discrete "$WORK/wrong.json.gz" 300 700 100
+mk_discrete "$WORK/disjoint.json.gz" 300 700 400   # almost no overlap: must be REFUSED
 printf '{"Normal":{"mean":404.0,"st_dev":69.0}}' | gzip > "$WORK/normal.json.gz"
 
 if [[ "${1:-}" == "--mutate" ]]; then
@@ -91,7 +97,9 @@ if [[ "${1:-}" == "--mutate" ]]; then
             printf '  caught   %s\n' "$label"
         fi
     done <<'MUTATIONS'
-a mismatched model is accepted@    awk -v v="$dm" 'BEGIN{exit !(v>2.0)}'  && { echo "      FAIL mean off by ${dm}% (>2%)";  FAIL=1; }@    if false; then echo; fi
+a mismatched model is accepted@        elif awk -v v="$got" -v t="$tol" 'BEGIN{exit !(v > t)}'; then@        elif false; then
+a model with no overlap is scored anyway@    if awk -v e="$EXCL" -v m="$MAX_EXCLUDED" 'BEGIN{exit !(e>m)}'; then@    if false; then
+a missing denominator passes silently@        if awk -v v="$got" 'BEGIN{exit !(v < 0)}'; then@        if false; then
 the truth is never restricted to the model support@    awk -v lo="$RLO" -v hi="$RHI" '$1>=lo && $1<=hi' "$WORK/truth.tsv" > "$WORK/truth_r.tsv"@    cp "$WORK/truth.tsv" "$WORK/truth_r.tsv"
 discordant pairs are counted as library fragments@  | awk '$7=="=" && $9>0 { c[$9]++ } END { for (l in c) print l, c[l] }' \@  | awk '$9>0 { c[$9]++ } END { for (l in c) print l, c[l] }' \
 a zero-pair measurement is not fatal@[[ "${NPAIRS:-0}" -gt 0 ]] || { echo "FATAL: zero pairs passed the filter -- nothing to compare against" >&2; exit 1; }@true
@@ -121,6 +129,44 @@ out="$(bash "$TOOL" "$WORK/fake.bam" "$WORK/wrong.json.gz" 2>&1)"; rc=$?
 [[ "$rc" -ne 0 ]] && ok "a shifted model fails" || bad "a shifted model fails" "it exited 0"
 has "and says the model does not match"  "$out" "does not match its input"
 has "and names the mean as the offender" "$out" "FAIL mean"
+
+echo "=== a model that barely overlaps the data is refused, not scored ==="
+# Rule 4: a comparison over 3 of 8262 pairs is not a measurement of fit, whatever number
+# it produces.
+out="$(bash "$TOOL" "$WORK/fake.bam" "$WORK/disjoint.json.gz" 2>&1)"; rc=$?
+[[ "$rc" -ne 0 ]] && ok "a disjoint model fails" || bad "a disjoint model fails" "it exited 0"
+has "it says the overlap is the problem" "$out" "not enough overlap to compare"
+has "it reports the denominator"         "$out" "of 8262"
+
+echo "=== a zero denominator is a failure, not a pass ==="
+# Reachable only with a degenerate library: enough of the mass inside the model's support
+# to clear the overlap gate, but ONE distinct length there, so the real side's standard
+# deviation is 0. Dividing by it is fatal in some awks and prints "inf" in others -- which
+# is exactly how this suite passed locally and failed on CI. The guard needs its own
+# fixture because the overlap gate now intercepts the easy version of this.
+{
+  awk 'BEGIN { for (i = 0; i < 5000; i++)
+      printf "d%d\t67\tchr1\t%d\t60\t100M\t=\t%d\t400\tA\tI\n", i, i*13+1, i*13+400 }'
+  awk 'BEGIN { for (l = 900; l <= 1000; l++) for (i = 0; i < 39; i++)
+      printf "e%d_%d\t67\tchr1\t%d\t60\t100M\t=\t%d\t%d\tA\tI\n", l, i, l*97+i+1, l*97+i+l, l }'
+} > "$WORK/degen.sam"
+cat > "$WORK/bin/samtools" <<STUB
+#!/usr/bin/env bash
+cat "$WORK/degen.sam"
+STUB
+chmod +x "$WORK/bin/samtools"
+# support 398-402: holds only length 400, which is 5000 of 8939 pairs (56%) -- past the gate
+printf '{"Discrete":{"distribution":{"values":[398,399,400,401,402],"weights":[0.2,0.4,0.6,0.8,1.0]}}}' \
+  | gzip > "$WORK/degen.json.gz"
+out="$(bash "$TOOL" "$WORK/fake.bam" "$WORK/degen.json.gz" 2>&1)"; rc=$?
+[[ "$rc" -ne 0 ]] && ok "a zero-variance real side fails" || bad "a zero-variance real side fails" "exit 0: $out"
+has "it says the denominator is missing" "$out" "no denominator"
+# restore the main fixture for anything after this
+cat > "$WORK/bin/samtools" <<STUB
+#!/usr/bin/env bash
+cat "$WORK/reads.sam"
+STUB
+chmod +x "$WORK/bin/samtools"
 
 echo "=== a Normal is reported but NOT asserted against ==="
 # It is EXPECTED to miss the skew. Asserting on it would only re-measure what is known,

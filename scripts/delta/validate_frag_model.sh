@@ -22,6 +22,10 @@
 # usage: validate_frag_model.sh <bam> <model.json.gz> [more_models.json.gz ...]
 set -uo pipefail
 
+# Refuse a verdict when the model's support misses more than this share of the pairs. A
+# comparison over a handful of surviving bins is not a measurement of fit.
+MAX_EXCLUDED="${MAX_EXCLUDED:-50}"
+
 BAM="${1:?usage: validate_frag_model.sh <bam> <model.json.gz> [...]}"; shift
 [[ $# -ge 1 ]] || { echo "need at least one model file" >&2; exit 2; }
 for t in samtools awk jq zcat; do
@@ -113,14 +117,28 @@ for MODEL in "$@"; do
     printf "%-24s %10.2f %9.2f %9.3f %6d %6d %6d %6d %7d %6d\n" \
            "model: $KIND" "$MMEAN" "$MSD" "$MSKEW" "$MP05" "$MP50" "$MP95" "$MP99" "$MBINS" "$MGAPS"
     printf "%-24s  support %d-%d, excludes %s%% of pairs as outliers\n" "" "$RLO" "$RHI" "$EXCL"
+    # Rule 4. A model whose support barely intersects the data leaves a handful of bins to
+    # compare, and a percentage difference over that denominator is not a measurement -- it
+    # can even be a division by zero when one bin survives, which different awks report
+    # differently. Refuse instead of producing a verdict nobody should read.
+    if awk -v e="$EXCL" -v m="$MAX_EXCLUDED" 'BEGIN{exit !(e>m)}'; then
+        echo "      FAIL the model's support covers only $(awk -v e="$EXCL" 'BEGIN{printf "%.2f", 100-e}')% of the pairs"
+        echo "           ($RPAIRS of $NPAIRS). There is not enough overlap to compare against;"
+        echo "           this model was almost certainly not built from this BAM."
+        FAIL=1
+        continue
+    fi
 
     REPORT+=("$(awk -v k="$KIND" -v mm="$MMEAN" -v ms="$MSD" -v mk="$MSKEW" -v m9="$MP99" \
                     -v tm="$RMEAN" -v ts="$RSD" -v tk="$RSKEW" -v t9="$RP99" -v g="$MGAPS" '
         BEGIN {
-            dm=(mm-tm)/tm*100; if(dm<0)dm=-dm
-            ds=(ms-ts)/ts*100; if(ds<0)ds=-ds
-            dk=mk-tk;          if(dk<0)dk=-dk
-            d9=(m9-t9)/t9*100; if(d9<0)d9=-d9
+            # Guarded rather than trusting the awk: a zero denominator is fatal in some
+            # awks and prints "inf" in others, so the same fixture reaches opposite
+            # verdicts on two machines. It did -- locally and on CI, on this very check.
+            dm = (tm != 0) ? (mm-tm)/tm*100 : -1; if(dm<0 && tm!=0) dm=-dm
+            ds = (ts != 0) ? (ms-ts)/ts*100 : -1; if(ds<0 && ts!=0) ds=-ds
+            dk = mk-tk;                           if(dk<0) dk=-dk
+            d9 = (t9 != 0) ? (m9-t9)/t9*100 : -1; if(d9<0 && t9!=0) d9=-d9
             printf "%s|%.2f|%.2f|%.3f|%.2f|%d", k, dm, ds, dk, d9, g
         }')")
 done
@@ -132,10 +150,14 @@ for r in "${REPORT[@]}"; do
     # Only the discrete model claims to reproduce the shape. A Normal is EXPECTED to miss
     # the skew -- asserting against it would just re-measure the thing we already know.
     [[ "$k" == "Discrete" ]] || continue
-    awk -v v="$dm" 'BEGIN{exit !(v>2.0)}'  && { echo "      FAIL mean off by ${dm}% (>2%)";  FAIL=1; }
-    awk -v v="$ds" 'BEGIN{exit !(v>5.0)}'  && { echo "      FAIL sd off by ${ds}% (>5%)";    FAIL=1; }
-    awk -v v="$dk" 'BEGIN{exit !(v>0.15)}' && { echo "      FAIL skew off by ${dk} (>0.15)"; FAIL=1; }
-    awk -v v="$d9" 'BEGIN{exit !(v>5.0)}'  && { echo "      FAIL p99 off by ${d9}% (>5%)";   FAIL=1; }
+    for spec in "mean:$dm:2.0" "sd:$ds:5.0" "skew:$dk:0.15" "p99:$d9:5.0"; do
+        lbl="${spec%%:*}"; rest="${spec#*:}"; got="${rest%%:*}"; tol="${rest##*:}"
+        if awk -v v="$got" 'BEGIN{exit !(v < 0)}'; then
+            echo "      FAIL $lbl has no denominator -- the real side measured zero here"; FAIL=1
+        elif awk -v v="$got" -v t="$tol" 'BEGIN{exit !(v > t)}'; then
+            echo "      FAIL $lbl off by $got (tolerance $tol)"; FAIL=1
+        fi
+    done
     [[ "$g" -gt 0 ]] && { echo "      FAIL the built model still has $g gaps"; FAIL=1; }
 done
 
