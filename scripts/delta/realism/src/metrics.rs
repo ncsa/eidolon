@@ -173,6 +173,35 @@ impl DepthStats {
 /// counted at different coordinates — the alignment start for a leading clip, the end of the
 /// reference span for a trailing one — because they mark opposite sides of a junction.
 pub fn candidate_breakpoints(records: &[AlnRecord], min_clip: usize, min_support: usize) -> usize {
+    candidate_sites(records, min_clip, min_support).len()
+}
+
+/// One side of a clip boundary that enough reads agree on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateSite {
+    pub pos: usize,
+    /// `L` for a leading clip (junction to the left), `R` for a trailing one.
+    pub side: char,
+    /// How many reads share this exact boundary.
+    pub support: usize,
+    /// Reads overlapping the position at all, clipped or not. The denominator: 3 reads
+    /// agreeing out of 4 is a different thing from 3 out of 90, and only one of them looks
+    /// like a real junction.
+    pub depth: usize,
+    /// How many of those overlapping reads are MAPQ 0. A boundary in a repeat looks
+    /// different from a boundary at a structural variant, and this is what separates them.
+    pub mapq0: usize,
+}
+
+/// The sites themselves, not just the count.
+///
+/// Split out so `--dump-candidates` reports exactly what the metric counted rather than a
+/// reimplementation of it. The count is the length of this list, by construction.
+pub fn candidate_sites(
+    records: &[AlnRecord],
+    min_clip: usize,
+    min_support: usize,
+) -> Vec<CandidateSite> {
     use std::collections::HashMap;
     let mut left: HashMap<usize, usize> = HashMap::new();
     let mut right: HashMap<usize, usize> = HashMap::new();
@@ -184,8 +213,33 @@ pub fn candidate_breakpoints(records: &[AlnRecord], min_clip: usize, min_support
             *right.entry(r.pos + r.reference_span()).or_insert(0) += 1;
         }
     }
-    left.values().filter(|c| **c >= min_support).count()
-        + right.values().filter(|c| **c >= min_support).count()
+
+    let mut out: Vec<CandidateSite> = Vec::new();
+    for (side, map) in [('L', &left), ('R', &right)] {
+        for (&pos, &support) in map.iter() {
+            if support < min_support {
+                continue;
+            }
+            let (mut depth, mut mapq0) = (0usize, 0usize);
+            for r in records {
+                if r.pos <= pos && pos < r.pos + r.reference_span() {
+                    depth += 1;
+                    if r.mapq == 0 {
+                        mapq0 += 1;
+                    }
+                }
+            }
+            out.push(CandidateSite {
+                pos,
+                side,
+                support,
+                depth,
+                mapq0,
+            });
+        }
+    }
+    out.sort_by_key(|c| (c.pos, c.side));
+    out
 }
 
 /// Insert-size distribution over library-scale pairs only.
@@ -314,6 +368,59 @@ mod tests {
     }
 
     // ── candidate breakpoints: the headline metric ─────────────────────────────
+
+    #[test]
+    fn the_dumped_sites_are_exactly_what_the_count_counted() {
+        // The count and the dump are two views of one thing, and a dump that disagreed with
+        // the headline would send someone hunting for a cause that is not there. Asserted
+        // rather than assumed, because `candidate_breakpoints` delegating to
+        // `candidate_sites` is an implementation detail that a later edit could undo.
+        let mut v = Vec::new();
+        // three reads sharing a leading-clip boundary at 500 -> one candidate
+        for _ in 0..3 {
+            v.push(rec(500, "30S100M", 60, true, 300));
+        }
+        // two sharing one at 900 -> below min_support, not a candidate
+        for _ in 0..2 {
+            v.push(rec(900, "30S100M", 60, true, 300));
+        }
+        // four sharing a trailing boundary; 700 + 100 = 800
+        for _ in 0..4 {
+            v.push(rec(700, "100M30S", 60, true, 300));
+        }
+        let sites = candidate_sites(&v, 20, 3);
+        assert_eq!(
+            sites.len(),
+            candidate_breakpoints(&v, 20, 3),
+            "dump and count disagree"
+        );
+        let described: Vec<(usize, char, usize)> =
+            sites.iter().map(|c| (c.pos, c.side, c.support)).collect();
+        assert_eq!(described, vec![(500, 'L', 3), (800, 'R', 4)]);
+    }
+
+    #[test]
+    fn a_dumped_site_carries_the_denominator_its_support_is_relative_to() {
+        // 3 of 4 reads agreeing is a junction; 3 of 90 is noise. Without the local depth the
+        // dump cannot tell those apart, which is the whole reason to dump rather than count.
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.push(rec(500, "30S100M", 60, true, 300));
+        }
+        // 20 unclipped reads spanning position 500, half of them unmappable
+        for i in 0..20 {
+            v.push(rec(450, "100M", if i < 10 { 0 } else { 60 }, true, 300));
+        }
+        let sites = candidate_sites(&v, 20, 3);
+        assert_eq!(sites.len(), 1);
+        let c = &sites[0];
+        assert_eq!(c.support, 3);
+        assert_eq!(c.depth, 23, "every read overlapping the position counts");
+        assert_eq!(
+            c.mapq0, 10,
+            "a repeat-driven boundary is what mapq0 separates"
+        );
+    }
 
     #[test]
     fn candidate_breakpoints_need_agreement_not_just_clipping() {

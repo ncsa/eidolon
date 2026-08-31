@@ -49,11 +49,17 @@ struct Args {
     min_support: usize,
     max_tlen: i64,
     depth_lag: usize,
+    /// Where to write the candidate sites themselves. The headline metric is a COUNT, and
+    /// a count cannot say whether the boundaries came from repeats, from structural
+    /// variation, or from scattered read-level artifacts -- which is the difference between
+    /// something a simulator should reproduce and something it should not.
+    dump_candidates: Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
     "usage: realism-panel --bam <file> --regions <bed> [--label NAME] \
-     [--min-clip N] [--min-support N] [--max-tlen N] [--depth-lag N]"
+     [--min-clip N] [--min-support N] [--max-tlen N] [--depth-lag N] \
+     [--dump-candidates <tsv>]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -64,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
     let mut min_support = 3usize;
     let mut max_tlen = 2000i64;
     let mut depth_lag = 500usize;
+    let mut dump_candidates: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -78,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--max-tlen" => max_tlen = val()?.parse().map_err(|e| format!("--max-tlen: {e}"))?,
             "--depth-lag" => depth_lag = val()?.parse().map_err(|e| format!("--depth-lag: {e}"))?,
+            "--dump-candidates" => dump_candidates = Some(PathBuf::from(val()?)),
             "-h" | "--help" => return Err(usage().to_string()),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
@@ -90,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
         min_support,
         max_tlen,
         depth_lag,
+        dump_candidates,
     })
 }
 
@@ -159,6 +168,7 @@ fn main() -> ExitCode {
         args.min_support,
         args.max_tlen,
         args.depth_lag,
+        args.dump_candidates.as_deref(),
     ) {
         Ok(m) => m,
         Err(e) => {
