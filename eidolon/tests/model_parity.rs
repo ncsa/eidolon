@@ -263,10 +263,16 @@ fn write_temp_yaml(content: &str) -> tempfile::NamedTempFile {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// `gen-frag-length-model` fits a Normal to the TLEN distribution observed
-/// in a paired BAM. The synthetic BAM has 50 pairs all at TLEN=200, so the
-/// fit collapses to mean=200, st_dev=0. The baseline file pins this exact
-/// fit; any change to the histogram→Normal pipeline will surface here.
+/// `gen-frag-length-model --distribution normal` fits a Normal to the TLEN
+/// distribution observed in a paired BAM. The synthetic BAM has 50 pairs all
+/// at TLEN=200, so the fit collapses to mean=200, st_dev=0. The baseline file
+/// pins this exact fit; any change to the histogram→Normal pipeline surfaces here.
+///
+/// EXPLICITLY `normal`, not the default. Since v3.3.0 the default is `discrete`,
+/// and one distinct TLEN is refused there -- a distribution over a single value
+/// has no shape. This test therefore pins the ESCAPE HATCH; the default is pinned
+/// by `frag_length_discrete_model_matches_baseline` below, so neither family can
+/// drift unnoticed.
 #[test]
 fn frag_length_model_matches_baseline() {
     let tmp = tempfile::tempdir().unwrap();
@@ -274,7 +280,8 @@ fn frag_length_model_matches_baseline() {
     write_test_bam(&bam, b"H1N1_HA", 1700, 50, 200, 100, 0);
     let out = tmp.path().join("frag.json.gz");
     let yaml = write_temp_yaml(&format!(
-        "input_file: {}\noutput_file: {}\noverwrite_output: true\nmin_reads: 2\n",
+        "input_file: {}\noutput_file: {}\noverwrite_output: true\nmin_reads: 2\n\
+         distribution: normal\n",
         bam.display(),
         out.display()
     ));
@@ -285,6 +292,133 @@ fn frag_length_model_matches_baseline() {
         .success();
     let canonical = canonical_model_json(&out);
     assert_or_bless(&canonical, "frag_length");
+}
+
+/// The DEFAULT path since v3.3.0: `gen-frag-length-model` keeps the observed shape
+/// instead of collapsing it to two floats. Pins the whole weight vector, so a silent
+/// return to a Normal fit -- which is what discarded the right tail of every real
+/// library -- cannot pass unnoticed.
+#[test]
+fn frag_length_discrete_model_matches_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bam = tmp.path().join("input_spread.bam");
+    // A spread of TLENs, deliberately with holes in it: lengths 150..250 in steps of 4.
+    // The gaps are the point -- a discrete model built from this must come out
+    // contiguous, and the baseline pins the bridged result.
+    let tlens: Vec<usize> = (150..=250)
+        .step_by(4)
+        .flat_map(|l| std::iter::repeat_n(l, 6))
+        .collect();
+    write_test_bam_with_tlens(&bam, b"H1N1_HA", 1700, &tlens, 100);
+    let out = tmp.path().join("frag_discrete.json.gz");
+    let yaml = write_temp_yaml(&format!(
+        "input_file: {}\noutput_file: {}\noverwrite_output: true\nmin_reads: 2\n",
+        bam.display(),
+        out.display()
+    ));
+    eidolon()
+        .args(["gen-frag-length-model", "-c"])
+        .arg(yaml.path())
+        .assert()
+        .success();
+
+    // Assert the SHAPE of the artifact before pinning its bytes. A baseline that was
+    // blessed from a Normal would otherwise keep passing forever.
+    let mut raw = String::new();
+    flate2::read::GzDecoder::new(fs::File::open(&out).unwrap())
+        .read_to_string(&mut raw)
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let dist = v
+        .get("Discrete")
+        .expect("the default must build a Discrete model")
+        .get("distribution")
+        .unwrap();
+    let values: Vec<i64> = dist["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        values.len() as i64,
+        values[values.len() - 1] - values[0] + 1,
+        "the built model must have no gaps, got {} bins spanning {}..{}",
+        values.len(),
+        values[0],
+        values[values.len() - 1]
+    );
+
+    let canonical = canonical_model_json(&out);
+    assert_or_bless(&canonical, "frag_length_discrete");
+}
+
+/// Like `write_test_bam` but lays one pair per supplied TLEN, so a test can control the
+/// SHAPE of the observed distribution rather than only its centre.
+fn write_test_bam_with_tlens(
+    path: &Path,
+    contig: &[u8],
+    contig_len: usize,
+    tlens: &[usize],
+    read_len: usize,
+) {
+    use noodles::bam;
+    use noodles::core::Position;
+    use noodles::sam::{
+        self as sam,
+        alignment::{
+            RecordBuf,
+            io::Write as _,
+            record::{
+                Flags, MappingQuality,
+                cigar::{Op, op::Kind},
+            },
+            record_buf::{Cigar, Sequence},
+        },
+        header::record::value::{Map, map::ReferenceSequence},
+    };
+
+    let header = sam::Header::builder()
+        .add_reference_sequence(
+            contig.to_vec(),
+            Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(contig_len).unwrap()),
+        )
+        .build();
+    let file = fs::File::create(path).unwrap();
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header).unwrap();
+
+    let cigar: Cigar = [Op::new(Kind::Match, read_len)].into_iter().collect();
+    let seq = vec![b'A'; read_len];
+    let paired_first = Flags::SEGMENTED | Flags::FIRST_SEGMENT;
+    let paired_second = Flags::SEGMENTED;
+
+    for &tlen in tlens {
+        let mate_start = tlen - read_len + 1;
+        let mut r1 = RecordBuf::default();
+        *r1.flags_mut() = paired_first;
+        *r1.cigar_mut() = cigar.clone();
+        *r1.reference_sequence_id_mut() = Some(0);
+        *r1.alignment_start_mut() = Position::new(1);
+        *r1.mate_reference_sequence_id_mut() = Some(0);
+        *r1.mate_alignment_start_mut() = Position::new(mate_start);
+        *r1.template_length_mut() = tlen as i32;
+        *r1.mapping_quality_mut() = MappingQuality::new(60);
+        *r1.sequence_mut() = Sequence::from(seq.clone());
+        writer.write_alignment_record(&header, &r1).unwrap();
+
+        let mut r2 = RecordBuf::default();
+        *r2.flags_mut() = paired_second;
+        *r2.cigar_mut() = cigar.clone();
+        *r2.reference_sequence_id_mut() = Some(0);
+        *r2.alignment_start_mut() = Position::new(mate_start);
+        *r2.mate_reference_sequence_id_mut() = Some(0);
+        *r2.mate_alignment_start_mut() = Position::new(1);
+        *r2.template_length_mut() = -(tlen as i32);
+        *r2.mapping_quality_mut() = MappingQuality::new(60);
+        *r2.sequence_mut() = Sequence::from(seq.clone());
+        writer.write_alignment_record(&header, &r2).unwrap();
+    }
 }
 
 /// `gen-gc-bias-model` walks the reference in windows, accumulates per-GC%

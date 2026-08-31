@@ -2,6 +2,7 @@
 // At least one of `frag_length` or `gc_bias` must be present. The shared
 // BAM walk uses `BamWalkFilter::for_coverage()` with the top-level
 // `min_mapq` (default 0); each observer self-filters for its own criteria.
+use crate::gen_frag_length_model::utils::runner::DistributionKind;
 use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -19,6 +20,7 @@ pub struct FragLengthSection {
     pub output_file: PathBuf,
     pub overwrite_output: bool,
     pub min_reads: usize,
+    pub distribution: DistributionKind,
 }
 
 #[derive(Debug, Clone)]
@@ -114,11 +116,20 @@ fn parse_frag_length_section(v: &Value) -> Result<FragLengthSection, GenBamModel
     check_overwrite("frag_length.output_file", &output_file, overwrite_output)
         .map_err(|e| GenBamModelsError::ConfigError(e.to_string()))?;
     let min_reads = get_u64("min_reads").unwrap_or(2) as usize;
+    let distribution = match get_str("distribution") {
+        None => DistributionKind::default(),
+        Some(raw) => DistributionKind::parse(raw).ok_or_else(|| {
+            GenBamModelsError::ConfigError(format!(
+                "frag_length.distribution must be `discrete` or `normal`, got `{raw}`"
+            ))
+        })?,
+    };
 
     Ok(FragLengthSection {
         output_file,
         overwrite_output,
         min_reads,
+        distribution,
     })
 }
 

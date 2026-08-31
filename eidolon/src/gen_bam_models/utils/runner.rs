@@ -49,7 +49,12 @@ pub fn runner(config_path: &PathBuf) -> Result<(), GenBamModelsError> {
 
     if let Some(fl) = &config.frag_length {
         info!("Building fragment-length model");
-        run_from_tlens(frag_obs.tlens, fl.min_reads, &fl.output_file)?;
+        run_from_tlens(
+            frag_obs.tlens,
+            fl.min_reads,
+            &fl.output_file,
+            fl.distribution,
+        )?;
     }
 
     if let Some(gc) = &config.gc_bias {
@@ -194,7 +199,8 @@ mod tests {
 
         let yaml = write_temp(&format!(
             "bam_file: {}\nmin_mapq: 0\n\
-             frag_length:\n  output_file: {}\n  overwrite_output: true\n  min_reads: 2\n\
+             frag_length:\n  output_file: {}\n  overwrite_output: true\n  min_reads: 2\n  \
+             distribution: normal\n\
              gc_bias:\n  reference: {}\n  output_file: {}\n  overwrite_output: true\n  \
              window_size: 100\n  window_stride: 100\n  min_windows_per_bin: 1\n",
             bam_path.display(),
@@ -233,7 +239,8 @@ mod tests {
         // Run unified path producing only the frag-length model.
         let unified_out = temp.path().join("frag_unified.json.gz");
         let unified_yaml = write_temp(&format!(
-            "bam_file: {}\nfrag_length:\n  output_file: {}\n  overwrite_output: true\n  min_reads: 2\n",
+            "bam_file: {}\nfrag_length:\n  output_file: {}\n  overwrite_output: true\n  \
+             min_reads: 2\n  distribution: normal\n",
             bam_path.display(),
             unified_out.display(),
         ));
@@ -242,7 +249,8 @@ mod tests {
         // Run standalone gen-frag-length-model on the same BAM.
         let standalone_out = temp.path().join("frag_standalone.json.gz");
         let standalone_yaml = write_temp(&format!(
-            "input_file: {}\noutput_file: {}\noverwrite_output: true\nmin_reads: 2\n",
+            "input_file: {}\noutput_file: {}\noverwrite_output: true\nmin_reads: 2\n\
+             distribution: normal\n",
             bam_path.display(),
             standalone_out.display(),
         ));

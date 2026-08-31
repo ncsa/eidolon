@@ -14,7 +14,12 @@ const FILTER_MEDDEV_M: f64 = 10.0;
 pub fn runner(config: &RunConfiguration) -> Result<(), GenFragLengthModelError> {
     info!("Reading fragment lengths from {:?}", config.input_file);
     let tlens = read_fragment_lengths(&config.input_file)?;
-    run_from_tlens(tlens, config.min_reads, &config.output_file)
+    run_from_tlens(
+        tlens,
+        config.min_reads,
+        &config.output_file,
+        config.distribution,
+    )
 }
 
 /// Builds and writes a fragment length model from a pre-collected list of
@@ -22,108 +27,328 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenFragLengthModelError> 
 /// BAM walk in the unified `gen-bam-models` runner). Applies MAD-based
 /// outlier filtering and rare-length pruning, fits a normal distribution,
 /// and writes the gzipped JSON model.
+/// Which distribution family the built model uses.
+///
+/// `Discrete` keeps the observed shape. `Normal` collapses it to mean + st_dev, which is
+/// what this builder did before v3.3.0 and is kept for sparse inputs (exome, amplicon, a
+/// small targeted BAM) where there is not enough data to estimate a shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DistributionKind {
+    #[default]
+    Discrete,
+    Normal,
+}
+
+impl DistributionKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "discrete" | "empirical" => Some(Self::Discrete),
+            "normal" | "gaussian" => Some(Self::Normal),
+            _ => None,
+        }
+    }
+}
+
+/// Widen the smoothing bandwidth by this much per attempt when gaps survive.
+const BANDWIDTH_GROWTH: f64 = 1.6;
+/// Give up after this many widenings rather than smoothing the shape into a flat line.
+const MAX_SMOOTHING_PASSES: usize = 24;
+/// Kernel truncation, in bandwidths. Beyond 4 sigma the Gaussian contributes < 1e-4.
+const KERNEL_TRUNCATION: f64 = 4.0;
+/// Trim each end while the cumulative mass there is below this.
+///
+/// MASS, NOT A QUANTILE. A quantile trim collapses onto the mode when the distribution is
+/// concentrated -- q0.999 of "3000 reads at 400, one at 401" is 400, so the trim deletes a
+/// length adjacent to the mode. What actually wants removing is the isolated stray: the
+/// model this crate shipped before v3.3.0 has a bin at length 1 carrying 2.3e-9 of the
+/// mass, with a 30-wide hole above it. A mass floor removes that and keeps anything with
+/// real weight, whatever quantile it happens to land on.
+const TRIM_MASS: f64 = 1e-5;
+/// Below this many distinct observed lengths there is no shape to estimate, and smoothing
+/// would only smear a handful of spikes into a plausible-looking line.
+const MIN_DISTINCT_LENGTHS: usize = 10;
+
+/// Builds and writes a fragment length model from a pre-collected list of template lengths
+/// (e.g. produced by `FragLengthObserver` during a shared BAM walk in the unified
+/// `gen-bam-models` runner).
+///
+/// EVERYTHING HERE IS COMPUTED FROM THE HISTOGRAM. The previous implementation sorted a
+/// per-read Vec<usize>, built a second full-size Vec of absolute deviations, sorted that
+/// too, and then rebuilt a third full-size Vec with repeat_n -- three simultaneous copies
+/// and two O(n log n) sorts over one element per read pair. On a whole-genome BAM that is
+/// ~800M elements, so ~19 GB before a model is fitted. Median, MAD, mean and standard
+/// deviation are all functions of the counts, so the histogram is the only thing that ever
+/// needs to exist: O(distinct lengths), about 800 entries.
 pub fn run_from_tlens(
     tlens: Vec<usize>,
     min_reads: usize,
     output_file: &std::path::PathBuf,
+    kind: DistributionKind,
 ) -> Result<(), GenFragLengthModelError> {
     if tlens.is_empty() {
         return Err(GenFragLengthModelError::EmptyData);
     }
     info!("Collected {} raw fragment lengths", tlens.len());
 
-    let filtered = filter_lengths(tlens, min_reads);
+    let hist = histogram(&tlens);
+    drop(tlens);
 
-    if filtered.is_empty() {
+    let trimmed = trim(hist, min_reads);
+    if trimmed.is_empty() {
         return Err(GenFragLengthModelError::FilteredToEmpty);
     }
+    let kept: u64 = trimmed.iter().map(|&(_, c)| c).sum();
     info!(
-        "Retained {} fragment lengths after filtering",
-        filtered.len()
+        "Retained {} fragment lengths across {} distinct values after filtering",
+        kept,
+        trimmed.len()
     );
 
-    let mean = compute_mean(&filtered);
-    let std_dev = compute_std_dev(&filtered, mean);
-    info!(
-        "Fragment length model: mean={:.1}, std_dev={:.1}",
-        mean, std_dev
-    );
+    let mean = hist_mean(&trimmed);
+    let st_dev = hist_std_dev(&trimmed, mean);
 
-    let model = FragmentLengthModel::new_normal(mean, std_dev)?;
+    let model = match kind {
+        DistributionKind::Normal => {
+            info!("Fragment length model: Normal(mean={mean:.1}, std_dev={st_dev:.1})");
+            FragmentLengthModel::new_normal(mean, st_dev)?
+        }
+        DistributionKind::Discrete => {
+            // A discrete model with holes in it is the failure this guards against: it
+            // builds clean, serializes clean, and then the shape it hands gen-reads is not
+            // the shape that was measured. Smoothing fills them from the neighbourhood
+            // rather than inventing a floor, and the result is ASSERTED gap-free below.
+            let (values, weights) = smooth_to_gap_free(&trimmed, st_dev, kept)?;
+            info!(
+                "Fragment length model: Discrete over {}-{} ({} bins, no gaps), mean={:.1}, std_dev={:.1}",
+                values[0],
+                values[values.len() - 1],
+                values.len(),
+                mean,
+                st_dev
+            );
+            FragmentLengthModel::new_discrete(values, weights)?
+        }
+    };
+
     model.write_file(output_file)?;
-    info!("Wrote fragment length model to {:?}", output_file);
+    info!("Wrote fragment length model to {output_file:?}");
     Ok(())
 }
 
-/// Filters a raw list of template lengths, removing outliers and rare lengths.
-///
-/// If `min_reads` is 0, the original list is returned unchanged.
-/// Otherwise, any fragment length l is retained only when:
-///   - l > 0
-///   - l <= median + FILTER_MEDDEV_M * MAD  (outlier ceiling)
-///   - count(l) >= min_reads
-fn filter_lengths(mut tlens: Vec<usize>, min_reads: usize) -> Vec<usize> {
-    if min_reads == 0 {
-        return tlens;
-    }
-
-    tlens.sort_unstable();
-
-    let median = median_f64(&tlens);
-
-    // MAD = median(|x - median|)
-    let mut abs_devs: Vec<usize> = tlens
-        .iter()
-        .map(|&x| (x as f64 - median).abs().round() as usize)
-        .collect();
-    abs_devs.sort_unstable();
-    let mad = median_f64(&abs_devs);
-
-    let ceiling = median + FILTER_MEDDEV_M * mad;
-
-    // Count occurrences of each length
-    let mut counts: HashMap<usize, usize> = HashMap::new();
-    for &l in &tlens {
+/// Counts per observed length, ascending. The only full pass over the input.
+fn histogram(tlens: &[usize]) -> Vec<(usize, u64)> {
+    let mut counts: HashMap<usize, u64> = HashMap::new();
+    for &l in tlens {
         *counts.entry(l).or_default() += 1;
     }
+    let mut out: Vec<(usize, u64)> = counts.into_iter().collect();
+    out.sort_unstable_by_key(|&(l, _)| l);
+    out
+}
 
-    let mut output = Vec::new();
-    let mut unique: Vec<usize> = counts.keys().copied().collect();
-    unique.sort_unstable();
-    for l in unique {
-        if l > 0 && (l as f64) <= ceiling && counts[&l] >= min_reads {
-            output.extend(std::iter::repeat_n(l, counts[&l]));
+/// Drops zero-length entries, anything above the MAD outlier ceiling, and the extreme
+/// quantile tails.
+///
+/// `min_reads` no longer deletes bins. Deleting a sparse bin is what MANUFACTURES a gap,
+/// and the tail -- the part we most want to keep -- is exactly where counts are lowest. It
+/// survives as a floor on the total number of observations instead.
+fn trim(hist: Vec<(usize, u64)>, min_reads: usize) -> Vec<(usize, u64)> {
+    let hist: Vec<(usize, u64)> = hist.into_iter().filter(|&(l, _)| l > 0).collect();
+    if hist.is_empty() {
+        return hist;
+    }
+    let total: u64 = hist.iter().map(|&(_, c)| c).sum();
+    if (total as usize) < min_reads.max(1) {
+        return Vec::new();
+    }
+    if min_reads == 0 {
+        return hist;
+    }
+
+    let median = hist_quantile(&hist, 0.5) as f64;
+    let mad = hist_mad(&hist, median);
+    // A concentrated histogram has MAD 0 -- "3000 reads at 400, one at 401" gives a median
+    // absolute deviation of exactly zero -- and `median + 10 * 0` is the median, so the
+    // ceiling would delete every length above the mode. There is no outlier scale to
+    // measure here, so there is no outlier rule to apply.
+    let ceiling = if mad > 0.0 {
+        median + FILTER_MEDDEV_M * mad
+    } else {
+        f64::INFINITY
+    };
+
+    let cutoff = total as f64 * TRIM_MASS;
+    let mut lo = hist[0].0;
+    let mut acc = 0f64;
+    for &(l, c) in &hist {
+        if acc + c as f64 > cutoff {
+            lo = l;
+            break;
+        }
+        acc += c as f64;
+    }
+    let mut hi = hist[hist.len() - 1].0;
+    acc = 0f64;
+    for &(l, c) in hist.iter().rev() {
+        if acc + c as f64 > cutoff {
+            hi = l;
+            break;
+        }
+        acc += c as f64;
+    }
+
+    hist.into_iter()
+        .filter(|&(l, _)| l >= lo && l <= hi && (l as f64) <= ceiling)
+        .collect()
+}
+
+/// Densify the support and smooth until no interior bin is empty.
+///
+/// Bandwidth comes from Silverman's rule, which scales as n^(-1/5): sparse inputs get more
+/// smoothing, which is exactly when gaps appear, and a dense whole-genome histogram gets a
+/// bandwidth of a couple of bp, so the result is the empirical distribution with its holes
+/// bridged rather than a reshaped one. If gaps still survive the bandwidth widens and it
+/// tries again -- so "no gaps" is a checked postcondition, not a hope.
+fn smooth_to_gap_free(
+    hist: &[(usize, u64)],
+    st_dev: f64,
+    n: u64,
+) -> Result<(Vec<usize>, Vec<f64>), GenFragLengthModelError> {
+    let lo = hist[0].0;
+    let hi = hist[hist.len() - 1].0;
+    // Refuse before smoothing rather than after. Given enough bandwidth the kernel will
+    // bridge ANY two spikes, and the result builds clean, serializes clean, and hands
+    // gen-reads a flat smear -- a model that is broken in exactly the way that is hardest
+    // to notice. Too few distinct observations is the honest answer.
+    if hist.len() < MIN_DISTINCT_LENGTHS {
+        return Err(GenFragLengthModelError::ConfigurationError(format!(
+            "only {} distinct fragment lengths observed ({lo}-{hi}); a discrete model needs \
+             at least {MIN_DISTINCT_LENGTHS} to have a shape worth estimating. Use \
+             `distribution: normal` for sparse input, or supply a BAM with more pairs.",
+            hist.len()
+        )));
+    }
+    debug_assert!(
+        hi > lo,
+        "{MIN_DISTINCT_LENGTHS} distinct values cannot share one length"
+    );
+    let span = hi - lo + 1;
+
+    let mut dense = vec![0f64; span];
+    for &(l, c) in hist {
+        dense[l - lo] = c as f64;
+    }
+    // Already contiguous: nothing to bridge, so do not touch the measured shape at all.
+    if !dense.iter().any(|&w| w <= 0.0) {
+        return Ok(finish(lo, dense));
+    }
+
+    let iqr = (hist_quantile(hist, 0.75) as f64) - (hist_quantile(hist, 0.25) as f64);
+    let spread = if iqr > 0.0 {
+        st_dev.min(iqr / 1.34)
+    } else {
+        st_dev
+    };
+    let mut h = (0.9 * spread * (n as f64).powf(-0.2)).max(0.5);
+
+    for _ in 0..MAX_SMOOTHING_PASSES {
+        let smoothed = gaussian_smooth(&dense, h);
+        if !smoothed.iter().any(|&w| w <= 0.0) {
+            return Ok(finish(lo, smoothed));
+        }
+        h *= BANDWIDTH_GROWTH;
+    }
+    Err(GenFragLengthModelError::ConfigurationError(format!(
+        "fragment lengths {lo}-{hi} could not be smoothed into a gap-free distribution; \
+         the input is too sparse for a discrete model. Use `distribution: normal`, or \
+         supply a BAM with more pairs."
+    )))
+}
+
+fn gaussian_smooth(dense: &[f64], h: f64) -> Vec<f64> {
+    let radius = (KERNEL_TRUNCATION * h).ceil() as usize;
+    let two_h2 = 2.0 * h * h;
+    let kernel: Vec<f64> = (0..=radius)
+        .map(|d| (-((d * d) as f64) / two_h2).exp())
+        .collect();
+
+    let mut out = vec![0f64; dense.len()];
+    for (i, &c) in dense.iter().enumerate() {
+        if c <= 0.0 {
+            continue;
+        }
+        let from = i.saturating_sub(radius);
+        let to = (i + radius).min(dense.len() - 1);
+        for (j, slot) in out.iter_mut().enumerate().take(to + 1).skip(from) {
+            *slot += c * kernel[i.abs_diff(j)];
         }
     }
-    output
+    out
 }
 
-fn median_f64(sorted: &[usize]) -> f64 {
-    let n = sorted.len();
-    if n == 0 {
+fn finish(lo: usize, weights: Vec<f64>) -> (Vec<usize>, Vec<f64>) {
+    let values = (lo..lo + weights.len()).collect();
+    (values, weights)
+}
+
+/// Smallest length at or below which `q` of the mass sits.
+fn hist_quantile(hist: &[(usize, u64)], q: f64) -> usize {
+    let total: u64 = hist.iter().map(|&(_, c)| c).sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (total as f64 * q).ceil().max(1.0) as u64;
+    let mut acc = 0u64;
+    for &(l, c) in hist {
+        acc += c;
+        if acc >= target {
+            return l;
+        }
+    }
+    hist[hist.len() - 1].0
+}
+
+/// median(|x - median|), computed from counts rather than a second full-size vector.
+fn hist_mad(hist: &[(usize, u64)], median: f64) -> f64 {
+    let mut devs: Vec<(usize, u64)> = hist
+        .iter()
+        .map(|&(l, c)| ((l as f64 - median).abs().round() as usize, c))
+        .collect();
+    devs.sort_unstable_by_key(|&(d, _)| d);
+    // Merge equal deviations so the quantile walk sees one entry per distinct value.
+    let mut merged: Vec<(usize, u64)> = Vec::with_capacity(devs.len());
+    for (d, c) in devs {
+        match merged.last_mut() {
+            Some((pd, pc)) if *pd == d => *pc += c,
+            _ => merged.push((d, c)),
+        }
+    }
+    hist_quantile(&merged, 0.5) as f64
+}
+
+fn hist_mean(hist: &[(usize, u64)]) -> f64 {
+    let total: u64 = hist.iter().map(|&(_, c)| c).sum();
+    if total == 0 {
         return 0.0;
     }
-    if n.is_multiple_of(2) {
-        (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
-    } else {
-        sorted[n / 2] as f64
+    let sum: f64 = hist.iter().map(|&(l, c)| l as f64 * c as f64).sum();
+    sum / total as f64
+}
+
+fn hist_std_dev(hist: &[(usize, u64)], mean: f64) -> f64 {
+    let total: u64 = hist.iter().map(|&(_, c)| c).sum();
+    if total == 0 {
+        return 0.0;
     }
-}
-
-fn compute_mean(data: &[usize]) -> f64 {
-    data.iter().map(|&x| x as f64).sum::<f64>() / data.len() as f64
-}
-
-fn compute_std_dev(data: &[usize], mean: f64) -> f64 {
-    let variance = data
+    let var: f64 = hist
         .iter()
-        .map(|&x| {
-            let d = x as f64 - mean;
-            d * d
+        .map(|&(l, c)| {
+            let d = l as f64 - mean;
+            d * d * c as f64
         })
         .sum::<f64>()
-        / data.len() as f64;
-    variance.sqrt()
+        / total as f64;
+    var.sqrt()
 }
 
 #[cfg(test)]
@@ -131,75 +356,471 @@ mod tests {
     use super::*;
     use eidolon_core::models::fragment_length::FragmentLengthModel;
 
-    // ── filter_lengths ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_filter_lengths_zero_min_reads_passthrough() {
-        let data = vec![100, 200, 100, 300, 50];
-        let result = filter_lengths(data.clone(), 0);
-        assert_eq!(result, data);
+    // ── naive references, so the histogram math is checked against something that is
+    //    obviously right rather than against itself ────────────────────────────────
+    fn naive_mean(d: &[usize]) -> f64 {
+        d.iter().map(|&x| x as f64).sum::<f64>() / d.len() as f64
+    }
+    fn naive_std(d: &[usize], mean: f64) -> f64 {
+        (d.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / d.len() as f64).sqrt()
+    }
+    fn expand(h: &[(usize, u64)]) -> Vec<usize> {
+        h.iter()
+            .flat_map(|&(l, c)| std::iter::repeat_n(l, c as usize))
+            .collect()
+    }
+    /// Third standardised moment. Positive = right tail, which is the property the whole
+    /// change exists to preserve.
+    fn skew(d: &[usize]) -> f64 {
+        let m = naive_mean(d);
+        let s = naive_std(d, m);
+        if s == 0.0 {
+            return 0.0;
+        }
+        d.iter().map(|&x| ((x as f64 - m) / s).powi(3)).sum::<f64>() / d.len() as f64
+    }
+    fn weighted_skew(values: &[usize], weights: &[f64]) -> f64 {
+        let tot: f64 = weights.iter().sum();
+        let m: f64 = values
+            .iter()
+            .zip(weights)
+            .map(|(&v, &w)| v as f64 * w)
+            .sum::<f64>()
+            / tot;
+        let var: f64 = values
+            .iter()
+            .zip(weights)
+            .map(|(&v, &w)| (v as f64 - m).powi(2) * w)
+            .sum::<f64>()
+            / tot;
+        let sd = var.sqrt();
+        values
+            .iter()
+            .zip(weights)
+            .map(|(&v, &w)| ((v as f64 - m) / sd).powi(3) * w)
+            .sum::<f64>()
+            / tot
+    }
+    /// Deterministic right-skewed sample: a long thin tail above a dense mode.
+    fn right_skewed() -> Vec<usize> {
+        let mut v = Vec::new();
+        for l in 300..=420 {
+            v.extend(std::iter::repeat_n(l, 400));
+        }
+        for (i, l) in (421..=900).enumerate() {
+            let c = (300usize).saturating_sub(i * 2).max(1);
+            v.extend(std::iter::repeat_n(l, c));
+        }
+        v
     }
 
+    /// The mirror image: a tail running DOWN from a dense mode.
+    fn left_skewed() -> Vec<usize> {
+        right_skewed().into_iter().map(|l| 1200 - l).collect()
+    }
+
+    /// A clean symmetric triangle.
+    fn symmetric() -> Vec<usize> {
+        (300..=700)
+            .flat_map(|l| {
+                let d = (l as i64 - 500).unsigned_abs() as usize;
+                std::iter::repeat_n(l, 200usize.saturating_sub(d).max(1))
+            })
+            .collect()
+    }
+
+    /// Two modes with a LOW valley between them, not an empty one.
+    ///
+    /// No two-parameter family reproduces this at all, which is the case that makes the
+    /// argument for keeping the measured shape. The valley is deliberately non-zero: a
+    /// hard 200 bp hole in the middle of a fragment distribution does not occur in a real
+    /// library, and testing against one measures the smoother bridging an artificial gap
+    /// rather than the builder preserving a real shape. A double-size-selected library
+    /// has a thin population between its peaks, not none.
+    fn bimodal() -> Vec<usize> {
+        let mut v = Vec::new();
+        for l in 300..=700 {
+            let c = if l <= 400 {
+                300usize.saturating_sub((l as i64 - 350).unsigned_abs() as usize * 4)
+            } else if l >= 600 {
+                200usize.saturating_sub((l as i64 - 650).unsigned_abs() as usize * 3)
+            } else {
+                0
+            };
+            v.extend(std::iter::repeat_n(l, c.max(6)));
+        }
+        v
+    }
+
+    /// Build a discrete model from raw lengths and report its skew, the way the runner does.
+    fn model_skew(data: &[usize]) -> (f64, f64) {
+        let h = trim(histogram(data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+        (skew(&expand(&h)), weighted_skew(&values, &weights))
+    }
+
+    // ── the histogram math reproduces the per-read math exactly ──────────────
+
     #[test]
-    fn test_filter_lengths_removes_rare() {
-        // 100 appears 3× (>= min_reads=2), 999 appears 1× (< min_reads=2)
-        let mut data: Vec<usize> = vec![999];
-        data.extend(std::iter::repeat_n(100, 3));
-        let result = filter_lengths(data, 2);
+    fn histogram_statistics_match_the_naive_per_read_computation() {
+        // The refactor's whole premise: mean, sd, median and MAD are functions of the
+        // counts, so dropping the three full-size vectors must change nothing.
+        let data = right_skewed();
+        let h = histogram(&data);
+        let m = naive_mean(&data);
+        assert!((hist_mean(&h) - m).abs() < 1e-9, "mean drifted");
         assert!(
-            result.iter().all(|&x| x == 100),
-            "rare length 999 should be removed"
+            (hist_std_dev(&h, m) - naive_std(&data, m)).abs() < 1e-9,
+            "sd drifted"
         );
-        assert_eq!(result.len(), 3);
+
+        let mut sorted = data.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            hist_quantile(&h, 0.5),
+            sorted[(sorted.len() as f64 * 0.5).ceil().max(1.0) as usize - 1],
+            "median drifted"
+        );
     }
 
     #[test]
-    fn test_filter_lengths_removes_outliers() {
-        // Tight cluster around 200, plus one extreme outlier at 100_000
+    fn test_compute_mean_and_std_dev_known_answer() {
+        // Population std of [100, 200, 300] = sqrt(20000/3) ~ 81.65, computed by hand.
+        let h = histogram(&[100usize, 200, 300]);
+        let mean = hist_mean(&h);
+        assert!((mean - 200.0).abs() < 1e-10);
+        assert!((hist_std_dev(&h, mean) - (20000.0f64 / 3.0).sqrt()).abs() < 1e-6);
+    }
+
+    // ── trim ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_trim_zero_min_reads_passthrough() {
+        let data = vec![100usize, 200, 100, 300, 50];
+        assert_eq!(expand(&trim(histogram(&data), 0)), {
+            let mut d = data.clone();
+            d.sort_unstable();
+            d
+        });
+    }
+
+    #[test]
+    fn test_trim_removes_outliers() {
         let mut data: Vec<usize> = (180..=220).flat_map(|v| vec![v; 5]).collect();
         data.extend(std::iter::repeat_n(100_000usize, 5));
-        let result = filter_lengths(data, 2);
+        let kept = expand(&trim(histogram(&data), 2));
         assert!(
-            result.iter().all(|&x| x < 100_000),
-            "outlier 100_000 should be filtered out"
+            kept.iter().all(|&x| x < 100_000),
+            "outlier should be filtered"
         );
-        assert!(!result.is_empty());
+        assert!(!kept.is_empty());
     }
 
     #[test]
-    fn test_filter_lengths_empty_input() {
-        let result = filter_lengths(vec![], 2);
-        assert!(result.is_empty());
-    }
-
-    // ── statistics ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_compute_mean() {
-        let data = vec![100usize, 200, 300];
-        let mean = compute_mean(&data);
-        assert!((mean - 200.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_compute_std_dev() {
-        // Population std of [100, 200, 300] = sqrt(6666.66...) ≈ 81.65
-        let data = vec![100usize, 200, 300];
-        let mean = compute_mean(&data);
-        let std = compute_std_dev(&data, mean);
-        assert!((std - (20000.0f64 / 3.0).sqrt()).abs() < 1e-6);
+    fn test_trim_keeps_rare_lengths_instead_of_deleting_them() {
+        // CHANGED DELIBERATELY. `min_reads` used to delete any bin with fewer than
+        // min_reads observations, which is what MANUFACTURED gaps -- and it deleted them
+        // hardest in the tail, the part worth keeping. Sparse bins are now handled by
+        // smoothing; min_reads survives only as a floor on the total.
+        let mut data: Vec<usize> = std::iter::repeat_n(100usize, 3000).collect();
+        data.push(101); // a single observation, adjacent to the mode
+        let kept = trim(histogram(&data), 2);
+        assert!(
+            kept.iter().any(|&(l, _)| l == 101),
+            "a rare in-range length must survive trimming, got {kept:?}"
+        );
     }
 
     #[test]
-    fn test_median_even() {
-        let data = vec![1usize, 2, 3, 4];
-        assert!((median_f64(&data) - 2.5).abs() < 1e-10);
+    fn test_trim_empty_input() {
+        assert!(trim(histogram(&[]), 2).is_empty());
     }
 
     #[test]
-    fn test_median_odd() {
-        let data = vec![1usize, 2, 3, 4, 5];
-        assert!((median_f64(&data) - 3.0).abs() < 1e-10);
+    fn test_trim_refuses_when_total_is_below_min_reads() {
+        assert!(trim(histogram(&[400usize]), 50).is_empty());
+    }
+
+    // ── the gap problem ──────────────────────────────────────────────────────
+
+    #[test]
+    fn discrete_model_has_no_gaps_even_from_a_gappy_histogram() {
+        // Every OTHER length missing: the shape of a sparse real histogram, and the shape
+        // that produced a model that built fine and behaved badly.
+        let data: Vec<usize> = (200..=400)
+            .step_by(2)
+            .flat_map(|l| std::iter::repeat_n(l, 20))
+            .collect();
+        let h = trim(histogram(&data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+
+        assert_eq!(
+            values.len(),
+            values[values.len() - 1] - values[0] + 1,
+            "support must be contiguous"
+        );
+        assert!(
+            weights.iter().all(|&w| w > 0.0),
+            "no interior bin may be empty"
+        );
+        for (i, pair) in values.windows(2).enumerate() {
+            assert_eq!(pair[1], pair[0] + 1, "gap at index {i}");
+        }
+    }
+
+    #[test]
+    fn a_contiguous_histogram_is_not_smoothed_at_all() {
+        // The must-not-fire case. Smoothing that always fires would pass the gap test
+        // above while quietly reshaping every dense whole-genome model.
+        let data = right_skewed();
+        let h = trim(histogram(&data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+        for (&v, &w) in values.iter().zip(&weights) {
+            let observed = h.iter().find(|&&(l, _)| l == v).map(|&(_, c)| c as f64);
+            assert_eq!(
+                Some(w),
+                observed,
+                "length {v} was altered though the input had no gaps"
+            );
+        }
+    }
+
+    // ── the decision under test: does the SHAPE survive? ─────────────────────
+
+    #[test]
+    fn discrete_preserves_the_right_tail_and_normal_destroys_it() {
+        let data = right_skewed();
+        let input_skew = skew(&data);
+        assert!(
+            input_skew > 0.4,
+            "fixture must actually be right-skewed, got {input_skew}"
+        );
+
+        let h = trim(histogram(&data), 2);
+        // Two separate claims, because trimming removes outliers BY DESIGN and skew is a
+        // cubed moment, so the extreme tail dominates it. Conflating them would let a
+        // tail-destroying trim hide behind a shape-preserving smoother, or vice versa.
+        let trimmed_skew = skew(&expand(&h));
+        assert!(
+            trimmed_skew > 0.85,
+            "trimming must not flatten the tail: input {input_skew:.3}, after trim {trimmed_skew:.3}"
+        );
+
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+        let kept = weighted_skew(&values, &weights);
+        assert!(
+            (kept - trimmed_skew).abs() < 0.01,
+            "Discrete must reproduce the shape it was given: trimmed {trimmed_skew:.3}, model {kept:.3}"
+        );
+
+        // And the escape hatch must still do the old thing -- a Normal has skew 0 by
+        // construction, which is precisely why ins_skew read 0.074 against a real 0.795.
+        let normal = FragmentLengthModel::new_normal(mean, sd).unwrap();
+        match normal {
+            FragmentLengthModel::Normal { mean: m, st_dev } => {
+                assert!((m - mean).abs() < 1e-9 && (st_dev - sd).abs() < 1e-9);
+            }
+            _ => panic!("new_normal must produce a Normal"),
+        }
+    }
+
+    #[test]
+    fn the_builder_reproduces_whatever_shape_it_is_given() {
+        // Not "a right-skewed input comes out right-skewed" -- code that only handled that
+        // one shape would pass such a test. The claim is that the builder is a PASS-THROUGH
+        // for shape, so it is checked against four distinct ones, including a bimodal
+        // distribution that no two-parameter family reproduces at all.
+        let cases: [(&str, Vec<usize>); 4] = [
+            ("right-skewed", right_skewed()),
+            ("left-skewed", left_skewed()),
+            ("symmetric", symmetric()),
+            ("bimodal", bimodal()),
+        ];
+
+        let mut observed = Vec::new();
+        for (name, data) in &cases {
+            let (input, model) = model_skew(data);
+            assert!(
+                (model - input).abs() < 0.01,
+                "{name}: model skew {model:.3} does not match its input {input:.3}"
+            );
+            observed.push((*name, input));
+        }
+
+        // Must-not-fire: the four fixtures have to be genuinely different, or "reproduces
+        // the input" is satisfied by any code that returns a constant. A left tail and a
+        // right tail must land on opposite sides of zero, and the symmetric one near it.
+        let get = |n: &str| observed.iter().find(|(k, _)| *k == n).unwrap().1;
+        assert!(
+            get("right-skewed") > 0.4,
+            "right fixture is not right-skewed"
+        );
+        assert!(get("left-skewed") < -0.4, "left fixture is not left-skewed");
+        assert!(get("symmetric").abs() < 0.1, "symmetric fixture is skewed");
+        assert!(
+            get("right-skewed") - get("left-skewed") > 1.0,
+            "the two tailed fixtures are not distinguishable from each other"
+        );
+    }
+
+    #[test]
+    fn a_bimodal_distribution_survives_as_two_modes() {
+        // The strongest case for keeping the histogram: a Normal fitted to this puts its
+        // peak in the VALLEY between the two modes, where the real library has almost no
+        // fragments at all.
+        let data = bimodal();
+        let h = trim(histogram(&data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+
+        let at = |target: usize| {
+            values
+                .iter()
+                .position(|&v| v == target)
+                .map(|i| weights[i])
+                .unwrap_or(0.0)
+        };
+        let (peak_a, valley, peak_b) = (at(350), at(500), at(650));
+        assert!(
+            peak_a > valley * 5.0 && peak_b > valley * 5.0,
+            "both modes must survive as modes: 350={peak_a:.1}, 500={valley:.1}, 650={peak_b:.1}"
+        );
+        // And the mean -- which is what a Normal would centre on -- sits in the valley.
+        assert!(
+            (450.0..550.0).contains(&mean),
+            "mean {mean:.1} should fall between the modes, which is the point"
+        );
+    }
+
+    #[test]
+    fn smoothing_fills_gaps_without_washing_out_the_shape() {
+        // The decision the smoother makes is HOW MUCH to smooth, and nothing tested it:
+        // the bandwidth is only reached when there are gaps, and every other fixture here
+        // is contiguous after trimming, so `h` was dead code in all of them. A fixed
+        // bandwidth of 40 passed the entire suite before this test existed. Measured: the
+        // Silverman bandwidth here is 8.0 and moves the skew by 0.009; a fixed 40 moves it
+        // by 0.101 and inflates the standard deviation 4.9%. That is the gap this asserts.
+        //
+        // The comparison is the gappy input against ITS OWN shape, not against the dense
+        // fixture it was thinned from. Thinning to every third length is a subsample and
+        // legitimately shifts the skew by ~0.03 on its own; measuring against the dense
+        // original spends that budget on something smoothing did not do, and leaves too
+        // little headroom to see a bandwidth four times too wide.
+        let dense = right_skewed();
+        let gappy: Vec<usize> = dense.iter().copied().filter(|l| l % 3 == 0).collect();
+
+        let h = trim(histogram(&gappy), 2);
+        let holes = {
+            let lo = h[0].0;
+            let hi = h[h.len() - 1].0;
+            (hi - lo + 1) - h.len()
+        };
+        assert!(
+            holes > 100,
+            "the fixture must actually be gappy, got {holes} holes"
+        );
+
+        let before_skew = skew(&expand(&h));
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+
+        assert!(weights.iter().all(|&w| w > 0.0), "gaps must be filled");
+
+        let after_skew = weighted_skew(&values, &weights);
+        assert!(
+            (after_skew - before_skew).abs() < 0.03,
+            "smoothing washed out the shape: {before_skew:.4} -> {after_skew:.4}. A bandwidth \
+             wide enough to bridge the gaps must still be narrow enough to keep the tail."
+        );
+
+        // An over-wide kernel also smears mass outward, inflating the spread.
+        let after_sd = {
+            let tot: f64 = weights.iter().sum();
+            let m: f64 = values
+                .iter()
+                .zip(&weights)
+                .map(|(&v, &w)| v as f64 * w)
+                .sum::<f64>()
+                / tot;
+            (values
+                .iter()
+                .zip(&weights)
+                .map(|(&v, &w)| (v as f64 - m).powi(2) * w)
+                .sum::<f64>()
+                / tot)
+                .sqrt()
+        };
+        assert!(
+            (after_sd - sd).abs() / sd < 0.02,
+            "smoothing inflated the spread: {sd:.2} -> {after_sd:.2}"
+        );
+    }
+
+    #[test]
+    fn a_symmetric_input_stays_symmetric() {
+        // The other must-not-fire: the change must not INVENT skew.
+        let data: Vec<usize> = (300..=500)
+            .flat_map(|l| {
+                let d = (l as i64 - 400).unsigned_abs() as usize;
+                std::iter::repeat_n(l, 200usize.saturating_sub(d).max(1))
+            })
+            .collect();
+        let h = trim(histogram(&data), 2);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        let (values, weights) = smooth_to_gap_free(&h, sd, n).unwrap();
+        assert!(
+            weighted_skew(&values, &weights).abs() < 0.05,
+            "symmetric input must not acquire a tail"
+        );
+    }
+
+    #[test]
+    fn an_unsmoothable_input_is_refused_rather_than_written() {
+        // Two lengths, a thousand apart: no bandwidth bridges that without flattening the
+        // distribution into noise. Refusing beats writing a model that builds fine.
+        let data: Vec<usize> = std::iter::repeat_n(200usize, 5)
+            .chain(std::iter::repeat_n(30_000usize, 5))
+            .collect();
+        let h = trim(histogram(&data), 0);
+        let mean = hist_mean(&h);
+        let sd = hist_std_dev(&h, mean);
+        let n: u64 = h.iter().map(|&(_, c)| c).sum();
+        assert!(
+            smooth_to_gap_free(&h, sd, n).is_err(),
+            "an unsmoothable histogram must be refused"
+        );
+    }
+
+    #[test]
+    fn distribution_kind_parses_both_spellings_and_rejects_junk() {
+        assert_eq!(
+            DistributionKind::parse("discrete"),
+            Some(DistributionKind::Discrete)
+        );
+        assert_eq!(
+            DistributionKind::parse(" NORMAL "),
+            Some(DistributionKind::Normal)
+        );
+        assert_eq!(DistributionKind::default(), DistributionKind::Discrete);
+        assert_eq!(DistributionKind::parse("lognormal"), None);
     }
 
     // ── runner integration ────────────────────────────────────────────────────
@@ -218,6 +839,7 @@ mod tests {
             output_file: output.clone(),
             overwrite_output: true,
             min_reads: 2,
+            distribution: DistributionKind::Normal,
         };
         runner(&config).unwrap();
         assert!(output.exists());
@@ -246,6 +868,7 @@ mod tests {
             output_file: output.clone(),
             overwrite_output: true,
             min_reads: 0,
+            distribution: DistributionKind::Normal,
         };
         runner(&config).unwrap();
         assert!(output.exists());
@@ -265,6 +888,7 @@ mod tests {
             output_file: output,
             overwrite_output: true,
             min_reads: 2,
+            distribution: DistributionKind::Normal,
         };
         let err = runner(&config).unwrap_err();
         assert!(
@@ -286,6 +910,7 @@ mod tests {
             output_file: output,
             overwrite_output: true,
             min_reads: 2,
+            distribution: DistributionKind::Normal,
         };
         let err = runner(&config).unwrap_err();
         assert!(
@@ -307,6 +932,7 @@ mod tests {
             output_file: output,
             overwrite_output: true,
             min_reads: 2,
+            distribution: DistributionKind::Normal,
         };
         let err = runner(&config).unwrap_err();
         assert!(
@@ -409,6 +1035,7 @@ mod tests {
             output_file: output,
             overwrite_output: true,
             min_reads: 2,
+            distribution: DistributionKind::Normal,
         };
         assert!(runner(&config).is_err());
     }
