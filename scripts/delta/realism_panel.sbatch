@@ -411,22 +411,34 @@ awk -F'\t' -f "$REPO_ROOT/scripts/delta/realism_summarise.awk" "$OUTDIR/panel.ts
 echo ""
 # What the candidate sites look like, not just how many. Bands are descriptive, not a
 # verdict: they say which explanation to go looking for.
+#
+# THE THIRD BAND IS NOT NOISE, and an earlier version of this block called it that. Do the
+# arithmetic on job 21639409: a 400 kb window at 46x holds ~122,000 reads, of which 0.19%
+# clip, so ~232 clipped reads spread over 400,000 positions. Poisson with lambda 0.00058
+# per base puts P(3 or more at one base) near 3e-11, which is ~1e-5 sites expected by
+# chance across the whole window. 318 were observed. Essentially every one has a real
+# shared cause; a minority of local reads agreeing is a statement about which reads' end
+# geometry lands on the breakpoint, not about whether the breakpoint is real. The median
+# site is 4 reads out of 47 -- weak as a fraction, overwhelming as evidence.
 if [[ -s "$OUTDIR/real_candidates.tsv" ]]; then
     echo ""
     echo "Candidate sites, REAL side — where the cand_per_mb gap comes from:"
     awk -F'\t' 'NR>1 {
             n++
             if ($8 >= 0.5) rep++            # half the overlapping reads unmappable
-            else if ($7 >= 0.30) sv++       # a third of the depth agrees on one boundary
-            else scat++
+            else if ($7 >= 0.30) strong++   # a third of the depth agrees on one boundary
+            else few++
             sup += $4; if ($4 > mx) mx = $4
         }
         END {
             if (!n) { print "              none"; exit }
-            printf "              %d sites, median support %.0f reads (max %d)\n", n, sup/n, mx
-            printf "              %5.1f%%  in repeat-like context (>=50%% of local depth is MAPQ 0)\n", rep*100/n
-            printf "              %5.1f%%  strongly supported in mappable sequence (>=30%% of depth agrees)\n", sv*100/n
-            printf "              %5.1f%%  weakly supported, mappable — read-level noise\n", scat*100/n
+            printf "              %d sites, mean support %.1f reads (max %d)\n", n, sup/n, mx
+            printf "              %5.1f%%  repeat-like (>=50%% of local depth is MAPQ 0)\n", rep*100/n
+            printf "              %5.1f%%  junction-like (>=30%% of local depth agrees)\n", strong*100/n
+            printf "              %5.1f%%  minority-support, mappable, normal MAPQ\n", few*100/n
+            printf "                       ^ NOT noise: 3+ reads on one base is ~1e-5 by chance\n"
+            printf "                         per window. A real cause affecting few reads --\n"
+            printf "                         a small indel or local divergence, not read error.\n"
         }' "$OUTDIR/real_candidates.tsv"
     echo "              full list: $OUTDIR/real_candidates.tsv"
 fi

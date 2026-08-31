@@ -220,9 +220,20 @@ pub fn candidate_sites(
             if support < min_support {
                 continue;
             }
+            // A trailing clip's boundary is `pos + reference_span()` -- the HALF-OPEN end of
+            // the alignment -- so a read that ends exactly there does not overlap it, and
+            // counting `pos <= P < pos + span` excludes the very reads that support the
+            // site. Measured on HCC1395 normal that produced support 159 against depth 62,
+            // a support fraction of 2.56, which is impossible. Probe the last base INSIDE
+            // the alignment for a right boundary so both sides use the same denominator.
+            let probe = if side == 'R' {
+                pos.saturating_sub(1)
+            } else {
+                pos
+            };
             let (mut depth, mut mapq0) = (0usize, 0usize);
             for r in records {
-                if r.pos <= pos && pos < r.pos + r.reference_span() {
+                if r.pos <= probe && probe < r.pos + r.reference_span() {
                     depth += 1;
                     if r.mapq == 0 {
                         mapq0 += 1;
@@ -368,6 +379,36 @@ mod tests {
     }
 
     // ── candidate breakpoints: the headline metric ─────────────────────────────
+
+    #[test]
+    fn a_right_boundarys_support_cannot_exceed_its_depth() {
+        // The bug this pins: a trailing clip's boundary is the HALF-OPEN end of the
+        // alignment, so probing at that coordinate misses every read that ends there --
+        // which is every read that supports the site. On HCC1395 normal it produced
+        // support 159 against depth 62, a support fraction of 2.56.
+        let mut v = Vec::new();
+        // 8 reads ending at 1000 with a trailing clip: boundary at 900 + 100 = 1000.
+        for _ in 0..8 {
+            v.push(rec(900, "100M40S", 60, true, 300));
+        }
+        // 12 reads spanning the same stretch, unclipped.
+        for _ in 0..12 {
+            v.push(rec(880, "150M", 60, true, 300));
+        }
+        let sites = candidate_sites(&v, 20, 3);
+        assert_eq!(sites.len(), 1, "expected one right boundary, got {sites:?}");
+        let c = &sites[0];
+        assert_eq!(c.side, 'R');
+        assert_eq!(c.support, 8);
+        assert!(
+            c.support <= c.depth,
+            "support {} exceeds depth {} -- the denominator excludes its own numerator",
+            c.support,
+            c.depth
+        );
+        // All 20 reads cover the last base inside the clipped alignments.
+        assert_eq!(c.depth, 20);
+    }
 
     #[test]
     fn the_dumped_sites_are_exactly_what_the_count_counted() {
