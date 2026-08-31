@@ -57,6 +57,12 @@
 #   REAL_BAM=... GC_BIAS_MODEL=$D/gc.json.gz FRAGMENT_MODEL=$D/frag.json.gz \
 #     ALIGN_TLEN=1 sbatch scripts/delta/realism_panel.sbatch
 #
+#   # ADAPTERS=truseq turns on 3' read-through, which is a direct source of soft clips and
+#   # also stops short fragments being rejected. clip_pct was 19x below real data without
+#   # it, and cand_per_mb was exactly 0 as a consequence.
+#   REAL_BAM=... GC_BIAS_MODEL=... FRAGMENT_MODEL=... ADAPTERS=truseq ALIGN_TLEN=1 \
+#     sbatch scripts/delta/realism_panel.sbatch
+#
 #   # ALIGN_TLEN=1 measures both sides over the fragment model's own range. Without it the
 #   # panel measures real inserts out to MAX_TLEN while the simulator is capped at the
 #   # model's ceiling, and the difference reads as an insert-shape gap that is really the
@@ -122,6 +128,11 @@ SEQ_ERROR_MODEL="${SEQ_ERROR_MODEL:-}"
 QUALITY_MODEL="${QUALITY_MODEL:-}"
 MUTATION_MODEL="${MUTATION_MODEL:-}"
 GC_NORMALIZE="${GC_NORMALIZE:-}"     # gc_bias_normalize_coverage; unset = eidolon's default
+# Adapter read-through: unset (off) | truseq | nextera. A direct source of soft clips, and
+# clip_pct is the metric furthest from real data after training the models -- 19x low on
+# job 21636456, which is why cand_per_mb is exactly 0 there (a candidate breakpoint needs
+# three reads sharing a clip boundary, and there are not three clipped reads to share one).
+ADAPTERS="${ADAPTERS:-}"
 
 # Thresholds. Passed to BOTH sides from one place: a gap measured with different settings
 # on each side would be measuring the settings.
@@ -138,6 +149,14 @@ PANEL_BIN="$CARGO_TARGET_DIR/release/realism-panel"
 [[ -f "$REAL_BAM" ]]  || { echo "ERROR: REAL_BAM not found: $REAL_BAM" >&2; exit 1; }
 [[ -f "$REFERENCE" ]] || { echo "ERROR: REFERENCE not found: $REFERENCE" >&2; exit 1; }
 [[ -x "$EIDOLON_BIN" ]] || { echo "ERROR: eidolon not built at $EIDOLON_BIN" >&2; exit 1; }
+case "${ADAPTERS:-}" in
+    ""|truseq|nextera) ;;
+    *) echo "ERROR: ADAPTERS must be truseq or nextera (or unset), got '$ADAPTERS'." >&2
+       echo "       gen-reads accepts a 'custom' preset too, but it needs r1/r2 sequences" >&2
+       echo "       that this job has no way to pass -- write a config by hand for that." >&2
+       exit 1 ;;
+esac
+
 for pair in "GC_BIAS_MODEL:$GC_BIAS_MODEL" "FRAGMENT_MODEL:$FRAGMENT_MODEL" \
             "SEQ_ERROR_MODEL:$SEQ_ERROR_MODEL" "QUALITY_MODEL:$QUALITY_MODEL" \
             "MUTATION_MODEL:$MUTATION_MODEL"; do
@@ -180,6 +199,13 @@ done
 if [[ -z "$FRAGMENT_MODEL" ]]; then
     printf '              %-16s Normal(%s, %s) -- OVERRIDES the shipped empirical distribution\n' \
            "  fragment via" "$FRAG_MEAN" "$FRAG_SD"
+fi
+if [[ -n "$ADAPTERS" ]]; then
+    printf '              %-16s %s (read-through ON; short fragments are clipped, not rejected)\n' \
+           "adapters" "$ADAPTERS"
+else
+    printf '              %-16s off -- no adapter read-through, so one real source of soft\n' "adapters"
+    printf '              %-16s clipping is absent from the simulated side by construction\n' ""
 fi
 if [[ "$N_TRAINED" -eq 0 ]]; then
     echo ""

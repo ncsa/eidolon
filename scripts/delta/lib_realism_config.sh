@@ -30,6 +30,15 @@ frag_model_ceiling() {
 # Optional model paths are read from the environment: GC_BIAS_MODEL, FRAGMENT_MODEL,
 # SEQ_ERROR_MODEL, QUALITY_MODEL, MUTATION_MODEL, GC_NORMALIZE. Unset means "let eidolon
 # use its built-in default", which is a real choice and not the same as a trained model.
+#
+# ADAPTERS (unset | truseq | nextera) is the same kind of choice and belongs in the same
+# place. Adapter read-through is a DIRECT source of soft clips -- eidolon's own
+# `adapter_readthrough_is_soft_clipped_in_the_bam` asserts exactly that -- and the panel
+# measured clip_pct 19x below real data with it switched off. Enabling it also flips
+# `keep_short` in gen_reads, so fragments shorter than a read stop being rejected by the
+# retry loop and become clipped reads instead; with a trained fragment model that is 0.557%
+# of the mass on HCC1395 normal. Whether that lands near the real 0.19% or overshoots is a
+# measurement, which is the point of exposing the knob rather than picking a value here.
 write_sim_config() {
     local out="$1" reference="$2" outdir="$3" seed="$4" threads="$5" depth="$6" \
           read_len="$7" frag_mean="$8" frag_sd="$9"
@@ -67,5 +76,10 @@ YML
         key="${pair%%:*}"; val="${pair#*:}"
         [[ -n "$val" ]] && printf '%s: %s\n' "$key" "$val" >> "$out"
     done
+
+    # A nested map, not a scalar, so it cannot ride the loop above.
+    if [[ -n "${ADAPTERS:-}" ]]; then
+        printf 'adapters:\n  enabled: true\n  preset: %s\n' "${ADAPTERS:-}" >> "$out"
+    fi
     return 0
 }
