@@ -518,6 +518,106 @@ invented constant.**
 > is exactly the kind of thing `gh issue view`/`gh issue list --search` should be checked
 > against before spending an hour on mechanism-hunting from scratch.
 
+### 5.7 The harness measuring itself — three in one session (2026-08-30)
+
+The realism panel exists to measure how far eidolon's reads sit from real human reads.
+Its first three attempts measured the panel instead. Same shape as § 5.3, in a component
+built *after* that section was written.
+
+**What the first real run reported** (job 21623108, HCC1395 normal, chr20/21/22 at 46x):
+`depth_excess` 16.2x, `ins_skew` 10.7x, and `inf` on every artifact column. Read as
+simulator properties. Three of the four turned out to be properties of the harness.
+
+| # | defect | what it made the table say |
+|---|---|---|
+| 1 | `place_regions` put every contig's first window at exactly `$MARGIN`, and on chr21/chr22 that is inside the acrocentric p-arm — megabases of `N` | the job **could not run at all** on any of chromosomes 13, 14, 15, 21, 22; the panel correctly refused a read-less region |
+| 2 | the panel emitted `fragment_mean: 400 / fragment_st_dev: 90`, which `gen_reads/utils/runner.rs:114` prefers over a model file | every run **overrode eidolon's own shipped empirical distribution** with a Gaussian, then reported the resulting symmetric inserts as a realism gap |
+| 3 | `gen-frag-length-model` built a full histogram and discarded it for `new_normal(mean, sd)` | a trained model **could not have fixed #2** — no code path built a `Discrete` model from data, though the type, the sampler, and the shipped default all already were one |
+
+And a fourth, in the check written to validate the fix: it compared a deliberately
+*trimmed* model against *untrimmed* ground truth, reporting the model as 99.92% off on
+standard deviation. Real BAMs carry pairs whose mates sit megabases apart; the builder
+drops them by design. Left in, the "truth" had sd 147,396 and skew 228.5 over a support
+61 million integers wide — not a fragment distribution at all. **The quantiles had been
+saying so the whole time and nothing asserted on them:** real p05/p50/p95 258/424/624
+against the model's 258/424/623.
+
+That same check then reached **opposite verdicts on two machines**. Its negative control
+left 3 of 8262 pairs inside the model's support — one distinct length, so the real side's
+standard deviation was 0. One awk prints `inf` for division by zero (tripping the
+tolerance, passing the test); another does not. The fix was not to pick an awk: a
+comparison over 3 of 8262 pairs should never produce a verdict, and now refuses to.
+
+**The tests could not tell any of it.** `built_fragment_model_drives_output_insert_size`
+asserted the **mean**, which a Normal reproduces perfectly while discarding the entire
+shape; it passed for years. `test_discrete_default` pinned all 766 values of the shipped
+model as a literal array — asserting the bytes had not changed, never that they were
+usable. The model it pinned was left-skewed (−0.434) where every real size-selected
+library is right-skewed, truncated at 799, and carried an isolated spike at **fragment
+length 1** with a 30-wide hole above it. All of that passed.
+
+#### What the trained run then measured, and the prediction it falsified
+
+A prediction was recorded *before* the run, so it could be falsified rather than confirmed
+afterwards: `depth_excess` and the insert columns would move a lot; `cand_per_mb`,
+`clip_pct` and `improper_pct` would barely move, "because no knob addresses them."
+
+**Half wrong** (job 21636456, same sample, GC-bias + fragment models trained on it):
+
+| metric | untrained | trained | |
+|---|---|---|---|
+| `ins_sd` / `ins_p99` / `ins_skew` | 1.3x / 1.2x / 10.7x | **1.0x / 1.0x / 0.9x** | closed |
+| `depth_acf` | 5.4x | **1.0x** | closed |
+| `depth_excess` | 16.2x | **4.1x** | ~75% closed |
+| `improper_pct` | inf (0 simulated) | **4.7x** | *predicted not to move* |
+| `clip_pct` | inf (0 simulated) | **19.0x** | *predicted not to move* |
+| `cand_per_mb` | inf | inf (still 0) | unchanged |
+
+Improper pairs and soft clipping went from **literally zero to nonzero**. A real empirical
+fragment distribution contains short and long fragments that *produce* improper pairs and
+clipped alignments on realignment; the hardcoded `Normal(400, 90)` was too tight to
+generate any. The fragment model reached further down the pipeline than predicted.
+
+**The real remaining gap**, and it reads as one causal chain: clipping is **19x** too low,
+so there are never three reads sharing a clip boundary, so the candidate-breakpoint
+background is **exactly empty** where real data shows 57.5/Mb. Plus coverage still **4.1x**
+too uniform after GC bias. That is a smaller and far better-specified target than the
+table the first run produced — most of which was configuration.
+
+And a fifth knob was still off: `adapters`. Adapter read-through is a direct source of soft
+clips — `adapter_readthrough_is_soft_clipped_in_the_bam` already asserts exactly that — and
+with the trained fragment model 0.557% of the mass sits below a 2x151 pair's minimum, where
+those fragments are currently rejected rather than clipped. Whether enabling it lands near
+the 0.19% target or overshoots is a measurement, not a prediction. **The recurring lesson is
+not "we forgot a knob" but that the panel had no way to say which knobs were off** — which
+is what the provenance line now fixes.
+
+One caveat on the denominator, unresolved: the simulation ran `sv_rate_scale: 0.0` with no
+germline VCF while the real BAM is a human genome carrying real germline structural
+variation. Some of the 57.5/Mb is biology the simulator was told not to produce. For
+calibrating a caller the comparison is still the right one; for deciding what eidolon should
+simulate, that number needs decomposing first.
+
+#### The rule this earns
+
+**A harness must state its own configuration alongside its numbers.** Every figure the
+panel printed was conditional on which models were loaded, and an untrained run was
+indistinguishable in the output from a trained one. It now prints the models it used,
+defaults named as defaults, and says which columns that makes uninformative. The same
+applies to a filter: the panel measured real inserts to `MAX_TLEN=2000` while the simulator
+was capped at its model's 1094 ceiling, and the leftover would have been reported as an
+insert-shape gap. **Measuring your own filter and calling it realism** is the specific
+failure mode, and it appeared three times in one session in three different guises.
+
+Corollary for fixtures, from the mutation runs: **a fixture that cannot distinguish the
+code from its absence is not a fixture.** The RNEXT-filter mutation survived because every
+stub record had `RNEXT "="`. The zero-denominator guard survived because the overlap gate
+intercepted the only case that reached it. The smoother's *bandwidth* — its one real
+decision — was never exercised at all, because smoothing only runs on a gappy histogram and
+every fixture was contiguous; a bandwidth five times too wide passed the entire suite.
+Each was found by mutating, and only after the fixture was rebuilt to make the mutation
+visible.
+
 ---
 
 ## 6. Case study: BND
