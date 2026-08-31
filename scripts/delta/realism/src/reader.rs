@@ -11,7 +11,8 @@
 //! against `samtools view` on the same file rather than against my expectations.
 
 use crate::metrics::{
-    AlnRecord, RegionMetrics, candidate_breakpoints, depth_stats, depth_track, insert_stats,
+    AlnRecord, RegionMetrics, candidate_breakpoints, candidate_sites, depth_stats, depth_track,
+    insert_stats,
 };
 use noodles::bam;
 use std::collections::HashMap;
@@ -135,6 +136,7 @@ pub fn measure(
     min_support: usize,
     max_tlen: i64,
     depth_lag: usize,
+    dump: Option<&Path>,
 ) -> Result<Vec<RegionMetrics>, RealismError> {
     let file =
         File::open(path).map_err(|e| RealismError::Io(format!("{}: {e}", path.display())))?;
@@ -182,6 +184,14 @@ pub fn measure(
         }
     }
 
+    // Written from the SAME records the metric is computed from, in the same pass. A second
+    // pass would re-apply the record filter, and a filter that drifted would make the dump
+    // describe a different read set than the count it is supposed to explain.
+    let mut dump_rows = String::new();
+    if dump.is_some() {
+        dump_rows.push_str("contig\tpos\tside\tsupport\tdepth\tmapq0\tsupport_frac\tmapq0_frac\n");
+    }
+
     let mut out = Vec::with_capacity(regions.len());
     for (bi, region) in regions.iter().enumerate() {
         let v = &buckets[bi];
@@ -190,6 +200,24 @@ pub fn measure(
                 "{}:{}-{}",
                 region.contig, region.start, region.end
             )));
+        }
+        if dump.is_some() {
+            for c in candidate_sites(v, min_clip, min_support) {
+                let sf = if c.depth > 0 {
+                    c.support as f64 / c.depth as f64
+                } else {
+                    0.0
+                };
+                let mf = if c.depth > 0 {
+                    c.mapq0 as f64 / c.depth as f64
+                } else {
+                    0.0
+                };
+                dump_rows.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{sf:.4}\t{mf:.4}\n",
+                    region.contig, c.pos, c.side, c.support, c.depth, c.mapq0
+                ));
+            }
         }
         out.push(summarize(
             v,
@@ -200,6 +228,11 @@ pub fn measure(
             max_tlen,
             depth_lag,
         ));
+    }
+
+    if let Some(path) = dump {
+        std::fs::write(path, dump_rows)
+            .map_err(|e| RealismError::Io(format!("{}: {e}", path.display())))?;
     }
     Ok(out)
 }

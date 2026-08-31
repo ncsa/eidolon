@@ -376,12 +376,20 @@ samtools index "$SIMDIR/sim.bam"
 
 # ── Measure both sides, identical settings ───────────────────────────────────
 echo "[3/3] measuring..."
+# --dump-candidates on the REAL side only. cand_per_mb is the headline gap and a count
+# cannot say what produced it: clip boundaries agreed on by many reads at a fixed locus come
+# from a shared cause -- a structural variant, a repeat boundary, an assembly error -- and
+# scattered read-level artifacts never cluster at all. Adapter read-through brought clip_pct
+# from 19x low to exactly 1.0x on job 21638729 and cand_per_mb stayed at zero, which is that
+# distinction measured. Classify the real sites before trying to reproduce them.
 "$PANEL_BIN" --bam "$REAL_BAM" --regions "$REGIONS" --label REAL \
     --min-clip "$MIN_CLIP" --min-support "$MIN_SUPPORT" \
-    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" > "$OUTDIR/real.tsv"
+    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" \
+    --dump-candidates "$OUTDIR/real_candidates.tsv" > "$OUTDIR/real.tsv"
 "$PANEL_BIN" --bam "$SIMDIR/sim.bam" --regions "$REGIONS" --label SIMULATED \
     --min-clip "$MIN_CLIP" --min-support "$MIN_SUPPORT" \
-    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" > "$OUTDIR/sim.tsv"
+    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" \
+    --dump-candidates "$OUTDIR/sim_candidates.tsv" > "$OUTDIR/sim.tsv"
 
 cat "$OUTDIR/real.tsv" > "$OUTDIR/panel.tsv"
 tail -n +2 "$OUTDIR/sim.tsv" >> "$OUTDIR/panel.tsv"
@@ -401,6 +409,28 @@ fi
 echo ""
 awk -F'\t' -f "$REPO_ROOT/scripts/delta/realism_summarise.awk" "$OUTDIR/panel.tsv"
 echo ""
+# What the candidate sites look like, not just how many. Bands are descriptive, not a
+# verdict: they say which explanation to go looking for.
+if [[ -s "$OUTDIR/real_candidates.tsv" ]]; then
+    echo ""
+    echo "Candidate sites, REAL side — where the cand_per_mb gap comes from:"
+    awk -F'\t' 'NR>1 {
+            n++
+            if ($8 >= 0.5) rep++            # half the overlapping reads unmappable
+            else if ($7 >= 0.30) sv++       # a third of the depth agrees on one boundary
+            else scat++
+            sup += $4; if ($4 > mx) mx = $4
+        }
+        END {
+            if (!n) { print "              none"; exit }
+            printf "              %d sites, median support %.0f reads (max %d)\n", n, sup/n, mx
+            printf "              %5.1f%%  in repeat-like context (>=50%% of local depth is MAPQ 0)\n", rep*100/n
+            printf "              %5.1f%%  strongly supported in mappable sequence (>=30%% of depth agrees)\n", sv*100/n
+            printf "              %5.1f%%  weakly supported, mappable — read-level noise\n", scat*100/n
+        }' "$OUTDIR/real_candidates.tsv"
+    echo "              full list: $OUTDIR/real_candidates.tsv"
+fi
+
 echo "Per-locus rows: $OUTDIR/panel.tsv"
 echo ""
 if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
@@ -413,4 +443,4 @@ echo "about, and the [min-max] beside each median is how much of it is the locus
 echo "than the data — real dispersion varies several-fold between loci on one chromosome."
 echo "════════════════════════════════════════════════════════════════"
 
-archive_run "realism" "$OUTDIR" "panel.tsv" || true
+archive_run "realism" "$OUTDIR" "panel.tsv" "real_candidates.tsv" || true
