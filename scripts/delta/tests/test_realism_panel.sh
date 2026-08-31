@@ -12,6 +12,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE="${PIPELINE:-$HERE/../realism_panel.sbatch}"
 SUMMARISER="${SUMMARISER:-$HERE/../realism_summarise.awk}"
+CONFIGLIB="${CONFIGLIB:-$HERE/../lib_realism_config.sh}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -37,6 +38,23 @@ a zero denominator prints a number@if (have_real && have_sim && sim_med == 0 && 
 values are not sorted before the median@            if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }@            if (0) { t = a[i]; a[i] = a[j]; a[j] = t }
 a sign change still prints a ratio@else if (have_real && have_sim && (real_med < 0 || sim_med < 0))@else if (0)
 MUTATIONS
+    while IFS='@' read -r label from to; do
+        [[ -n "$label" ]] || continue
+        cp "$CONFIGLIB" "$WORK/mutant.sh"
+        FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/' "$WORK/mutant.sh"
+        if cmp -s "$CONFIGLIB" "$WORK/mutant.sh"; then
+            printf '  ERROR   %-52s mutation did not apply\n' "$label"; survived=$((survived+1)); continue
+        fi
+        if CONFIGLIB="$WORK/mutant.sh" bash "$0" >/dev/null 2>&1; then
+            printf '  SURVIVED %-51s <- nothing caught this\n' "$label"; survived=$((survived+1))
+        else
+            printf '  caught   %s\n' "$label"
+        fi
+    done <<'CONFIG_MUTATIONS'
+a fragment model does not suppress fragment_mean@    if [[ -n "${FRAGMENT_MODEL:-}" ]]; then@    if false; then
+model paths are dropped from the config@        [[ -n "$val" ]] && printf '%s: %s\n' "$key" "$val" >> "$out"@        [[ -n "$val" ]] && true
+a Normal ceiling is read as unbounded@else ((.Normal.mean + 4 * .Normal.st_dev) | floor) end@else 999999 end
+CONFIG_MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
 fi
@@ -118,6 +136,87 @@ has "the cap says what it is for" "$cap" "smoke run"
 echo "=== the cap is off by default ==="
 # Defaulting to capped would make every run cheap and every number unquotable.
 has "MAX_SIM_DEPTH defaults to 0" "$(grep -o 'MAX_SIM_DEPTH:-[0-9]*' "$PIPELINE" | head -1)" "MAX_SIM_DEPTH:-0"
+
+# ── the simulation config: what the panel actually asks eidolon for ─────────
+#
+# Running the real function, not grepping the sbatch for a string. The bug being guarded
+# against is conditional -- a key emitted when it should not be -- and a grep cannot see a
+# condition.
+source "$CONFIGLIB"
+
+echo "=== with no models set, the config names eidolon's defaults by omission ==="
+(
+  unset GC_BIAS_MODEL FRAGMENT_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
+  write_sim_config "$WORK/c_default.yml" /ref.fa /out seed 8 30 151 400 90
+)
+cfg="$(cat "$WORK/c_default.yml")"
+has   "an untrained run still sets fragment_mean"    "$cfg" "fragment_mean: 400"
+has   "an untrained run still sets fragment_st_dev"  "$cfg" "fragment_st_dev: 90"
+hasnt "no gc_bias_model key when unset"              "$cfg" "gc_bias_model:"
+hasnt "no fragment_model key when unset"             "$cfg" "fragment_model:"
+hasnt "no sequence_error_model key when unset"       "$cfg" "sequence_error_model:"
+
+echo "=== a supplied fragment model REPLACES fragment_mean/st_dev, never joins them ==="
+# This is the defect: gen_reads/utils/runner.rs prefers explicit mean/st_dev, so emitting
+# both silently discards the trained model -- which is what every panel run did, overriding
+# eidolon's own shipped empirical distribution with Normal(400, 90).
+(
+  unset GC_BIAS_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
+  FRAGMENT_MODEL=/models/frag.json.gz \
+    write_sim_config "$WORK/c_frag.yml" /ref.fa /out seed 8 30 151 400 90
+)
+cfg="$(cat "$WORK/c_frag.yml")"
+has   "the trained fragment model is passed through" "$cfg" "fragment_model: /models/frag.json.gz"
+hasnt "fragment_mean must NOT also be emitted"       "$cfg" "fragment_mean:"
+hasnt "fragment_st_dev must NOT also be emitted"     "$cfg" "fragment_st_dev:"
+
+echo "=== every model knob reaches the config ==="
+(
+  GC_BIAS_MODEL=/m/gc.json.gz FRAGMENT_MODEL=/m/f.json.gz SEQ_ERROR_MODEL=/m/e.json.gz \
+  QUALITY_MODEL=/m/q.json.gz MUTATION_MODEL=/m/mut.json.gz GC_NORMALIZE=true \
+    write_sim_config "$WORK/c_all.yml" /ref.fa /out seed 8 30 151 400 90
+)
+cfg="$(cat "$WORK/c_all.yml")"
+has "gc_bias_model"               "$cfg" "gc_bias_model: /m/gc.json.gz"
+has "sequence_error_model"        "$cfg" "sequence_error_model: /m/e.json.gz"
+has "quality_score_model"         "$cfg" "quality_score_model: /m/q.json.gz"
+has "mutation_model"              "$cfg" "mutation_model: /m/mut.json.gz"
+has "gc_bias_normalize_coverage"  "$cfg" "gc_bias_normalize_coverage: true"
+
+echo "=== the fragment model's ceiling is read from the model, not assumed ==="
+if command -v jq >/dev/null 2>&1; then
+  # Known answer: a Discrete model whose largest value is 1094 tops out at 1094.
+  printf '{"Discrete":{"distribution":{"values":[300,700,1094],"weights":[0.2,0.6,1.0]}}}' \
+    | gzip > "$WORK/disc.json.gz"
+  eq_ceiling="$(frag_model_ceiling "$WORK/disc.json.gz")"
+  has "a discrete model reports its largest observed length" "$eq_ceiling" "1094"
+  # A Normal is unbounded, so the practical ceiling is mean + 4sd = 400 + 360 = 760.
+  printf '{"Normal":{"mean":400.0,"st_dev":90.0}}' | gzip > "$WORK/norm.json.gz"
+  has "a normal model reports mean + 4sd" "$(frag_model_ceiling "$WORK/norm.json.gz")" "760"
+  # Must not fire: an unreadable model must fail rather than invent a ceiling, or the
+  # panel would silently skip the MAX_TLEN comparison it exists to make.
+  if frag_model_ceiling "$WORK/nope.json.gz" >/dev/null 2>&1; then
+    bad "a missing model yields no ceiling" "non-zero exit" "it succeeded"
+  else ok "a missing model yields no ceiling"; fi
+else
+  echo "  SKIP: jq unavailable"
+fi
+
+echo "=== the panel refuses a model path that does not exist ==="
+# Falling back to a default while reporting a trained model is worse than not running.
+guard="$(sed -n '/Refusing rather than silently falling back/,+3p' "$PIPELINE")"
+has "the refusal explains why it is fatal" "$guard" "quietly measured defaults"
+
+echo "=== an untrained run says so in the output ==="
+prov="$(sed -n '/NO TRAINED MODELS/,+8p' "$PIPELINE")"
+has "it names what is being measured"  "$prov" "eidolon AS SHIPPED"
+has "it names GC bias as off"          "$prov" "GC bias is off"
+has "it points at the fix"             "$prov" "gen-bam-models"
+
+echo "=== the frag ceiling vs MAX_TLEN mismatch is reported ==="
+ceil="$(sed -n '/Frag ceiling:/,+14p' "$PIPELINE")"
+has "it warns the gap may be the ceiling" "$ceil" "rather than the simulator"
+has "it offers the alignment knob"        "$ceil" "ALIGN_TLEN=1"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
