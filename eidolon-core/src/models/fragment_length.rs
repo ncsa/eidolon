@@ -42,6 +42,14 @@ pub enum FragmentLengthModel {
     },
 }
 
+/// The shipped fallback, used when a config supplies neither `fragment_model` nor
+/// `fragment_mean`. Built from HCC1395 normal (SEQC2 `WGS_NS_N_1`, NovaSeq, chr20/21/22,
+/// 32.6M pairs) and cross-validated against chr1 of the same library.
+///
+/// Fragment length is set by library chemistry, so this is a real distribution rather than
+/// a universal one -- see `model_data/README.md` for full provenance and for how to build
+/// your own. `the_shipped_default_is_a_usable_fragment_distribution` below asserts the
+/// properties this file has to have.
 static DATA_FILE: &[u8] = include_bytes!("model_data/default_fragment_length_model.json.gz");
 
 impl FragmentLengthModel {
@@ -193,69 +201,121 @@ mod tests {
     }
 
     #[test]
-    fn test_discrete_default() {
+    fn the_shipped_default_is_a_usable_fragment_distribution() {
+        // Replaces a test that pinned all 766 values of the old default as a literal
+        // array. That asserted the bytes had not changed; it said nothing about whether
+        // they were any good -- and they were not. The model it pinned was LEFT-skewed
+        // (-0.434) where every real size-selected library is right-skewed, truncated at
+        // 799, had 33 integer lengths inside its own range with no bin at all, and carried
+        // an isolated spike at fragment length 1 holding 2.3e-09 of the mass with a 30-wide
+        // hole above it. Every one of those passed that test.
+        //
+        // These assertions are about whether the shipped default can be USED. Provenance
+        // for the current file is in model_data/README.md.
         let model = FragmentLengthModel::default().unwrap();
-        match model {
-            FragmentLengthModel::Discrete { distribution } => {
-                assert_eq!(
-                    distribution.values().unwrap(),
-                    [
-                        1, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
-                        50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-                        69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87,
-                        88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104,
-                        105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
-                        120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134,
-                        135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149,
-                        150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164,
-                        165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179,
-                        180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194,
-                        195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
-                        210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224,
-                        225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239,
-                        240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254,
-                        255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
-                        270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284,
-                        285, 286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299,
-                        300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
-                        315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329,
-                        330, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344,
-                        345, 346, 347, 348, 349, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359,
-                        360, 361, 362, 363, 364, 365, 366, 367, 368, 369, 370, 371, 372, 373, 374,
-                        375, 376, 377, 378, 379, 380, 381, 382, 383, 384, 385, 386, 387, 388, 389,
-                        390, 391, 392, 393, 394, 395, 396, 397, 398, 399, 400, 401, 402, 403, 404,
-                        405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419,
-                        420, 421, 422, 423, 424, 425, 426, 427, 428, 429, 430, 431, 432, 433, 434,
-                        435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445, 446, 447, 448, 449,
-                        450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461, 462, 463, 464,
-                        465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477, 478, 479,
-                        480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493, 494,
-                        495, 496, 497, 498, 499, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509,
-                        510, 511, 512, 513, 514, 515, 516, 517, 518, 519, 520, 521, 522, 523, 524,
-                        525, 526, 527, 528, 529, 530, 531, 532, 533, 534, 535, 536, 537, 538, 539,
-                        540, 541, 542, 543, 544, 545, 546, 547, 548, 549, 550, 551, 552, 553, 554,
-                        555, 556, 557, 558, 559, 560, 561, 562, 563, 564, 565, 566, 567, 568, 569,
-                        570, 571, 572, 573, 574, 575, 576, 577, 578, 579, 580, 581, 582, 583, 584,
-                        585, 586, 587, 588, 589, 590, 591, 592, 593, 594, 595, 596, 597, 598, 599,
-                        600, 601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612, 613, 614,
-                        615, 616, 617, 618, 619, 620, 621, 622, 623, 624, 625, 626, 627, 628, 629,
-                        630, 631, 632, 633, 634, 635, 636, 637, 638, 639, 640, 641, 642, 643, 644,
-                        645, 646, 647, 648, 649, 650, 651, 652, 653, 654, 655, 656, 657, 658, 659,
-                        660, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671, 672, 673, 674,
-                        675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688, 689,
-                        690, 691, 692, 693, 694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704,
-                        705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716, 717, 718, 719,
-                        720, 721, 722, 723, 724, 725, 726, 727, 728, 729, 730, 731, 732, 733, 734,
-                        735, 736, 737, 738, 739, 740, 741, 742, 743, 744, 745, 746, 747, 748, 749,
-                        750, 751, 752, 753, 754, 755, 756, 757, 758, 759, 760, 761, 762, 763, 764,
-                        765, 766, 767, 768, 769, 770, 771, 772, 773, 774, 775, 776, 777, 778, 779,
-                        780, 781, 782, 783, 784, 785, 786, 787, 788, 789, 790, 791, 793, 795, 796,
-                        797, 799
-                    ]
-                )
-            }
-            _ => panic!("Wrong type!!"),
+        let FragmentLengthModel::Discrete { distribution } = model else {
+            panic!(
+                "the shipped default must be Discrete; a Normal cannot hold a real library's shape"
+            )
+        };
+        let values = distribution.values().unwrap();
+        let cumulative = distribution.weights().unwrap();
+        assert_eq!(values.len(), cumulative.len());
+        assert!(
+            values.len() > 100,
+            "too few bins to describe a distribution"
+        );
+
+        // NO GAPS. A hole in the support is a length the simulator can never produce
+        // sitting inside a range where the real library has fragments.
+        for pair in values.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "gap in the shipped default between {} and {}",
+                pair[0],
+                pair[1]
+            );
         }
+
+        // A valid inverse-CDF: non-decreasing, ending at 1.
+        for w in cumulative.windows(2) {
+            assert!(w[1] >= w[0], "cumulative weights must not decrease");
+        }
+        assert!(
+            (cumulative[cumulative.len() - 1] - 1.0).abs() < 1e-9,
+            "cumulative weights must end at 1.0, got {}",
+            cumulative[cumulative.len() - 1]
+        );
+
+        // Per-bin mass, recovered from the cumulative array.
+        let mut mass = Vec::with_capacity(cumulative.len());
+        for (i, &c) in cumulative.iter().enumerate() {
+            mass.push(if i == 0 { c } else { c - cumulative[i - 1] });
+        }
+        assert!(
+            mass.iter().all(|&m| m > 0.0),
+            "no bin may hold zero mass -- that is a gap wearing a bin's clothes"
+        );
+
+        // NO ISOLATED SPIKE AT THE BOTTOM. The old default's first bin was 4000x lighter
+        // than the second and 31 lengths away from it: one stray read surviving the filter.
+        // A real distribution's edge is a continuum.
+        let ratio = mass[1] / mass[0];
+        assert!(
+            (0.05..=20.0).contains(&ratio),
+            "the first two bins differ by {ratio:.0}x -- the support starts on an outlier, not on data"
+        );
+
+        let total: f64 = mass.iter().sum();
+        let mean: f64 = values
+            .iter()
+            .zip(&mass)
+            .map(|(&v, &m)| v as f64 * m)
+            .sum::<f64>()
+            / total;
+        let sd = (values
+            .iter()
+            .zip(&mass)
+            .map(|(&v, &m)| (v as f64 - mean).powi(2) * m)
+            .sum::<f64>()
+            / total)
+            .sqrt();
+        let skew = values
+            .iter()
+            .zip(&mass)
+            .map(|(&v, &m)| ((v as f64 - mean) / sd).powi(3) * m)
+            .sum::<f64>()
+            / total;
+
+        assert!(
+            (150.0..=800.0).contains(&mean),
+            "mean fragment length {mean:.1} is outside anything a paired-end library produces"
+        );
+        assert!(sd > 10.0, "a real library has spread; sd {sd:.1} does not");
+        // A LEFT tail means the distribution was cut off at the top -- which is what the
+        // old default looked like, and why its p50 sat 130 bp above the real library's.
+        // Not asserting a specific positive value: a different chemistry can be flatter.
+        assert!(
+            skew > -0.1,
+            "skew {skew:+.3} suggests the distribution is truncated at its upper end"
+        );
+
+        // Most of the mass must be usable at a common read length. Fragments shorter than
+        // the reads get rejected in generate_fragments, and a model that is mostly
+        // unusable produces silent under-coverage.
+        let unusable: f64 = values
+            .iter()
+            .zip(&mass)
+            .filter(|&(&v, _)| v < 161)
+            .map(|(_, &m)| m)
+            .sum::<f64>()
+            / total;
+        assert!(
+            unusable < 0.05,
+            "{:.2}% of the default's mass is below a 2x151 read pair's minimum",
+            unusable * 100.0
+        );
     }
 
     #[test]
@@ -308,10 +368,51 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_fragment() {
+    fn generate_fragment_is_the_inverse_cdf_of_the_model() {
+        // Was `assert_eq!(model.generate_fragment(0.1), 295)`. That pinned one output of
+        // one model, so it broke the moment the shipped default changed and said nothing
+        // about whether sampling was correct in the first place. What generate_fragment
+        // OWES its caller is the inverse CDF: feed it a uniform draw, get back that
+        // quantile of the distribution. That is checkable against the model itself.
         let model = FragmentLengthModel::default().unwrap();
-        let frag = model.generate_fragment(0.1).unwrap();
-        assert_eq!(frag, 295)
+        let FragmentLengthModel::Discrete { ref distribution } = model else {
+            panic!("expected the shipped default to be Discrete")
+        };
+        let values = distribution.values().unwrap();
+        let cumulative = distribution.weights().unwrap();
+
+        // The quantile the model itself says sits at q, computed here by walking the
+        // cumulative array -- not by asking the code under test.
+        let expected_at = |q: f64| -> usize {
+            for (i, &c) in cumulative.iter().enumerate() {
+                if c >= q {
+                    return values[i];
+                }
+            }
+            values[values.len() - 1]
+        };
+
+        for q in [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] {
+            let got = model.generate_fragment(q).unwrap();
+            assert_eq!(
+                got,
+                expected_at(q),
+                "generate_fragment({q}) returned {got}, but the model's own CDF puts that \
+                 quantile at {}",
+                expected_at(q)
+            );
+        }
+
+        // Monotone: a larger uniform draw can never yield a shorter fragment. A sampler
+        // that ignored its input entirely would still pass the equality checks above if
+        // the CDF walk had the same bug, so assert the ordering independently.
+        let mut prev = 0usize;
+        for i in 1..100 {
+            let f = model.generate_fragment(i as f64 / 100.0).unwrap();
+            assert!(f >= prev, "sampling is not monotone: {prev} then {f}");
+            prev = f;
+        }
+        assert!(prev > values[0], "sampling never left the first bin");
     }
 
     #[test]
