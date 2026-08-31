@@ -54,6 +54,8 @@ MUTATIONS
 a fragment model does not suppress fragment_mean@    if [[ -n "${FRAGMENT_MODEL:-}" ]]; then@    if false; then
 model paths are dropped from the config@        [[ -n "$val" ]] && printf '%s: %s\n' "$key" "$val" >> "$out"@        [[ -n "$val" ]] && true
 a Normal ceiling is read as unbounded@else ((.Normal.mean + 4 * .Normal.st_dev) | floor) end@else 999999 end
+adapters are emitted as a flat scalar@printf 'adapters:\n  enabled: true\n  preset: %s\n'@printf 'adapters: %s\n' #
+adapters are emitted even when unset@    if [[ -n "${ADAPTERS:-}" ]]; then@    if true; then
 CONFIG_MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -182,6 +184,37 @@ has "sequence_error_model"        "$cfg" "sequence_error_model: /m/e.json.gz"
 has "quality_score_model"         "$cfg" "quality_score_model: /m/q.json.gz"
 has "mutation_model"              "$cfg" "mutation_model: /m/mut.json.gz"
 has "gc_bias_normalize_coverage"  "$cfg" "gc_bias_normalize_coverage: true"
+
+echo "=== adapters: off by default, and a nested map when set ==="
+# clip_pct was 19x below real data with this off, and cand_per_mb exactly 0 as a result.
+(
+  unset GC_BIAS_MODEL FRAGMENT_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE ADAPTERS
+  write_sim_config "$WORK/c_noad.yml" /ref.fa /out seed 8 30 151 400 90
+)
+hasnt "no adapters key when unset" "$(cat "$WORK/c_noad.yml")" "adapters"
+(
+  unset GC_BIAS_MODEL FRAGMENT_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
+  ADAPTERS=truseq write_sim_config "$WORK/c_ad.yml" /ref.fa /out seed 8 30 151 400 90
+)
+cfg="$(cat "$WORK/c_ad.yml")"
+# gen-reads parses `adapters` as a NESTED MAP -- `adapters: truseq` on one line is silently
+# ignored (enabled defaults to false), which would leave read-through off while the run
+# reported it on. That is the failure this asserts against.
+has "adapters is emitted as a mapping"  "$cfg" "adapters:"
+has "with enabled: true"                "$cfg" "  enabled: true"
+has "and the preset nested under it"    "$cfg" "  preset: truseq"
+hasnt "not as a bare scalar"            "$cfg" "adapters: truseq"
+
+echo "=== the panel refuses a preset it cannot pass through ==="
+# `custom` needs r1/r2 sequences the job has no way to carry, so accepting it would set
+# adapters.enabled with empty sequences -- read-through on, nothing to read through into.
+guard="$(sed -n '/ADAPTERS must be truseq or nextera/,+3p' "$PIPELINE")"
+has "custom is named as unsupported here" "$guard" "custom"
+has "and says why"                        "$guard" "r1/r2 sequences"
+
+echo "=== an adapters-off run says what that costs ==="
+prov="$(sed -n '/no adapter read-through/,+1p' "$PIPELINE")"
+has "it names the consequence" "$prov" "soft"
 
 echo "=== the fragment model's ceiling is read from the model, not assumed ==="
 if command -v jq >/dev/null 2>&1; then
