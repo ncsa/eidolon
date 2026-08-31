@@ -9,6 +9,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTRACT="${EXTRACT:-$HERE/../indel_context_extract.awk}"
 SUMMARISE="${SUMMARISE:-$HERE/../indel_context_summarise.awk}"
+JOIN="${JOIN:-$HERE/../indel_context_join.awk}"
 PIPELINE="${PIPELINE:-$HERE/../indel_context.sbatch}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -37,6 +38,11 @@ soft clips advance the cursor@        } else if (ch ~ /[MN=X]/) {@        } else
 insertions are not recorded@        if (ch == "I" || ch == "D") {@        if (ch == "D") {
 support is not counted per position@            c[$1 SUBSEP pos]++@            c[$1 SUBSEP pos] = 1
 M1
+    run_muts "$JOIN" JOIN <<'M3'
+a candidate with no nearby indel is counted as having one@    if (best < 0)          { none++ }@    if (0)                 { none++ }
+the search window is ignored@    for (d = 0; d <= win; d++) {@    for (d = 0; d <= 100000; d++) {
+the header line is counted as a candidate@    if ($2 !~ /^[0-9]+$/) next@    if (0) next
+M3
     run_muts "$SUMMARISE" SUMMARISE <<'M2'
 the background is not binned like the observed side@FILENAME ~ /bg/     { b = $1 + 0; if (b > mx) b = mx; bgn[b] += $2; bgtot += $2; next }@FILENAME ~ /bg/     { bgn[$1 + 0] += $2; bgtot += $2; next }
 support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++ }@        if (f < hf)      { hi[h]++; thi++ }
@@ -51,6 +57,13 @@ ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 eq()  { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "$3" "$2"; }
 has() { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "contains: $3" "$2";; esac; }
+# Padding-insensitive. Asserting on a %5.1f field means the assertion changes when the value
+# crosses a width boundary -- "2 ( 66.7%)" has a leading space and "3 (100.0%)" does not, so
+# the same assertion passes for one and fails for the other. Spaces are DELETED, not
+# squeezed: squeezing leaves the single space in "( 66.7%)" intact and the needle still
+# has to guess the padding.
+hasw() { local h="$(printf '%s' "$2" | tr -d ' ')" n="$(printf '%s' "$3" | tr -d ' ')"
+         case "$h" in *"$n"*) ok "$1";; *) bad "$1" "contains (spaces collapsed): $3" "$2";; esac; }
 
 extract() { awk -f "$EXTRACT" "$@"; }
 
@@ -128,6 +141,48 @@ has "it names variant placement as one branch" "$(sed -n '/HOW TO READ IT/,+5p' 
 has "it names the error model as the other"    "$(sed -n '/HOW TO READ IT/,+5p' "$SUMMARISE")" "error model"
 guard="$(grep -c 'MEASURES' "$SUMMARISE")"
 eq "and refuses to call the result a verdict" "$guard" "1"
+
+echo "=== the join: is there a VARIANT at the clip boundary, or nothing? ==="
+# Known answer, hand-written. Three candidates:
+#   1000 -> an indel at 1005 with 20/40 support   -> HIGH  (a variant)
+#   2000 -> an indel at 2003 with 2/40  support   -> LOW   (slippage)
+#   3000 -> nothing within the window             -> NONE  (alignment difficulty)
+printf 'chr1\t1005\t20\nchr1\t2003\t2\nchr1\t9999\t9\n' > "$WORK/j_indels.tsv"
+printf 'chr1\t1005\t40\nchr1\t2003\t40\nchr1\t9999\t40\n' > "$WORK/j_depth.tsv"
+{ printf 'contig\tpos\tside\tsupport\tdepth\tmapq0\tsupport_frac\tmapq0_frac\n'
+  printf 'chr1\t1000\tL\t6\t40\t0\t0.15\t0.00\n'
+  printf 'chr1\t2000\tR\t5\t40\t0\t0.12\t0.00\n'
+  printf 'chr1\t3000\tL\t4\t40\t0\t0.10\t0.00\n'; } > "$WORK/j_candidates.tsv"
+out="$(awk -v win=25 -v hf=0.25 -v lf=0.10 -f "$JOIN" \
+        "$WORK/j_indels.tsv" "$WORK/j_depth.tsv" "$WORK/j_candidates.tsv")"
+hasw "the header row is not counted as a candidate" "$out" "3 candidate sites"
+hasw "two of three have an indel in range"         "$out" "2 (66.7%) have an indel"
+hasw "and one has none"                            "$out" "1 (33.3%) have NONE"
+hasw "the support classes are split"               "$out" "1 high-support, 0 mid, 1 low"
+
+echo "=== an indel just outside the window does not count ==="
+# 3000 -> 9999 is far; narrowing the window to 2 also drops 1005 (distance 5) and
+# 2003 (distance 3), leaving nothing.
+out="$(awk -v win=2 -v hf=0.25 -v lf=0.10 -f "$JOIN" \
+        "$WORK/j_indels.tsv" "$WORK/j_depth.tsv" "$WORK/j_candidates.tsv")"
+hasw "a tight window finds no indels at all" "$out" "3 (100.0%) have NONE"
+
+echo "=== the job names all three outcomes and what each implies ==="
+has "high -> placement"   "$(grep -A4 'HOW TO READ IT' "$JOIN")" "#378"
+has "low -> error model"  "$(grep -A4 'HOW TO READ IT' "$JOIN")" "error model"
+has "none -> neither"     "$(grep -A6 'HOW TO READ IT' "$JOIN")" "Neither"
+
+echo "=== a CANDIDATES path that does not exist is refused, not skipped ==="
+guard="$(sed -n '/CANDIDATES is set to/,+2p' "$PIPELINE")"
+has "the refusal says why silence would be worse" "$(sed -n '/Refusing rather than skipping/,+2p' "$PIPELINE")" "never asked"
+
+echo "=== the job loads its own tools and preflights them ==="
+# Job 21656030 printed a clean header and then died on `samtools: command not found` a
+# minute in. samtools is a MODULE on Delta, not part of the bioinf conda env.
+has "it loads the samtools module itself"  "$(grep -v '^[[:space:]]*#' "$PIPELINE")" "module load samtools"
+has "and fails fast when a tool is absent" "$(sed -n '/required tool(s) not found/,+3p' "$PIPELINE")" "module load samtools"
+guard="$(grep -vE '^[[:space:]]*#' "$PIPELINE" | grep -c 'command -v "\$t"')"
+eq "the preflight actually checks each tool" "$guard" "1"
 
 echo "=== the sbatch reads the BAM once, not twice ==="
 # The first version called `samtools view` for the indels and `samtools depth` for the

@@ -145,6 +145,19 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRATCH/cargo-target/eidolon}"
 EIDOLON_BIN="$CARGO_TARGET_DIR/release/eidolon"
 PANEL_BIN="$CARGO_TARGET_DIR/release/realism-panel"
 
+# This job loads no modules and activates no env -- it inherits its tools from whatever
+# shell submitted it, which works until someone submits it from a clean one. indel_context
+# failed exactly that way (job 21656030). Fail in a second with a clear message rather than
+# partway through, and say where samtools comes from.
+missing=""
+for t in samtools bwa-mem2 awk; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+if [[ -n "$missing" ]]; then
+    echo "ERROR: required tool(s) not found:$missing" >&2
+    echo "       On Delta:  module load samtools/1.22-cce19.0.0" >&2
+    echo "                  conda activate bioinf        # bwa-mem2" >&2
+    exit 1
+fi
+
 [[ -n "$REAL_BAM" ]] || { echo "ERROR: REAL_BAM is required — this job compares against real data, and without it there is nothing to compare to." >&2; exit 1; }
 [[ -f "$REAL_BAM" ]]  || { echo "ERROR: REAL_BAM not found: $REAL_BAM" >&2; exit 1; }
 [[ -f "$REFERENCE" ]] || { echo "ERROR: REFERENCE not found: $REFERENCE" >&2; exit 1; }

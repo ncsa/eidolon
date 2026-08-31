@@ -46,13 +46,38 @@ echo "[selftest] stderr reaches this log (if this line is missing, diagnostics a
 
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"
+
+# samtools comes from a MODULE on Delta, not from the bioinf conda env -- see
+# sv_pipeline.sbatch and stage_hcc1395.sh, which both load it explicitly. Activating bioinf
+# alone left `samtools: command not found` at the first read (job 21656030), a minute into
+# a job that had already printed a clean header.
+module load samtools/1.22-cce19.0.0 2>/dev/null || true
+module load htslib/1.22-gcc13.3.1  2>/dev/null || true
 setup_conda
 conda_activate bioinf
+
+# Preflight, so a missing tool fails in a second with a clear message rather than partway
+# through the read loop. A job that inherits its tools from whatever shell submitted it is
+# a job that works until someone submits it from a clean one.
+missing=""
+for t in samtools awk; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+if [[ -n "$missing" ]]; then
+    echo "ERROR: required tool(s) not found:$missing" >&2
+    echo "       samtools is a module on Delta:  module load samtools/1.22-cce19.0.0" >&2
+    echo "       This job loads it itself; if it is still missing the module name has" >&2
+    echo "       changed or this is not Delta." >&2
+    exit 1
+fi
 
 REAL_BAM="${REAL_BAM:?REAL_BAM is required}"
 REFERENCE="${REFERENCE:?REFERENCE is required}"
 REGIONS="${REGIONS:?REGIONS is required -- reuse the regions.bed a realism_panel run wrote}"
 OUTDIR="${OUTDIR:-$SCRATCH/indelctx_${SLURM_JOB_ID:-local}}"
+# Optional: a realism_panel --dump-candidates TSV. Given one, the job also reports whether
+# the clip boundaries have a VARIANT near them or nothing at all -- see
+# indel_context_join.awk for why that distinction picks the fix.
+CANDIDATES="${CANDIDATES:-}"
+JOIN_WIN="${JOIN_WIN:-25}"        # how far from a clip boundary an indel still counts
 MAX_RUN="${MAX_RUN:-10}"          # run lengths above this are pooled into one bin
 HIGH_FRAC="${HIGH_FRAC:-0.25}"    # >= this share of local depth reads as a variant
 LOW_FRAC="${LOW_FRAC:-0.10}"      # <  this share reads as a slippage error
@@ -145,6 +170,21 @@ awk -v mx="$MAX_RUN" -v hf="$HIGH_FRAC" -v lf="$LOW_FRAC" \
     -f "$REPO_ROOT/scripts/delta/indel_context_summarise.awk" \
     "$OUTDIR/indels.tsv" "$OUTDIR/depth.tsv" "$OUTDIR/ctx.tsv" "$OUTDIR/bg.tsv" \
   | tee "$OUTDIR/summary.txt"
+
+if [[ -n "$CANDIDATES" ]]; then
+    if [[ -s "$CANDIDATES" ]]; then
+        cp -f "$CANDIDATES" "$OUTDIR/candidates.tsv"
+        awk -v win="$JOIN_WIN" -v hf="$HIGH_FRAC" -v lf="$LOW_FRAC" \
+            -f "$REPO_ROOT/scripts/delta/indel_context_join.awk" \
+            "$OUTDIR/indels.tsv" "$OUTDIR/depth.tsv" "$OUTDIR/candidates.tsv" \
+          | tee -a "$OUTDIR/summary.txt"
+    else
+        # Refusing rather than skipping: a run asked to make this comparison and silently
+        # not making it looks identical to one that was never asked.
+        echo "ERROR: CANDIDATES is set to '$CANDIDATES', which is missing or empty." >&2
+        exit 1
+    fi
+fi
 
 rm -f "$CACHE"   # the read cache is large and reproducible; the summary is not
 archive_run "indelctx" "$OUTDIR" "summary.txt" "indels.tsv" || true
