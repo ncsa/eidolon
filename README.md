@@ -1006,6 +1006,8 @@ Generating a Fragment Length Model
 
 **Since v3.3.0 the model keeps the observed shape by default.** Real size-selected libraries are right-skewed — a steep left edge from size selection, and a long tail of larger fragments that escaped it. A normal distribution is symmetric by construction and cannot hold that tail, and the tail is exactly what a paired-end SV caller thresholds against when it decides an insert is "larger than expected". The builder therefore fits a *discrete* (empirical) distribution over the observed lengths. Sparse histograms are smoothed so the support has no holes in it, and a model too sparse to have a shape is refused rather than written. Set `distribution: normal` for the pre-v3.3.0 two-parameter fit, which is still the right choice for small or targeted BAMs (exome, amplicon) where there is not enough data to estimate a shape.
 
+**The shipped default** — used when a config supplies neither `fragment_model` nor `fragment_mean` — is built from HCC1395 matched normal (SEQC2 `WGS_NS_N_1`, NovaSeq, GRCh38 chr20/21/22, 32.6M read pairs): 1087 bins over 8–1094 bp, mean 431.8, sd 112.3, skew +0.528. It is cross-validated against chr1 of the same library, agreeing within 0.34% on the mean and 0.011 on the skew, which is why three chromosomes suffice. Fragment length is set by library chemistry, so treat it as one real library rather than a universal shape: if yours differs, build your own with the command above. Full provenance is in `eidolon-core/src/models/model_data/README.md`.
+
 ```bash
 $ eidolon gen-frag-length-model -c gen_frag_length_model_config.yml
 ```
