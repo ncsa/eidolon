@@ -57,7 +57,7 @@ fi
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=23
+MIN_ASSERTIONS=43
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
@@ -227,6 +227,22 @@ has "none -> neither"     "$(grep -A6 'HOW TO READ IT' "$JOIN")" "Neither"
 echo "=== a CANDIDATES path that does not exist is refused, not skipped ==="
 guard="$(sed -n '/CANDIDATES is set to/,+2p' "$PIPELINE")"
 has "the refusal says why silence would be worse" "$(sed -n '/Refusing rather than skipping/,+2p' "$PIPELINE")" "never asked"
+
+echo "=== the sbatch passes the file paths both awks now require ==="
+# The awks refuse to guess which input is which, so a caller that omits the -v flags gets
+# exit 2 -- and the unit tests would not notice, because they invoke the awks directly.
+# A rebase silently dropped these flags from the summariser call while the suite stayed
+# green, which is exactly the gap this closes.
+# Each call is isolated to its own command line -- a check against the whole file would
+# pass on the OTHER awk's flags and assert nothing.
+sum_call="$(awk '/indel_context_summarise\.awk/{for(i=NR-5;i<NR;i++) print a[i]; print} {a[NR]=$0}' "$PIPELINE")"
+for v in f_ind f_dep f_ctx f_bg; do
+    has "summariser -v $v is on its command line" "$sum_call" "$v="
+done
+join_call="$(awk '/indel_context_join\.awk/{for(i=NR-5;i<NR;i++) print a[i]; print} {a[NR]=$0}' "$PIPELINE")"
+for v in f_ind f_dep f_cand; do
+    has "join -v $v is on its command line" "$join_call" "$v="
+done
 
 echo "=== the job loads its own tools and preflights them ==="
 # Job 21656030 printed a clean header and then died on `samtools: command not found` a
