@@ -63,6 +63,15 @@
 #   REAL_BAM=... GC_BIAS_MODEL=... FRAGMENT_MODEL=... ADAPTERS=truseq ALIGN_TLEN=1 \
 #     sbatch scripts/delta/realism_panel.sbatch
 #
+#   # ALIGN_REFERENCE makes mapq0_pct comparable. MAPQ is about competing placements, and
+#   # a real BAM aligned to the whole genome had 2555 non-primary contigs to be ambiguous
+#   # against; simulated reads aligned to a 3-contig subset have none. Align them to the
+#   # SAME reference the real BAM used, while still simulating only the contigs you staged:
+#   REAL_BAM=... REFERENCE=$SCRATCH/neat_data/GRCh38_chr20_21_22.fa \
+#     ALIGN_REFERENCE=$SCRATCH/neat_data/GRCh38.fa ... sbatch scripts/delta/realism_panel.sbatch
+#   # Note: reads that map better to a paralog elsewhere then LEAVE the measured regions,
+#   # which is what happens to real reads too, and is the point.
+#
 #   # ALIGN_TLEN=1 measures both sides over the fragment model's own range. Without it the
 #   # panel measures real inserts out to MAX_TLEN while the simulator is capped at the
 #   # model's ceiling, and the difference reads as an insert-shape gap that is really the
@@ -94,6 +103,21 @@ source "$REPO_ROOT/scripts/delta/lib_realism_contig.sh"
 source "$REPO_ROOT/scripts/delta/lib_realism_config.sh"
 
 REFERENCE="${REFERENCE:-$SCRATCH/neat_data/chr22.fa}"
+# What the simulated reads are ALIGNED to, which is not necessarily what they were
+# simulated FROM. Defaults to REFERENCE, so an unset value changes nothing.
+#
+# WHY THIS EXISTS. MAPQ is a statement about competing placements, so it is only comparable
+# between two BAMs aligned against the same search space. The HCC1395 normal BAM carries
+# 2779 @SQ lines, 2555 of them alt/unplaced/unlocalized/decoy; the panel was aligning
+# simulated reads against a 3-contig subset. A read whose true origin is chr20 but which
+# has a paralog on chr7 is MAPQ 0 in the real BAM and MAPQ 60 in the simulation -- because
+# chr7 was deleted from the reference, not because the simulator is cleaner. Job 21638729
+# reported mapq0_pct real 0.42% against simulated 0, and that gap may be entirely this.
+#
+# Alt contigs matter most: they are alternate haplotypes of the SAME locus, so a
+# non-alt-aware aligner scores them equal to the primary and emits MAPQ 0. They are a
+# source of MAPQ 0, not a sink for it.
+ALIGN_REFERENCE="${ALIGN_REFERENCE:-}"
 REAL_BAM="${REAL_BAM:-}"
 OUTDIR="${OUTDIR:-$SCRATCH/realism_$SLURM_JOB_ID}"
 THREADS="${THREADS:-${SLURM_CPUS_PER_TASK:-64}}"
@@ -213,6 +237,13 @@ if [[ -z "$FRAGMENT_MODEL" ]]; then
     printf '              %-16s Normal(%s, %s) -- OVERRIDES the shipped empirical distribution\n' \
            "  fragment via" "$FRAG_MEAN" "$FRAG_SD"
 fi
+if [[ -n "$ALIGN_REFERENCE" ]]; then
+    printf '              %-16s %s\n' "align ref" "$ALIGN_REFERENCE"
+    printf '              %-16s (simulated from %s)\n' "" "$(basename "$REFERENCE")"
+else
+    printf '              %-16s same as the simulation reference -- mapq0_pct is NOT\n' "align ref"
+    printf '              %-16s comparable if the real BAM used a larger one\n' ""
+fi
 if [[ -n "$ADAPTERS" ]]; then
     printf '              %-16s %s (read-through ON; short fragments are clipped, not rejected)\n' \
            "adapters" "$ADAPTERS"
@@ -326,6 +357,47 @@ echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
 [[ "$N_PLACED" -eq "$N_REGIONS" ]] \
     || echo "  NOTE: asked for $N_REGIONS regions, placed $N_PLACED — see the notes above"
 
+# ── Does the REAL BAM actually have reads in each of them? ──────────────────
+#
+# The N mask says where the REFERENCE has sequence. It cannot say whether the BAM has
+# reads there, and the two disagree: the aligner may have used a reference that masked a
+# region this one models, or the sample may simply have no coverage. realism-panel refuses
+# a read-less region -- correctly, since zero artifacts and zero reads are indistinguishable
+# -- but it does so in the MEASURE step, after simulate and align have already run. Checked
+# on NA12878 chr22, a peri-centromeric window that the local FASTA calls real sequence held
+# exactly zero reads, and the job would have found out an hour later.
+#
+# Empty regions are DROPPED and named, not fatal: losing one of ten loci is a smaller
+# measurement, while failing the run over it wastes the other nine. Falling below
+# MIN_REGIONS is fatal, because a median over two loci is not a result.
+MIN_REGIONS="${MIN_REGIONS:-3}"
+KEPT="$OUTDIR/regions_covered.bed"
+: > "$KEPT"
+DROPPED=0
+while read -r rc rs re _; do
+    [[ -n "${rc:-}" ]] || continue
+    n="$(samtools view -c -F 0x904 "$REAL_BAM" "$rc:$((rs+1))-$re" 2>/dev/null || echo 0)"
+    if [[ "${n:-0}" -gt 0 ]]; then
+        printf '%s\t%s\t%s\n' "$rc" "$rs" "$re" >> "$KEPT"
+    else
+        echo "  NOTE: $rc:$rs-$re has NO READS in the real BAM — dropped before simulating"
+        DROPPED=$((DROPPED + 1))
+    fi
+done < "$REGIONS"
+if [[ "$DROPPED" -gt 0 ]]; then
+    mv -f "$KEPT" "$REGIONS"
+    N_PLACED="$(wc -l < "$REGIONS")"
+    echo "  Regions with coverage: $N_PLACED (dropped $DROPPED)"
+else
+    rm -f "$KEPT"
+fi
+if [[ "$N_PLACED" -lt "$MIN_REGIONS" ]]; then
+    echo "ERROR: only $N_PLACED region(s) have reads in the real BAM; need $MIN_REGIONS." >&2
+    echo "       A median over that few loci is not a measurement. Check that REAL_BAM and" >&2
+    echo "       REFERENCE describe the same assembly, and that the BAM covers these contigs." >&2
+    exit 1
+fi
+
 # ── Depth of the real BAM, measured where we know there is sequence ──────────
 #
 # This probe used to be a fixed $FIRST_CONTIG:1000000-1200000, which is the same bug as the
@@ -382,8 +454,21 @@ echo "[1/3] simulating ${SIM_DEPTH}x with no variants..."
 "$EIDOLON_BIN" gen-reads -c "$SIMDIR/config.yml"
 
 echo "[2/3] aligning the simulated reads..."
-index_reference_locked "$REFERENCE"
-bwa-mem2 mem -t "$THREADS" "$REFERENCE" "$SIMDIR/sim_r1.fastq.gz" "$SIMDIR/sim_r2.fastq.gz" \
+ALIGN_TO="${ALIGN_REFERENCE:-$REFERENCE}"
+if [[ "$ALIGN_TO" != "$REFERENCE" ]]; then
+    [[ -f "$ALIGN_TO" ]] || { echo "ERROR: ALIGN_REFERENCE not found: $ALIGN_TO" >&2; exit 1; }
+    echo "  simulated FROM $REFERENCE"
+    echo "  aligned    TO  $ALIGN_TO"
+    echo "  MAPQ is a statement about competing placements, so this is what makes mapq0_pct"
+    echo "  comparable against a real BAM aligned to the whole genome."
+else
+    echo "  aligned to the simulation reference ($(basename "$REFERENCE"))"
+    echo "  NOTE: if the real BAM was aligned to a larger reference, its reads had more"
+    echo "        places to be ambiguous and mapq0_pct is not comparable. Set"
+    echo "        ALIGN_REFERENCE to the reference the real BAM actually used."
+fi
+index_reference_locked "$ALIGN_TO"
+bwa-mem2 mem -t "$THREADS" "$ALIGN_TO" "$SIMDIR/sim_r1.fastq.gz" "$SIMDIR/sim_r2.fastq.gz" \
   2> "$SIMDIR/bwa.log" | samtools sort -@ 8 -o "$SIMDIR/sim.bam" -
 samtools index "$SIMDIR/sim.bam"
 
