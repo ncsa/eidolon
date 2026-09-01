@@ -45,7 +45,9 @@ the search window is ignored@    for (d = 0; d <= win; d++) {@    for (d = 0; d 
 the header line is counted as a candidate@    if ($2 !~ /^[0-9]+$/) next@    if (0) next
 M3
     run_muts "$SUMMARISE" SUMMARISE <<'M2'
-the background is not binned like the observed side@FILENAME ~ /bg/     { b = $1 + 0; if (b > mx) b = mx; bgn[b] += $2; bgtot += $2; next }@FILENAME ~ /bg/     { bgn[$1 + 0] += $2; bgtot += $2; next }
+the background is not binned like the observed side@FILENAME == f_bg  { b = $1 + 0; if (b > mx) b = mx; bgn[b] += $2; bgtot += $2; next }@FILENAME == f_bg  { bgn[$1 + 0] += $2; bgtot += $2; next }
+files are matched by substring instead of exact path@FILENAME == f_ctx { hp[$1 SUBSEP $2]  = $3; next }@FILENAME ~ /ctx/ { hp[$1 SUBSEP $2]  = $3; next }
+an empty background is not fatal@    if (bgtot == 0) {@    if (0) {
 support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++ }@        if (f < hf)      { hi[h]++; thi++ }
 enrichment ignores the background@        printf "%-7s %9d %9d %9d %9d %11.6f %11.2fx\n", (h == mx ? ">=" mx : h ""), \@        printf "%-7s %9d %9d %9d %9d %11.6f %11.2fx\n", (h == mx ? ">=" mx : h ""), bs = 1, \
 M2
@@ -53,18 +55,22 @@ M2
     [[ "$survived" -eq 0 ]]; exit $?
 fi
 
+# Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
+# low, an assertion stopped running rather than started failing.
+MIN_ASSERTIONS=23
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 eq()  { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "$3" "$2"; }
 has() { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "contains: $3" "$2";; esac; }
-# Padding-insensitive. Asserting on a %5.1f field means the assertion changes when the value
+# Padding-insensitive. Asserting on a %5.1f field means the assertion changes when a value
 # crosses a width boundary -- "2 ( 66.7%)" has a leading space and "3 (100.0%)" does not, so
-# the same assertion passes for one and fails for the other. Spaces are DELETED, not
-# squeezed: squeezing leaves the single space in "( 66.7%)" intact and the needle still
-# has to guess the padding.
-hasw() { local h="$(printf '%s' "$2" | tr -d ' ')" n="$(printf '%s' "$3" | tr -d ' ')"
-         case "$h" in *"$n"*) ok "$1";; *) bad "$1" "contains (spaces collapsed): $3" "$2";; esac; }
+# the same assertion passed for one and failed for the other. Spaces are DELETED, not
+# squeezed: squeezing leaves the single space inside "( 66.7%)" and the needle would still
+# have to guess the padding.
+hasw() { local h n; h="$(printf '%s' "$2" | tr -d ' ')"; n="$(printf '%s' "$3" | tr -d ' ')"
+         case "$h" in *"$n"*) ok "$1";; *) bad "$1" "contains (spaces removed): $3" "$2";; esac; }
+
 
 extract() { awk -f "$EXTRACT" "$@"; }
 
@@ -119,8 +125,11 @@ printf 'chr1\t1000\t40\nchr1\t2000\t40\nchr1\t3000\t40\n' > "$WORK/depth.tsv"
 printf 'chr1\t1000\t12\nchr1\t2000\t12\nchr1\t3000\t1\n'  > "$WORK/ctx.tsv"
 # background: 9000 bases in run-1, 1000 in run-12
 printf '1\t9000\n12\t1000\n' > "$WORK/bg.tsv"
-out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 -f "$SUMMARISE" \
-        "$WORK/indels.tsv" "$WORK/depth.tsv" "$WORK/ctx.tsv" "$WORK/bg.tsv")"
+summarise() { awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+      -v f_ind="$WORK/indels.tsv" -v f_dep="$WORK/depth.tsv" \
+      -v f_ctx="$WORK/ctx.tsv"    -v f_bg="$WORK/bg.tsv" \
+      -f "$SUMMARISE" "$WORK/indels.tsv" "$WORK/depth.tsv" "$WORK/ctx.tsv" "$WORK/bg.tsv"; }
+out="$(summarise)"
 has "run 12 is pooled into the >=10 bin"          "$out" ">=10"
 has "totals split the three support classes"       "$out" "1 high, 1 mid, 1 low"
 has "background reports its own denominator"       "$out" "10000 reference bases"
@@ -129,11 +138,41 @@ has "enrichment is observed share over background share" "$out" "6.67x"
 # and the run-1 bin: 1 of 3 over 9000/10000 = 90% -> 0.37x
 has "an under-represented bin reads below 1x"      "$out" "0.37x"
 
+echo "=== an OUTDIR whose name contains a file marker does not break the matching ==="
+# Job 21671697 ran with OUTDIR=/scratch/.../indelctx_21671697. bg.tsv's full path contained
+# "ctx", the old `FILENAME ~ /ctx/` rule matched it before the /bg/ rule, and the background
+# was read as context data -- bgtot 0, every enrichment 0.00x, and a table that looked
+# complete. The local fixture used `mktemp -d`, whose path has no "ctx" in it, so the test
+# could not see the bug.
+CTXDIR="$WORK/indelctx_21671697"; mkdir -p "$CTXDIR"
+cp "$WORK/indels.tsv" "$WORK/depth.tsv" "$WORK/ctx.tsv" "$WORK/bg.tsv" "$CTXDIR/"
+out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+      -v f_ind="$CTXDIR/indels.tsv" -v f_dep="$CTXDIR/depth.tsv" \
+      -v f_ctx="$CTXDIR/ctx.tsv"    -v f_bg="$CTXDIR/bg.tsv" \
+      -f "$SUMMARISE" "$CTXDIR/indels.tsv" "$CTXDIR/depth.tsv" "$CTXDIR/ctx.tsv" "$CTXDIR/bg.tsv")"
+hasw "the background still accumulates" "$out" "10000 reference bases"
+hasw "and the enrichment is a number"   "$out" "6.67x"
+
+echo "=== an empty background is fatal, not a table of 0.00x ==="
+: > "$WORK/empty_bg.tsv"
+if awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+     -v f_ind="$WORK/indels.tsv" -v f_dep="$WORK/depth.tsv" \
+     -v f_ctx="$WORK/ctx.tsv"    -v f_bg="$WORK/empty_bg.tsv" \
+     -f "$SUMMARISE" "$WORK/indels.tsv" "$WORK/depth.tsv" "$WORK/ctx.tsv" "$WORK/empty_bg.tsv" \
+     >"$WORK/eb.out" 2>&1; then
+  bad "an empty background exits non-zero" "non-zero" "it exited 0"
+else ok "an empty background exits non-zero"; fi
+hasw "and says the enrichments mean nothing" "$(cat "$WORK/eb.out")" "0.00x by"
+
+echo "=== the summariser refuses to guess which file is which ==="
+if awk -v mx=10 -f "$SUMMARISE" "$WORK/indels.tsv" >/dev/null 2>&1; then
+  bad "missing -v paths is an error" "non-zero" "it exited 0"
+else ok "missing -v paths is an error"; fi
+
 echo "=== a zero-depth position is reported, not silently dropped ==="
 printf 'chr1\t5000\t3\n' >> "$WORK/indels.tsv"
 printf 'chr1\t5000\t1\n' >> "$WORK/ctx.tsv"
-out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 -f "$SUMMARISE" \
-        "$WORK/indels.tsv" "$WORK/depth.tsv" "$WORK/ctx.tsv" "$WORK/bg.tsv")"
+out="$(summarise)"
 has "a position with no depth is counted as such" "$out" "1 without depth"
 has "and still counts toward the total"           "$out" "totals: 4 positions"
 
@@ -205,6 +244,16 @@ echo "=== the sbatch reads the BAM once, not twice ==="
 code_lines() { grep -vE '^[[:space:]]*#' "$PIPELINE" | grep -c "$1" || true; }
 eq "no samtools depth pass" "$(code_lines 'samtools depth')" "0"
 eq "one samtools view loop"  "$(code_lines 'samtools view')" "1"
+
+# Guard against an assertion that never ran. A helper typo, a missing function, a `case`
+# that silently matched nothing -- all of them leave PASS+FAIL short while the suite prints
+# a clean summary.
+RAN=$((PASS + FAIL))
+if [[ "$RAN" -lt "$MIN_ASSERTIONS" ]]; then
+    printf '  FAIL  only %d assertions ran, expected at least %d -- some did not execute\n' \
+           "$RAN" "$MIN_ASSERTIONS"
+    FAIL=$((FAIL + 1))
+fi
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
