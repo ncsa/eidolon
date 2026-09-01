@@ -1,3 +1,67 @@
+8/31/2026
+=========
+## eidolon v3.3.0 — fragment length realism
+
+`gen-frag-length-model` now keeps the fragment length distribution it measures instead of
+collapsing it to a mean and a standard deviation, and the shipped default was rebuilt from
+real sequencing data with its provenance recorded.
+
+### What changed for you
+
+**Built models keep their shape.** The builder computed a full histogram of observed
+template lengths and then discarded it to fit a normal distribution. A normal is symmetric
+by construction; every real size-selected library is right-skewed, with a steep left edge
+from size selection and a long tail of larger fragments that escaped it. That tail is what a
+paired-end SV caller thresholds against when deciding an insert is "larger than expected",
+and it was being thrown away at the point of fitting.
+
+Measured against the BAM it was built from (HCC1395 normal, 16.3M read pairs), the new model
+reproduces the library to within **0.01% on the mean, 0.03% on the standard deviation, 0.001
+on skew and 0.00% at p99**. The old normal fit matched the mean and standard deviation and
+missed the skew entirely — under-predicting long fragments by 4.81% at p99.
+
+**The shipped default was replaced.** The previous one was left-skewed (−0.434) where every
+real library is right-skewed, centred 130 bp high, truncated at 799 bp, carried 33 integer
+lengths inside its own range with no bin at all, and held an isolated spike at fragment
+length **1**. Its provenance was unknown; it predates the Rust port.
+
+The new default is built from HCC1395 matched normal (SEQC2 `WGS_NS_N_1`, NovaSeq, GRCh38
+chr20/21/22, 32.6M read pairs): 1087 bins over 8–1094 bp, no gaps, mean 431.8, sd 112.3,
+skew +0.528. It is cross-validated against chr1 of the same library — 27.6M independent
+pairs — agreeing to within 0.34% on the mean and 0.011 on skew, which is why three
+chromosomes suffice. Full provenance is in `eidolon-core/src/models/model_data/README.md`.
+
+**Fragment length is set by library chemistry.** Insert skew measured 0.521 on this library
+and 0.122 on NA12878 — 4x apart between two real human libraries. Treat the default as one
+real library rather than a universal shape, and build your own if yours differs; that is a
+two-minute job and the whole reason `gen-frag-length-model` exists.
+
+### Compatibility
+
+- **Model files built by `gen-frag-length-model` change format**, from two floats to a
+  distribution. Existing model files still load; rebuilt ones differ.
+- `distribution: normal` restores the previous two-parameter fit. It remains the right
+  choice for sparse input — exome, amplicon, a small targeted BAM — where there is not
+  enough data to estimate a shape. Below 10 distinct observed lengths the discrete builder
+  refuses rather than smoothing a handful of spikes into a plausible-looking curve.
+- `min_reads` no longer deletes individual lengths. Deleting a sparse bin is what punched
+  holes in the distribution, and it bit hardest in the tail. It is now a floor on the total
+  number of observations; sparse bins are handled by smoothing.
+
+### Also
+
+Sparse histograms are smoothed so the support has no holes in it, with the bandwidth taken
+from Silverman's rule — sparse input gets more smoothing, and a dense whole-genome histogram
+is returned untouched. "No gaps" is an asserted postcondition, not a hope.
+
+Everything else in this release is validation harness (`scripts/delta/`) and documentation;
+none of it ships in the binary or the conda package.
+
+### Verified end to end
+
+Simulating with a trained fragment model, the realism panel measures simulated insert
+standard deviation, skew and p99 all at **1.0x** of real — closed from 1.3x, 10.7x and 1.2x.
+
 8/30/2026
 =========
 ## eidolon v3.2.1 — complete release assets
