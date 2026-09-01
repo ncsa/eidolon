@@ -216,6 +216,26 @@ echo "=== an adapters-off run says what that costs ==="
 prov="$(sed -n '/no adapter read-through/,+1p' "$PIPELINE")"
 has "it names the consequence" "$prov" "soft"
 
+echo "=== the alignment reference can differ from the simulation reference ==="
+# MAPQ is a statement about COMPETING PLACEMENTS. The HCC1395 normal BAM carries 2779 @SQ
+# lines, 2555 of them alt/unplaced/decoy; aligning simulated reads to a 3-contig subset
+# gives them nothing to be ambiguous against, so mapq0_pct reads 0 for reasons that have
+# nothing to do with the simulator.
+sep="$(sed -n '/ALIGN_TO=/,+14p' "$PIPELINE")"
+has "the aligner uses ALIGN_TO, not REFERENCE"   "$sep" 'bwa-mem2 mem -t "$THREADS" "$ALIGN_TO"'
+has "and the index is built for the same one"    "$sep" 'index_reference_locked "$ALIGN_TO"'
+has "a missing ALIGN_REFERENCE is fatal"         "$sep" "ALIGN_REFERENCE not found"
+has "defaulting is called out, not silent"       "$sep" "not comparable"
+# Must not fire: unset must behave exactly as before, or every existing run changes meaning.
+has "unset falls back to the simulation reference" \
+    "$(grep -n 'ALIGN_TO=' "$PIPELINE")" 'ALIGN_TO="${ALIGN_REFERENCE:-$REFERENCE}"'
+has "the knob defaults to empty" "$(grep -o 'ALIGN_REFERENCE:-[^}]*' "$PIPELINE" | head -1)" "ALIGN_REFERENCE:-"
+
+echo "=== the provenance block names the alignment reference either way ==="
+prov="$(sed -n '/align ref/,+3p' "$PIPELINE")"
+has "it says when the two differ"    "$prov" "simulated from"
+has "and warns when they do not"     "$prov" "NOT"
+
 echo "=== the fragment model's ceiling is read from the model, not assumed ==="
 if command -v jq >/dev/null 2>&1; then
   # Known answer: a Discrete model whose largest value is 1094 tops out at 1094.
