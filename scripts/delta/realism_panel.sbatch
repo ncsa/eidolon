@@ -99,6 +99,16 @@ echo "[selftest] stderr reaches this log (if this line is missing, diagnostics a
 
 REPO_ROOT="${EIDOLON_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
 source "$REPO_ROOT/scripts/delta/lib_report.sh"
+
+# Load its OWN tools rather than inheriting whatever shell submitted it. samtools is a
+# module on Delta; bwa-mem2 is in the bioinf conda env. This job loaded neither and worked
+# only because it was always submitted from a shell that happened to have both -- job
+# 21674488 was not, and died on `bwa-mem2` after the preflight below caught it. Same shape
+# as indel_context job 21656030, which is why that one already does this.
+module load samtools/1.22-cce19.0.0 2>/dev/null || true
+module load htslib/1.22-gcc13.3.1  2>/dev/null || true
+setup_conda
+conda_activate bioinf
 source "$REPO_ROOT/scripts/delta/lib_realism_contig.sh"
 source "$REPO_ROOT/scripts/delta/lib_realism_config.sh"
 

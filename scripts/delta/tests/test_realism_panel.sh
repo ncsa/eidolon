@@ -216,6 +216,21 @@ echo "=== an adapters-off run says what that costs ==="
 prov="$(sed -n '/no adapter read-through/,+1p' "$PIPELINE")"
 has "it names the consequence" "$prov" "soft"
 
+echo "=== the job loads its own tools, it does not inherit them ==="
+# Job 21674488 died on `bwa-mem2: not found`. The preflight caught it in a second rather
+# than at [2/3], but the job should not have needed the submitting shell to have provided
+# it: samtools is a module on Delta and bwa-mem2 is in the bioinf conda env.
+setup="$(grep -vE '^[[:space:]]*#' "$PIPELINE" | sed -n '1,60p')"
+has "it loads the samtools module"  "$setup" "module load samtools"
+has "and activates the conda env"   "$setup" "conda_activate bioinf"
+# The loading has to happen BEFORE the preflight, or the preflight rejects tools the job
+# would have loaded for itself.
+load_line="$(grep -n 'conda_activate bioinf' "$PIPELINE" | head -1 | cut -d: -f1)"
+pre_line="$(grep -n 'required tool(s) not found' "$PIPELINE" | head -1 | cut -d: -f1)"
+[[ -n "$load_line" && -n "$pre_line" && "$load_line" -lt "$pre_line" ]] \
+  && ok "tools are loaded before they are checked" \
+  || bad "tools are loaded before they are checked" "load < preflight" "$load_line vs $pre_line"
+
 echo "=== regions without reads are dropped BEFORE the expensive work ==="
 # realism-panel refuses a read-less region, but in the MEASURE step -- after simulate and
 # align. On NA12878 chr22 a peri-centromeric window that the reference calls real sequence
