@@ -3,12 +3,15 @@
 members = [
     "eidolon",
     "eidolon-core",
+    # Delta validation helper, not shipped. See its Cargo.toml for why it is a workspace
+    # member rather than a standalone crate or a shell script.
+    "scripts/delta/realism",
 ]
 
 resolver = "2"
 
 [workspace.package]
-version = '3.2.1'
+version = '3.3.0'
 edition = '2024'
 authors = ["Joshua Allen", "Mikolaj Kowalik", "See coauthors of Python Neat versions"]
 description = "Toolkit for generating simulated NGS read data in fastq and vcf formats. Feature set under development."

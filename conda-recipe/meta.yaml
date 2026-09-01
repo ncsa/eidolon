@@ -1,5 +1,5 @@
 {% set name = "eidolon" %}
-{% set version = "3.2.1" %}
+{% set version = "3.3.0" %}
 
 package:
   name: {{ name }}

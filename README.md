@@ -17,6 +17,33 @@ We have spent some dedicated time toward gearing the current version of `eidolon
 Find us on Zenodo:
 [![DOI](https://zenodo.org/badge/765847780.svg)](https://doi.org/10.5281/zenodo.20100558)
 
+## Scope: germline is general, somatic is human
+
+These two halves of `eidolon` have deliberately different reach, and it is worth knowing which
+one you are using.
+
+**Germline simulation is species-agnostic.** `gen-reads` needs a reference and, optionally,
+models trained from your own data — nothing in that path assumes a human genome. It has been
+exercised on H1N1 (13.5 kb, eight contigs), *E. coli*, yeast, soy, and human references from a
+single chromosome up to whole-genome GRCh38. If you are simulating germline variation for any
+organism, that is a supported use.
+
+**Somatic / cancer simulation is specialized to human.** The bundled mutational models are
+derived from human cancer cohorts — COSMIC signatures and PCAWG structural-variant
+distributions — and the per-tissue models (BRCA, skin, lung) are human tissue types. SV size
+and type distributions, mutation rates, and signature weights all carry that provenance.
+
+`gen-cancer-reads` will *run* against a non-human reference and produce output, but the model
+driving it has no meaning there: a yeast genome given a human pan-cancer SV spectrum produces
+numbers, not biology. **We do not claim cancer simulation for non-human references**, and the
+validation campaigns behind those models are human-only. Use another organism's reference for
+cancer work only if you have trained your own models against matched data, and treat the
+bundled ones as human-specific.
+
+This split is also why the two halves are validated differently: germline correctness is
+checked across deliberately varied contig shapes and sizes, while somatic realism is measured
+against real human sequencing data.
+
 ## Cancer simulation
 
 `eidolon` simulates tumor / normal sequencing data end-to-end. The
@@ -975,7 +1002,11 @@ gc_bias_normalize_coverage: true
 
 Generating a Fragment Length Model
 ====================
-`eidolon` can learn a fragment length model from real paired-end alignment data using the `eidolon gen-frag-length-model` subcommand. It reads a BAM or SAM file, collects the template lengths (TLEN) of confidently-mapped concordant read pairs, filters out rare and extreme-outlier lengths, then fits a normal distribution to the result and writes a `FragmentLengthModel` that `gen-reads` can use.
+`eidolon` can learn a fragment length model from real paired-end alignment data using the `eidolon gen-frag-length-model` subcommand. It reads a BAM or SAM file, collects the template lengths (TLEN) of confidently-mapped concordant read pairs, trims extreme outliers, and writes a `FragmentLengthModel` that `gen-reads` can use.
+
+**Since v3.3.0 the model keeps the observed shape by default.** Real size-selected libraries are right-skewed — a steep left edge from size selection, and a long tail of larger fragments that escaped it. A normal distribution is symmetric by construction and cannot hold that tail, and the tail is exactly what a paired-end SV caller thresholds against when it decides an insert is "larger than expected". The builder therefore fits a *discrete* (empirical) distribution over the observed lengths. Sparse histograms are smoothed so the support has no holes in it, and a model too sparse to have a shape is refused rather than written. Set `distribution: normal` for the pre-v3.3.0 two-parameter fit, which is still the right choice for small or targeted BAMs (exome, amplicon) where there is not enough data to estimate a shape.
+
+**The shipped default** — used when a config supplies neither `fragment_model` nor `fragment_mean` — is built from HCC1395 matched normal (SEQC2 `WGS_NS_N_1`, NovaSeq, GRCh38 chr20/21/22, 32.6M read pairs): 1087 bins over 8–1094 bp, mean 431.8, sd 112.3, skew +0.528. It is cross-validated against chr1 of the same library, agreeing within 0.34% on the mean and 0.011 on the skew, which is why three chromosomes suffice. Fragment length is set by library chemistry, so treat it as one real library rather than a universal shape: if yours differs, build your own with the command above. Full provenance is in `eidolon-core/src/models/model_data/README.md`.
 
 ```bash
 $ eidolon gen-frag-length-model -c gen_frag_length_model_config.yml
@@ -993,9 +1024,16 @@ input_file: /path/to/aligned.bam
 # required: output path for the generated model; should end in .json.gz
 output_file: /path/to/fragment_length_model.json.gz
 
-# optional: minimum number of reads for a fragment length to be included in the model
+# optional: `discrete` (default) keeps the measured shape, including the right tail.
+# `normal` collapses it to mean + standard deviation, which is the pre-v3.3.0 behaviour
+# and is the right choice for sparse input (exome, amplicon, a small targeted BAM).
+distribution: discrete
+
+# optional: floor on the TOTAL number of observations, below which the model is refused.
 # Default is 2 to handle smaller datasets. Set to 0 to disable filtering entirely.
-# For larger datasets (e.g. whole-genome), try 100 and adjust from there.
+# NOTE: before v3.3.0 this also DELETED any individual length seen fewer than min_reads
+# times, which punched holes in the distribution — hardest in the tail, where counts are
+# lowest. Sparse lengths are now handled by smoothing instead.
 min_reads: 2
 
 # optional: set to true to overwrite an existing output file (default: false)

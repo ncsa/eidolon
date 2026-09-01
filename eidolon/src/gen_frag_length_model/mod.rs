@@ -22,12 +22,12 @@ mod tests {
         // Smoke test: config YAML → RunConfiguration → runner → serialized model.
         let temp = tempfile::tempdir().unwrap();
         let bam_path = temp.path().join("frags.bam");
-        write_frag_bam(
-            &bam_path,
-            &[
-                150usize, 151, 152, 150, 151, 152, 150, 151, 152, 150, 151, 152,
-            ],
-        );
+        // A spread of lengths, not three values repeated: a discrete model over three
+        // distinct fragment lengths is refused now, and rightly -- it has no shape.
+        let tlens: Vec<usize> = (300..=360)
+            .flat_map(|l| std::iter::repeat_n(l, 4))
+            .collect();
+        write_frag_bam(&bam_path, &tlens);
         let output = temp.path().join("model.json.gz");
         let yaml = format!(
             "input_file: {}\noutput_file: {}\noverwrite_output: true\nmin_reads: 2\n",

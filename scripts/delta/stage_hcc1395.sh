@@ -54,6 +54,14 @@ BAM_BASE="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutat
 VCF_BASE="https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/release/latest"
 TUMOR_BAM="${TUMOR_BAM:-WGS_NS_T_1.bwa.dedup.bam}"    # NovaSeq replicate 1
 NORMAL_BAM="${NORMAL_BAM:-WGS_NS_N_1.bwa.dedup.bam}"
+# Which BAMs to pull. The realism panel needs only the normal, and each sample is a
+# separate multi-GB range-request subset, so fetching both to use one doubles the download
+# for nothing.
+SAMPLES="${SAMPLES:-tumor normal}"
+# Stage the BAMs and stop. Steps 3 and 4 exist to build model inputs: germline calling over
+# the whole region at ~50x takes hours, and the tumor FASTQ gzips a multi-GB BAM. Neither
+# is an input to anything that just needs real reads to measure against.
+BAM_ONLY="${BAM_ONLY:-0}"
 EIDOLON_HINT="${EIDOLON_BIN:-$SCRATCH/cargo-target/eidolon/release/eidolon}"   # for the printed next-step cmds
 
 mkdir -p "$D"
@@ -82,7 +90,7 @@ if [[ "$REGION" != "all" ]]; then
 fi
 
 # ── 1. somatic truth VCF (SNV + INDEL, high-conf in high-conf regions; GRCh38) ──
-if [[ ! -s "$D/somatic.vcf.gz" ]]; then
+if [[ "$BAM_ONLY" == "0" && ! -s "$D/somatic.vcf.gz" ]]; then
     for f in high-confidence_sSNV_in_HC_regions_v1.2.vcf.gz \
              high-confidence_sINDEL_in_HC_regions_v1.2.vcf.gz; do
         [[ -s "$D/$f" ]] || wget -c -O "$D/$f" "$VCF_BASE/$f"
@@ -119,10 +127,33 @@ fetch_bam() {   # <remote_name> <local_prefix>
     [[ -s "$out" ]] && [[ "$(samtools view -c "$out")" -gt 0 ]] \
         || { echo "empty BAM after subset: $out (bad REGION contig name? check chr-prefix)" >&2; exit 1; }
 }
-fetch_bam "$TUMOR_BAM"  tumor
-fetch_bam "$NORMAL_BAM" normal
+for sample in $SAMPLES; do
+    case "$sample" in
+        tumor)  fetch_bam "$TUMOR_BAM"  tumor  ;;
+        normal) fetch_bam "$NORMAL_BAM" normal ;;
+        # Not a warning: a typo here would otherwise stage nothing and exit 0, and an
+        # absent BAM is indistinguishable from one that was never asked for.
+        *) echo "FATAL: unknown SAMPLES entry '$sample' (want: tumor, normal)" >&2; exit 1 ;;
+    esac
+done
+
+if [[ "$BAM_ONLY" != "0" ]]; then
+    echo
+    echo "════════════════════════════════════════════════════════════════"
+    echo "BAM_ONLY: staged reads only, over [$REGION]. No truth VCF, no germline"
+    echo "calls, no FASTQ, no model configs — rerun without BAM_ONLY for those."
+    for sample in $SAMPLES; do
+        n="$(samtools view -c "$D/$sample.bam")"
+        echo "  $D/$sample.bam — $n reads on [$REGION]"
+        # A BAM that exists but holds nothing measures nothing while reading as staged.
+        [[ "$n" -gt 0 ]] || { echo "FATAL: $sample.bam is empty" >&2; exit 1; }
+    done
+    echo "════════════════════════════════════════════════════════════════"
+    exit 0
+fi
 
 # ── 3. call germline from the NORMAL bam (this donor's germline; per-contig || ) ─
+[[ -s "$D/normal.bam" ]] || { echo "FATAL: step 3 needs normal.bam — add 'normal' to SAMPLES, or set BAM_ONLY=1" >&2; exit 1; }
 if [[ ! -s "$D/germline.vcf.gz" ]]; then
     echo "calling germline from normal BAM over [$REGION]..."
     if [[ "$REGION" == "all" ]]; then
@@ -146,6 +177,7 @@ if [[ ! -s "$D/germline.vcf.gz" ]]; then
 fi
 
 # ── 4. FASTQ for seq-error (tumor reads) + contig-naming sanity ─────────────────
+[[ -s "$D/tumor.bam" ]] || { echo "FATAL: step 4 needs tumor.bam — add 'tumor' to SAMPLES, or set BAM_ONLY=1" >&2; exit 1; }
 [[ -s "$D/tumor.fastq.gz" ]] || samtools fastq -n "$D/tumor.bam" 2>/dev/null | gzip > "$D/tumor.fastq.gz"
 
 # Summary + sanity below use `head` and `grep -q`, which close their pipe early →

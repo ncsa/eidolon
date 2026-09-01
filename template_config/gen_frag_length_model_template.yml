@@ -6,9 +6,13 @@ input_file:
 output_file:
 
 # OPTIONAL PARAMS
-# Minimum number of reads for a fragment length to be included in the model [optional]
+# Distribution family [optional] - `discrete` (default) or `normal`
+# `discrete` keeps the observed shape, including the right tail a real size-selected
+# library has. `normal` collapses it to mean + st_dev (the pre-v3.3.0 behaviour); use it
+# for sparse input such as exome or amplicon, where there is no shape to estimate.
+distribution: discrete
+# Minimum TOTAL number of observations, below which the model is refused [optional]
 # Default is 2 to handle smaller datasets. Set to 0 to disable filtering entirely.
-# For larger datasets (e.g. whole-genome), try 100 and adjust from there.
 min_reads: 2
 # Overwrite existing output file [optional] - set to true to allow overwriting (default: false)
 overwrite_output: false
