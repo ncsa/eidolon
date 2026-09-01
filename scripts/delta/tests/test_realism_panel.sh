@@ -216,6 +216,25 @@ echo "=== an adapters-off run says what that costs ==="
 prov="$(sed -n '/no adapter read-through/,+1p' "$PIPELINE")"
 has "it names the consequence" "$prov" "soft"
 
+echo "=== regions without reads are dropped BEFORE the expensive work ==="
+# realism-panel refuses a read-less region, but in the MEASURE step -- after simulate and
+# align. On NA12878 chr22 a peri-centromeric window that the reference calls real sequence
+# held exactly zero reads, and the job would have found out an hour in.
+pre="$(sed -n '/Does the REAL BAM actually have reads/,+40p' "$PIPELINE")"
+has "it counts reads per region up front"   "$pre" 'samtools view -c -F 0x904 "$REAL_BAM"'
+has "an empty region is named, not silent"  "$pre" "NO READS in the real BAM"
+has "and dropped rather than fatal"         "$pre" "dropped before simulating"
+has "falling too low IS fatal"              "$pre" "not a measurement"
+has "the floor is a knob"                   "$pre" 'MIN_REGIONS:-'
+# Must not fire: with every region covered, nothing is dropped and the BED is untouched.
+has "an all-covered run leaves the BED alone" "$pre" 'rm -f "$KEPT"'
+# It has to run BEFORE the simulation, or it saves nothing.
+pre_line="$(grep -n 'Does the REAL BAM actually have reads' "$PIPELINE" | cut -d: -f1)"
+sim_line="$(grep -n '1/3. simulating' "$PIPELINE" | cut -d: -f1)"
+[[ -n "$pre_line" && -n "$sim_line" && "$pre_line" -lt "$sim_line" ]] \
+  && ok "the precheck runs before the simulation" \
+  || bad "the precheck runs before the simulation" "precheck < simulate" "$pre_line vs $sim_line"
+
 echo "=== the alignment reference can differ from the simulation reference ==="
 # MAPQ is a statement about COMPETING PLACEMENTS. The HCC1395 normal BAM carries 2779 @SQ
 # lines, 2555 of them alt/unplaced/decoy; aligning simulated reads to a 3-contig subset

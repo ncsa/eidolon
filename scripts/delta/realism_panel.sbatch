@@ -344,6 +344,47 @@ echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
 [[ "$N_PLACED" -eq "$N_REGIONS" ]] \
     || echo "  NOTE: asked for $N_REGIONS regions, placed $N_PLACED — see the notes above"
 
+# ── Does the REAL BAM actually have reads in each of them? ──────────────────
+#
+# The N mask says where the REFERENCE has sequence. It cannot say whether the BAM has
+# reads there, and the two disagree: the aligner may have used a reference that masked a
+# region this one models, or the sample may simply have no coverage. realism-panel refuses
+# a read-less region -- correctly, since zero artifacts and zero reads are indistinguishable
+# -- but it does so in the MEASURE step, after simulate and align have already run. Checked
+# on NA12878 chr22, a peri-centromeric window that the local FASTA calls real sequence held
+# exactly zero reads, and the job would have found out an hour later.
+#
+# Empty regions are DROPPED and named, not fatal: losing one of ten loci is a smaller
+# measurement, while failing the run over it wastes the other nine. Falling below
+# MIN_REGIONS is fatal, because a median over two loci is not a result.
+MIN_REGIONS="${MIN_REGIONS:-3}"
+KEPT="$OUTDIR/regions_covered.bed"
+: > "$KEPT"
+DROPPED=0
+while read -r rc rs re _; do
+    [[ -n "${rc:-}" ]] || continue
+    n="$(samtools view -c -F 0x904 "$REAL_BAM" "$rc:$((rs+1))-$re" 2>/dev/null || echo 0)"
+    if [[ "${n:-0}" -gt 0 ]]; then
+        printf '%s\t%s\t%s\n' "$rc" "$rs" "$re" >> "$KEPT"
+    else
+        echo "  NOTE: $rc:$rs-$re has NO READS in the real BAM — dropped before simulating"
+        DROPPED=$((DROPPED + 1))
+    fi
+done < "$REGIONS"
+if [[ "$DROPPED" -gt 0 ]]; then
+    mv -f "$KEPT" "$REGIONS"
+    N_PLACED="$(wc -l < "$REGIONS")"
+    echo "  Regions with coverage: $N_PLACED (dropped $DROPPED)"
+else
+    rm -f "$KEPT"
+fi
+if [[ "$N_PLACED" -lt "$MIN_REGIONS" ]]; then
+    echo "ERROR: only $N_PLACED region(s) have reads in the real BAM; need $MIN_REGIONS." >&2
+    echo "       A median over that few loci is not a measurement. Check that REAL_BAM and" >&2
+    echo "       REFERENCE describe the same assembly, and that the BAM covers these contigs." >&2
+    exit 1
+fi
+
 # ── Depth of the real BAM, measured where we know there is sequence ──────────
 #
 # This probe used to be a fixed $FIRST_CONTIG:1000000-1200000, which is the same bug as the
