@@ -15,12 +15,23 @@
 #
 # A SEPARATE FILE so the test runs the same program the job runs.
 #
-# Pass -v win=<bp> -v hf=<high frac> -v lf=<low frac>. Reads: indels, depth, candidates.
-FILENAME ~ /indels/ { isup[$1 SUBSEP $2] = $3; ipos[++ni] = $1 SUBSEP $2; next }
-FILENAME ~ /depth/  { dep[$1 SUBSEP $2] = $3; next }
+# EXACT PATHS, not substrings of FILENAME. Job 21671697 ran with
+# OUTDIR=/scratch/.../indelctx_21671697, and the summariser's `FILENAME ~ /ctx/` rule
+# matched bg.tsv's full path -- the background was read as context data and every
+# enrichment printed 0.00x from an empty denominator. Same hazard here.
+#
+# Pass -v win= -v hf= -v lf= and -v f_ind= -v f_dep= -v f_cand=.
+BEGIN {
+    if (f_ind == "" || f_dep == "" || f_cand == "") {
+        print "indel_context_join.awk: need -v f_ind= -v f_dep= -v f_cand=" > "/dev/stderr"
+        exit 2
+    }
+}
+FILENAME == f_ind  { isup[$1 SUBSEP $2] = $3; next }
+FILENAME == f_dep  { dep[$1 SUBSEP $2] = $3; next }
 # candidates: the realism panel's --dump-candidates TSV. Header line skipped by the
 # non-numeric position, not by NR -- this is the third file, so NR is already large.
-FILENAME ~ /candidates/ {
+FILENAME == f_cand {
     if ($2 !~ /^[0-9]+$/) next
     cn++
     best = -1; bestf = -1

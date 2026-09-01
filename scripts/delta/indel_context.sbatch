@@ -175,6 +175,8 @@ if [[ -n "$CANDIDATES" ]]; then
     if [[ -s "$CANDIDATES" ]]; then
         cp -f "$CANDIDATES" "$OUTDIR/candidates.tsv"
         awk -v win="$JOIN_WIN" -v hf="$HIGH_FRAC" -v lf="$LOW_FRAC" \
+            -v f_ind="$OUTDIR/indels.tsv" -v f_dep="$OUTDIR/depth.tsv" \
+            -v f_cand="$OUTDIR/candidates.tsv" \
             -f "$REPO_ROOT/scripts/delta/indel_context_join.awk" \
             "$OUTDIR/indels.tsv" "$OUTDIR/depth.tsv" "$OUTDIR/candidates.tsv" \
           | tee -a "$OUTDIR/summary.txt"

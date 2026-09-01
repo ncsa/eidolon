@@ -40,6 +40,7 @@ support is not counted per position@            c[$1 SUBSEP pos]++@            c
 M1
     run_muts "$JOIN" JOIN <<'M3'
 a candidate with no nearby indel is counted as having one@    if (best < 0)          { none++ }@    if (0)                 { none++ }
+the join runs without being told which file is which@    if (f_ind == "" || f_dep == "" || f_cand == "") {@    if (0) {
 the search window is ignored@    for (d = 0; d <= win; d++) {@    for (d = 0; d <= 100000; d++) {
 the header line is counted as a candidate@    if ($2 !~ /^[0-9]+$/) next@    if (0) next
 M3
@@ -153,18 +154,30 @@ printf 'chr1\t1005\t40\nchr1\t2003\t40\nchr1\t9999\t40\n' > "$WORK/j_depth.tsv"
   printf 'chr1\t1000\tL\t6\t40\t0\t0.15\t0.00\n'
   printf 'chr1\t2000\tR\t5\t40\t0\t0.12\t0.00\n'
   printf 'chr1\t3000\tL\t4\t40\t0\t0.10\t0.00\n'; } > "$WORK/j_candidates.tsv"
-out="$(awk -v win=25 -v hf=0.25 -v lf=0.10 -f "$JOIN" \
-        "$WORK/j_indels.tsv" "$WORK/j_depth.tsv" "$WORK/j_candidates.tsv")"
+join_run() { awk -v win="$1" -v hf=0.25 -v lf=0.10 \
+      -v f_ind="$JD/j_indels.tsv" -v f_dep="$JD/j_depth.tsv" -v f_cand="$JD/j_candidates.tsv" \
+      -f "$JOIN" "$JD/j_indels.tsv" "$JD/j_depth.tsv" "$JD/j_candidates.tsv"; }
+# Run it out of a directory whose name contains a marker, so substring matching would break.
+JD="$WORK/indelctx_21671697"; mkdir -p "$JD"
+cp "$WORK"/j_*.tsv "$JD/"
+out="$(join_run 25)"
 hasw "the header row is not counted as a candidate" "$out" "3 candidate sites"
 hasw "two of three have an indel in range"         "$out" "2 (66.7%) have an indel"
 hasw "and one has none"                            "$out" "1 (33.3%) have NONE"
 hasw "the support classes are split"               "$out" "1 high-support, 0 mid, 1 low"
 
+echo "=== the join refuses to guess which file is which ==="
+# The summariser's inputs were once matched by substring, and an OUTDIR named "indelctx"
+# made bg.tsv match the /ctx/ rule -- an empty background and a table of 0.00x. Requiring
+# the paths explicitly is what removes the whole class.
+if awk -v win=25 -f "$JOIN" "$JD/j_indels.tsv" >/dev/null 2>&1; then
+  bad "missing -v paths is an error" "non-zero" "it exited 0"
+else ok "missing -v paths is an error"; fi
+
 echo "=== an indel just outside the window does not count ==="
 # 3000 -> 9999 is far; narrowing the window to 2 also drops 1005 (distance 5) and
 # 2003 (distance 3), leaving nothing.
-out="$(awk -v win=2 -v hf=0.25 -v lf=0.10 -f "$JOIN" \
-        "$WORK/j_indels.tsv" "$WORK/j_depth.tsv" "$WORK/j_candidates.tsv")"
+out="$(join_run 2)"
 hasw "a tight window finds no indels at all" "$out" "3 (100.0%) have NONE"
 
 echo "=== the job names all three outcomes and what each implies ==="
