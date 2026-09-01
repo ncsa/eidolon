@@ -167,6 +167,8 @@ while read -r c s e _; do
 done < "$REGIONS"
 
 awk -v mx="$MAX_RUN" -v hf="$HIGH_FRAC" -v lf="$LOW_FRAC" \
+    -v f_ind="$OUTDIR/indels.tsv" -v f_dep="$OUTDIR/depth.tsv" \
+    -v f_ctx="$OUTDIR/ctx.tsv"    -v f_bg="$OUTDIR/bg.tsv" \
     -f "$REPO_ROOT/scripts/delta/indel_context_summarise.awk" \
     "$OUTDIR/indels.tsv" "$OUTDIR/depth.tsv" "$OUTDIR/ctx.tsv" "$OUTDIR/bg.tsv" \
   | tee "$OUTDIR/summary.txt"
