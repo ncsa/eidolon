@@ -24,11 +24,8 @@
 mod common;
 
 use common::{GenReadsConfig, eidolon, fresh_workdir, h1n1_reference, read_gzip_fastq_lines};
-use eidolon_core::{
-    models::{
-        quality_scores::QualityScoreModel,
-        sequencing_error_model::SequencingErrorModel,
-    },
+use eidolon_core::models::{
+    quality_scores::QualityScoreModel, sequencing_error_model::SequencingErrorModel,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -41,14 +38,9 @@ const MIN_IDENTITY: f64 = 0.90;
 /// Configure a Phred-60 error model for geometry tests.  Its per-base error probability
 /// is 1e-6, so the fixture does not depend on the production default error rates.
 fn configure_geometry_error_model(config: &mut GenReadsConfig, work: &Path) {
-    let quality_model = QualityScoreModel::from_counts(
-        vec![60],
-        50,
-        vec![1.0],
-        vec![vec![vec![1.0]]; 50],
-        false,
-    )
-    .unwrap();
+    let quality_model =
+        QualityScoreModel::from_counts(vec![60], 50, vec![1.0], vec![vec![vec![1.0]]; 50], false)
+            .unwrap();
     let model = SequencingErrorModel::from_raw_data(0.0, quality_model, None).unwrap();
     let path = work.join("geometry-sequencing-error-model.json.gz");
     model.write_model(&path).unwrap();
