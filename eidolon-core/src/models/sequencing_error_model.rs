@@ -402,13 +402,17 @@ mod tests {
         assert!((loaded.error_rate() - 0.00555).abs() < 1e-10);
     }
 
-    fn assert_distribution<T: std::fmt::Debug + PartialEq>(
+    fn assert_distribution<T>(
         distribution: &DiscreteDistribution<T>,
         expected_values: Vec<T>,
         expected_cdf: &[f64],
         name: &str,
     ) where
-        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+        T: std::fmt::Debug
+            + PartialEq
+            + Clone
+            + serde::Serialize
+            + for<'de> serde::Deserialize<'de>,
     {
         assert_eq!(
             distribution.values().unwrap(),
