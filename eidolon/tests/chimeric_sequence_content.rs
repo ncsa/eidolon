@@ -18,20 +18,42 @@
 //! The expectations below are derived from VCF 4.2 semantics, not read off the
 //! implementation, so this is a known-answer test rather than a blessed baseline.
 //!
-//! Identity is compared with a tolerance because the default sequencing-error model is
-//! active. That costs nothing in discrimination: a correctly stitched piece matches its
-//! expected reference window at ~98%, while a piece in the wrong orientation or at the
-//! wrong locus scores ~25% (random over 4 bases). The threshold sits far from both.
+//! These tests use an explicit high-quality sequencing-error model so their known-answer
+//! assertions remain about junction geometry rather than the current global defaults.
 
 mod common;
 
 use common::{GenReadsConfig, eidolon, fresh_workdir, h1n1_reference, read_gzip_fastq_lines};
+use eidolon_core::{
+    models::{
+        quality_scores::QualityScoreModel,
+        sequencing_error_model::SequencingErrorModel,
+    },
+};
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::Path;
 
 const CONTIG: &str = "H1N1_HA";
 /// A correctly placed piece scores ~0.98 against its window; a wrong one ~0.25.
 const MIN_IDENTITY: f64 = 0.90;
+
+/// Configure a Phred-60 error model for geometry tests.  Its per-base error probability
+/// is 1e-6, so the fixture does not depend on the production default error rates.
+fn configure_geometry_error_model(config: &mut GenReadsConfig, work: &Path) {
+    let quality_model = QualityScoreModel::from_counts(
+        vec![60],
+        50,
+        vec![1.0],
+        vec![vec![vec![1.0]]; 50],
+        false,
+    )
+    .unwrap();
+    let model = SequencingErrorModel::from_raw_data(0.0, quality_model, None).unwrap();
+    let path = work.join("geometry-sequencing-error-model.json.gz");
+    model.write_model(&path).unwrap();
+    config.sequence_error_model = Some(path);
+}
 
 fn load_reference() -> HashMap<String, Vec<u8>> {
     let text = std::fs::read_to_string(h1n1_reference()).unwrap();
@@ -260,11 +282,14 @@ fn chimeric_reads_with_names(tag: &str, record: &str) -> Vec<(String, Vec<u8>)> 
     write_sv_vcf(&input_vcf, record);
     let mut config = GenReadsConfig::new(h1n1_reference(), work.clone(), tag);
     config.read_len = 50;
-    config.coverage = 30;
+    // Label-routing assertions require independent spanning reads at both inversion
+    // junctions. Use a denser deterministic fixture rather than weakening that proof.
+    config.coverage = 60;
     config.paired_ended = true;
     config.produce_fastq = true;
     config.input_vcf = Some(input_vcf);
     config.mutation_rate = Some(0.0);
+    configure_geometry_error_model(&mut config, &work);
     let yaml = config.write_yaml();
     eidolon()
         .args(["gen-reads", "-c"])
@@ -296,6 +321,7 @@ fn chimeric_reads(tag: &str, record: &str) -> Vec<Vec<u8>> {
     // No de novo mutations: any mismatch against the derived haplotype must come from
     // the junction, not from a planted SNP.
     config.mutation_rate = Some(0.0);
+    configure_geometry_error_model(&mut config, &work);
     let yaml = config.write_yaml();
     eidolon()
         .args(["gen-reads", "-c"])
