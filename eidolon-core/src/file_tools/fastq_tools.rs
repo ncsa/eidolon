@@ -15,7 +15,7 @@ use crate::file_tools::bam_writer::BamRecordStager;
 use crate::file_tools::file_io::append_to_file;
 use crate::models::quality_scores::QualityScoreModel;
 use crate::models::sequencing_error_model::{
-    INDEL_CONTEXT_RUN_CAP, SeqModelError, SequencingErrorModel, SequencingErrorType,
+    SeqModelError, SequencingErrorModel, SequencingErrorType,
 };
 use crate::structs::haplotype_map::InsertionCoordinateMap;
 use crate::structs::mutated_map::{AdCounter, MutatedMap, MutatedMapError};
@@ -975,6 +975,10 @@ pub fn generate_read(
     let mut ins_buf: Vec<Nucleotide> = Vec::new();
     let mut quality_index = 0;
     let mut seq_index = 0;
+    // Read off the model, not a constant: a fitted curve (#662) may carry more
+    // buckets than the shipped default, and a scan capped at the default's length
+    // could never reach them. Hoisted out of the per-base loop below.
+    let run_cap = sequencing_error_model.context_run_cap();
 
     'outer: while (seq_index < fragment_length) && (bases_written < read_length) {
         // Index variants by seq_index for BOTH strands. The caller already
@@ -1072,7 +1076,7 @@ pub fn generate_read(
                 // slippage is a property of the template being copied, not of whatever
                 // variant this read ends up carrying. `seq_index` jumps on deletions, so
                 // this is read from the current index rather than carried in a counter.
-                let run = homopolymer_run_at(sequence, seq_index, INDEL_CONTEXT_RUN_CAP);
+                let run = homopolymer_run_at(sequence, seq_index, run_cap);
                 let error = sequencing_error_model.generate_sequencing_error(
                     reference_base,
                     Some(run),
@@ -2936,6 +2940,7 @@ mod tests {
 #[cfg(test)]
 mod homopolymer_context_tests {
     use super::*;
+    use crate::models::sequencing_error_model::INDEL_CONTEXT_RUN_CAP;
     use crate::structs::nucleotides::Nucleotide::{A, C, G, T};
 
     fn run_at(seq: &[Nucleotide], index: usize) -> usize {

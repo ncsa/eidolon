@@ -70,13 +70,14 @@ fn default_indel_context_curve() -> Vec<f64> {
     DEFAULT_INDEL_CONTEXT_CURVE.to_vec()
 }
 
-/// How far a caller needs to measure a homopolymer run before the answer stops mattering.
+/// How far a run must be measured for the SHIPPED curve before the answer stops mattering.
 ///
-/// Exported so the read generator and the curve cannot drift apart: the generator caps its
-/// scan here, and any run at or beyond this length maps to the curve's saturated last
-/// entry, so measuring further could not change the result. An invariant test asserts the
-/// two agree — the kind of cross-component agreement CLAUDE.md requires be pinned by a
-/// shared helper rather than by two sides happening to hold the same literal.
+/// This describes [`DEFAULT_INDEL_CONTEXT_CURVE`] only. A caller must not use it to bound
+/// its own scan — a model carrying a FITTED curve (#662) may have more buckets than the
+/// default, and a scan capped here could never reach them: the file would hold 20 entries,
+/// every value lookup would be correct, and the top buckets would simply never be asked
+/// about. Use [`SequencingErrorModel::context_run_cap`], which reads the length off the
+/// curve actually loaded.
 pub const INDEL_CONTEXT_RUN_CAP: usize = DEFAULT_INDEL_CONTEXT_CURVE.len();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +204,18 @@ impl SequencingErrorModel {
         // would otherwise exceed 1.0 at long runs. Unreachable at the shipped 0.01, but
         // #662 makes the base rate fittable and a fitted value has no such guarantee.
         (self.indel_probability * scale).clamp(0.0, 1.0)
+    }
+
+    /// How far a caller must measure a homopolymer run for THIS model's curve.
+    ///
+    /// Read off the loaded curve rather than a constant, so a fitted curve with more
+    /// buckets than the shipped default still has its tail reached. Capping a scan at the
+    /// default's length would make a longer curve's top entries unreachable without any
+    /// error — the file would look complete and the strongest signal would be inert.
+    ///
+    /// At least 1: a degenerate empty curve must not ask for a zero-length scan.
+    pub fn context_run_cap(&self) -> usize {
+        self.indel_context_curve.len().max(1)
     }
 
     pub fn generate_sequencing_error(
@@ -647,6 +660,45 @@ mod tests {
             "curve must cross 1.0 at run 4; it crosses at run {}",
             crossing + 1
         );
+    }
+
+    #[test]
+    fn the_scan_cap_follows_the_loaded_curve_not_the_shipped_default() {
+        // The trap this guards: #662 fits a curve from a BAM, and a fitted curve need not
+        // have the default's ten buckets. If the read generator bounded its run-length
+        // scan by the DEFAULT's length, a longer curve's top entries could never be
+        // reached — the model file would hold every value, each lookup would return the
+        // right number, and the strongest buckets would simply never be asked about. That
+        // failure is completely silent, which is why it gets an explicit test.
+        let mut model = SequencingErrorModel::default().unwrap();
+        assert_eq!(model.context_run_cap(), DEFAULT_INDEL_CONTEXT_CURVE.len());
+
+        model.indel_context_curve = (1..=20).map(|i| i as f64).collect();
+        assert_eq!(
+            model.context_run_cap(),
+            20,
+            "a 20-bucket fitted curve must ask for a 20-deep scan"
+        );
+        // Every bucket must be distinguishable at the cap the model asks for, or the tail
+        // is dead weight.
+        assert_ne!(
+            model.indel_probability_at(Some(model.context_run_cap())),
+            model.indel_probability_at(Some(DEFAULT_INDEL_CONTEXT_CURVE.len())),
+            "buckets past the default length are unreachable — the #662 trap"
+        );
+
+        // A shorter curve is safe in the other direction, but must still saturate rather
+        // than index out of bounds.
+        model.indel_context_curve = vec![0.5, 2.0];
+        assert_eq!(model.context_run_cap(), 2);
+        assert_eq!(
+            model.indel_probability_at(Some(2)),
+            model.indel_probability_at(Some(50))
+        );
+
+        // Degenerate: an empty curve must not request a zero-length scan.
+        model.indel_context_curve = Vec::new();
+        assert_eq!(model.context_run_cap(), 1, "cap must never be 0");
     }
 
     #[test]
