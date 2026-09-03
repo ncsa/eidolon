@@ -67,13 +67,37 @@ do_collect() {
           order)
             local f="$REPO_ROOT/eidolon-orderindep_${jobid}.out"
             [[ -f "$f" ]] || f="eidolon-orderindep_${jobid}.out"
-            get(){ grep -m1 "$1" "$f" 2>/dev/null | grep -oE 'PASS|FAIL' | head -1; }
-            local ti=FAIL
-            if grep -q 'multithread_vs_1thread:.*same' "$f" 2>/dev/null && [[ "$(get determinism_1thread)" == PASS ]]; then ti=PASS; fi
+            # Emits MISSING, never an empty string, when the label is absent. An empty
+            # value string-compares to a FAIL on an `exact` gate and is then
+            # indistinguishable from a measured failure -- which is how the two label
+            # mismatches below went unnoticed while the gate reported them as regressions.
+            get(){
+                local v; v="$(grep -m1 "$1:" "$f" 2>/dev/null | grep -oE 'PASS|FAIL' | head -1)"
+                if [[ -z "$v" ]]; then
+                    echo "WARNING: '$1:' not found in $f — collector and harness labels have drifted" >&2
+                    v=MISSING
+                fi
+                printf '%s' "$v"
+            }
+            # thread_invariant is the harness's A1-vs-B1 comparison (1 thread vs N on the
+            # SAME build). It was grepped as `multithread_vs_1thread:.*same`, a label the
+            # harness has not printed since d0cd060 renamed it -- so the local `ti=FAIL`
+            # default was never overwritten and this metric reported FAIL on every run
+            # without reading a measurement. Baseline says PASS, so every run since that
+            # redesign showed a false regression here.
+            local ti; ti="$(get thread_invariant)"
+            if [[ "$ti" == PASS && "$(get determinism_1thread)" != PASS ]]; then
+                # Thread invariance is meaningless if the build is not deterministic at a
+                # fixed thread count: two identical hashes prove nothing when neither run
+                # is reproducible.
+                ti=FAIL
+            fi
             printf '%s\t%s\n' determinism_thread_invariant "$ti"
             printf '%s\t%s\n' shard_order_independent "$(get shard_order_independent)"
             printf '%s\t%s\n' shard_disjoint          "$(get shard_disjoint)"
-            printf '%s\t%s\n' contig_order_independent "$(get contig_order_independent)"
+            # Metric name kept for baseline pairing; the harness label is
+            # contig_name_invariant, which is what it actually measures.
+            printf '%s\t%s\n' contig_order_independent "$(get contig_name_invariant)"
             ;;
           germline)
             python3 - "$outdir/eidolon_scored.summary.csv" "$prefix" <<'PY'

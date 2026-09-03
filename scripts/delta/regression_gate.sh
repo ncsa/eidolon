@@ -45,6 +45,14 @@ for m, v in B.items():
         rows.append((m, tier, "SKIP", "absent in candidate")); missing += 1; continue
     cv = C[m][0]
     cvn = num(cv)
+    # Missing data is not a measured failure. `exact` gates are string comparisons, so an
+    # empty or MISSING candidate silently reads as FAIL and looks exactly like a real
+    # regression -- which is what happened to determinism_thread_invariant and
+    # contig_order_independent for every run after d0cd060 renamed their harness labels.
+    if cv in ("", "MISSING", "NA"):
+        rows.append((m, tier, "FAIL", f"NOT MEASURED ({cv or 'empty'}) — no value from the "
+                                      f"collector; harness/collector label drift, not a result"))
+        fails += 1; continue
     if gate != "exact" and cvn is None:
         rows.append((m, tier, "FAIL", f"{cv} — non-numeric (job failed / no output?)")); fails += 1; continue
     if gate == "exact":
