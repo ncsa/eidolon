@@ -90,13 +90,57 @@ collect_line="$(grep -m1 'for gg in' "$SUITE")"
 eq "the gate still collects exactly ecoli and chr22" \
    "$(printf '%s' "$collect_line" | tr -s ' ' | sed 's/^ *//')" "for gg in ecoli chr22; do"
 
+echo "=== the NEAT size cap fails CLOSED on an unknown genome size ==="
+# Job 21766280's root cause. `stat -c%s` returned nothing for the human genome, so
+# size_mb was 0, `(( 0 > 200 ))` was false, and the cap that exists to keep NEAT 4 off a
+# 3.1 Gb genome let it through -- ~12 h/rep against a 6 h wall clock. The guard defaulted
+# to the dangerous direction, which is the `*)`-not-handled shape CLAUDE.md warns about.
+size_fn() { sed -n '/^genome_size_mb() {/,/^}/p' "$BENCH"; }
+# The GUARD ITSELF, lifted out of run_neat -- not a reimplementation. An inline copy of
+# this logic passed happily while the real guard was deleted, which is the drift this
+# file's own header warns about. Wrapped in a function so the extracted `return`s work.
+cap_fn() {
+    awk '/local neat_cap_mb=/{f=1}
+         f{print}
+         /intractable at this size/{seen=1}
+         seen && /^    fi$/{exit}' "$BENCH"
+}
+cap_probe() { # <file> <cap> -> "SKIP" or "RUN"
+    bash -c "
+$(size_fn)
+probe() {
+    local label=probe fasta='$1'
+    NEAT_MAX_GENOME_MB='$2'
+$(cap_fn)
+    echo RUN
+}
+probe" 2>/dev/null | grep -oE 'SKIP|RUN' | head -1
+}
+[[ -n "$(size_fn)" ]] && ok "genome_size_mb helper found in benchmark.sbatch" \
+  || bad "genome_size_mb helper found in benchmark.sbatch" "a function body" "nothing matched"
+# Non-vacuity for the extraction itself: an empty cap_fn would make every probe read RUN,
+# and the must-not-fire assertions below would all quietly invert.
+case "$(cap_fn)" in *neat_cap_mb*) ok "the real cap guard was extracted from run_neat";;
+  *) bad "the real cap guard was extracted from run_neat" "the guard body" "$(cap_fn)";; esac
+tiny="$(mktemp)"; printf '>c\nACGT\n' > "$tiny"
+eq "a small genome under the cap RUNS the NEAT arm"   "$(cap_probe "$tiny" 200)"  "RUN"
+eq "an UNSTATTABLE genome SKIPS the NEAT arm"          "$(cap_probe "/nonexistent/GRCh38.fa" 200)" "SKIP"
+eq "an unstattable genome skips even with a huge cap"  "$(cap_probe "/nonexistent/GRCh38.fa" 999999)" "SKIP"
+eq "a cap of 0 disables the NEAT arm outright"         "$(cap_probe "$tiny" 0)"    "SKIP"
+# The empty-size case must not be reachable as a NUMBER: if genome_size_mb ever returned
+# "0" instead of "", the cap would compare 0 > 200 and fail open again.
+eq "genome_size_mb returns empty, not 0, when it cannot tell" \
+   "$(bash -c "$(size_fn)
+genome_size_mb /nonexistent/GRCh38.fa; printf '|'")" "|"
+rm -f "$tiny"
+
 echo "=== both scripts still parse ==="
 bash -n "$BENCH"  && ok "benchmark.sbatch parses"   || bad "benchmark.sbatch parses" "exit 0" "syntax error"
 bash -n "$SUITE"  && ok "regression_suite.sh parses" || bad "regression_suite.sh parses" "exit 0" "syntax error"
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=25
+MIN_ASSERTIONS=32
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"

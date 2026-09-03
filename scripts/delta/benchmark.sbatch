@@ -133,11 +133,30 @@ median_of() {
              else{printf "%.2f",(v[NR/2]+v[NR/2+1])/2} }'
 }
 
+# Size in whole MB, or empty if it cannot be determined.
+#
+# `stat -c%s` returning nothing is not hypothetical: job 21766280 recorded size_mb=0.0 for
+# the human genome while the same file was read successfully by eidolon for 77 minutes.
+# Whatever the cause, an UNKNOWN size must never be silently treated as a small one --
+# `(( 0 > 200 ))` is false, so the NEAT size cap failed OPEN and ran the ~12 h/rep human
+# arm that the cap exists to prevent. Callers must handle the empty case explicitly.
+genome_size_mb() {
+    local bytes; bytes="$(stat -Lc%s "$1" 2>/dev/null)" || return 0
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+    awk -v b="$bytes" 'BEGIN{printf "%.0f", b/1048576}'
+}
+
 run_one() {
     local label="$1" fasta="$2" nthreads="$3" tool="$4" cfg="$5" run_dir="$6"
     local size_mb walls=() rsss=() ok=0
 
-    size_mb=$(awk -v b="$(stat -c%s "$fasta")" 'BEGIN{printf "%.1f", b/1048576}')
+    size_mb="$(genome_size_mb "$fasta")"
+    if [[ -z "$size_mb" ]]; then
+        # Reported, not swallowed: a 0.0 in the TSV is indistinguishable from a tiny
+        # genome, and that ambiguity is what hid the cap failure for a whole 6 h job.
+        echo "  WARNING: cannot determine size of $fasta — recording size_mb=NA" >&2
+        size_mb="NA"
+    fi
 
     for rep in $(seq 1 "$REPS"); do
         local tf="$OUTDIR/${tool}_${label}_t${nthreads}_r${rep}.time"
@@ -207,7 +226,20 @@ run_neat() {
     # size; eidolon still runs on the large genome for its own numbers, and that eidolon-
     # only result (eidolon does human in ~1 h; NEAT can't) is itself the comparison.
     local neat_cap_mb="${NEAT_MAX_GENOME_MB:-200}"
-    local sz_mb; sz_mb=$(awk -v b="$(stat -c%s "$fasta")" 'BEGIN{printf "%.0f", b/1048576}')
+    local sz_mb; sz_mb="$(genome_size_mb "$fasta")"
+    # FAIL CLOSED. An unknown size skips the NEAT arm rather than risking it. Getting this
+    # backwards cost job 21766280 its entire 6 h wall clock and produced no perf rows.
+    if [[ -z "$sz_mb" ]]; then
+        echo "  [neat] SKIP $label: cannot determine genome size, so the ${neat_cap_mb} MB cap"
+        echo "         cannot be enforced. Skipping rather than risking an unbounded NEAT arm."
+        return
+    fi
+    # A cap of 0 disables the NEAT arm outright — how the regression suite asks for
+    # eidolon-only perf rows without editing this file.
+    if (( neat_cap_mb <= 0 )); then
+        echo "  [neat] SKIP $label (NEAT_MAX_GENOME_MB=${neat_cap_mb}): NEAT arm disabled"
+        return
+    fi
     if (( sz_mb > neat_cap_mb )); then
         echo "  [neat] SKIP $label (${sz_mb} MB > NEAT_MAX_GENOME_MB=${neat_cap_mb} MB): NEAT 4 is intractable at this size"
         return
