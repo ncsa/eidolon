@@ -59,12 +59,17 @@ CONDA_ENV_NAME="neat4"
 # sweep on a single-contig genome (e.g. chr22) is pure redundancy — every mode
 # returns the same number — and NEAT-at-every-thread-count is what blew the
 # 8h walltime. Missing files are skipped.
-GENOMES=(
-    "ecoli:$DATA_DIR/ecoli.fa"        # single-contig, tiny
-    "yeast:$DATA_DIR/yeast.fa"        # MULTI-contig (~16) — also the Phase B genome
-    "chr22:$DATA_DIR/chr22.fa"        # single-contig, ~50 Mb
-    "human:$DATA_DIR/GRCh38.fa"       # multi-contig, large — eidolon-only (NEAT arm auto-skipped: too big, see run_neat)
-)
+# Overridable as a space-separated "label:path" list, because a caller that needs only
+# some of these has no other way to say so. The regression gate reads FOUR numbers out of
+# this job — ecoli and chr22, eidolon, 1 thread — and discards the rest, so it was paying
+# ~3 h for the GRCh38 arm and ~45 min for the NEAT arm to obtain ~3 min of gated compute,
+# and timing out (job 21766280) doing it.
+GENOMES=(${GENOMES:-
+    "ecoli:$DATA_DIR/ecoli.fa"
+    "yeast:$DATA_DIR/yeast.fa"
+    "chr22:$DATA_DIR/chr22.fa"
+    "human:$DATA_DIR/GRCh38.fa"
+})
 HEADTOHEAD_THREADS="${HEADTOHEAD_THREADS:-1}"
 
 # PHASE B — eidolon thread-scaling curve. Only meaningful on a MULTI-CONTIG genome
@@ -80,7 +85,11 @@ COVERAGE=10
 READ_LEN=151
 FRAG_MEAN=350
 FRAG_SD=50
-REPS=3       # repetitions per config; median is reported
+REPS="${REPS:-3}"   # repetitions per config; median is reported.
+# Was a plain `REPS=3`, which silently ignored the environment while line 20 of
+# this header documented `REPS=2` as a supported override. A documented knob that
+# does nothing is worse than no knob: it sends a caller looking for the real cause
+# somewhere else.
 
 # ── Environment ─────────────────────────────────────────────────────────
 source "$HOME/.cargo/env"

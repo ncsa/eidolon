@@ -43,7 +43,15 @@ do_submit() {
         echo "$kind $prefix $jid $out" | tee -a "$MANIFEST"; }
     sub order    -      "$SCRATCH/reg_${LABEL}_order"      run_order_independence.sbatch REFERENCE="$DATA/yeast.fa"
     sub germline ecoli  "$SCRATCH/reg_${LABEL}_germ_ecoli" germline_e2e.sbatch           REFERENCE="$DATA/ecoli.fa" TOOLS=eidolon
-    sub perf     -      "$SCRATCH/reg_${LABEL}_perf"       benchmark.sbatch
+    # Perf arm trimmed to EXACTLY what do_collect reads back: ecoli and chr22, eidolon,
+    # one thread. The full benchmark also sweeps yeast, GRCh38 and a 5-point thread curve
+    # against NEAT 4, none of which reaches the gate — ~4 h of discarded compute that timed
+    # out the 6 h job (21766280) and produced no perf rows at all. NEAT_MAX_GENOME_MB=0
+    # drops the NEAT arm; SCALING_THREAD_MODES=1 collapses Phase B. Use benchmark.sbatch
+    # directly, unoverridden, for the head-to-head publication numbers.
+    sub perf     -      "$SCRATCH/reg_${LABEL}_perf"       benchmark.sbatch \
+        GENOMES="ecoli:$DATA/ecoli.fa chr22:$DATA/chr22.fa" \
+        NEAT_MAX_GENOME_MB=0 SCALING_THREAD_MODES=1
     if [[ "$TIER" -ge 1 ]]; then
         sub germline chr22 "$SCRATCH/reg_${LABEL}_germ_chr22" germline_e2e.sbatch   REFERENCE="$DATA/chr22.fa" TOOLS=eidolon
         sub cancer  somatic "$SCRATCH/reg_${LABEL}_cancer"    cancer_pipeline.sbatch REFERENCE="$DATA/chr22.fa" TOTAL_COVERAGE=30 PURITY=0.6 PRUNE=1
