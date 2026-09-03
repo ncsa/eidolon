@@ -15,7 +15,7 @@ use crate::file_tools::bam_writer::BamRecordStager;
 use crate::file_tools::file_io::append_to_file;
 use crate::models::quality_scores::QualityScoreModel;
 use crate::models::sequencing_error_model::{
-    SeqModelError, SequencingErrorModel, SequencingErrorType,
+    INDEL_CONTEXT_RUN_CAP, SeqModelError, SequencingErrorModel, SequencingErrorType,
 };
 use crate::structs::haplotype_map::InsertionCoordinateMap;
 use crate::structs::mutated_map::{AdCounter, MutatedMap, MutatedMapError};
@@ -88,6 +88,43 @@ fn reference_span(cigar_ops: &[char]) -> usize {
         .iter()
         .filter(|&&op| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
         .count()
+}
+
+/// Length of the maximal homopolymer run containing `index`, saturating at `cap`.
+///
+/// This is the FULL run, scanning both directions — not the trailing count a
+/// reset-on-change counter would give. The distinction is the whole point: under a
+/// trailing counter the first base of a 10-mer scores 1, so the enrichment that belongs at
+/// the repeat lands on its wrong end, and the acceptance test for #661 is precisely that
+/// simulated clip boundaries sit in homopolymers at the rate real ones do.
+///
+/// `cap` bounds the work: the curve saturates at 10, so there is never a reason to walk a
+/// 300 bp poly-A tract to its end. Both scans stop as soon as `cap` is reached, making this
+/// O(cap) worst case and ~2 comparisons on the random sequence that dominates a genome.
+/// No allocation — this runs once per base of every read, in the loop that
+/// [`generate_read`] deliberately keeps off the heap.
+///
+/// `N` is unsequenced reference, not a homopolymer, so it never forms or extends a run.
+fn homopolymer_run_at(sequence: &[Nucleotide], index: usize, cap: usize) -> usize {
+    let base = sequence[index].get_unmasked_base();
+    if base == N {
+        return 0;
+    }
+    let mut run = 1;
+    // Backwards from index, then forwards, stopping at the first differing base.
+    for i in (0..index).rev() {
+        if run >= cap || sequence[i].get_unmasked_base() != base {
+            break;
+        }
+        run += 1;
+    }
+    for base_at in sequence.iter().skip(index + 1) {
+        if run >= cap || base_at.get_unmasked_base() != base {
+            break;
+        }
+        run += 1;
+    }
+    run
 }
 
 /// Set SAM TLEN from the realized pair geometry rather than the sampled
@@ -1030,8 +1067,17 @@ pub fn generate_read(
             let score = quality_scores[quality_index];
             let prob = sequencing_error_model.convert_score(score)?;
             if rng.random()? < prob {
-                let error =
-                    sequencing_error_model.generate_sequencing_error(reference_base, rng)?;
+                // Homopolymer context for the indel/substitution split (#661). Computed
+                // from `sequence`, which is the fragment as drawn from the reference —
+                // slippage is a property of the template being copied, not of whatever
+                // variant this read ends up carrying. `seq_index` jumps on deletions, so
+                // this is read from the current index rather than carried in a counter.
+                let run = homopolymer_run_at(sequence, seq_index, INDEL_CONTEXT_RUN_CAP);
+                let error = sequencing_error_model.generate_sequencing_error(
+                    reference_base,
+                    Some(run),
+                    rng,
+                )?;
                 match error {
                     SequencingErrorType::SnpError(base) => {
                         single[0] = base;
@@ -1206,8 +1252,11 @@ fn append_adapter_readthrough(
         let prob = sequencing_error_model.convert_score(score)?;
         if rng.random()? < prob {
             // Substitution noise only — preserves exact read_length.
+            // `None` for homopolymer context: this is synthetic adapter sequence, not
+            // genome, so a run length measured in it would not mean what the #661 curve
+            // measured. Passing no context keeps this path's behaviour unchanged.
             if let SequencingErrorType::SnpError(b) =
-                sequencing_error_model.generate_sequencing_error(base, rng)?
+                sequencing_error_model.generate_sequencing_error(base, None, rng)?
             {
                 base = b;
             }
@@ -2875,5 +2924,97 @@ mod tests {
             "BAM must be coordinate-sorted; got: {:?}",
             positions
         );
+    }
+}
+
+/// Tests for the homopolymer-run context that drives the #661 indel-error curve.
+///
+/// These cover the geometry only — that `homopolymer_run_at` reports the run a base sits
+/// in. Whether that run then changes the error mix is asserted in
+/// `sequencing_error_model`, and whether it reaches the reads in
+/// `eidolon/tests/indel_context_fidelity.rs`.
+#[cfg(test)]
+mod homopolymer_context_tests {
+    use super::*;
+    use crate::structs::nucleotides::Nucleotide::{A, C, G, T};
+
+    fn run_at(seq: &[Nucleotide], index: usize) -> usize {
+        homopolymer_run_at(seq, index, INDEL_CONTEXT_RUN_CAP)
+    }
+
+    #[test]
+    fn a_run_is_measured_from_both_ends_not_just_backwards() {
+        // The distinction that matters. `AAAAAC`: every A is in the SAME run of 5, so all
+        // five positions must report 5. A reset-on-change counter reports 1,2,3,4,5 —
+        // right only at the last base, and wrong at the boundary where an aligner
+        // actually clips. This test fails against that implementation.
+        let seq = [A, A, A, A, A, C];
+        for index in 0..5 {
+            assert_eq!(
+                run_at(&seq, index),
+                5,
+                "position {index} of a 5-mer must report the whole run"
+            );
+        }
+        assert_eq!(run_at(&seq, 5), 1, "the lone C is a run of 1");
+    }
+
+    #[test]
+    fn an_isolated_base_between_two_runs_is_a_run_of_one() {
+        // Must-not-fire: a single base flanked by different bases gets no enrichment.
+        let seq = [G, G, G, A, T, T, T];
+        assert_eq!(run_at(&seq, 3), 1, "the single A is its own run");
+        assert_eq!(run_at(&seq, 0), 3);
+        assert_eq!(run_at(&seq, 6), 3);
+    }
+
+    #[test]
+    fn runs_at_the_sequence_edges_are_not_truncated_or_overrun() {
+        // Off-by-one guard at both boundaries: the backward scan starts at index 0 and the
+        // forward scan must stop at len(), neither panicking nor under-counting.
+        let seq = [T, T, T, C, A, A];
+        assert_eq!(run_at(&seq, 0), 3, "run touching the left edge");
+        assert_eq!(run_at(&seq, 2), 3);
+        assert_eq!(run_at(&seq, 5), 2, "run touching the right edge");
+        assert_eq!(run_at(&[A], 0), 1, "single-base sequence");
+    }
+
+    #[test]
+    fn n_forms_no_run_and_breaks_the_runs_around_it() {
+        // N is unsequenced reference, not a homopolymer. `indel_context.sbatch` excludes
+        // N runs from both the observed and background sides, so the simulator must not
+        // treat them as context either.
+        let seq = [A, A, N, A, A];
+        assert_eq!(run_at(&seq, 2), 0, "N itself has no run length");
+        assert_eq!(run_at(&seq, 0), 2, "the N must not join the two A pairs");
+        assert_eq!(run_at(&seq, 4), 2);
+    }
+
+    #[test]
+    fn a_long_run_saturates_at_the_cap_without_walking_to_its_end() {
+        // A 300 bp poly-A tract must cost the same as a 10 bp one. The curve pools
+        // everything at or above the cap into one bucket, so scanning further could not
+        // change the answer.
+        let seq = vec![A; 300];
+        assert_eq!(run_at(&seq, 0), INDEL_CONTEXT_RUN_CAP);
+        assert_eq!(run_at(&seq, 150), INDEL_CONTEXT_RUN_CAP);
+        assert_eq!(run_at(&seq, 299), INDEL_CONTEXT_RUN_CAP);
+    }
+
+    #[test]
+    fn run_length_is_strand_symmetric() {
+        // Reverse (R2) reads are reverse-complemented before this walk, so a run of A on
+        // one strand is the same-length run of T on the other. If these disagreed, R2
+        // reads would carry different slippage from R1 at the same locus — the shape of
+        // the strand-bias defect the `generate_read` comment above already records.
+        let forward = [C, A, A, A, A, G];
+        let reverse: Vec<Nucleotide> = reverse_complement(forward.to_vec());
+        for index in 0..forward.len() {
+            assert_eq!(
+                run_at(&forward, index),
+                run_at(&reverse, forward.len() - 1 - index),
+                "strand disagreement at forward index {index}"
+            );
+        }
     }
 }

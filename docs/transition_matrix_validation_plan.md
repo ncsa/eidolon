@@ -54,11 +54,18 @@ Two findings came out of that exercise:
   (`ref=AAAACCCC` / `read=CCGTAAAG`, A row 2C/1G/1T against C row 3A/1G). Single-entry rows
   are useless for this too, since normalization puts one nonzero cell at probability 1.0
   wherever it sits.
-- **A forced matrix does not drive output to 100%.** `indel_probability` is 0.4 and
-  `insertion_bias` is uniform over ACGT, so ~40% of sequencing errors are indels whose
-  inserted bases never consult the transition matrix. An absolute `>98% T` assertion fails
-  on correct code. The fidelity test is therefore differential against a control run:
-  default matrix gives a T share of **0.198**, forcing the A row to T gives **0.867**.
+- **A forced matrix does not drive output to 100%.** `insertion_bias` is uniform over ACGT,
+  so indel errors put inserted bases into the output that never consult the transition
+  matrix. An absolute `>98% T` assertion fails on correct code. The fidelity test is
+  therefore differential against a control run: default matrix gives a T share of
+  **0.193**, forcing the A row to T gives **0.892**.
+
+  This bullet previously read "`indel_probability` is 0.4, so ~40% of sequencing errors are
+  indels". That constant was a NEAT2 mistranslation, corrected to 0.01 by #660. The indel
+  floor on this fixture is still ~39%, but now because #661 scales the indel share by local
+  homopolymer run length and the fixture is a 20,000-base poly-A reference — the curve's
+  most enriched case (0.01 x 39.20 = 0.392). Same number, different mechanism; on a
+  homopolymer-free reference the floor would be ~0.6%.
 
 ## What the local tier cannot establish
 

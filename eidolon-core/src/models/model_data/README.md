@@ -59,6 +59,78 @@ which asserted the bytes had not changed and said nothing about whether they wer
 `the_shipped_default_is_a_usable_fragment_distribution` in `fragment_length.rs` now checks
 the properties that actually matter, and it rejects the old file on its first gap.
 
+## The sequencing error model
+
+Not a file — it is built inline in `models/sequencing_error_model.rs`, small enough that it
+was never worth a `.json.gz`. It ships with every run that does not supply its own, so it
+gets the same accounting as the files above.
+
+### The NEAT2 constants (#660)
+
+Four of its parameters come from `neat2/utilities/genSeqErrorModel.py`, and they are
+**placeholders that were never fitted from data.** They live in that script's
+`if PILEUP == None:` branch — the one that prints *"Using default sequencing error
+parameters..."*. The other branch reads `print 'Pileup parsing coming soon!'; exit(1)`: the
+fitting code was never written, so these defaults were the only path anyone ever took.
+
+| parameter | value | NEAT2 name |
+|---|---|---|
+| `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
+| `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
+| length distribution | `[0.999, 0.001]` over lengths `[1, 2]` | — |
+| insertion base composition | uniform over ACGT | — |
+
+**These were mistranslated in the Rust port.** The insertion fraction was used as the indel
+rate, the real indel rate was dropped, and the insertion split was replaced by a hardcoded
+`0.5` — about **40x too many** sequencing errors made into indels. #660 restored them.
+
+**Restoring is not the same as making them right.** Real Illumina indel error is around
+1e-5/base; NEAT2's 0.01 gives ~3.2e-6 at Q35, roughly 3x low, where the pre-#660 0.4 was
+~13x high. The value matches its source, and its source was a guess. Deviating from 0.01
+needs its own measurement and its own justification.
+
+### The indel context curve (#661)
+
+`indel_context_curve` scales `indel_probability` by the length of the homopolymer run the
+base sits in — the mechanism that concentrates a realistic total where real slippage
+actually happens, rather than spreading it uniformly.
+
+| | |
+|---|---|
+| **Source** | HCC1395 matched **normal**, SEQC2 Somatic Mutation WG reference sample |
+| **Reference** | GRCh38, chr20 + chr21 + chr22 at 46x |
+| **Background** | 3,999,990 reference bases, exact (N runs excluded) |
+| **Events** | 1,726 slippage errors |
+| **Measured by** | `scripts/delta/indel_context.sbatch`, Delta job 21674484 |
+| **Raw data** | `/projects/bhrd/jallen17/eidolon-access-results/indelctx/job_21674484/` |
+
+| run | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | >=10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| propensity | 0.64 | 0.76 | 0.82 | 1.11 | 1.58 | 1.84 | 5.64 | 12.16 | 24.24 | 39.20 |
+
+Monotone, crossing 1.0 at run 4. Reproduced on a second sample with a different aligner:
+candidate clip boundaries sit in homopolymers at 2.26x on HCC1395/bwa and 2.56x on
+NA12878/novoalign, with controls at chance in both.
+
+**Each entry is a normalized enrichment** — the share of indel errors at that run length
+divided by the share of reference bases at that run length. That makes the curve
+1.0-centred **by construction** over its human background, so applying it *redistributes*
+`indel_probability` rather than raising it: the genome-wide total on human is unchanged.
+On a reference with different homopolymer composition the realized total moves with that
+composition, which is the intended behaviour — measured at **0.745x** on the 4.6 Mb E. coli
+fixture and **0.734x** for an idealized 50% GC random sequence. A genome with fewer
+homopolymers really does slip less.
+
+**This is a default, not a measurement of your data.** Same status as the fragment-length
+model above: one sample, one instrument, one prep. Slippage depends on chemistry and on
+the aligner's gap placement, so if yours differs this curve will not describe it. #662
+makes it fittable from a BAM.
+
+**It is deliberately not the variant curve.** #378 measures a *separate* homopolymer
+propensity for germline and somatic variants, which reaches 60.44x at runs >= 10 where
+errors reach 39.20x. The two are measurably different and conflating them is a mistake
+#378 already records.
+
 ## The others
 
 **Provenance unknown.** All predate the Rust port and none is validated by anything beyond
