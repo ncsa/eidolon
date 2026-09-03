@@ -135,22 +135,34 @@ median_of() {
 
 # Size in whole MB, or empty if it cannot be determined.
 #
-# `stat -c%s` returning nothing is not hypothetical: job 21766280 recorded size_mb=0.0 for
-# the human genome while the same file was read successfully by eidolon for 77 minutes.
-# Whatever the cause, an UNKNOWN size must never be silently treated as a small one --
-# `(( 0 > 200 ))` is false, so the NEAT size cap failed OPEN and ran the ~12 h/rep human
-# arm that the cap exists to prevent. Callers must handle the empty case explicitly.
+# The `-L` is load-bearing, and job 21766280 is why. `$SCRATCH/neat_data/GRCh38.fa` is a
+# relative SYMLINK to `GRCh38.chr.fa`, and `stat -c%s` without `-L` reports the size of the
+# LINK -- 13 bytes, the character length of that target path -- not the 3,144,230,986-byte
+# genome. 13/1048576 rounds to 0.0 MB, so the NEAT size cap compared `(( 0 > 200 ))`, found
+# it false, and ran the ~12 h/rep human arm the cap exists to prevent, burning the whole
+# 6 h wall clock for zero perf rows.
+#
+# The asymmetry is what hid it: `[[ -f ]]` DOES follow symlinks, so the file passed every
+# existence check and eidolon read it correctly for 77 minutes. Only the size was wrong.
+#
+# An unknown size is still returned as EMPTY rather than 0, so it can never reach a numeric
+# comparison and fail open a second way. Callers must handle the empty case explicitly.
+# Second arg is the printf format, defaulting to the whole-MB integer the size cap needs
+# for its `(( ))` comparison. run_one passes %.1f: the per_rep.tsv `size_mb` column has
+# always carried one decimal (4.5, 11.7, 49.4), and collapsing it to `4`/`49` would quietly
+# change a reported artifact to suit an internal caller.
 genome_size_mb() {
-    local bytes; bytes="$(stat -Lc%s "$1" 2>/dev/null)" || return 0
+    local bytes fmt="${2:-%.0f}"
+    bytes="$(stat -Lc%s "$1" 2>/dev/null)" || return 0
     [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
-    awk -v b="$bytes" 'BEGIN{printf "%.0f", b/1048576}'
+    awk -v b="$bytes" -v f="$fmt" 'BEGIN{printf f, b/1048576}'
 }
 
 run_one() {
     local label="$1" fasta="$2" nthreads="$3" tool="$4" cfg="$5" run_dir="$6"
     local size_mb walls=() rsss=() ok=0
 
-    size_mb="$(genome_size_mb "$fasta")"
+    size_mb="$(genome_size_mb "$fasta" '%.1f')"
     if [[ -z "$size_mb" ]]; then
         # Reported, not swallowed: a 0.0 in the TSV is indistinguishable from a tiny
         # genome, and that ambiguity is what hid the cap failure for a whole 6 h job.

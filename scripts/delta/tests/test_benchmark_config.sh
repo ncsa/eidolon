@@ -132,6 +132,38 @@ eq "a cap of 0 disables the NEAT arm outright"         "$(cap_probe "$tiny" 0)" 
 eq "genome_size_mb returns empty, not 0, when it cannot tell" \
    "$(bash -c "$(size_fn)
 genome_size_mb /nonexistent/GRCh38.fa; printf '|'")" "|"
+# THE ACTUAL JOB 21766280 CASE, as a known answer. `$SCRATCH/neat_data/GRCh38.fa` is a
+# symlink to `GRCh38.chr.fa`; `stat -c%s` without `-L` returns 13 -- the length of that
+# target path string -- which is 0.0 MB, so the cap compared 0 > 200 and let NEAT onto a
+# 3.1 Gb genome. A 3 MB target under a 2 MB cap discriminates the two implementations
+# cheaply: following the link gives 3 and SKIPS, reading the link gives 0 and RUNS.
+linkdir="$(mktemp -d)"
+head -c 3000000 /dev/zero > "$linkdir/GRCh38.chr.fa"
+ln -s GRCh38.chr.fa "$linkdir/GRCh38.fa"
+eq "the symlink's own size is the 13-byte target path, as in job 21766280" \
+   "$(stat -c%s "$linkdir/GRCh38.fa")" "13"
+eq "genome_size_mb follows the symlink to the real genome" \
+   "$(bash -c "$(size_fn)
+genome_size_mb '$linkdir/GRCh38.fa'")" "3"
+eq "a symlinked genome over the cap SKIPS the NEAT arm" \
+   "$(cap_probe "$linkdir/GRCh38.fa" 2)" "SKIP"
+# Must-not-fire: the same link UNDER the cap still runs, so the assertion above is about
+# size and not about symlinks being rejected outright.
+eq "a symlinked genome under the cap still RUNS the NEAT arm" \
+   "$(cap_probe "$linkdir/GRCh38.fa" 200)" "RUN"
+# per_rep.tsv's size_mb column has always carried one decimal. The cap needs an integer for
+# `(( ))`, and folding both into one format silently turned 4.5 into 4 in a reported
+# artifact (job 21778746 printed `ecoli 4` where every prior run printed `4.5`).
+eq "the whole-MB default is what the cap compares" \
+   "$(bash -c "$(size_fn)
+genome_size_mb '$linkdir/GRCh38.fa'")" "3"
+eq "run_one's one-decimal format is still available for the TSV" \
+   "$(bash -c "$(size_fn)
+genome_size_mb '$linkdir/GRCh38.fa' '%.1f'")" "2.9"
+has "run_one asks for the one-decimal format" \
+   "$(grep -m1 'size_mb=\"\$(genome_size_mb' "$BENCH")" "%.1f"
+rm -rf "$linkdir"
+
 rm -f "$tiny"
 
 echo "=== both scripts still parse ==="
@@ -140,7 +172,7 @@ bash -n "$SUITE"  && ok "regression_suite.sh parses" || bad "regression_suite.sh
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=32
+MIN_ASSERTIONS=39
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
