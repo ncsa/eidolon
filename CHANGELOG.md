@@ -1,3 +1,69 @@
+9/2/2026
+=========
+## eidolon v3.4.0 (unreleased) — sequencing-error indels
+
+Sequencing-error indels were being generated about 40x too often, uniformly across the
+genome. Two NEAT2 constants are restored to their source values, and the indel share now
+depends on local homopolymer run length, which is where real slippage happens.
+
+### What changed for you
+
+**Two mistranslated NEAT2 constants (#660).** `neat2/utilities/genSeqErrorModel.py` defines
+`SIE_RATE = 0.01` (odds a sequencing error is an indel) and `SIE_INS_FREQ = 0.4` (odds such
+an indel is an insertion). The Rust port took the *insertion fraction* and used it as the
+*indel rate*, dropped the real indel rate, and replaced the insertion split with a
+hardcoded `0.5`. At Q35 that emitted 1.26e-4 indel errors per base against NEAT2's intended
+3.16e-6. Both constants are now correct, and the insertion split is a serialized
+`insertion_fraction` field rather than a literal.
+
+**Correcting these does not make them right, and we are not pretending otherwise.** Real
+Illumina indel error is around 1e-5/base. NEAT2's 0.01 gives ~3.2e-6 at Q35 — about 3x low,
+where the previous 0.4 was ~13x high. These values now match their source; their source is
+a pair of placeholders in a branch of NEAT2 whose alternative reads
+`print 'Pileup parsing coming soon!'; exit(1)`. The fitting code was never written. Tuning
+them to some other number nobody measured would trade a documented guess for an
+undocumented one.
+
+**Indel errors now follow local homopolymer run length (#661).** Real slippage is
+concentrated in homopolymers, where gap placement is ambiguous and aligners clip at the
+repeat boundary consistently across reads. Measured on HCC1395 normal (chr20/21/22 at 46x,
+1,726 slippage events over an exact 3,999,990-base background), the propensity is monotone
+from **0.64x** at run 1 to **39.20x** at runs of 10 or more, crossing 1.0 at run 4.
+
+This **redistributes** the indel rate rather than raising it. Each entry is a normalized
+enrichment, so the curve is 1.0-centred by construction over its human background and the
+genome-wide total is unchanged there. On a reference with different homopolymer composition
+the total moves with that composition — measured at 0.745x on E. coli — because a genome
+with fewer homopolymers genuinely slips less.
+
+The curve is a **default, not a measurement of your data**, the same status the
+fragment-length model carries. Full provenance is in
+`eidolon-core/src/models/model_data/README.md`. #662 makes it fittable from a BAM.
+
+### Compatibility
+
+**Model files built before this release keep working.** `insertion_fraction` and
+`indel_context_curve` both deserialize to their shipped defaults when absent, so an older
+`.json.gz` loads and picks up the corrected behaviour rather than failing.
+
+**Output will differ at the same seed.** Both changes alter which errors are drawn, so runs
+are not byte-comparable across this version. Anything measured against a pre-3.4.0 baseline
+needs re-baselining.
+
+### Evidence
+
+Verified locally: unit tests pin both NEAT2 constants and the curve against their sources;
+an end-to-end test measures indel enrichment out of produced BAMs at **60.25x** against a
+predicted 61.25x (poly-A vs. alternating-AT references, both 0% GC so GC bias cannot
+confound), and **1.89x** against a predicted 1.92x for positional enrichment on a
+mixed-composition reference. Nine mutation experiments were run against these tests; all
+were killed, one only after a positional test was added — the overall rate was correct
+while placement was not.
+
+**Not yet verified:** `cand_per_mb` moving off 0 toward the real 57.5/Mb is a Delta
+measurement and has not been run. The local tests establish that the mechanism works and
+lands where the curve puts it; they are not the number.
+
 8/31/2026
 =========
 ## eidolon v3.3.0 — fragment length realism

@@ -751,12 +751,20 @@ fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usi
 /// (0.4918 C / 0.3377 G / 0.1705 T), one with the A row forced entirely to T.
 ///
 /// This is differential rather than absolute because a forced run does NOT reach 100% T.
-/// The model's `indel_probability` is 0.4 and its `insertion_bias` is uniform over ACGT, so
-/// roughly 40% of sequencing errors are indels whose inserted bases never consult the
-/// transition matrix. That floor puts a few hundred C and G into the output no matter what
-/// the matrix says — which is correct behavior, and the reason an absolute `>98% T`
+/// `insertion_bias` is uniform over ACGT, so indel errors put inserted bases into the
+/// output that never consult the transition matrix. That floor is a few hundred C and G no
+/// matter what the matrix says — correct behavior, and the reason an absolute `>98% T`
 /// assertion would fail on working code. The control run pins where the substitution
 /// spectrum sits without the override, so the comparison isolates the matrix's effect.
+///
+/// **Why the floor is ~39% here and not the model's 1%.** This comment used to read
+/// "`indel_probability` is 0.4, so roughly 40% of errors are indels". #660 corrected that
+/// constant to NEAT2's 0.01, and #661 then made the indel share depend on local
+/// homopolymer run length. `simulate_over_polya` uses a 20,000-base all-A reference — a
+/// homopolymer far past the curve's cap, and so its most enriched case: 0.01 x 39.20 =
+/// 0.392. The old number is accidentally close to the new one for an entirely different
+/// reason, which is worth stating plainly rather than leaving as a comment that happens to
+/// still look right. A homopolymer-free fixture would have a ~0.6% floor instead.
 #[test]
 fn built_seq_error_transition_matrix_decides_the_substituted_base() {
     let tmp = tempfile::tempdir().unwrap();

@@ -43,6 +43,43 @@ fn default_insertion_fraction() -> f64 {
     0.4
 }
 
+/// Indel-error propensity by local homopolymer run length, indexed by `run - 1`, with the
+/// last entry covering every run at or above its index.
+///
+/// Measured on HCC1395 matched normal, chr20/21/22 at 46x, over an exact background of
+/// 3,999,990 reference bases (1,726 slippage events; Delta job 21674484). Each entry is a
+/// normalized enrichment — the share of indel errors occurring at that run length divided
+/// by the share of reference bases at that run length — so it is 1.0-centred **by
+/// construction** over the human background it was measured on. Applying it therefore
+/// redistributes [`SequencingErrorModel::indel_probability`] across sequence context
+/// without changing the genome-wide total on human. On a reference with a different
+/// homopolymer composition the realized total moves with that composition, which is the
+/// intended behaviour: a genome with fewer homopolymers really does slip less.
+///
+/// This is a **shipped default, not a measurement of the user's data** — the same status
+/// the fragment-length model carries. See `model_data/README.md`. Issue #662 makes it
+/// fittable from a BAM.
+///
+/// Deliberately NOT the variant curve from #378: variants reach 60.44x at runs >= 10 where
+/// errors reach 39.20x, and conflating the two is the mistake #378 already records.
+pub(crate) const DEFAULT_INDEL_CONTEXT_CURVE: [f64; 10] = [
+    0.64, 0.76, 0.82, 1.11, 1.58, 1.84, 5.64, 12.16, 24.24, 39.20,
+];
+
+fn default_indel_context_curve() -> Vec<f64> {
+    DEFAULT_INDEL_CONTEXT_CURVE.to_vec()
+}
+
+/// How far a run must be measured for the SHIPPED curve before the answer stops mattering.
+///
+/// This describes [`DEFAULT_INDEL_CONTEXT_CURVE`] only. A caller must not use it to bound
+/// its own scan — a model carrying a FITTED curve (#662) may have more buckets than the
+/// default, and a scan capped here could never reach them: the file would hold 20 entries,
+/// every value lookup would be correct, and the top buckets would simply never be asked
+/// about. Use [`SequencingErrorModel::context_run_cap`], which reads the length off the
+/// curve actually loaded.
+pub const INDEL_CONTEXT_RUN_CAP: usize = DEFAULT_INDEL_CONTEXT_CURVE.len();
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequencingErrorModel {
     // Neat only dealt with 2 types of sequencing errors: snps and small indels.
@@ -53,6 +90,10 @@ pub struct SequencingErrorModel {
     indel_probability: f64,
     #[serde(default = "default_insertion_fraction")]
     insertion_fraction: f64,
+    /// Scales `indel_probability` by local homopolymer run length. A model file written
+    /// before this field existed deserializes to the shipped curve rather than failing.
+    #[serde(default = "default_indel_context_curve")]
+    indel_context_curve: Vec<f64>,
     insertion_bias: DiscreteDistribution<Nucleotide>,
     transition_distros: TransitionMatrix,
     quality_score_model: QualityScoreModel,
@@ -88,6 +129,7 @@ impl SequencingErrorModel {
             ins_length_distribution: default_ins_distr,
             indel_probability: default_indel_probability,
             insertion_fraction: default_insertion_fraction(),
+            indel_context_curve: default_indel_context_curve(),
             insertion_bias: default_insertion_bias,
             transition_distros: default_transition_distros,
             quality_score_model,
@@ -121,6 +163,7 @@ impl SequencingErrorModel {
             ins_length_distribution: default_ins_distr,
             indel_probability: 0.01,
             insertion_fraction: default_insertion_fraction(),
+            indel_context_curve: default_indel_context_curve(),
             insertion_bias: DiscreteDistribution::new(
                 &vec![1.0, 1.0, 1.0, 1.0],
                 &ALLOWED_NUCS.to_vec(),
@@ -139,14 +182,51 @@ impl SequencingErrorModel {
         Ok(())
     }
 
+    /// The chance that an error at this base is an indel rather than a substitution.
+    ///
+    /// `homopolymer_run` is the length of the maximal homopolymer run the base sits in.
+    /// `None` — or `Some(0)`, which is not a meaningful run length — means "no context
+    /// available" and yields the flat, context-free probability, so a caller that cannot
+    /// supply context keeps its previous behaviour exactly.
+    ///
+    /// Runs longer than the curve saturate at its last entry: the measurement pooled every
+    /// run of 10 or more into one bucket, so claiming a distinction beyond that would be
+    /// inventing precision the data does not have.
+    fn indel_probability_at(&self, homopolymer_run: Option<usize>) -> f64 {
+        let scale = match homopolymer_run {
+            Some(run) if run > 0 && !self.indel_context_curve.is_empty() => {
+                let last = self.indel_context_curve.len() - 1;
+                self.indel_context_curve[(run - 1).min(last)]
+            }
+            _ => 1.0,
+        };
+        // Clamped because the curve reaches 39.2x: any `indel_probability` above ~0.026
+        // would otherwise exceed 1.0 at long runs. Unreachable at the shipped 0.01, but
+        // #662 makes the base rate fittable and a fitted value has no such guarantee.
+        (self.indel_probability * scale).clamp(0.0, 1.0)
+    }
+
+    /// How far a caller must measure a homopolymer run for THIS model's curve.
+    ///
+    /// Read off the loaded curve rather than a constant, so a fitted curve with more
+    /// buckets than the shipped default still has its tail reached. Capping a scan at the
+    /// default's length would make a longer curve's top entries unreachable without any
+    /// error — the file would look complete and the strongest signal would be inert.
+    ///
+    /// At least 1: a degenerate empty curve must not ask for a zero-length scan.
+    pub fn context_run_cap(&self) -> usize {
+        self.indel_context_curve.len().max(1)
+    }
+
     pub fn generate_sequencing_error(
         &self,
         reference: Nucleotide,
+        homopolymer_run: Option<usize>,
         rng: &mut NeatRng,
     ) -> Result<SequencingErrorType, SeqModelError> {
         // This method picks an error type and determines any additional data needed
         // for the current error, based on the statistical model
-        if rng.random()? < self.indel_probability {
+        if rng.random()? < self.indel_probability_at(homopolymer_run) {
             // Indel error
             Ok(self.generate_indel_error(rng)?)
         } else {
@@ -185,7 +265,9 @@ impl SequencingErrorModel {
         // Returns either an insertion (option 1) or a deletion (option 2) depending on a random selection from a list of potential
         // error lengths (-2..2). This makes an insertion of up to 2 bases as likely as a random deletion of up to 2 bases.
         if rng.random()? < self.insertion_fraction {
-            // We assume fifty-fifty chance of insertion v deletion
+            // Insertion vs deletion is NEAT2's SIE_INS_FREQ (0.4), not an even split; the
+            // "fifty-fifty" this comment used to claim was the hardcoded 0.5 that #660
+            // replaced with `insertion_fraction`.
             // insertion
             let mut sequence = Vec::new();
             let length = self.ins_length_distribution.sample(rng.random()?)?;
@@ -245,7 +327,7 @@ mod tests {
         let model = SequencingErrorModel::default().unwrap();
         let mut rng = make_rng();
         let result = model
-            .generate_sequencing_error(Nucleotide::A, &mut rng)
+            .generate_sequencing_error(Nucleotide::A, None, &mut rng)
             .unwrap();
         match result {
             SequencingErrorType::SnpError(base) => assert_ne!(base, Nucleotide::A),
@@ -269,10 +351,10 @@ mod tests {
     fn test_sequencing_error_deterministic() {
         let model = SequencingErrorModel::default().unwrap();
         let error1 = model
-            .generate_sequencing_error(Nucleotide::C, &mut make_rng())
+            .generate_sequencing_error(Nucleotide::C, None, &mut make_rng())
             .unwrap();
         let error2 = model
-            .generate_sequencing_error(Nucleotide::C, &mut make_rng())
+            .generate_sequencing_error(Nucleotide::C, None, &mut make_rng())
             .unwrap();
         let type1 = match error1 {
             SequencingErrorType::SnpError(_) => 0,
@@ -296,6 +378,9 @@ mod tests {
             ins_length_distribution: DiscreteDistribution::new(&vec![1.0], &vec![1]).unwrap(),
             indel_probability: 1.0,
             insertion_fraction: 0.4,
+            // The shipped curve, but the calls below pass no context, so it never
+            // applies — indel_probability stays a flat 1.0 and the assertion holds.
+            indel_context_curve: default_indel_context_curve(),
             insertion_bias: DiscreteDistribution::new(
                 &vec![1.0, 1.0, 1.0, 1.0],
                 &Vec::from(ALLOWED_NUCS),
@@ -315,7 +400,7 @@ mod tests {
         let mut saw_deletion = false;
         for _ in 0..20 {
             match model
-                .generate_sequencing_error(Nucleotide::A, &mut rng)
+                .generate_sequencing_error(Nucleotide::A, None, &mut rng)
                 .unwrap()
             {
                 SequencingErrorType::SnpError(_) => {
@@ -516,7 +601,7 @@ mod tests {
 
         for _ in 0..DRAWS {
             match model
-                .generate_sequencing_error(Nucleotide::A, &mut rng)
+                .generate_sequencing_error(Nucleotide::A, None, &mut rng)
                 .unwrap()
             {
                 SequencingErrorType::SnpError(_) => {}
@@ -537,6 +622,193 @@ mod tests {
         assert!(
             (0.37..0.43).contains(&insertion_fraction),
             "SIE_INS_FREQ: observed {insertion_fraction:.5}; expected about 0.4 insertions per indel"
+        );
+    }
+
+    #[test]
+    fn the_shipped_curve_is_pinned_to_the_measured_values() {
+        // Known answer, pinned against its source the way #660 pinned the NEAT2 constants.
+        // These are enrichments from Delta job 21674484 (HCC1395 normal, chr20/21/22,
+        // 1,726 slippage events over 3,999,990 reference bases). Changing one silently is
+        // exactly how the NEAT2 mistranslation survived, so name them here.
+        assert_eq!(
+            DEFAULT_INDEL_CONTEXT_CURVE,
+            [
+                0.64, 0.76, 0.82, 1.11, 1.58, 1.84, 5.64, 12.16, 24.24, 39.20
+            ],
+            "the shipped indel-context curve drifted from job 21674484"
+        );
+        // Monotone, crossing 1.0 at run 4. Both properties are load-bearing: monotonicity
+        // is the biological claim (longer run, more slippage), and the crossing point is
+        // what makes this a redistribution rather than a rate increase.
+        for window in DEFAULT_INDEL_CONTEXT_CURVE.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "curve must be monotone increasing; {:?} is not",
+                window
+            );
+        }
+        // Stated as "where does it cross" rather than two point checks: the crossing
+        // point is the claim that this redistributes rather than adds.
+        let crossing = DEFAULT_INDEL_CONTEXT_CURVE
+            .iter()
+            .position(|&value| value > 1.0)
+            .expect("a curve that never exceeds 1.0 could only ever suppress");
+        assert_eq!(
+            crossing + 1,
+            4,
+            "curve must cross 1.0 at run 4; it crosses at run {}",
+            crossing + 1
+        );
+    }
+
+    #[test]
+    fn the_scan_cap_follows_the_loaded_curve_not_the_shipped_default() {
+        // The trap this guards: #662 fits a curve from a BAM, and a fitted curve need not
+        // have the default's ten buckets. If the read generator bounded its run-length
+        // scan by the DEFAULT's length, a longer curve's top entries could never be
+        // reached — the model file would hold every value, each lookup would return the
+        // right number, and the strongest buckets would simply never be asked about. That
+        // failure is completely silent, which is why it gets an explicit test.
+        let mut model = SequencingErrorModel::default().unwrap();
+        assert_eq!(model.context_run_cap(), DEFAULT_INDEL_CONTEXT_CURVE.len());
+
+        model.indel_context_curve = (1..=20).map(|i| i as f64).collect();
+        assert_eq!(
+            model.context_run_cap(),
+            20,
+            "a 20-bucket fitted curve must ask for a 20-deep scan"
+        );
+        // Every bucket must be distinguishable at the cap the model asks for, or the tail
+        // is dead weight.
+        assert_ne!(
+            model.indel_probability_at(Some(model.context_run_cap())),
+            model.indel_probability_at(Some(DEFAULT_INDEL_CONTEXT_CURVE.len())),
+            "buckets past the default length are unreachable — the #662 trap"
+        );
+
+        // A shorter curve is safe in the other direction, but must still saturate rather
+        // than index out of bounds.
+        model.indel_context_curve = vec![0.5, 2.0];
+        assert_eq!(model.context_run_cap(), 2);
+        assert_eq!(
+            model.indel_probability_at(Some(2)),
+            model.indel_probability_at(Some(50))
+        );
+
+        // Degenerate: an empty curve must not request a zero-length scan.
+        model.indel_context_curve = Vec::new();
+        assert_eq!(model.context_run_cap(), 1, "cap must never be 0");
+    }
+
+    #[test]
+    fn the_run_cap_and_the_curve_cannot_drift_apart() {
+        // Cross-component invariant. The read generator caps its scan at
+        // INDEL_CONTEXT_RUN_CAP; the model saturates at the curve's last entry. Neither
+        // side is wrong on its own, and nothing else asserts they must agree — the exact
+        // shape of defect CLAUDE.md requires be pinned rather than left to two literals
+        // happening to match.
+        assert_eq!(
+            INDEL_CONTEXT_RUN_CAP,
+            DEFAULT_INDEL_CONTEXT_CURVE.len(),
+            "a scan capped short of the curve would never reach its top entries"
+        );
+        let model = SequencingErrorModel::default().unwrap();
+        assert_eq!(
+            model.indel_probability_at(Some(INDEL_CONTEXT_RUN_CAP)),
+            model.indel_probability_at(Some(INDEL_CONTEXT_RUN_CAP + 500)),
+            "runs past the cap must be indistinguishable, or capping the scan changes results"
+        );
+    }
+
+    #[test]
+    fn indel_probability_tracks_the_curve_across_every_run_length() {
+        // The decision under test is the SCALING, so assert the whole shape. A single
+        // fixture would pass just as happily for code that returns a constant.
+        let model = SequencingErrorModel::default().unwrap();
+        for (index, scale) in DEFAULT_INDEL_CONTEXT_CURVE.iter().enumerate() {
+            let run = index + 1;
+            let expected = 0.01 * scale; // computed from the table, not from the code
+            let actual = model.indel_probability_at(Some(run));
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "run {run}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_context_yields_exactly_the_flat_context_free_rate() {
+        // Must-not-fire. `None` is the adapter path and every pre-#661 caller; it must
+        // reproduce #660 behaviour bit for bit, not merely approximately.
+        let model = SequencingErrorModel::default().unwrap();
+        assert_eq!(model.indel_probability_at(None), model.indel_probability);
+        // 0 is not a run length. A caller that computes a run over an N gets 0 back from
+        // `homopolymer_run_at`, and that must mean "no context", not "index -1".
+        assert_eq!(model.indel_probability_at(Some(0)), model.indel_probability);
+        // An empty curve is a degenerate model file, not a panic and not an index error.
+        let mut empty = SequencingErrorModel::default().unwrap();
+        empty.indel_context_curve = Vec::new();
+        assert_eq!(empty.indel_probability_at(Some(7)), empty.indel_probability);
+    }
+
+    #[test]
+    fn a_fitted_base_rate_cannot_push_the_scaled_probability_past_one() {
+        // #662 makes indel_probability fittable. 39.2x means any base rate above ~0.026
+        // would otherwise produce a probability over 1.0, which `rng.random() < p` would
+        // silently read as "always an indel".
+        let mut model = SequencingErrorModel::default().unwrap();
+        model.indel_probability = 0.5;
+        let scaled = model.indel_probability_at(Some(INDEL_CONTEXT_RUN_CAP));
+        assert!(
+            (0.0..=1.0).contains(&scaled),
+            "scaled probability {scaled} escaped [0, 1]"
+        );
+        assert_eq!(scaled, 1.0, "0.5 x 39.2 must clamp to exactly 1.0");
+    }
+
+    #[test]
+    fn a_homopolymer_shifts_the_generated_error_mix_by_the_curves_factor() {
+        // Behavioural counterpart to the arithmetic above: the curve must reach the
+        // generated error TYPES, not merely the probability function. Run 10 (39.2x)
+        // against no context, same seed, 250k draws each.
+        fn indel_share(run: Option<usize>, draws: usize) -> f64 {
+            let model = SequencingErrorModel::default().unwrap();
+            let mut rng = NeatRng::new_from_seed(&vec!["indel context mix".to_string()]).unwrap();
+            let mut indels = 0usize;
+            for _ in 0..draws {
+                match model
+                    .generate_sequencing_error(Nucleotide::A, run, &mut rng)
+                    .unwrap()
+                {
+                    SequencingErrorType::SnpError(_) => {}
+                    _ => indels += 1,
+                }
+            }
+            indels as f64 / draws as f64
+        }
+        const DRAWS: usize = 250_000;
+        let flat = indel_share(None, DRAWS);
+        let enriched = indel_share(Some(10), DRAWS);
+        let suppressed = indel_share(Some(1), DRAWS);
+
+        // Expected values come from the table (0.01 x 39.20 and 0.01 x 0.64), computed
+        // independently of the code under test.
+        assert!(
+            (0.37..0.41).contains(&enriched),
+            "run 10 should give about 0.392 indels per error; got {enriched:.5}"
+        );
+        assert!(
+            (0.0055..0.0075).contains(&suppressed),
+            "run 1 should give about 0.0064 indels per error; got {suppressed:.5}"
+        );
+        assert!(
+            (0.008..0.012).contains(&flat),
+            "no context must stay at #660's 0.01; got {flat:.5}"
+        );
+        assert!(
+            enriched > flat && flat > suppressed,
+            "ordering broke: run1 {suppressed:.5} < none {flat:.5} < run10 {enriched:.5}"
         );
     }
 
