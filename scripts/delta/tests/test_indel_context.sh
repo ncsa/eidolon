@@ -49,7 +49,10 @@ the background is not binned like the observed side@FILENAME == f_bg  { b = $1 +
 files are matched by substring instead of exact path@FILENAME == f_ctx { hp[$1 SUBSEP $2]  = $3; next }@FILENAME ~ /ctx/ { hp[$1 SUBSEP $2]  = $3; next }
 an empty background is not fatal@    if (bgtot == 0) {@    if (0) {
 support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++ }@        if (f < hf)      { hi[h]++; thi++ }
-enrichment ignores the background@        printf "%-7s %9d %9d %9d %9d %11.6f %11.2fx\n", (h == mx ? ">=" mx : h ""), \@        printf "%-7s %9d %9d %9d %9d %11.6f %11.2fx\n", (h == mx ? ">=" mx : h ""), bs = 1, \
+enrichment ignores the background@        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot / bs : 0@        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot : 0
+the low-support curve is normalized by the pooled total@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tot / bs : 0
+the low-support curve counts every indel, not just slippage@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0@        e_low  = (bs > 0 && tlo > 0) ? (n[h] + 0) / tlo / bs : 0
+the variant curve is fed the slippage counts@        e_high = (bs > 0 && thi > 0) ? (hi[h] + 0) / thi / bs : 0@        e_high = (bs > 0 && thi > 0) ? (lo[h] + 0) / thi / bs : 0
 M2
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -57,7 +60,7 @@ fi
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=43
+MIN_ASSERTIONS=67
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
@@ -137,6 +140,110 @@ has "background reports its own denominator"       "$out" "10000 reference bases
 has "enrichment is observed share over background share" "$out" "6.67x"
 # and the run-1 bin: 1 of 3 over 9000/10000 = 90% -> 0.37x
 has "an under-represented bin reads below 1x"      "$out" "0.37x"
+
+echo "=== the three enrichment columns are computed from different populations ==="
+# The pooled column feeds NO model: enr_low is the sequencing-error curve (#661/#662) and
+# enr_high is the variant curve (#378). A fixture where all three agree cannot show they
+# were computed separately, so this one INVERTS them: slippage sits in the long runs,
+# variants in the short ones.
+#
+#   3 low-support indels  (2/40 = 0.05)  in a run-12 context
+#   3 high-support indels (20/40 = 0.50) in a run-1 context
+#   background: 9000 bases at run 1, 1000 at run 12  ->  bg_share 0.9 / 0.1
+#
+# Hand-computed, independent of the awk:
+#   run >=10:  enr_all = (3/6)/0.1 = 5.00x   enr_low = (3/3)/0.1 = 10.00x   enr_high = 0.00x
+#   run 1:     enr_all = (3/6)/0.9 = 0.56x   enr_low = 0.00x                enr_high = (3/3)/0.9 = 1.11x
+{ printf 'chr1\t1000\t2\nchr1\t1100\t2\nchr1\t1200\t2\n'
+  printf 'chr1\t2000\t20\nchr1\t2100\t20\nchr1\t2200\t20\n'; } > "$WORK/s2_indels.tsv"
+{ for p in 1000 1100 1200 2000 2100 2200; do printf 'chr1\t%s\t40\n' "$p"; done; } > "$WORK/s2_depth.tsv"
+{ printf 'chr1\t1000\t12\nchr1\t1100\t12\nchr1\t1200\t12\n'
+  printf 'chr1\t2000\t1\nchr1\t2100\t1\nchr1\t2200\t1\n'; } > "$WORK/s2_ctx.tsv"
+printf '1\t9000\n12\t1000\n' > "$WORK/s2_bg.tsv"
+summarise2() { awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+      -v f_ind="$WORK/s2_indels.tsv" -v f_dep="$WORK/s2_depth.tsv" \
+      -v f_ctx="$WORK/s2_ctx.tsv"    -v f_bg="$WORK/s2_bg.tsv" \
+      -f "$SUMMARISE" "$WORK/s2_indels.tsv" "$WORK/s2_depth.tsv" "$WORK/s2_ctx.tsv" "$WORK/s2_bg.tsv"; }
+out2="$(summarise2)"
+row10="$(printf '%s' "$out2" | awk '$1 == ">=10"')"
+row1="$(printf '%s' "$out2" | awk '$1 == "1"')"
+hasw "the header names all three enrichment columns" "$out2" "enr_all"
+hasw "the header names the low-support curve"        "$out2" "enr_low"
+hasw "the header names the variant curve"            "$out2" "enr_high"
+# The whole point: at run >=10 the three columns must read 5.00 / 10.00 / 0.00.
+eq "long runs: pooled enrichment is 5.00x"   "$(printf '%s' "$row10" | awk '{print $7}')" "5.00x"
+eq "long runs: the slippage curve is 10.00x" "$(printf '%s' "$row10" | awk '{print $8}')" "10.00x"
+eq "long runs: the variant curve is 0.00x"   "$(printf '%s' "$row10" | awk '{print $9}')" "0.00x"
+# Inverted at run 1, so neither column can be a copy of the other or of the pooled one.
+eq "short runs: pooled enrichment is 0.56x"  "$(printf '%s' "$row1" | awk '{print $7}')" "0.56x"
+eq "short runs: the slippage curve is 0.00x" "$(printf '%s' "$row1" | awk '{print $8}')" "0.00x"
+eq "short runs: the variant curve is 1.11x"  "$(printf '%s' "$row1" | awk '{print $9}')" "1.11x"
+# Non-vacuity: if any two columns were the same expression these would coincide.
+[[ "$(printf '%s' "$row10" | awk '{print $7}')" != "$(printf '%s' "$row10" | awk '{print $8}')" ]] \
+  && ok "pooled and slippage columns are not the same expression" \
+  || bad "pooled and slippage columns are not the same expression" "different values" "identical"
+hasw "the legend says which column #662 must fit" "$out2" "enr_low  IS the sequencing-error context curve"
+hasw "the legend warns the pooled column is neither" "$out2" "enr_all  is neither"
+
+echo "=== the archived job 21674484 reproduces all three published curves ==="
+# Known answer against REAL data, not a synthetic fixture. The counts below are job
+# 21674484's summary.txt verbatim -- the run the shipped curve was derived from. Rebuilding
+# its four inputs from those counts and re-summarising must land on all three published
+# numbers at once:
+#
+#   enr_all  -> the enrichment column that job actually printed  (52.06x at >=10)
+#   enr_low  -> the curve shipped in sequencing_error_model.rs   (39.20x at >=10)
+#   enr_high -> the variant figure #378 cites                    (60.44x at >=10)
+#
+# One fixture, three independently-sourced targets. Before this file printed enr_low, the
+# only visible column was 52.06x while the model shipped 39.20x, and nothing connected them.
+# Support is encoded by depth 40 with 20 / 2 / 6 reads -> 0.50 high, 0.05 low, 0.15 mid.
+: > "$WORK/j_ind.tsv"; : > "$WORK/j_dep.tsv"; : > "$WORK/j_ctx.tsv"; : > "$WORK/j_bg.tsv"
+jpos=1000
+# run  n    high  low  mid  bg_share
+while read -r run n hi lo mid share; do
+    [[ -n "$run" ]] || continue
+    [[ $((hi + lo + mid)) -eq "$n" ]] || { bad "job fixture run $run splits to n" "$n" "$((hi+lo+mid))"; }
+    for pair in "20 $hi" "2 $lo" "6 $mid"; do
+        set -- $pair
+        for _ in $(seq 1 "$2"); do
+            printf 'chr1\t%s\t%s\n' "$jpos" "$1" >> "$WORK/j_ind.tsv"
+            printf 'chr1\t%s\t40\n'  "$jpos"      >> "$WORK/j_dep.tsv"
+            printf 'chr1\t%s\t%s\n' "$jpos" "$run" >> "$WORK/j_ctx.tsv"
+            jpos=$((jpos + 10))
+        done
+    done
+    awk -v r="$run" -v s="$share" 'BEGIN{printf "%s\t%d\n", r, int(s * 3999990 + 0.5)}' >> "$WORK/j_bg.tsv"
+done <<'JOB'
+1 920 253 562 105 0.506731
+2 507 113 348 46 0.264043
+3 287 81 184 22 0.130416
+4 179 54 108 17 0.056547
+5 98 22 65 11 0.023781
+6 51 19 25 7 0.007890
+7 67 32 33 2 0.003392
+8 56 22 28 6 0.001334
+9 82 39 39 4 0.000932
+10 777 270 334 173 0.004936
+JOB
+jout="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+    -v f_ind="$WORK/j_ind.tsv" -v f_dep="$WORK/j_dep.tsv" \
+    -v f_ctx="$WORK/j_ctx.tsv" -v f_bg="$WORK/j_bg.tsv" \
+    -f "$SUMMARISE" "$WORK/j_ind.tsv" "$WORK/j_dep.tsv" "$WORK/j_ctx.tsv" "$WORK/j_bg.tsv")"
+jrow() { printf '%s' "$jout" | awk -v r="$1" '$1 == r'; }
+hasw "the archived job's support split is reproduced" "$jout" "3024 positions -- 905 high, 393 mid, 1726 low"
+# The shipped curve, every bucket. These are the ten numbers in
+# DEFAULT_INDEL_CONTEXT_CURVE; if this row ever disagrees, one of the two moved.
+i=0
+for expect in 0.64 0.76 0.82 1.11 1.58 1.84 5.64 12.16 24.24 39.20; do
+    i=$((i+1)); label=$i; [[ "$i" -eq 10 ]] && label=">=10"
+    eq "enr_low at run $label is the shipped curve's ${expect}x" \
+       "$(jrow "$label" | awk '{print $8}')" "${expect}x"
+done
+# The other two columns, at the bucket where they diverge most -- so a single-column bug
+# cannot hide behind the curve being right.
+eq "enr_all at >=10 is the pooled 52.06x the job printed" "$(jrow ">=10" | awk '{print $7}')" "52.06x"
+eq "enr_high at >=10 is the 60.44x variant figure"        "$(jrow ">=10" | awk '{print $9}')" "60.44x"
 
 echo "=== an OUTDIR whose name contains a file marker does not break the matching ==="
 # Job 21671697 ran with OUTDIR=/scratch/.../indelctx_21671697. bg.tsv's full path contained

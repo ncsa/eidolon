@@ -43,13 +43,33 @@ END {
     print "════════════════════════════════════════════════════════════════"
     print "INDEL POSITIONS BY REFERENCE HOMOPOLYMER RUN LENGTH"
     print ""
-    printf "%-7s %9s %9s %9s %9s %11s %12s\n", "run", "n", "high", "low", "mid", "bg_share", "enrichment"
+    # THREE enrichment columns, because the pooled one feeds no model.
+    #
+    # Each is a share-over-share against the SAME background, differing only in which
+    # subset of indels forms the numerator and its denominator:
+    #
+    #   enr_all  -- every indel position. Mixes slippage with variants, so it is a
+    #               description of the data and NOT the input to anything.
+    #   enr_low  -- slippage only. This is the sequencing-error curve (#661, fitted by #662).
+    #   enr_high -- variants only. This is the placement curve (#378).
+    #
+    # Printing only the pooled column is what made this file misleading: on job 21674484 it
+    # read 52.06x at runs >=10 where the error curve the model actually ships is 39.20x,
+    # because 270 of those 777 positions were variants. Anyone checking a fitted curve
+    # against that column would see a 33% shortfall and "correct" the fit toward a
+    # variant-contaminated number. Each model's own column is now printed beside it.
+    printf "%-7s %8s %8s %8s %8s %11s %10s %10s %10s\n", \
+           "run", "n", "high", "low", "mid", "bg_share", "enr_all", "enr_low", "enr_high"
     for (h = 1; h <= mx; h++) {
         if (!(h in n) && !(h in bgn)) continue
         bs = bgtot ? bgn[h] / bgtot : 0
-        os = tot   ? n[h]   / tot   : 0
-        printf "%-7s %9d %9d %9d %9d %11.6f %11.2fx\n", (h == mx ? ">=" mx : h ""), \
-               n[h]+0, hi[h]+0, lo[h]+0, mid[h]+0, bs, (bs > 0 ? os / bs : 0)
+        # Each subset is normalized by ITS OWN total, not by `tot`. Dividing the low count
+        # by the pooled total would report a share of the wrong population.
+        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot / bs : 0
+        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0
+        e_high = (bs > 0 && thi > 0) ? (hi[h] + 0) / thi / bs : 0
+        printf "%-7s %8d %8d %8d %8d %11.6f %9.2fx %9.2fx %9.2fx\n", (h == mx ? ">=" mx : h ""), \
+               n[h]+0, hi[h]+0, lo[h]+0, mid[h]+0, bs, e_all, e_low, e_high
     }
     print ""
     printf "totals: %d positions -- %d high, %d mid, %d low, %d without depth\n",
@@ -70,6 +90,15 @@ END {
     print "  high -> germline/somatic variants in homopolymers   -> issue #378, placement"
     print "  low  -> PCR/sequencer slippage                      -> the error model"
     print "  both -> both mechanisms; #378 first, and split the acceptance criterion"
+    print ""
+    print "WHICH ENRICHMENT COLUMN TO USE:"
+    print "  enr_low  IS the sequencing-error context curve. Compare a gen-bam-models fit"
+    print "           (#662) against THIS column, and against the shipped default in"
+    print "           eidolon-core/src/models/sequencing_error_model.rs."
+    print "  enr_high IS the variant placement curve for #378."
+    print "  enr_all  is neither. It pools both mechanisms and is here for description"
+    print "           only -- a fit that reproduces it has absorbed variants into the"
+    print "           error model, which is the exact conflation #661 forbids."
     print ""
     print "This job MEASURES. It does not say the simulator is wrong, only where real"
     print "indels are and what kind they are."
