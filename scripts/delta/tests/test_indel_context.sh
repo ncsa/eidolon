@@ -36,7 +36,10 @@ if [[ "${1:-}" == "--mutate" ]]; then
 a deletion does not advance the reference cursor@            if (ch == "D") pos += len@            if (0) pos += len
 soft clips advance the cursor@        } else if (ch ~ /[MN=X]/) {@        } else if (ch ~ /[MN=XS]/) {
 insertions are not recorded@        if (ch == "I" || ch == "D") {@        if (ch == "D") {
-support is not counted per position@            c[$1 SUBSEP pos]++@            c[$1 SUBSEP pos] = 1
+support is not counted per position@            c[k]++@            c[k] = 1
+the indel length is not recorded at all@            if (lc[k SUBSEP sl] > bestn[k]) { bestn[k] = lc[k SUBSEP sl]; bestl[k] = sl }@            bestl[k] = ""
+insertions and deletions share one unsigned length@            sl = (ch == "I") ? len : -len@            sl = len
+the length is first-seen rather than modal@            if (lc[k SUBSEP sl] > bestn[k]) { bestn[k] = lc[k SUBSEP sl]; bestl[k] = sl }@            if (!(k in bestl)) { bestl[k] = sl }
 M1
     run_muts "$JOIN" JOIN <<'M3'
 a candidate with no nearby indel is counted as having one@    if (best < 0)          { none++ }@    if (0)                 { none++ }
@@ -48,11 +51,14 @@ M3
 the background is not binned like the observed side@FILENAME == f_bg  { b = $1 + 0; if (b > mx) b = mx; bgn[b] += $2; bgtot += $2; next }@FILENAME == f_bg  { bgn[$1 + 0] += $2; bgtot += $2; next }
 files are matched by substring instead of exact path@FILENAME == f_ctx { hp[$1 SUBSEP $2]  = $3; next }@FILENAME ~ /ctx/ { hp[$1 SUBSEP $2]  = $3; next }
 an empty background is not fatal@    if (bgtot == 0) {@    if (0) {
-support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++ }@        if (f < hf)      { hi[h]++; thi++ }
+support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }@        if (f < hf)      { hi[h]++; thi++; hlen[L]++; }
 enrichment ignores the background@        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot / bs : 0@        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot : 0
 the low-support curve is normalized by the pooled total@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tot / bs : 0
 the low-support curve counts every indel, not just slippage@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0@        e_low  = (bs > 0 && tlo > 0) ? (n[h] + 0) / tlo / bs : 0
 the variant curve is fed the slippage counts@        e_high = (bs > 0 && thi > 0) ? (hi[h] + 0) / thi / bs : 0@        e_high = (bs > 0 && thi > 0) ? (lo[h] + 0) / thi / bs : 0
+the slippage length column is fed every indel@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; llen[L]++; }
+the length table normalizes by the pooled total@               llen[L]+0, (tlo ? llen[L]/tlo : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)@               llen[L]+0, (tot ? llen[L]/tot : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)
+an empty slippage length table is not fatal@    if (tlo == 0) {@    if (0) {
 M2
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -60,7 +66,7 @@ fi
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=67
+MIN_ASSERTIONS=84
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
@@ -85,13 +91,13 @@ echo "=== the reference cursor: only M/D/N/=/X consume reference ==="
 #   30M -> 121..150
 printf 'chr1\t100\t10S20M1D30M\n' > "$WORK/one.tsv"
 eq "a deletion is recorded at the cursor, after the soft clip and match" \
-   "$(extract "$WORK/one.tsv")" "$(printf 'chr1\t120\t1')"
+   "$(extract "$WORK/one.tsv")" "$(printf 'chr1\t120\t1\t-1')"
 
 # An insertion does NOT advance the cursor, so a second op after it stays in frame:
 #   POS=200, 5M2I5M1D  -> I at 205, cursor still 205, 5M -> 210, D at 210
 printf 'chr1\t200\t5M2I5M1D\n' > "$WORK/two.tsv"
 eq "an insertion is recorded without consuming reference" \
-   "$(extract "$WORK/two.tsv" | sort -k2,2n)" "$(printf 'chr1\t205\t1\nchr1\t210\t1')"
+   "$(extract "$WORK/two.tsv" | sort -k2,2n)" "$(printf 'chr1\t205\t1\t2\nchr1\t210\t1\t-1')"
 
 # TWO deletions, because the cursor advance is only observable in what comes AFTER it.
 # Every single-deletion fixture above passes whether or not `D` advances -- there is
@@ -101,19 +107,44 @@ eq "an insertion is recorded without consuming reference" \
 #   Without the advance the second deletion would land at 120.
 printf 'chr1\t100\t10M5D10M3D10M\n' > "$WORK/twodel.tsv"
 eq "a second deletion sits where the first one advanced the cursor to" \
-   "$(extract "$WORK/twodel.tsv" | sort -k2,2n)" "$(printf 'chr1\t110\t1\nchr1\t125\t1')"
+   "$(extract "$WORK/twodel.tsv" | sort -k2,2n)" "$(printf 'chr1\t110\t1\t-5\nchr1\t125\t1\t-3')"
 
 echo "=== hard clips are query-only too ==="
 printf 'chr1\t300\t8H10M1D10M\n' > "$WORK/three.tsv"
 eq "a hard clip does not shift the deletion position" \
-   "$(extract "$WORK/three.tsv")" "$(printf 'chr1\t310\t1')"
+   "$(extract "$WORK/three.tsv")" "$(printf 'chr1\t310\t1\t-1')"
 
 echo "=== support is the number of reads agreeing at one position ==="
 { for _ in 1 2 3 4 5; do printf 'chr1\t100\t20M1D30M\n'; done
   printf 'chr1\t100\t20M2D30M\n'; } > "$WORK/sup.tsv"
 # All six put a deletion at 120 -- differing LENGTH is still the same junction position.
 eq "six reads at one junction report support 6" \
-   "$(extract "$WORK/sup.tsv")" "$(printf 'chr1\t120\t6')"
+   "$(extract "$WORK/sup.tsv")" "$(printf 'chr1\t120\t6\t-1')"
+
+echo "=== indel LENGTH is emitted, signed, and modal across disagreeing reads ==="
+# The length column is the input to SequencingErrorModel's length distribution, so its
+# sign and its tie-breaking both matter. An insertion of 2 and a deletion of 2 at one
+# junction are different events; an unsigned column would pool them.
+printf 'chr1\t100\t20M3I30M\n' > "$WORK/ins3.tsv"
+eq "an insertion reports a POSITIVE length"  "$(extract "$WORK/ins3.tsv")" "$(printf 'chr1\t120\t1\t3')"
+printf 'chr1\t100\t20M3D30M\n' > "$WORK/del3.tsv"
+eq "a deletion of the same size reports NEGATIVE" "$(extract "$WORK/del3.tsv")" "$(printf 'chr1\t120\t1\t-3')"
+# Modal, not first-seen and not last-seen: 2 reads at -1 then 3 at -4 must report -4,
+# and the reverse order must give the same answer.
+{ printf 'chr1\t100\t20M1D30M\n'; printf 'chr1\t100\t20M1D30M\n'
+  for _ in 1 2 3; do printf 'chr1\t100\t20M4D30M\n'; done; } > "$WORK/modal.tsv"
+eq "the modal length wins over the first-seen one" \
+   "$(extract "$WORK/modal.tsv")" "$(printf 'chr1\t120\t5\t-4')"
+{ for _ in 1 2 3; do printf 'chr1\t100\t20M4D30M\n'; done
+  printf 'chr1\t100\t20M1D30M\n'; printf 'chr1\t100\t20M1D30M\n'; } > "$WORK/modal2.tsv"
+eq "and the same answer with the reads in the other order" \
+   "$(extract "$WORK/modal2.tsv")" "$(printf 'chr1\t120\t5\t-4')"
+# Must-not-fire: an insertion and a deletion of equal size at one junction must not
+# cancel or pool. Support is 2; the modal length is whichever appeared more.
+{ printf 'chr1\t100\t20M2I30M\n'; printf 'chr1\t100\t20M2I30M\n'
+  printf 'chr1\t100\t20M2D30M\n'; } > "$WORK/mixed.tsv"
+eq "an insertion and a deletion of equal size do not pool" \
+   "$(extract "$WORK/mixed.tsv" | awk '$2==120')" "$(printf 'chr1\t120\t3\t2')"
 
 echo "=== a read with no indel contributes nothing ==="
 printf 'chr1\t100\t150M\nchr1\t400\t100M50S\n' > "$WORK/none.tsv"
@@ -123,7 +154,7 @@ echo "=== the summariser: binning, support classes, enrichment ==="
 # Known answer, all four inputs hand-written.
 #   two indels in a run-12 context: one high support (20/40), one low (2/40)
 #   one indel in a run-1 context, mid support (6/40 = 0.15)
-printf 'chr1\t1000\t20\nchr1\t2000\t2\nchr1\t3000\t6\n' > "$WORK/indels.tsv"
+printf 'chr1\t1000\t20\t-1\nchr1\t2000\t2\t-1\nchr1\t3000\t6\t2\n' > "$WORK/indels.tsv"
 printf 'chr1\t1000\t40\nchr1\t2000\t40\nchr1\t3000\t40\n' > "$WORK/depth.tsv"
 printf 'chr1\t1000\t12\nchr1\t2000\t12\nchr1\t3000\t1\n'  > "$WORK/ctx.tsv"
 # background: 9000 bases in run-1, 1000 in run-12
@@ -154,8 +185,8 @@ echo "=== the three enrichment columns are computed from different populations =
 # Hand-computed, independent of the awk:
 #   run >=10:  enr_all = (3/6)/0.1 = 5.00x   enr_low = (3/3)/0.1 = 10.00x   enr_high = 0.00x
 #   run 1:     enr_all = (3/6)/0.9 = 0.56x   enr_low = 0.00x                enr_high = (3/3)/0.9 = 1.11x
-{ printf 'chr1\t1000\t2\nchr1\t1100\t2\nchr1\t1200\t2\n'
-  printf 'chr1\t2000\t20\nchr1\t2100\t20\nchr1\t2200\t20\n'; } > "$WORK/s2_indels.tsv"
+{ printf 'chr1\t1000\t2\t-1\nchr1\t1100\t2\t-1\nchr1\t1200\t2\t-2\n'
+  printf 'chr1\t2000\t20\t-5\nchr1\t2100\t20\t3\nchr1\t2200\t20\t3\n'; } > "$WORK/s2_indels.tsv"
 { for p in 1000 1100 1200 2000 2100 2200; do printf 'chr1\t%s\t40\n' "$p"; done; } > "$WORK/s2_depth.tsv"
 { printf 'chr1\t1000\t12\nchr1\t1100\t12\nchr1\t1200\t12\n'
   printf 'chr1\t2000\t1\nchr1\t2100\t1\nchr1\t2200\t1\n'; } > "$WORK/s2_ctx.tsv"
@@ -185,6 +216,37 @@ eq "short runs: the variant curve is 1.11x"  "$(printf '%s' "$row1" | awk '{prin
 hasw "the legend says which column #662 must fit" "$out2" "enr_low  IS the sequencing-error context curve"
 hasw "the legend warns the pooled column is neither" "$out2" "enr_all  is neither"
 
+echo "=== the length table splits slippage sizes from variant sizes ==="
+# The `low` column is the input to SequencingErrorModel's ins/del_length_distribution, so
+# it must carry ONLY low-support events. The s2 fixture inverts the two populations, and
+# no length appears in both classes, so a pooled implementation cannot pass:
+#   low  (2/40 = 0.05):  -1, -1, -2   -> -1 at 2/3, -2 at 1/3
+#   high (20/40 = 0.50): -5, +3, +3   -> +3 at 2/3, -5 at 1/3
+lrow() { printf '%s' "$out2" | awk -v L="$1" '$1 == L'; }
+hasw "the length table is printed"             "$out2" "INDEL LENGTH BY SUPPORT CLASS"
+hasw "it names the model the low column feeds" "$out2" "ins_length_distribution"
+eq "low -1 is 2 of 3 slippage events" "$(lrow -1 | awk '{print $2, $3}')" "2 0.6667"
+eq "low -2 is 1 of 3 slippage events" "$(lrow -2 | awk '{print $2, $3}')" "1 0.3333"
+eq "high +3 is 2 of 3 variant events" "$(lrow +3 | awk '{print $4, $5}')" "2 0.6667"
+eq "high -5 is 1 of 3 variant events" "$(lrow -5 | awk '{print $4, $5}')" "1 0.3333"
+# Must-not-fire in both directions: a length seen in one class must read 0 in the other.
+eq "a slippage length does not leak into the variant column" "$(lrow -1 | awk '{print $4}')" "0"
+eq "a variant length does not leak into the slippage column" "$(lrow +3 | awk '{print $2}')" "0"
+# Sign is preserved, not folded to magnitude: +3 and -3 must be separate rows.
+eq "insertions print with a leading +" "$(lrow +3 | awk '{print $1}')" "+3"
+hasw "totals name both populations"    "$out2" "3 low (slippage), 3 high (variant)"
+# Rule 4 on this table's own denominator.
+printf 'chr1\t1000\t20\t-1\n' > "$WORK/hi_only.tsv"
+printf 'chr1\t1000\t40\n'      > "$WORK/hi_dep.tsv"
+printf 'chr1\t1000\t3\n'       > "$WORK/hi_ctx.tsv"
+printf '1\t9000\n3\t1000\n'   > "$WORK/hi_bg.tsv"
+hi_out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+    -v f_ind="$WORK/hi_only.tsv" -v f_dep="$WORK/hi_dep.tsv" \
+    -v f_ctx="$WORK/hi_ctx.tsv"  -v f_bg="$WORK/hi_bg.tsv" \
+    -f "$SUMMARISE" "$WORK/hi_only.tsv" "$WORK/hi_dep.tsv" "$WORK/hi_ctx.tsv" "$WORK/hi_bg.tsv" 2>&1 || true)"
+hasw "a run with no slippage events refuses rather than printing zeros" \
+     "$hi_out" "FATAL: no low-support indels"
+
 echo "=== the archived job 21674484 reproduces all three published curves ==="
 # Known answer against REAL data, not a synthetic fixture. The counts below are job
 # 21674484's summary.txt verbatim -- the run the shipped curve was derived from. Rebuilding
@@ -207,7 +269,7 @@ while read -r run n hi lo mid share; do
     for pair in "20 $hi" "2 $lo" "6 $mid"; do
         set -- $pair
         for _ in $(seq 1 "$2"); do
-            printf 'chr1\t%s\t%s\n' "$jpos" "$1" >> "$WORK/j_ind.tsv"
+            printf 'chr1\t%s\t%s\t-1\n' "$jpos" "$1" >> "$WORK/j_ind.tsv"
             printf 'chr1\t%s\t40\n'  "$jpos"      >> "$WORK/j_dep.tsv"
             printf 'chr1\t%s\t%s\n' "$jpos" "$run" >> "$WORK/j_ctx.tsv"
             jpos=$((jpos + 10))

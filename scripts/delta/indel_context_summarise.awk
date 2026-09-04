@@ -18,7 +18,7 @@ BEGIN {
         exit 2
     }
 }
-FILENAME == f_ind { sup[$1 SUBSEP $2] = $3; next }
+FILENAME == f_ind { sup[$1 SUBSEP $2] = $3; ilen[$1 SUBSEP $2] = $4; next }
 FILENAME == f_dep { dep[$1 SUBSEP $2] = $3; next }
 FILENAME == f_ctx { hp[$1 SUBSEP $2]  = $3; next }
 # Binned the SAME way as the observed side. Capping one and not the other makes the top row
@@ -35,8 +35,13 @@ END {
         d = dep[k] + 0
         if (d <= 0) { nodep++; continue }
         f = sup[k] / d
-        if (f >= hf)     { hi[h]++; thi++ }
-        else if (f < lf) { lo[h]++; tlo++ }
+        # Length is banked per support class, because the two classes feed different
+        # models: `low` is the sequencing-error length distribution
+        # (SequencingErrorModel's ins/del_length_distribution), `high` is variant indel
+        # size. Pooling them would hand the error model variant-sized events.
+        L = ilen[k] + 0
+        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }
+        else if (f < lf) { lo[h]++; tlo++; llen[L]++; }
         else             { mid[h]++; tmid++ }
     }
     print ""
@@ -99,6 +104,43 @@ END {
     print "  enr_all  is neither. It pools both mechanisms and is here for description"
     print "           only -- a fit that reproduces it has absorbed variants into the"
     print "           error model, which is the exact conflation #661 forbids."
+    # ── indel LENGTH by support class ────────────────────────────────────────
+    # The input to SequencingErrorModel's length distribution. Its shipped default is
+    # [0.999, 0.001] over lengths [1, 2], carried over from NEAT2 and never measured.
+    print ""
+    print "════════════════════════════════════════════════════════════════"
+    print "INDEL LENGTH BY SUPPORT CLASS  (+ = insertion, - = deletion)"
+    print ""
+    printf "%-8s %10s %9s %10s %9s\n", "length", "low(n)", "low(frac)", "high(n)", "high(frac)"
+    # Union of observed lengths, printed in signed order so deletions and insertions
+    # read as two arms around zero rather than as one pooled magnitude.
+    for (L in llen) seen[L] = 1
+    for (L in hlen) seen[L] = 1
+    nL = 0
+    for (L in seen) { nL++; ord[nL] = L + 0 }
+    for (a = 2; a <= nL; a++) { v = ord[a]; b = a - 1
+        while (b >= 1 && ord[b] > v) { ord[b+1] = ord[b]; b-- }
+        ord[b+1] = v }
+    for (a = 1; a <= nL; a++) {
+        L = ord[a]
+        printf "%-8s %10d %9.4f %10d %9.4f\n", (L > 0 ? "+" L : L ""), \
+               llen[L]+0, (tlo ? llen[L]/tlo : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)
+    }
+    printf "\ntotals: %d low (slippage), %d high (variant)\n", tlo+0, thi+0
+    # Rule 4 on this table's own denominator: a length column over zero events is not a
+    # distribution, and printing 0.0000 for every row would look like one.
+    if (tlo == 0) {
+        print ""
+        print "FATAL: no low-support indels, so the slippage length distribution above is"
+        print "       empty by construction and cannot be fitted from this run."
+        exit 1
+    }
+    print ""
+    print "WHAT THE low COLUMN IS FOR. It is the measured length distribution of"
+    print "sequencing-error indels -- the input to SequencingErrorModel's"
+    print "ins_length_distribution / del_length_distribution, whose shipped default is"
+    print "[0.999, 0.001] over lengths [1, 2] inherited from NEAT2. The high column is"
+    print "variant indel size and belongs to placement, not to the error model."
     print ""
     print "This job MEASURES. It does not say the simulator is wrong, only where real"
     print "indels are and what kind they are."
