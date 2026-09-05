@@ -131,19 +131,31 @@ model above: one sample, one instrument, one prep. Slippage depends on chemistry
 the aligner's gap placement, so if yours differs this curve will not describe it. #662
 makes it fittable from a BAM.
 
-**It is deliberately not the variant curve.** #378 measures a *separate* homopolymer
-propensity for germline and somatic variants, which reaches 60.44x at runs >= 10 where
-errors reach 39.20x. The two are measurably different and conflating them is a mistake
-#378 already records.
+**This is the sequencing-error curve.** Variants have their own, measurably steeper,
+propensity — 60.44x at runs >= 10 against 39.20x here. That one belongs to variant
+placement; see #378.
 
 ## The others
+
+### `default_quality_score_model.json.gz`
+
+Converted from NEAT2's bundled `errorModel_toy.p` — its `initQ1` seed vector and `probQ1`
+transition tensor, verified to agree to floating-point epsilon (max abs diff 5.6e-16 across
+sampled cells). Same standing as `error_rate` above: fitted from the sequencing data that
+model was built on, originating sample not recorded upstream.
+
+Shape: 101-base reads, 42 continuous scores (0–41), a 100 x 42 x 42 position-by-previous-score
+transition tensor. **That describes an older chemistry** — current instruments commonly emit
+binned quality scores at 151 bp. The model supports binned scores and other read lengths;
+this default does not exercise either. See #677.
+
+### The others
 
 **Provenance unknown.** All predate the Rust port and none is validated by anything beyond
 round-trip serialization:
 
 - `default_mutation_model.json.gz` (+ `_bkup`)
 - `default_indel_model.json.gz`
-- `default_quality_score_model.json.gz`
 - `default_trinuc_model.json.gz`
 
 Each deserves the same treatment: a known source, a measurement against real data, and a
