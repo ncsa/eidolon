@@ -7,8 +7,14 @@
 # original perf baseline was captured under the old default log-level `trace`
 # (per-base debug I/O), so it was 3-4x too slow. Fidelity/determinism rows unchanged
 # (the logging fix is output-preserving; Tier-1 gate re-confirmed all fidelity PASS).
+# contig_order_independent re-frozen to PASS (jobs 21795292, 21797545, and the indellen
+# tier). It was set to FAIL when the collector could not read it: regression_suite.sh
+# grepped `contig_order_independent` while run_order_independence.sbatch prints
+# `contig_name_invariant`, so the metric collected an empty string, which an `exact` gate
+# compares as a failure. #669 fixed the collector; the metric passes and has since it was
+# readable.
 determinism_thread_invariant	PASS	0	exact	0
-contig_order_independent	FAIL	0	exact	0
+contig_order_independent	PASS	0	exact	0
 shard_order_independent	PASS	0	exact	1
 shard_disjoint	PASS	0	exact	1
 ecoli_snp_recall	0.9859	0.0010	ge2sd	0
