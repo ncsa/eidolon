@@ -9,8 +9,13 @@
 # the observation that germline SNV recall is unchanged while somatic dropped.
 #
 # That is a hypothesis. This script makes it testable without real data: run the cancer
-# pipeline twice, identical in every respect except this one field, and see whether the
-# 0.4 arm returns to the ~0.92 baseline.
+# pipeline twice, identical in every respect except this one field.
+#
+# ALREADY RUN, AND THE HYPOTHESIS FAILED (jobs 21823970 / 21823971). Reverting
+# indel_probability to 0.4 moved SNV recall by +0.0136 -- five variants of 368 -- against
+# a 0.081 gap, and both arms landed near 0.85 rather than the 0.921 baseline. #660 is not
+# the cause. The script is kept because the A/B is the right shape for the next candidate;
+# change the field it patches and the guidance below still applies.
 #
 # BOTH arms share one quality-score model -- the same built file, copied and patched -- so
 # the only difference between them is the field under test. Neither arm uses the model
@@ -61,6 +66,17 @@ if "indel_probability" not in model:
 built = model["indel_probability"]
 print(f"       built model carries indel_probability = {built}")
 
+# Both arms are pinned to the shipped error_rate. A model built from a modern library
+# lands far quieter than the inherited default -- 0.000392 against 0.006638 on HCC1395
+# normal, ~17x -- so arms built straight from real reads would run well below the
+# operating point where the effect appears, and a null result could not be told apart
+# from an underpowered one.
+SHIPPED_ERROR_RATE = 0.006638164688495656
+built_rate = model.get("error_rate")
+print(f"       built model error_rate = {built_rate}")
+print(f"       pinning both arms to the shipped {SHIPPED_ERROR_RATE}")
+model["error_rate"] = SHIPPED_ERROR_RATE
+
 for value, tag in ((0.01, "p0.01"), (0.40, "p0.40")):
     model["indel_probability"] = value
     path = f"{outdir}/seq_error_{tag}.json.gz"
@@ -98,11 +114,21 @@ Two arms are in $OUTDIR. Run the cancer pipeline once per arm, changing nothing 
       sbatch $REPO_ROOT/scripts/delta/cancer_pipeline.sbatch
   done
 
-Read somatic SNV recall from each run's scored.stats.csv. Baseline is 0.921 +/- 0.018;
-recent runs on the shipped model give 0.837 and 0.842.
+Read somatic SNV recall from each run's scored.stats.csv:
 
-  p0.40 near 0.92  -> indel_probability is the cause, and the question becomes which
-                      value is right, which needs real data (#680).
-  p0.40 near 0.84  -> something else is responsible; #660 is not the cause and the
-                      search should move on.
+  python3 -c "
+import csv,sys
+r={(x.get('type') or '').strip().lower():x for x in csv.DictReader(open(sys.argv[1]))}
+print(r['snvs']['recall'], r['snvs']['precision'])" <outdir>/scored.stats.csv
+
+COMPARE THE TWO ARMS TO EACH OTHER, not to the tier baseline. Both arms use a quality
+model built from your FASTQ rather than the one compiled into the binary, so their
+absolute recall will not line up with historical runs. Only the difference is meaningful.
+
+  arms differ materially  -> indel_probability affects somatic calling at this operating
+                             point, and the question becomes which value is right.
+  arms within noise       -> it does not, and the hypothesis under test is eliminated.
+
+For scale: 368 truth SNVs means one variant is ~0.003 of recall. A difference of a few
+variants is not a result. Run replicates before concluding anything from a small gap.
 EOF
