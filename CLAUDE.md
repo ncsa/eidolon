@@ -345,6 +345,11 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   Keep using the API when it matters. When
   checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds
   the missed-merge hazard above: both the "did it land" checks can lie in the same direction.)
+- **A broad `git add -A` picks up shell accidents.** An empty file named `=10` reached
+  `main` from an unquoted `>=10` in an interactive shell. Before a `develop` -> `main`
+  merge, check for empty tracked files and paths with characters outside
+  `[A-Za-z0-9_./-]`; the release skill has the two commands. `.gitignore` does not help
+  once a file is tracked — it needs `git rm`.
 - End commit messages with `Co-Authored-By: Claude <noreply@anthropic.com>`.
 
 ## GitNexus block (below)
