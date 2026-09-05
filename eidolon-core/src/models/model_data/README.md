@@ -49,7 +49,7 @@ The choice here was deliberate: **data we can account for beats data that looks 
 ### What it replaced, and why
 
 The previous default was left-skewed (**−0.434**) where every real size-selected library is
-right-skewed; centred at p50 554 against this library's 424; truncated at 799; carried 33
+right-skewed; centered at p50 554 against this library's 424; truncated at 799; carried 33
 integer lengths inside its own range with **no bin at all**; and held an isolated spike at
 fragment length **1** with a 30-wide hole above it — one stray read that survived a filter.
 Its provenance is unknown; it predates the Rust port.
@@ -119,10 +119,10 @@ NA12878/novoalign, with controls at chance in both.
 
 **Each entry is a normalized enrichment** — the share of indel errors at that run length
 divided by the share of reference bases at that run length. That makes the curve
-1.0-centred **by construction** over its human background, so applying it *redistributes*
+1.0-centered **by construction** over its human background, so applying it *redistributes*
 `indel_probability` rather than raising it: the genome-wide total on human is unchanged.
 On a reference with different homopolymer composition the realized total moves with that
-composition, which is the intended behaviour — measured at **0.745x** on the 4.6 Mb E. coli
+composition, which is the intended behavior — measured at **0.745x** on the 4.6 Mb E. coli
 fixture and **0.734x** for an idealized 50% GC random sequence. A genome with fewer
 homopolymers really does slip less.
 

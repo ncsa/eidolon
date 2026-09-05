@@ -568,7 +568,7 @@ fn built_gc_bias_model_depletes_disfavored_gc_in_output() {
 /// checked that quality varies with cycle at all.
 ///
 /// Real Illumina quality decays along the read, and callers weight bases by it, so a
-/// simulator that emits flat quality is not modelling the thing it claims to.
+/// simulator that emits flat quality is not modeling the thing it claims to.
 #[test]
 fn built_seq_error_model_reproduces_the_positional_quality_profile() {
     let tmp = tempfile::tempdir().unwrap();

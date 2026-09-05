@@ -49,12 +49,12 @@ fn default_insertion_fraction() -> f64 {
 /// Measured on HCC1395 matched normal, chr20/21/22 at 46x, over an exact background of
 /// 3,999,990 reference bases (1,726 slippage events; Delta job 21674484). Each entry is a
 /// normalized enrichment — the share of indel errors occurring at that run length divided
-/// by the share of reference bases at that run length — so it is 1.0-centred **by
+/// by the share of reference bases at that run length — so it is 1.0-centered **by
 /// construction** over the human background it was measured on. Applying it therefore
 /// redistributes [`SequencingErrorModel::indel_probability`] across sequence context
 /// without changing the genome-wide total on human. On a reference with a different
 /// homopolymer composition the realized total moves with that composition, which is the
-/// intended behaviour: a genome with fewer homopolymers really does slip less.
+/// intended behavior: a genome with fewer homopolymers really does slip less.
 ///
 /// This is a **shipped default, not a measurement of the user's data** — the same status
 /// the fragment-length model carries. See `model_data/README.md`. Issue #662 makes it
@@ -188,7 +188,7 @@ impl SequencingErrorModel {
     /// `homopolymer_run` is the length of the maximal homopolymer run the base sits in.
     /// `None` — or `Some(0)`, which is not a meaningful run length — means "no context
     /// available" and yields the flat, context-free probability, so a caller that cannot
-    /// supply context keeps its previous behaviour exactly.
+    /// supply context keeps its previous behavior exactly.
     ///
     /// Runs longer than the curve saturate at its last entry: the measurement pooled every
     /// run of 10 or more into one bucket, so claiming a distinction beyond that would be
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn absent_context_yields_exactly_the_flat_context_free_rate() {
         // Must-not-fire. `None` is the adapter path and every pre-#661 caller; it must
-        // reproduce #660 behaviour bit for bit, not merely approximately.
+        // reproduce #660 behavior bit for bit, not merely approximately.
         let model = SequencingErrorModel::default().unwrap();
         assert_eq!(model.indel_probability_at(None), model.indel_probability);
         // 0 is not a run length. A caller that computes a run over an N gets 0 back from
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_homopolymer_shifts_the_generated_error_mix_by_the_curves_factor() {
-        // Behavioural counterpart to the arithmetic above: the curve must reach the
+        // Behavioral counterpart to the arithmetic above: the curve must reach the
         // generated error TYPES, not merely the probability function. Run 10 (39.2x)
         // against no context, same seed, 250k draws each.
         fn indel_share(run: Option<usize>, draws: usize) -> f64 {

@@ -27,7 +27,7 @@ repeat boundary consistently across reads. Measured on HCC1395 normal (chr20/21/
 from **0.64x** at run 1 to **39.20x** at runs of 10 or more, crossing 1.0 at run 4.
 
 This **redistributes** the indel rate rather than raising it. Each entry is a normalized
-enrichment, so the curve is 1.0-centred by construction over its human background and the
+enrichment, so the curve is 1.0-centered by construction over its human background and the
 genome-wide total is unchanged there. On a reference with different homopolymer composition
 the total moves with that composition — measured at 0.745x on E. coli — because a genome
 with fewer homopolymers genuinely slips less.
@@ -43,7 +43,7 @@ not ship; the parameters were static defaults there.
 
 **Model files built before this release keep working.** `insertion_fraction` and
 `indel_context_curve` both deserialize to their shipped defaults when absent, so an older
-`.json.gz` loads and picks up the corrected behaviour rather than failing.
+`.json.gz` loads and picks up the corrected behavior rather than failing.
 
 **Output will differ at the same seed.** Both changes alter which errors are drawn, so runs
 are not byte-comparable across this version. Anything measured against a pre-3.4.0 baseline
@@ -86,7 +86,7 @@ on skew and 0.00% at p99**. The old normal fit matched the mean and standard dev
 missed the skew entirely — under-predicting long fragments by 4.81% at p99.
 
 **The shipped default was replaced.** The previous one was left-skewed (−0.434) where every
-real library is right-skewed, centred 130 bp high, truncated at 799 bp, carried 33 integer
+real library is right-skewed, centered 130 bp high, truncated at 799 bp, carried 33 integer
 lengths inside its own range with no bin at all, and held an isolated spike at fragment
 length **1**. Its provenance was unknown; it predates the Rust port.
 
@@ -133,7 +133,7 @@ standard deviation, skew and p99 all at **1.0x** of real — closed from 1.3x, 1
 
 **The binary is unchanged from v3.2.0.** `eidolon/src`, `eidolon-core/src` and their
 manifests are byte-for-byte identical between the two tags. This release exists solely to
-publish a complete set of platform binaries; nothing in it alters simulator behaviour.
+publish a complete set of platform binaries; nothing in it alters simulator behavior.
 
 ### What was wrong
 
@@ -168,7 +168,7 @@ purity 0.6, `SV_RATE_SCALE=30`, exit 0). Every claim below states the evidence b
 ### Insertions now reach the reads, the CIGAR, and the truth
 
 - **Symbolic `<INS>` is realized** (#500). `SVTYPE=INS;SVLEN=60` from `input_vcf` used to be
-  preserved verbatim while the reads came out behaviourally identical to a no-variant
+  preserved verbatim while the reads came out behaviorally identical to a no-variant
   control — same `I` count, same `D` count, same depth. A benchmark built on that truth
   scored a caller as missing an insertion that was never in the data. `SVLEN` novel bases are
   now drawn and the record becomes a literal ALT, which is what routes them through the
@@ -438,7 +438,7 @@ Three defects:
   (one record per junction, `POS`=min, `END`=max) for callers that re-represent a
   junction as `<DUP:TANDEM>`/`<DEL>`/`<INV>` — a span and a point record are not
   interval-comparable, which no similarity threshold can bridge. Both are reported and
-  labelled. Spans are a comparison artifact only; `END` on an emitted BND still equals
+  labeled. Spans are a comparison artifact only; `END` on an emitted BND still equals
   `POS` per VCF 4.2 §5.4.
 - **The aggregate was dominated by unmatchable types.** BND + CNV were 23 of 47 truth
   records in one run, all guaranteed misses, capping the aggregate near 0.5 regardless of

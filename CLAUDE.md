@@ -112,7 +112,7 @@ contig lengths).
 ## Writing about models and inherited code
 
 The vetting standard above is deliberately blunt about defects. That applies to **eidolon's
-own behaviour**. It does not extend to attribution.
+own behavior**. It does not extend to attribution.
 
 For any model parameter, docs and comments state three things and stop: **the value, where
 it came from, and whether it has been measured.** Provenance belongs in
@@ -120,14 +120,20 @@ it came from, and whether it has been measured.** Provenance belongs in
 
 - Write "inherited static default, not yet measured", not "placeholder that was never
   fitted".
-- Name an upstream file when it helps someone reproduce a number. Don't catalogue what
+- Name an upstream file when it helps someone reproduce a number. Don't catalog what
   upstream left unfinished.
 - State a correction as what is true now — "X and Y were transposed; both now carry their
   correct values" — rather than narrating how wrong the previous value was.
-- eidolon's context-dependent modelling implements designs anticipated upstream but not
+- eidolon's context-dependent modeling implements designs anticipated upstream but not
   shipped. Describe it that way.
 
 This is a standard for CHANGELOGs, issues and PR bodies as much as for code comments.
+
+**American spelling throughout** — code, comments, docs, commit messages, issues and PR
+bodies. `behavior` not `behaviour`, `centered` not `centred`, `normalize` not `normalise`,
+`modeling` not `modelling`, `analyze` not `analyse`, `labeled` not `labelled`, `judgment`
+not `judgement`, `defense` not `defence`. Existing identifiers and filenames are left alone
+unless they are being changed for another reason — `indel_context_summarise.awk` stays.
 
 ## Languages: Rust, bash, and (reluctantly) Python
 - **The shipped artifact is pure Rust** and must stay that way: the binary invokes no
@@ -178,7 +184,7 @@ This is a standard for CHANGELOGs, issues and PR bodies as much as for code comm
   It removes the package while leaving `craype-accel-nvidia80`, the module that demands it.
   Unloading `craype-accel-nvidia80` instead is untested; it should work by the same reasoning,
   but it would not persist anyway since `default` reloads at every login.
-  **Symptom to recognise:** every dependency *build script* fails to link on a fresh
+  **Symptom to recognize:** every dependency *build script* fails to link on a fresh
   `CARGO_TARGET_DIR`, while a cached target dir gets all the way to the final binary and fails
   there. Same cause; the cache only changes where it surfaces.
   **`CARGO_TARGET_DIR` must be `$SCRATCH/cargo-target/eidolon`** — the pipeline reads
@@ -205,7 +211,7 @@ This is a standard for CHANGELOGs, issues and PR bodies as much as for code comm
   Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~214 GB peak per
   replicate** — the pipeline's disk gate scales this by genome size and coverage, so chr22 at
   30x asks for the 5 GB floor rather than 214 (a constant would have refused every smoke run
-  once `/scratch` passed 336 GB used). Itemised from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
+  once `/scratch` passed 336 GB used). Itemized from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
   normal 12+12) **plus** BAMs 98 GB (the figure `prune_bams` itself reported across
   campaign 20925151), which coexist because pruning only runs at the end. An earlier
   "~113 GB" figure here counted the FASTQ only and was wrong; every capacity estimate built on it was ~half of reality. With a ~171 GB fixed
@@ -328,7 +334,7 @@ This is a standard for CHANGELOGs, issues and PR bodies as much as for code comm
 - **`gh pr view --json commits` has served a STALE commit list** — it showed only the first
   commit of a branch while `gh api repos/ncsa/eidolon/pulls/<N>/commits` was correct.
   Retested on gh 2.98.0 (2026-08-30): the two agreed on PR #640. That is ONE PR, not proof
-  the bug is gone — it was never characterised well enough to know if it was timing-dependent
+  the bug is gone — it was never characterized well enough to know if it was timing-dependent
   — but it is consistent with the same stale-client cause as the `gh pr edit` failure above.
   Keep using the API when it matters. When
   checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds
