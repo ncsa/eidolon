@@ -41,7 +41,7 @@ END {
         # size. Pooling them would hand the error model variant-sized events.
         L = ilen[k] + 0
         if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }
-        else if (f < lf) { lo[h]++; tlo++; llen[L]++; }
+        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[h SUBSEP (L<0?-L:L)]++; }
         else             { mid[h]++; tmid++ }
     }
     print ""
@@ -135,6 +135,39 @@ END {
         print "       empty by construction and cannot be fitted from this run."
         exit 1
     }
+    print ""
+    # ── slippage length CONDITIONED on homopolymer run length ────────────────
+    # Marginals cannot answer whether long indel errors are slippage. #661 already makes
+    # indel errors ~39x more likely inside a 10+-mer while their LENGTH is drawn
+    # independently, so the simulator places long deletions inside homopolymers without
+    # any evidence that real ones sit there. This is the table that decides it.
+    print ""
+    print "════════════════════════════════════════════════════════════════"
+    print "SLIPPAGE INDEL LENGTH BY HOMOPOLYMER RUN LENGTH  (low support only)"
+    print ""
+    printf "%-6s", "run"
+    for (b = 1; b <= 6; b++) printf "%8s", b
+    printf "%8s%8s%8s%10s\n", "7-9", "10-19", ">=20", "n"
+    for (h = 1; h <= mx; h++) {
+        rn = 0
+        for (b = 1; b <= 60; b++) rn += lxr[h SUBSEP b] + 0
+        if (rn == 0) continue
+        printf "%-6s", (h == mx ? ">=" mx : h "")
+        for (b = 1; b <= 6; b++) printf "%8d", lxr[h SUBSEP b] + 0
+        s79 = 0;  for (b = 7;  b <= 9;  b++) s79 += lxr[h SUBSEP b] + 0
+        s19 = 0;  for (b = 10; b <= 19; b++) s19 += lxr[h SUBSEP b] + 0
+        s20 = 0;  for (b = 20; b <= 60; b++) s20 += lxr[h SUBSEP b] + 0
+        printf "%8d%8d%8d%10d\n", s79, s19, s20, rn
+    }
+    print ""
+    print "HOW TO READ IT. If slippage length is a function of run length, the mass moves"
+    print "right as run length grows and >=20 bp events sit only in long runs. If the >=20"
+    print "column is populated at run 1-2, those events are not slippage -- they are"
+    print "mapping artifacts or rare somatic events landing in the low-support class, and"
+    print "indel-error length should NOT be conditioned on run length."
+    print ""
+    print "A deletion longer than its run cannot be slippage by construction: a 3-mer"
+    print "cannot lose 10 bases of register. Cells right of the diagonal are that case."
     print ""
     print "WHAT THE low COLUMN IS FOR. It is the measured length distribution of"
     print "sequencing-error indels -- the input to SequencingErrorModel's"
