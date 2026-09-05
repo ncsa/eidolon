@@ -65,29 +65,34 @@ Not a file — it is built inline in `models/sequencing_error_model.rs`, small e
 was never worth a `.json.gz`. It ships with every run that does not supply its own, so it
 gets the same accounting as the files above.
 
-### The NEAT2 constants (#660)
+### Inherited parameters (#660)
 
-Four of its parameters come from `neat2/utilities/genSeqErrorModel.py`, and they are
-**placeholders that were never fitted from data.** They live in that script's
-`if PILEUP == None:` branch — the one that prints *"Using default sequencing error
-parameters..."*. The other branch reads `print 'Pileup parsing coming soon!'; exit(1)`: the
-fitting code was never written, so these defaults were the only path anyone ever took.
+Four parameters carry over from NEAT2's `genSeqErrorModel.py`, where they are static
+defaults rather than fitted values — that tool fits the quality-score model from FASTQ and
+leaves the indel parameters fixed.
 
-| parameter | value | NEAT2 name |
+| parameter | value | source name |
 |---|---|---|
 | `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
 | `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
-| length distribution | `[0.999, 0.001]` over lengths `[1, 2]` | — |
-| insertion base composition | uniform over ACGT | — |
+| insertion base composition | uniform over ACGT | `SIE_INS_NUCL` |
+| substitution transition matrix | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` |
 
-**These were mistranslated in the Rust port.** The insertion fraction was used as the indel
-rate, the real indel rate was dropped, and the insertion split was replaced by a hardcoded
-`0.5` — about **40x too many** sequencing errors made into indels. #660 restored them.
+`indel_probability` and `insertion_fraction` were transposed during the Rust port: 0.4 was
+applied as the indel rate and the insertion split was fixed at 0.5, giving roughly 40x the
+intended indel-error rate. #660 corrected both.
 
-**Restoring is not the same as making them right.** Real Illumina indel error is around
-1e-5/base; NEAT2's 0.01 gives ~3.2e-6 at Q35, roughly 3x low, where the pre-#660 0.4 was
-~13x high. The value matches its source, and its source was a guess. Deviating from 0.01
-needs its own measurement and its own justification.
+**Status.** 0.01 matches its source but has not been measured against real data; at Q35 it
+gives ~3.2e-6 indel errors per base against a real Illumina rate near 1e-5. Changing it
+needs its own measurement. `insertion_fraction` **has** been measured and holds — see the
+indel-error length section below.
+
+### `error_rate` (0.006638164688495656)
+
+Fitted, not a static default. It is the `avgError` of NEAT2's bundled `errorModel_toy.p`,
+computed from the sequencing data that model was built on. The originating sample is not
+recorded upstream. Listed separately here because it has different standing from the four
+above.
 
 ### The indel context curve (#661)
 

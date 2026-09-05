@@ -3,26 +3,22 @@
 ## eidolon v3.4.0 (unreleased) — sequencing-error indels
 
 Sequencing-error indels were being generated about 40x too often, uniformly across the
-genome. Two NEAT2 constants are restored to their source values, and the indel share now
-depends on local homopolymer run length, which is where real slippage happens.
+genome. Two inherited constants are corrected, and the indel share now depends on local
+homopolymer run length, which is where slippage occurs.
 
 ### What changed for you
 
-**Two mistranslated NEAT2 constants (#660).** `neat2/utilities/genSeqErrorModel.py` defines
-`SIE_RATE = 0.01` (odds a sequencing error is an indel) and `SIE_INS_FREQ = 0.4` (odds such
-an indel is an insertion). The Rust port took the *insertion fraction* and used it as the
-*indel rate*, dropped the real indel rate, and replaced the insertion split with a
-hardcoded `0.5`. At Q35 that emitted 1.26e-4 indel errors per base against NEAT2's intended
-3.16e-6. Both constants are now correct, and the insertion split is a serialized
+**Two corrected constants (#660).** `indel_probability` (the odds a sequencing error is an
+indel) and `insertion_fraction` (the odds such an indel is an insertion) had been
+transposed: 0.4 was applied as the indel rate and the insertion split was fixed at 0.5. At
+Q35 that produced 1.26e-4 indel errors per base against an intended 3.16e-6. Both now carry
+their correct values, 0.01 and 0.4, and the insertion split is a serialized
 `insertion_fraction` field rather than a literal.
 
-**Correcting these does not make them right, and we are not pretending otherwise.** Real
-Illumina indel error is around 1e-5/base. NEAT2's 0.01 gives ~3.2e-6 at Q35 — about 3x low,
-where the previous 0.4 was ~13x high. These values now match their source; their source is
-a pair of placeholders in a branch of NEAT2 whose alternative reads
-`print 'Pileup parsing coming soon!'; exit(1)`. The fitting code was never written. Tuning
-them to some other number nobody measured would trade a documented guess for an
-undocumented one.
+**`indel_probability` is not yet measured.** 0.01 matches its source but sits about 3x below
+a real Illumina indel-error rate near 1e-5/base. It is left at its source value pending a
+measurement rather than tuned to an unverified number. `insertion_fraction` **has** been
+measured — 0.387 on HCC1395 normal — and holds at 0.4.
 
 **Indel errors now follow local homopolymer run length (#661).** Real slippage is
 concentrated in homopolymers, where gap placement is ambiguous and aligners clip at the
@@ -39,6 +35,9 @@ with fewer homopolymers genuinely slips less.
 The curve is a **default, not a measurement of your data**, the same status the
 fragment-length model carries. Full provenance is in
 `eidolon-core/src/models/model_data/README.md`. #662 makes it fittable from a BAM.
+
+This implements sequence-context dependence that the upstream design anticipated but did
+not ship; the parameters were static defaults there.
 
 ### Compatibility
 
