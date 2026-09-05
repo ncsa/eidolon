@@ -51,17 +51,19 @@ M3
 the background is not binned like the observed side@FILENAME == f_bg  { b = $1 + 0; if (b > mx) b = mx; bgn[b] += $2; bgtot += $2; next }@FILENAME == f_bg  { bgn[$1 + 0] += $2; bgtot += $2; next }
 files are matched by substring instead of exact path@FILENAME == f_ctx { hp[$1 SUBSEP $2]  = $3; next }@FILENAME ~ /ctx/ { hp[$1 SUBSEP $2]  = $3; next }
 an empty background is not fatal@    if (bgtot == 0) {@    if (0) {
-support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }@        if (f < hf)      { hi[h]++; thi++; hlen[L]++; }
+support class thresholds are inverted@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; hxr[h SUBSEP (L<0?-L:L)]++; }@        if (f < hf)      { hi[h]++; thi++; hlen[L]++; hxr[h SUBSEP (L<0?-L:L)]++; }
 enrichment ignores the background@        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot / bs : 0@        e_all  = (bs > 0 && tot > 0) ? (n[h]  + 0) / tot : 0
 the low-support curve is normalized by the pooled total@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tot / bs : 0
 the low-support curve counts every indel, not just slippage@        e_low  = (bs > 0 && tlo > 0) ? (lo[h] + 0) / tlo / bs : 0@        e_low  = (bs > 0 && tlo > 0) ? (n[h] + 0) / tlo / bs : 0
 the variant curve is fed the slippage counts@        e_high = (bs > 0 && thi > 0) ? (hi[h] + 0) / thi / bs : 0@        e_high = (bs > 0 && thi > 0) ? (lo[h] + 0) / thi / bs : 0
-the slippage length column is fed every indel@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; llen[L]++; }
+the slippage length column is fed every indel@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; hxr[h SUBSEP (L<0?-L:L)]++; }@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; hxr[h SUBSEP (L<0?-L:L)]++; llen[L]++; }
 the length table normalizes by the pooled total@               llen[L]+0, (tlo ? llen[L]/tlo : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)@               llen[L]+0, (tot ? llen[L]/tot : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)
 an empty slippage length table is not fatal@    if (tlo == 0) {@    if (0) {
 the cross-tab is fed high-support events too@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[h SUBSEP (L<0?-L:L)]++; }@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; } { lxr[h SUBSEP (L<0?-L:L)]++; }
 the cross-tab keys on length instead of run length@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[h SUBSEP (L<0?-L:L)]++; }@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[(L<0?-L:L) SUBSEP h]++; }
-the >=20 column stops at 20 instead of pooling above it@        s20 = 0;  for (b = 20; b <= 60; b++) s20 += lxr[h SUBSEP b] + 0@        s20 = 0;  for (b = 20; b <= 20; b++) s20 += lxr[h SUBSEP b] + 0
+the >=20 column stops at 20 instead of pooling above it@        s20 = 0;  for (b = 20; b <= 60; b++) s20 += arr[h SUBSEP b] + 0@        s20 = 0;  for (b = 20; b <= 20; b++) s20 += arr[h SUBSEP b] + 0
+the variant cross-tab is fed the slippage counts@    print_length_by_run("VARIANT INDEL LENGTH BY HOMOPOLYMER RUN LENGTH  (high support)", hxr, mx)@    print_length_by_run("VARIANT INDEL LENGTH BY HOMOPOLYMER RUN LENGTH  (high support)", lxr, mx)
+the variant class is not cross-tabulated at all@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; hxr[h SUBSEP (L<0?-L:L)]++; }@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }
 M2
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -69,7 +71,7 @@ fi
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=96
+MIN_ASSERTIONS=102
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
@@ -272,10 +274,16 @@ xout="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
     -v f_ind="$WORK/x_ind.tsv" -v f_dep="$WORK/x_dep.tsv" \
     -v f_ctx="$WORK/x_ctx.tsv" -v f_bg="$WORK/x_bg.tsv" \
     -f "$SUMMARISE" "$WORK/x_ind.tsv" "$WORK/x_dep.tsv" "$WORK/x_ctx.tsv" "$WORK/x_bg.tsv")"
-xtab() { printf '%s' "$xout" | awk '/SLIPPAGE INDEL LENGTH BY HOMOPOLYMER/,0'; }
-xrow() { xtab | awk -v r="$1" '$1 == r'; }
+# Bounded at the next table's title. An unbounded `,0` swallows the variant cross-tab and
+# returns two rows for the same run label, which reads as a mismatch on a correct value.
+xtab()  { printf '%s' "$xout" | awk '/SLIPPAGE INDEL LENGTH BY HOMOPOLYMER/,/VARIANT INDEL LENGTH BY HOMOPOLYMER/'; }
+xrow()  { xtab | awk -v r="$1" '$1 == r'; }
+vtab()  { printf '%s' "$xout" | awk '/VARIANT INDEL LENGTH BY HOMOPOLYMER/,/^HOW TO READ THEM/'; }
+vrow()  { vtab | awk -v r="$1" '$1 == r'; }
 hasw "the cross-tab is printed"                  "$xout" "SLIPPAGE INDEL LENGTH BY HOMOPOLYMER RUN LENGTH"
-hasw "it says what a populated >=20 cell at short runs means" "$xout" "should NOT be conditioned on run length"
+hasw "it says what a populated >=20 cell at short runs means" "$xout" "those events are not repeat-driven"
+hasw "the variant cross-tab is printed too"        "$xout" "VARIANT INDEL LENGTH BY HOMOPOLYMER RUN LENGTH"
+hasw "it says why both classes are tabulated"      "$xout" "whether VARIANT placement can"
 # columns: run=$1, lengths 1..6 = $2..$7, 7-9=$8, 10-19=$9, >=20=$10, n=$11
 eq "run 1 has two 1 bp events"        "$(xrow 1 | awk '{print $2}')" "2"
 eq "run 1 has one >=20 bp event"      "$(xrow 1 | awk '{print $10}')" "1"
@@ -299,11 +307,22 @@ x2out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
     -v f_ind="$WORK/x2_ind.tsv" -v f_dep="$WORK/x_dep.tsv" \
     -v f_ctx="$WORK/x_ctx.tsv" -v f_bg="$WORK/x_bg.tsv" \
     -f "$SUMMARISE" "$WORK/x2_ind.tsv" "$WORK/x_dep.tsv" "$WORK/x_ctx.tsv" "$WORK/x_bg.tsv")"
-x2row() { printf '%s' "$x2out" | awk '/SLIPPAGE INDEL LENGTH BY HOMOPOLYMER/,0' | awk -v r="$1" '$1 == r'; }
+x2row()  { printf '%s' "$x2out" | awk '/SLIPPAGE INDEL LENGTH BY HOMOPOLYMER/,/VARIANT INDEL LENGTH BY HOMOPOLYMER/' | awk -v r="$1" '$1 == r'; }
+x2vrow() { printf '%s' "$x2out" | awk '/VARIANT INDEL LENGTH BY HOMOPOLYMER/,/^HOW TO READ THEM/' | awk -v r="$1" '$1 == r'; }
 eq "a high-support long event does not enter the slippage cross-tab" \
    "$(x2row 1 | awk '{print $10}')" "0"
 eq "and the short events it kept are still counted" \
    "$(x2row 1 | awk '{print $11}')" "2"
+# The same events must appear in the VARIANT table instead -- promoted, not discarded.
+# x2 has one high-support -30 at run 1 and one high-support -25 at run 12.
+eq "the promoted long event appears in the variant cross-tab at run 1" \
+   "$(x2vrow 1 | awk '{print $10}')" "1"
+eq "and the other at run >=10"      "$(x2vrow '>=10' | awk '{print $10}')" "1"
+eq "the variant table counts only high-support events at run 1" \
+   "$(x2vrow 1 | awk '{print $11}')" "1"
+# Must-not-fire: with no high-support events at all, the variant table has no rows.
+eq "an all-low-support run prints an empty variant table" \
+   "$(vtab | awk '$1 ~ /^[0-9]+$/ || $1 ~ /^>=/' | wc -l | tr -d ' ')" "0"
 
 echo "=== the archived job 21674484 reproduces all three published curves ==="
 # Known answer against REAL data, not a synthetic fixture. The counts below are job
