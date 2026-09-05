@@ -61,11 +61,10 @@ Two findings came out of that exercise:
   **0.193**, forcing the A row to T gives **0.892**.
 
   This bullet previously read "`indel_probability` is 0.4, so ~40% of sequencing errors are
-  indels". That constant was a NEAT2 mistranslation, corrected to 0.01 by #660. The indel
-  floor on this fixture is still ~39%, but now because #661 scales the indel share by local
-  homopolymer run length and the fixture is a 20,000-base poly-A reference — the curve's
-  most enriched case (0.01 x 39.20 = 0.392). Same number, different mechanism; on a
-  homopolymer-free reference the floor would be ~0.6%.
+  indels". #660 corrected that constant to 0.01. The floor on this fixture is still ~39%,
+  but for a different reason: #661 scales the indel share by local homopolymer run length,
+  and the fixture is a 20,000-base poly-A reference — the curve's most enriched case
+  (0.01 x 39.20 = 0.392). On a homopolymer-free reference the floor would be ~0.6%.
 
 ## What the local tier cannot establish
 

@@ -49,19 +49,19 @@ fn default_insertion_fraction() -> f64 {
 /// Measured on HCC1395 matched normal, chr20/21/22 at 46x, over an exact background of
 /// 3,999,990 reference bases (1,726 slippage events; Delta job 21674484). Each entry is a
 /// normalized enrichment — the share of indel errors occurring at that run length divided
-/// by the share of reference bases at that run length — so it is 1.0-centred **by
+/// by the share of reference bases at that run length — so it is 1.0-centered **by
 /// construction** over the human background it was measured on. Applying it therefore
 /// redistributes [`SequencingErrorModel::indel_probability`] across sequence context
 /// without changing the genome-wide total on human. On a reference with a different
 /// homopolymer composition the realized total moves with that composition, which is the
-/// intended behaviour: a genome with fewer homopolymers really does slip less.
+/// intended behavior: a genome with fewer homopolymers really does slip less.
 ///
 /// This is a **shipped default, not a measurement of the user's data** — the same status
 /// the fragment-length model carries. See `model_data/README.md`. Issue #662 makes it
 /// fittable from a BAM.
 ///
-/// Deliberately NOT the variant curve from #378: variants reach 60.44x at runs >= 10 where
-/// errors reach 39.20x, and conflating the two is the mistake #378 already records.
+/// This is the sequencing-error curve. Variants have their own, measurably steeper, curve
+/// (60.44x at runs >= 10 against 39.20x here); it belongs to placement — see #378.
 pub(crate) const DEFAULT_INDEL_CONTEXT_CURVE: [f64; 10] = [
     0.64, 0.76, 0.82, 1.11, 1.58, 1.84, 5.64, 12.16, 24.24, 39.20,
 ];
@@ -104,7 +104,8 @@ impl SequencingErrorModel {
     // requires infallible `fn default() -> Self`, which doesn't fit.
     #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self, SeqModelError> {
-        // This is the default sequencing error model employed by NEAT2
+        // Static defaults inherited from NEAT2, plus measured values where we have them;
+        // provenance for each is in model_data/README.md.
         // Note that this was originally in a file, and we could have done it the way we did
         // the other defaults, but it was so small, I just included it in full here.
         let default_transition_distros = TransitionMatrix::from(
@@ -187,7 +188,7 @@ impl SequencingErrorModel {
     /// `homopolymer_run` is the length of the maximal homopolymer run the base sits in.
     /// `None` — or `Some(0)`, which is not a meaningful run length — means "no context
     /// available" and yields the flat, context-free probability, so a caller that cannot
-    /// supply context keeps its previous behaviour exactly.
+    /// supply context keeps its previous behavior exactly.
     ///
     /// Runs longer than the curve saturate at its last entry: the measurement pooled every
     /// run of 10 or more into one bucket, so claiming a distinction beyond that would be
@@ -265,9 +266,8 @@ impl SequencingErrorModel {
         // Returns either an insertion (option 1) or a deletion (option 2) depending on a random selection from a list of potential
         // error lengths (-2..2). This makes an insertion of up to 2 bases as likely as a random deletion of up to 2 bases.
         if rng.random()? < self.insertion_fraction {
-            // Insertion vs deletion is NEAT2's SIE_INS_FREQ (0.4), not an even split; the
-            // "fifty-fifty" this comment used to claim was the hardcoded 0.5 that #660
-            // replaced with `insertion_fraction`.
+            // Insertions are 0.4 of indel errors, not an even split (#660). Measured at
+            // 0.387 on real data; see model_data/README.md.
             // insertion
             let mut sequence = Vec::new();
             let length = self.ins_length_distribution.sample(rng.random()?)?;
@@ -461,7 +461,7 @@ mod tests {
         let model =
             SequencingErrorModel::from_raw_data(error_rate, quality_score_model, None).unwrap();
         assert!((model.error_rate() - error_rate).abs() < 1e-15);
-        // indel_probability default from NEAT2 should be preserved
+        // indel_probability must keep its inherited value
         assert!((model.indel_probability - 0.01).abs() < 1e-15);
         assert!((model.insertion_fraction - 0.4).abs() < 1e-15);
         // Model must be usable
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(
             distribution.values().unwrap(),
             expected_values,
-            "{name}: values drifted from NEAT2"
+            "{name}: values drifted from their source"
         );
         let actual_cdf = distribution.weights().unwrap();
         assert_eq!(
@@ -521,11 +521,10 @@ mod tests {
 
     #[test]
     fn neat2_gen_seq_error_model_defaults_are_pinned_to_the_source_constants() {
-        // NEAT2 neat2/utilities/genSeqErrorModel.py, in the `if PILEUP == None`
-        // default branch, defines SIE_RATE = 0.01 (fraction of sequencing errors
-        // that are indels) and SIE_INS_FREQ = 0.4 (fraction of those indels that
-        // are insertions). Keep their meanings separate: their earlier conflation
-        // made 40 times too many sequencing errors into indels.
+        // Pins the two inherited constants to their source values: SIE_RATE = 0.01 (the
+        // fraction of sequencing errors that are indels) and SIE_INS_FREQ = 0.4 (the
+        // fraction of those that are insertions), from NEAT2's genSeqErrorModel.py. The
+        // two were transposed in the Rust port; this keeps their meanings separate.
         let default_model = SequencingErrorModel::default().unwrap();
         let fitted_model =
             SequencingErrorModel::from_raw_data(0.006, QualityScoreModel::default().unwrap(), None)
@@ -537,15 +536,15 @@ mod tests {
         ] {
             assert!(
                 (model.indel_probability - 0.01).abs() < f64::EPSILON,
-                "{name}: NEAT2 genSeqErrorModel.py SIE_RATE must remain 0.01"
+                "{name}: SIE_RATE must remain 0.01"
             );
             assert!(
                 (model.insertion_fraction - 0.4).abs() < f64::EPSILON,
-                "{name}: NEAT2 genSeqErrorModel.py SIE_INS_FREQ must remain 0.4"
+                "{name}: SIE_INS_FREQ must remain 0.4"
             );
 
-            // These NEAT2 defaults already translated correctly. Assert them here so
-            // changing SIE_RATE cannot accidentally rewrite unrelated parameters.
+            // These translated correctly. Asserted here so changing SIE_RATE cannot
+            // rewrite unrelated parameters.
             assert_distribution(
                 &model.ins_length_distribution,
                 vec![1, 2],
@@ -562,7 +561,7 @@ mod tests {
                 &model.insertion_bias,
                 ALLOWED_NUCS.to_vec(),
                 &[0.25, 0.5, 0.75, 1.0],
-                "NEAT2 uniform sequencing insertion-base composition",
+                "uniform sequencing insertion-base composition",
             );
         }
 
@@ -581,7 +580,7 @@ mod tests {
                     &model.transition_distros[base],
                     ALLOWED_NUCS.to_vec(),
                     &expected,
-                    &format!("{name}: NEAT2 sequencing-error transition matrix row {base:?}"),
+                    &format!("{name}: sequencing-error transition matrix row {base:?}"),
                 );
             }
         }
@@ -594,7 +593,7 @@ mod tests {
         // affect this split.  250k draws make both historical mutations (0.4 indels and
         // a 0.5 insertion split) unambiguously outside these intervals.
         let model = SequencingErrorModel::default().unwrap();
-        let mut rng = NeatRng::new_from_seed(&vec!["NEAT2 SIE regression".to_string()]).unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["SIE regression".to_string()]).unwrap();
         let mut indels = 0usize;
         let mut insertions = 0usize;
         const DRAWS: usize = 250_000;
@@ -627,10 +626,9 @@ mod tests {
 
     #[test]
     fn the_shipped_curve_is_pinned_to_the_measured_values() {
-        // Known answer, pinned against its source the way #660 pinned the NEAT2 constants.
-        // These are enrichments from Delta job 21674484 (HCC1395 normal, chr20/21/22,
-        // 1,726 slippage events over 3,999,990 reference bases). Changing one silently is
-        // exactly how the NEAT2 mistranslation survived, so name them here.
+        // Known answer, pinned against its source: enrichments from Delta job 21674484
+        // (HCC1395 normal, chr20/21/22, 1,726 slippage events over 3,999,990 reference
+        // bases). Named here so a silent change fails.
         assert_eq!(
             DEFAULT_INDEL_CONTEXT_CURVE,
             [
@@ -740,7 +738,7 @@ mod tests {
     #[test]
     fn absent_context_yields_exactly_the_flat_context_free_rate() {
         // Must-not-fire. `None` is the adapter path and every pre-#661 caller; it must
-        // reproduce #660 behaviour bit for bit, not merely approximately.
+        // reproduce #660 behavior bit for bit, not merely approximately.
         let model = SequencingErrorModel::default().unwrap();
         assert_eq!(model.indel_probability_at(None), model.indel_probability);
         // 0 is not a run length. A caller that computes a run over an N gets 0 back from
@@ -769,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_homopolymer_shifts_the_generated_error_mix_by_the_curves_factor() {
-        // Behavioural counterpart to the arithmetic above: the curve must reach the
+        // Behavioral counterpart to the arithmetic above: the curve must reach the
         // generated error TYPES, not merely the probability function. Run 10 (39.2x)
         // against no context, same seed, 250k draws each.
         fn indel_share(run: Option<usize>, draws: usize) -> f64 {
@@ -839,7 +837,7 @@ mod tests {
         let model = SequencingErrorModel::from_file(&path).unwrap();
         assert!(
             (model.insertion_fraction - 0.4).abs() < f64::EPSILON,
-            "models without insertion_fraction must default to NEAT2 SIE_INS_FREQ = 0.4"
+            "models without insertion_fraction must default to 0.4"
         );
     }
 

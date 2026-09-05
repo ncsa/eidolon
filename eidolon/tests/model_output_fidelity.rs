@@ -568,7 +568,7 @@ fn built_gc_bias_model_depletes_disfavored_gc_in_output() {
 /// checked that quality varies with cycle at all.
 ///
 /// Real Illumina quality decays along the read, and callers weight bases by it, so a
-/// simulator that emits flat quality is not modelling the thing it claims to.
+/// simulator that emits flat quality is not modeling the thing it claims to.
 #[test]
 fn built_seq_error_model_reproduces_the_positional_quality_profile() {
     let tmp = tempfile::tempdir().unwrap();
@@ -757,14 +757,11 @@ fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usi
 /// assertion would fail on working code. The control run pins where the substitution
 /// spectrum sits without the override, so the comparison isolates the matrix's effect.
 ///
-/// **Why the floor is ~39% here and not the model's 1%.** This comment used to read
-/// "`indel_probability` is 0.4, so roughly 40% of errors are indels". #660 corrected that
-/// constant to NEAT2's 0.01, and #661 then made the indel share depend on local
-/// homopolymer run length. `simulate_over_polya` uses a 20,000-base all-A reference — a
-/// homopolymer far past the curve's cap, and so its most enriched case: 0.01 x 39.20 =
-/// 0.392. The old number is accidentally close to the new one for an entirely different
-/// reason, which is worth stating plainly rather than leaving as a comment that happens to
-/// still look right. A homopolymer-free fixture would have a ~0.6% floor instead.
+/// **Why the floor is ~39% here and not the model's 1%.** `simulate_over_polya` uses a
+/// 20,000-base all-A reference — a homopolymer past the #661 curve's cap, so its most
+/// enriched case: 0.01 x 39.20 = 0.392. Before #660 this figure was ~40% for an unrelated
+/// reason (`indel_probability` was 0.4), so the number is coincidentally similar. A
+/// homopolymer-free fixture would have a ~0.6% floor instead.
 #[test]
 fn built_seq_error_transition_matrix_decides_the_substituted_base() {
     let tmp = tempfile::tempdir().unwrap();

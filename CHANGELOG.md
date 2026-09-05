@@ -3,26 +3,22 @@
 ## eidolon v3.4.0 (unreleased) — sequencing-error indels
 
 Sequencing-error indels were being generated about 40x too often, uniformly across the
-genome. Two NEAT2 constants are restored to their source values, and the indel share now
-depends on local homopolymer run length, which is where real slippage happens.
+genome. Two inherited constants are corrected, and the indel share now depends on local
+homopolymer run length, which is where slippage occurs.
 
 ### What changed for you
 
-**Two mistranslated NEAT2 constants (#660).** `neat2/utilities/genSeqErrorModel.py` defines
-`SIE_RATE = 0.01` (odds a sequencing error is an indel) and `SIE_INS_FREQ = 0.4` (odds such
-an indel is an insertion). The Rust port took the *insertion fraction* and used it as the
-*indel rate*, dropped the real indel rate, and replaced the insertion split with a
-hardcoded `0.5`. At Q35 that emitted 1.26e-4 indel errors per base against NEAT2's intended
-3.16e-6. Both constants are now correct, and the insertion split is a serialized
+**Two corrected constants (#660).** `indel_probability` (the odds a sequencing error is an
+indel) and `insertion_fraction` (the odds such an indel is an insertion) had been
+transposed: 0.4 was applied as the indel rate and the insertion split was fixed at 0.5. At
+Q35 that produced 1.26e-4 indel errors per base against an intended 3.16e-6. Both now carry
+their correct values, 0.01 and 0.4, and the insertion split is a serialized
 `insertion_fraction` field rather than a literal.
 
-**Correcting these does not make them right, and we are not pretending otherwise.** Real
-Illumina indel error is around 1e-5/base. NEAT2's 0.01 gives ~3.2e-6 at Q35 — about 3x low,
-where the previous 0.4 was ~13x high. These values now match their source; their source is
-a pair of placeholders in a branch of NEAT2 whose alternative reads
-`print 'Pileup parsing coming soon!'; exit(1)`. The fitting code was never written. Tuning
-them to some other number nobody measured would trade a documented guess for an
-undocumented one.
+**`indel_probability` is not yet measured.** 0.01 matches its source but sits about 3x below
+a real Illumina indel-error rate near 1e-5/base. It is left at its source value pending a
+measurement rather than tuned to an unverified number. `insertion_fraction` **has** been
+measured — 0.387 on HCC1395 normal — and holds at 0.4.
 
 **Indel errors now follow local homopolymer run length (#661).** Real slippage is
 concentrated in homopolymers, where gap placement is ambiguous and aligners clip at the
@@ -31,7 +27,7 @@ repeat boundary consistently across reads. Measured on HCC1395 normal (chr20/21/
 from **0.64x** at run 1 to **39.20x** at runs of 10 or more, crossing 1.0 at run 4.
 
 This **redistributes** the indel rate rather than raising it. Each entry is a normalized
-enrichment, so the curve is 1.0-centred by construction over its human background and the
+enrichment, so the curve is 1.0-centered by construction over its human background and the
 genome-wide total is unchanged there. On a reference with different homopolymer composition
 the total moves with that composition — measured at 0.745x on E. coli — because a genome
 with fewer homopolymers genuinely slips less.
@@ -40,11 +36,14 @@ The curve is a **default, not a measurement of your data**, the same status the
 fragment-length model carries. Full provenance is in
 `eidolon-core/src/models/model_data/README.md`. #662 makes it fittable from a BAM.
 
+This implements sequence-context dependence that the upstream design anticipated but did
+not ship; the parameters were static defaults there.
+
 ### Compatibility
 
 **Model files built before this release keep working.** `insertion_fraction` and
 `indel_context_curve` both deserialize to their shipped defaults when absent, so an older
-`.json.gz` loads and picks up the corrected behaviour rather than failing.
+`.json.gz` loads and picks up the corrected behavior rather than failing.
 
 **Output will differ at the same seed.** Both changes alter which errors are drawn, so runs
 are not byte-comparable across this version. Anything measured against a pre-3.4.0 baseline
@@ -87,7 +86,7 @@ on skew and 0.00% at p99**. The old normal fit matched the mean and standard dev
 missed the skew entirely — under-predicting long fragments by 4.81% at p99.
 
 **The shipped default was replaced.** The previous one was left-skewed (−0.434) where every
-real library is right-skewed, centred 130 bp high, truncated at 799 bp, carried 33 integer
+real library is right-skewed, centered 130 bp high, truncated at 799 bp, carried 33 integer
 lengths inside its own range with no bin at all, and held an isolated spike at fragment
 length **1**. Its provenance was unknown; it predates the Rust port.
 
@@ -134,7 +133,7 @@ standard deviation, skew and p99 all at **1.0x** of real — closed from 1.3x, 1
 
 **The binary is unchanged from v3.2.0.** `eidolon/src`, `eidolon-core/src` and their
 manifests are byte-for-byte identical between the two tags. This release exists solely to
-publish a complete set of platform binaries; nothing in it alters simulator behaviour.
+publish a complete set of platform binaries; nothing in it alters simulator behavior.
 
 ### What was wrong
 
@@ -169,7 +168,7 @@ purity 0.6, `SV_RATE_SCALE=30`, exit 0). Every claim below states the evidence b
 ### Insertions now reach the reads, the CIGAR, and the truth
 
 - **Symbolic `<INS>` is realized** (#500). `SVTYPE=INS;SVLEN=60` from `input_vcf` used to be
-  preserved verbatim while the reads came out behaviourally identical to a no-variant
+  preserved verbatim while the reads came out behaviorally identical to a no-variant
   control — same `I` count, same `D` count, same depth. A benchmark built on that truth
   scored a caller as missing an insertion that was never in the data. `SVLEN` novel bases are
   now drawn and the record becomes a literal ALT, which is what routes them through the
@@ -439,7 +438,7 @@ Three defects:
   (one record per junction, `POS`=min, `END`=max) for callers that re-represent a
   junction as `<DUP:TANDEM>`/`<DEL>`/`<INV>` — a span and a point record are not
   interval-comparable, which no similarity threshold can bridge. Both are reported and
-  labelled. Spans are a comparison artifact only; `END` on an emitted BND still equals
+  labeled. Spans are a comparison artifact only; `END` on an emitted BND still equals
   `POS` per VCF 4.2 §5.4.
 - **The aggregate was dominated by unmatchable types.** BND + CNV were 23 of 47 truth
   records in one run, all guaranteed misses, capping the aggregate near 0.5 regardless of

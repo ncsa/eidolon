@@ -49,7 +49,7 @@ The choice here was deliberate: **data we can account for beats data that looks 
 ### What it replaced, and why
 
 The previous default was left-skewed (**−0.434**) where every real size-selected library is
-right-skewed; centred at p50 554 against this library's 424; truncated at 799; carried 33
+right-skewed; centered at p50 554 against this library's 424; truncated at 799; carried 33
 integer lengths inside its own range with **no bin at all**; and held an isolated spike at
 fragment length **1** with a 30-wide hole above it — one stray read that survived a filter.
 Its provenance is unknown; it predates the Rust port.
@@ -65,29 +65,34 @@ Not a file — it is built inline in `models/sequencing_error_model.rs`, small e
 was never worth a `.json.gz`. It ships with every run that does not supply its own, so it
 gets the same accounting as the files above.
 
-### The NEAT2 constants (#660)
+### Inherited parameters (#660)
 
-Four of its parameters come from `neat2/utilities/genSeqErrorModel.py`, and they are
-**placeholders that were never fitted from data.** They live in that script's
-`if PILEUP == None:` branch — the one that prints *"Using default sequencing error
-parameters..."*. The other branch reads `print 'Pileup parsing coming soon!'; exit(1)`: the
-fitting code was never written, so these defaults were the only path anyone ever took.
+Four parameters carry over from NEAT2's `genSeqErrorModel.py`, where they are static
+defaults rather than fitted values — that tool fits the quality-score model from FASTQ and
+leaves the indel parameters fixed.
 
-| parameter | value | NEAT2 name |
+| parameter | value | source name |
 |---|---|---|
 | `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
 | `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
-| length distribution | `[0.999, 0.001]` over lengths `[1, 2]` | — |
-| insertion base composition | uniform over ACGT | — |
+| insertion base composition | uniform over ACGT | `SIE_INS_NUCL` |
+| substitution transition matrix | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` |
 
-**These were mistranslated in the Rust port.** The insertion fraction was used as the indel
-rate, the real indel rate was dropped, and the insertion split was replaced by a hardcoded
-`0.5` — about **40x too many** sequencing errors made into indels. #660 restored them.
+`indel_probability` and `insertion_fraction` were transposed during the Rust port: 0.4 was
+applied as the indel rate and the insertion split was fixed at 0.5, giving roughly 40x the
+intended indel-error rate. #660 corrected both.
 
-**Restoring is not the same as making them right.** Real Illumina indel error is around
-1e-5/base; NEAT2's 0.01 gives ~3.2e-6 at Q35, roughly 3x low, where the pre-#660 0.4 was
-~13x high. The value matches its source, and its source was a guess. Deviating from 0.01
-needs its own measurement and its own justification.
+**Status.** 0.01 matches its source but has not been measured against real data; at Q35 it
+gives ~3.2e-6 indel errors per base against a real Illumina rate near 1e-5. Changing it
+needs its own measurement. `insertion_fraction` **has** been measured and holds — see the
+indel-error length section below.
+
+### `error_rate` (0.006638164688495656)
+
+Fitted, not a static default. It is the `avgError` of NEAT2's bundled `errorModel_toy.p`,
+computed from the sequencing data that model was built on. The originating sample is not
+recorded upstream. Listed separately here because it has different standing from the four
+above.
 
 ### The indel context curve (#661)
 
@@ -114,10 +119,10 @@ NA12878/novoalign, with controls at chance in both.
 
 **Each entry is a normalized enrichment** — the share of indel errors at that run length
 divided by the share of reference bases at that run length. That makes the curve
-1.0-centred **by construction** over its human background, so applying it *redistributes*
+1.0-centered **by construction** over its human background, so applying it *redistributes*
 `indel_probability` rather than raising it: the genome-wide total on human is unchanged.
 On a reference with different homopolymer composition the realized total moves with that
-composition, which is the intended behaviour — measured at **0.745x** on the 4.6 Mb E. coli
+composition, which is the intended behavior — measured at **0.745x** on the 4.6 Mb E. coli
 fixture and **0.734x** for an idealized 50% GC random sequence. A genome with fewer
 homopolymers really does slip less.
 
@@ -126,19 +131,31 @@ model above: one sample, one instrument, one prep. Slippage depends on chemistry
 the aligner's gap placement, so if yours differs this curve will not describe it. #662
 makes it fittable from a BAM.
 
-**It is deliberately not the variant curve.** #378 measures a *separate* homopolymer
-propensity for germline and somatic variants, which reaches 60.44x at runs >= 10 where
-errors reach 39.20x. The two are measurably different and conflating them is a mistake
-#378 already records.
+**This is the sequencing-error curve.** Variants have their own, measurably steeper,
+propensity — 60.44x at runs >= 10 against 39.20x here. That one belongs to variant
+placement; see #378.
 
 ## The others
+
+### `default_quality_score_model.json.gz`
+
+Converted from NEAT2's bundled `errorModel_toy.p` — its `initQ1` seed vector and `probQ1`
+transition tensor, verified to agree to floating-point epsilon (max abs diff 5.6e-16 across
+sampled cells). Same standing as `error_rate` above: fitted from the sequencing data that
+model was built on, originating sample not recorded upstream.
+
+Shape: 101-base reads, 42 continuous scores (0–41), a 100 x 42 x 42 position-by-previous-score
+transition tensor. **That describes an older chemistry** — current instruments commonly emit
+binned quality scores at 151 bp. The model supports binned scores and other read lengths;
+this default does not exercise either. See #677.
+
+### The others
 
 **Provenance unknown.** All predate the Rust port and none is validated by anything beyond
 round-trip serialization:
 
 - `default_mutation_model.json.gz` (+ `_bkup`)
 - `default_indel_model.json.gz`
-- `default_quality_score_model.json.gz`
 - `default_trinuc_model.json.gz`
 
 Each deserves the same treatment: a known source, a measurement against real data, and a
