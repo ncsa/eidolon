@@ -59,6 +59,9 @@ the variant curve is fed the slippage counts@        e_high = (bs > 0 && thi > 0
 the slippage length column is fed every indel@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }@        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; llen[L]++; }
 the length table normalizes by the pooled total@               llen[L]+0, (tlo ? llen[L]/tlo : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)@               llen[L]+0, (tot ? llen[L]/tot : 0), hlen[L]+0, (thi ? hlen[L]/thi : 0)
 an empty slippage length table is not fatal@    if (tlo == 0) {@    if (0) {
+the cross-tab is fed high-support events too@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[h SUBSEP (L<0?-L:L)]++; }@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; } { lxr[h SUBSEP (L<0?-L:L)]++; }
+the cross-tab keys on length instead of run length@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[h SUBSEP (L<0?-L:L)]++; }@        else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[(L<0?-L:L) SUBSEP h]++; }
+the >=20 column stops at 20 instead of pooling above it@        s20 = 0;  for (b = 20; b <= 60; b++) s20 += lxr[h SUBSEP b] + 0@        s20 = 0;  for (b = 20; b <= 20; b++) s20 += lxr[h SUBSEP b] + 0
 M2
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -66,7 +69,7 @@ fi
 
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads
 # low, an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=84
+MIN_ASSERTIONS=96
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
@@ -80,6 +83,12 @@ has() { case "$2" in *"$3"*) ok "$1";; *) bad "$1" "contains: $3" "$2";; esac; }
 hasw() { local h n; h="$(printf '%s' "$2" | tr -d ' ')"; n="$(printf '%s' "$3" | tr -d ' ')"
          case "$h" in *"$n"*) ok "$1";; *) bad "$1" "contains (spaces removed): $3" "$2";; esac; }
 
+
+# Rows are selected WITHIN a table. The enrichment table and the length-by-run cross-tab
+# both label their rows 1..>=10, so a bare `$1 == "1"` matched two tables at once and
+# returned two values glued together -- which reads as a mismatch on a value that is
+# actually correct.
+enr_table() { awk '/INDEL POSITIONS BY REFERENCE/,/^totals:/'; }
 
 extract() { awk -f "$EXTRACT" "$@"; }
 
@@ -196,8 +205,8 @@ summarise2() { awk -v mx=10 -v hf=0.25 -v lf=0.10 \
       -v f_ctx="$WORK/s2_ctx.tsv"    -v f_bg="$WORK/s2_bg.tsv" \
       -f "$SUMMARISE" "$WORK/s2_indels.tsv" "$WORK/s2_depth.tsv" "$WORK/s2_ctx.tsv" "$WORK/s2_bg.tsv"; }
 out2="$(summarise2)"
-row10="$(printf '%s' "$out2" | awk '$1 == ">=10"')"
-row1="$(printf '%s' "$out2" | awk '$1 == "1"')"
+row10="$(printf '%s' "$out2" | enr_table | awk '$1 == ">=10"')"
+row1="$(printf '%s' "$out2" | enr_table | awk '$1 == "1"')"
 hasw "the header names all three enrichment columns" "$out2" "enr_all"
 hasw "the header names the low-support curve"        "$out2" "enr_low"
 hasw "the header names the variant curve"            "$out2" "enr_high"
@@ -247,6 +256,55 @@ hi_out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
 hasw "a run with no slippage events refuses rather than printing zeros" \
      "$hi_out" "FATAL: no low-support indels"
 
+echo "=== slippage length is cross-tabulated against homopolymer run length ==="
+# This table exists to decide whether indel-error LENGTH should be conditioned on run
+# length. The fixture therefore has to be able to show either answer:
+#   run 1  : two 1 bp events and one 30 bp event   <- long event in a SHORT run
+#   run 12 : one 1 bp event and one 25 bp event    <- long event in a LONG run
+# A table that only summed lengths, or only run lengths, cannot distinguish these.
+{ printf 'chr1\t1000\t2\t-1\nchr1\t1100\t2\t1\nchr1\t1200\t2\t-30\n'
+  printf 'chr1\t2000\t2\t-1\nchr1\t2100\t2\t-25\n'; } > "$WORK/x_ind.tsv"
+{ for p in 1000 1100 1200 2000 2100; do printf 'chr1\t%s\t40\n' "$p"; done; } > "$WORK/x_dep.tsv"
+{ printf 'chr1\t1000\t1\nchr1\t1100\t1\nchr1\t1200\t1\n'
+  printf 'chr1\t2000\t12\nchr1\t2100\t12\n'; } > "$WORK/x_ctx.tsv"
+printf '1\t9000\n12\t1000\n' > "$WORK/x_bg.tsv"
+xout="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+    -v f_ind="$WORK/x_ind.tsv" -v f_dep="$WORK/x_dep.tsv" \
+    -v f_ctx="$WORK/x_ctx.tsv" -v f_bg="$WORK/x_bg.tsv" \
+    -f "$SUMMARISE" "$WORK/x_ind.tsv" "$WORK/x_dep.tsv" "$WORK/x_ctx.tsv" "$WORK/x_bg.tsv")"
+xtab() { printf '%s' "$xout" | awk '/SLIPPAGE INDEL LENGTH BY HOMOPOLYMER/,0'; }
+xrow() { xtab | awk -v r="$1" '$1 == r'; }
+hasw "the cross-tab is printed"                  "$xout" "SLIPPAGE INDEL LENGTH BY HOMOPOLYMER RUN LENGTH"
+hasw "it says what a populated >=20 cell at short runs means" "$xout" "should NOT be conditioned on run length"
+# columns: run=$1, lengths 1..6 = $2..$7, 7-9=$8, 10-19=$9, >=20=$10, n=$11
+eq "run 1 has two 1 bp events"        "$(xrow 1 | awk '{print $2}')" "2"
+eq "run 1 has one >=20 bp event"      "$(xrow 1 | awk '{print $10}')" "1"
+eq "run 1 totals three events"        "$(xrow 1 | awk '{print $11}')" "3"
+# run 12 bins into >=10
+eq "run >=10 has one 1 bp event"      "$(xrow '>=10' | awk '{print $2}')" "1"
+eq "run >=10 has one >=20 bp event"   "$(xrow '>=10' | awk '{print $10}')" "1"
+eq "run >=10 totals two events"       "$(xrow '>=10' | awk '{print $11}')" "2"
+# Sign is folded to MAGNITUDE here on purpose: a 30 bp insertion and a 30 bp deletion are
+# the same slippage step. The signed split lives in the length table above.
+eq "a +30 insertion counts in the same >=20 cell as a -25 deletion" \
+   "$(( $(xrow 1 | awk '{print $10}') + $(xrow '>=10' | awk '{print $10}') ))" "2"
+# Non-vacuity: a run with no low-support events must not print a row of zeros.
+eq "runs with no slippage events are omitted, not printed as zeros" \
+   "$(xtab | awk '$1 ~ /^[0-9]+$/ || $1 ~ /^>=/' | wc -l | tr -d ' ')" "2"
+# Must-not-fire: high-support events must not appear here at all. Re-run with the two
+# long events promoted to variants; their cells must empty.
+{ printf 'chr1\t1000\t2\t-1\nchr1\t1100\t2\t1\nchr1\t1200\t20\t-30\n'
+  printf 'chr1\t2000\t2\t-1\nchr1\t2100\t20\t-25\n'; } > "$WORK/x2_ind.tsv"
+x2out="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
+    -v f_ind="$WORK/x2_ind.tsv" -v f_dep="$WORK/x_dep.tsv" \
+    -v f_ctx="$WORK/x_ctx.tsv" -v f_bg="$WORK/x_bg.tsv" \
+    -f "$SUMMARISE" "$WORK/x2_ind.tsv" "$WORK/x_dep.tsv" "$WORK/x_ctx.tsv" "$WORK/x_bg.tsv")"
+x2row() { printf '%s' "$x2out" | awk '/SLIPPAGE INDEL LENGTH BY HOMOPOLYMER/,0' | awk -v r="$1" '$1 == r'; }
+eq "a high-support long event does not enter the slippage cross-tab" \
+   "$(x2row 1 | awk '{print $10}')" "0"
+eq "and the short events it kept are still counted" \
+   "$(x2row 1 | awk '{print $11}')" "2"
+
 echo "=== the archived job 21674484 reproduces all three published curves ==="
 # Known answer against REAL data, not a synthetic fixture. The counts below are job
 # 21674484's summary.txt verbatim -- the run the shipped curve was derived from. Rebuilding
@@ -292,7 +350,7 @@ jout="$(awk -v mx=10 -v hf=0.25 -v lf=0.10 \
     -v f_ind="$WORK/j_ind.tsv" -v f_dep="$WORK/j_dep.tsv" \
     -v f_ctx="$WORK/j_ctx.tsv" -v f_bg="$WORK/j_bg.tsv" \
     -f "$SUMMARISE" "$WORK/j_ind.tsv" "$WORK/j_dep.tsv" "$WORK/j_ctx.tsv" "$WORK/j_bg.tsv")"
-jrow() { printf '%s' "$jout" | awk -v r="$1" '$1 == r'; }
+jrow() { printf '%s' "$jout" | enr_table | awk -v r="$1" '$1 == r'; }
 hasw "the archived job's support split is reproduced" "$jout" "3024 positions -- 905 high, 393 mid, 1726 low"
 # The shipped curve, every bucket. These are the ten numbers in
 # DEFAULT_INDEL_CONTEXT_CURVE; if this row ever disagrees, one of the two moved.
