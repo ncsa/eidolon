@@ -79,7 +79,7 @@ The default models are based on public data and may not match the properties of 
 that you want to simulate.
 
 Fragment length distribution can vary across different labs and preparation methods. To 
-match your own data as closely  as possible, `eidolon` provides `gen-frag-length-model`, 
+match your own data as closely as possible, `eidolon` provides `gen-frag-length-model`, 
 a tool that can generate a model based on your data, with the library prep you want to 
 simulate:
 
@@ -88,7 +88,15 @@ eidolon gen-frag-length-model -c your_config.yml   # or gen-bam-models for frag 
 ```
 
 Indel distributions can vary between datasets, and so our default model may not fit your
-use case. To simulate your data, use `gen-seq-err
+use case. To build one from your own reads, use `gen-seq-error-model`:
+
+```bash
+eidolon gen-seq-error-model -c your_config.yml
+```
+
+That fits the quality-score model from your FASTQ. The indel parameters above are static
+defaults that this tool does not fit; #662 tracks making the context curve fittable from
+a BAM.
 
 ### Analysis findings
 
@@ -98,8 +106,15 @@ right-skewed.
 
 ## The sequencing error model
 
-The model was built inline in `models/sequencing_error_model.rs`. It ships with every run 
-that does not supply its own, so it gets the same accounting as the files above.
+Built inline in `eidolon-core/src/models/sequencing_error_model.rs` rather than as a data
+file. It ships with every run that supplies no model of its own, so it gets the same
+accounting as the files above.
+
+### `error_rate` (0.006638164688495656)
+
+Fitted, unlike the constants below. It is the `avgError` of NEAT2's bundled
+`errorModel_toy.p`, computed from the sequencing data that model was built on. The
+originating sample is not recorded upstream.
 
 ### The NEAT2 constants (#660)
 
@@ -144,3 +159,30 @@ homopolymers shows less slippage overall.
 **It is deliberately not the variant curve.** #378 measures a *separate* homopolymer
 propensity for germline and somatic variants, which reaches 60.44x at runs >= 10 where
 errors reach 39.20x. The two are measurably different.
+
+## `default_quality_score_model.json.gz`
+
+| | |
+|---|---|
+| **Source** | NEAT2's bundled `errorModel_toy.p`, converted |
+| **Verified** | `initQ1` and `probQ1` agree to floating-point epsilon (max abs diff 5.6e-16) |
+| **Origin sample** | not recorded upstream |
+
+Shape: 101 bp reads, 42 continuous scores (0-41), and a 100 x 42 x 42
+position-by-previous-score transition tensor.
+
+That describes an older chemistry. Current instruments commonly emit binned quality scores
+at 151 bp; the model supports both, and this default exercises neither. Tracked in #677.
+
+## Models with unrecorded provenance
+
+These predate the Rust port. Round-trip serialization is the only property currently
+asserted for them.
+
+- `default_mutation_model.json.gz` (+ `_bkup`)
+- `default_indel_model.json.gz` — variant indel lengths, `ins_dist` (70 values) and
+  `del_dist` (72)
+- `default_trinuc_model.json.gz`
+
+Each needs the same treatment as the models above: a recorded source, a measurement against
+real data, and a test asserting the default is usable.
