@@ -3,7 +3,7 @@
 These are the models `gen-reads` falls back on when a config supplies none. They are
 compiled into the binary with `include_bytes!`, so they ship with every release.
 
-**Updated Defaults** After analysis of the latest literature, we have updated the default error 
+**Updated Defaults** After analysis of real sequencing data, we have updated the default error 
 model for `eidolon`. These are the parameters and the value that they are assigned in the absence
 of a custom fragment model. This file records the source of each value, for future reference and for 
 repeatability.
@@ -75,15 +75,20 @@ of the homopolymer run the base sits in, rather than spreading it uniformly.
 
 ### Building a Custom Model
 
-The default model is one library, one instrument, one prep, based on HCC1395, cross-referenced
-against NA12878, and cross-checked on an E. coli reference. Because  fragment length is a 
-function of library prep, it can vary across different labs and preparation methods. To match
-your own data as closely as possible, `eidolon` provides `gen-frag-length-model`, a tool 
-that can generate a model based on your data, with the library prep you want to simulate:
+The default models are based on public data and may not match the properties of the data
+that you want to simulate.
+
+Fragment length distribution can vary across different labs and preparation methods. To 
+match your own data as closely  as possible, `eidolon` provides `gen-frag-length-model`, 
+a tool that can generate a model based on your data, with the library prep you want to 
+simulate:
 
 ```bash
 eidolon gen-frag-length-model -c your_config.yml   # or gen-bam-models for frag + GC together
 ```
+
+Indel distributions can vary between datasets, and so our default model may not fit your
+use case. To simulate your data, use `gen-seq-err
 
 ### Analysis findings
 
@@ -117,12 +122,12 @@ by a hardcoded `0.5` — about **40x too many** sequencing errors made into inde
 1e-5/base. The original error model was a first-order approximation using a simple length 
 distribution that produced indel errors of a single base 99% of the time. The data showed
 a significant (16.4%) number of slippage events at 3bp or more, and a small but measurable
-(at scale) number of events (0.70%) exceed 20 base pairs in length. We decided to use 
+(at scale) number of events (0.70%) 20 base pairs or more in length. We decided to use 
 this data set to build our new baseline error model, as it's error properties were more 
-robust and produced artifacts that downstream callers were expecting.
+robust.
 
-We found in the data that deletions and insertions are not the same shape — 74.0% of 
-deletions are 1 bp against 64.8% of insertions — so we separated the distributions, similar
+We found in the data that deletions and insertions are not the same shape — 72.0% of 
+deletions are 1 bp against 63.8% of insertions — so we separated the distributions, similar
 to how the mutation model treats insertions and deletions as independent events.
 
 The data showed an `insertion_fraction` 0.387, comparable to our existing default of 0.4.
