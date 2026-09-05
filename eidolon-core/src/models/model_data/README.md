@@ -94,6 +94,56 @@ computed from the sequencing data that model was built on. The originating sampl
 recorded upstream. Listed separately here because it has different standing from the four
 above.
 
+### Indel-error lengths
+
+`ins_length_distribution` / `del_length_distribution` are **measured**, not NEAT2's.
+
+| | |
+|---|---|
+| **Source** | HCC1395 matched **normal**, SEQC2 Somatic Mutation WG reference sample |
+| **Reference** | GRCh38, chr20 + chr21 + chr22 |
+| **Region** | the ten 400 kb loci a realism-panel run placed (`realism_21795898/regions.bed`) |
+| **Events** | 1,726 low-support indels — 1,058 deletions and 668 insertions |
+| **Measured by** | `scripts/delta/indel_context.sbatch`, Delta job 21801707 |
+
+Indels were split from variants by support fraction: below 10% of local depth is slippage,
+at or above 25% is a variant. Only the **low-support** side feeds this model; variant indel
+size is a different population and belongs to placement.
+
+| \|len\| | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | tail |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| deletions (n) | 762 | 135 | 42 | 47 | 11 | 8 | 5 | 9 | 5 | 6 | 11,12,13,15,16,17,19,20,21,22,23,25,27,34,38,45 |
+| insertions (n) | 426 | 120 | 22 | 55 | 13 | 8 | 1 | 6 | 1 | 5 | 11,12,13,15,18,19,22,27,30 |
+
+Deletions: n = 1,058 over 26 bins. Insertions: n = 668 over 19 bins. The two arms did not
+observe the same lengths, so each carries its own value list.
+
+The source ships the **raw counts** as weights — `DiscreteDistribution` normalizes them — so
+the constants can be checked against the job output directly.
+
+**Not truncated.** Every observed length is carried, to 45 bp for deletions and 30 bp for
+insertions. The tail bins hold single observations, so the *shape within* the tail is
+uncertain — but its total mass (12 of 1,726 events, **0.70%** at >= 20 bp) is an ordinary
+estimate, and dropping it would remove the only part of this distribution able to produce a
+candidate breakpoint, deciding #672 by construction rather than measuring it.
+
+The model can therefore emit a 45 bp deletion as a sequencing error, at p = 0.00095. If that
+turns out to be a mapping artifact rather than slippage, the fix belongs in the classifier
+upstream, not in a cutoff chosen here.
+
+Deletions and insertions are **not the same shape** — 74.0% of deletions are 1 bp against
+64.8% of insertions — and are now separate distributions. They were previously one
+distribution cloned twice.
+
+**What it replaced.** NEAT2's `[0.999, 0.001]` over lengths `[1, 2]`: 99.9% of indel errors
+at a single base, and nothing above 2 bp emittable at all, against a measured **16.4%** of
+slippage events at 3 bp or more. Same provenance as the constants above — the
+`if PILEUP == None` branch, never fitted.
+
+**Independently, this run confirms `insertion_fraction`.** 668 of 1,726 low-support indels
+are insertions, a fraction of **0.387** against NEAT2's `SIE_INS_FREQ = 0.4`. That is the
+first of these NEAT2 placeholders to be checked against real data and hold.
+
 ### The indel context curve (#661)
 
 `indel_context_curve` scales `indel_probability` by the length of the homopolymer run the

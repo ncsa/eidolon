@@ -70,6 +70,75 @@ fn default_indel_context_curve() -> Vec<f64> {
     DEFAULT_INDEL_CONTEXT_CURVE.to_vec()
 }
 
+/// Sequencing-error indel lengths, and the observed counts behind them.
+///
+/// Measured on HCC1395 matched normal, GRCh38 chr20/21/22, over the ten 400 kb loci a
+/// realism-panel run placed (Delta job 21801707). Indels were separated from variants by
+/// support fraction — below 10% of local depth is slippage, at or above 25% is a variant —
+/// and these are the **low-support** counts. The variant length distribution is a different
+/// population and belongs to placement, not here.
+///
+/// **The weights are raw event counts, not a normalized pmf.** `DiscreteDistribution::new`
+/// divides by their sum, so what appears here is the measurement as reported rather than
+/// arithmetic performed on it, and it can be checked against the job output by eye.
+///
+/// **Not truncated.** Every observed length is carried, out to 45 bp for deletions and 30 bp
+/// for insertions. An earlier version cut this at 10 bp on the grounds that the tail bins
+/// hold single observations and that "low support" means below 10% of local depth rather
+/// than "proven sequencing error". Both points are true and neither justifies dropping the
+/// data: sparse bins make the *shape within* the tail uncertain, not its existence, and its
+/// total mass (12 of 1726 events, 0.70%) is an ordinary estimate. Cutting it also removes
+/// the only part of this distribution that could ever produce a candidate breakpoint, which
+/// decides #672 by construction instead of measuring it.
+///
+/// Consequence to be aware of: the model can now emit a 45 bp deletion as a sequencing
+/// error, at p = 0.00095. If that turns out to be a mapping artifact rather than slippage,
+/// the fix is a better classifier upstream, not a cutoff chosen here.
+///
+/// What this replaced: `[0.999, 0.001]` over lengths `[1, 2]`, inherited from NEAT2 and
+/// never measured. That put 99.9% of indel errors at a single base and could not emit
+/// anything above 2 bp at all, against a measured 16.4% of slippage events at 3 bp or more.
+/// Deletion lengths observed, in order. Insertions have their own set: the two arms did
+/// not observe the same lengths, so they cannot share one array.
+pub(crate) const DEL_ERROR_LENGTHS: [usize; 26] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20, 21, 22, 23, 25, 27, 34, 38, 45,
+];
+
+/// Insertion lengths observed, in order.
+pub(crate) const INS_ERROR_LENGTHS: [usize; 19] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 18, 19, 22, 27, 30,
+];
+
+/// Observed deletion-error counts, aligned to `DEL_ERROR_LENGTHS` (n = 1058).
+pub(crate) const DEL_ERROR_LENGTH_COUNTS: [f64; 26] = [
+    762.0, 135.0, 42.0, 47.0, 11.0, 8.0, 5.0, 9.0, 5.0, 6.0, 2.0, 7.0, 2.0, 2.0, 3.0, 1.0, 2.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+];
+
+/// Observed insertion-error counts, aligned to `INS_ERROR_LENGTHS` (n = 668).
+///
+/// Deletions and insertions are NOT the same shape — 74.0% of deletions are 1 bp against
+/// 64.8% of insertions — so these are separate distributions. They were previously one
+/// distribution cloned twice.
+pub(crate) const INS_ERROR_LENGTH_COUNTS: [f64; 19] = [
+    426.0, 120.0, 22.0, 55.0, 13.0, 8.0, 1.0, 6.0, 1.0, 5.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0,
+    1.0, 1.0,
+];
+
+fn indel_error_length_distributions()
+-> Result<(DiscreteDistribution<usize>, DiscreteDistribution<usize>), SeqModelError> {
+    Ok((
+        DiscreteDistribution::new(
+            &INS_ERROR_LENGTH_COUNTS.to_vec(),
+            &INS_ERROR_LENGTHS.to_vec(),
+        )?,
+        DiscreteDistribution::new(
+            &DEL_ERROR_LENGTH_COUNTS.to_vec(),
+            &DEL_ERROR_LENGTHS.to_vec(),
+        )?,
+    ))
+}
+
 /// How far a run must be measured for the SHIPPED curve before the answer stops mattering.
 ///
 /// This describes [`DEFAULT_INDEL_CONTEXT_CURVE`] only. A caller must not use it to bound
@@ -115,9 +184,7 @@ impl SequencingErrorModel {
             [0.2505, 0.2552, 0.4942, 0.0],
         )?;
         let default_error_rate = 0.006638164688495656;
-        let default_lengths = vec![1, 2];
-        let default_ins_distr = DiscreteDistribution::new(&vec![0.999, 0.001], &default_lengths)?;
-        let default_del_distr = default_ins_distr.clone();
+        let (default_ins_distr, default_del_distr) = indel_error_length_distributions()?;
         let default_indel_probability = 0.01;
         // default is no bias
         let default_insertion_bias =
@@ -155,9 +222,7 @@ impl SequencingErrorModel {
                 [0.2505, 0.2552, 0.4942, 0.0],
             )?,
         };
-        let default_lengths = vec![1, 2];
-        let default_ins_distr = DiscreteDistribution::new(&vec![0.999, 0.001], &default_lengths)?;
-        let default_del_distr = default_ins_distr.clone();
+        let (default_ins_distr, default_del_distr) = indel_error_length_distributions()?;
         Ok(SequencingErrorModel {
             error_rate,
             del_length_distribution: default_del_distr,
@@ -545,18 +610,10 @@ mod tests {
 
             // These translated correctly. Asserted here so changing SIE_RATE cannot
             // rewrite unrelated parameters.
-            assert_distribution(
-                &model.ins_length_distribution,
-                vec![1, 2],
-                &[0.999, 1.0],
-                "NEAT2 sequencing insertion-length distribution [0.999, 0.001]",
-            );
-            assert_distribution(
-                &model.del_length_distribution,
-                vec![1, 2],
-                &[0.999, 1.0],
-                "NEAT2 sequencing deletion-length distribution [0.999, 0.001]",
-            );
+            //
+            // The length distributions are asserted separately, in
+            // `indel_error_lengths_are_pinned_to_the_measured_distribution`: they are a
+            // measurement now (job 21801707) rather than an inherited default.
             assert_distribution(
                 &model.insertion_bias,
                 ALLOWED_NUCS.to_vec(),
@@ -621,6 +678,162 @@ mod tests {
         assert!(
             (0.37..0.43).contains(&insertion_fraction),
             "SIE_INS_FREQ: observed {insertion_fraction:.5}; expected about 0.4 insertions per indel"
+        );
+    }
+
+    #[test]
+    fn indel_error_lengths_are_pinned_to_the_measured_distribution() {
+        // Known answer against the source measurement, the way #660 pinned the NEAT2
+        // constants. These are the low-support (slippage) counts from Delta job 21801707,
+        // truncated at 10 bp; they can be read straight off that job's length table.
+        assert_eq!(
+            DEL_ERROR_LENGTHS,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20, 21, 22, 23, 25, 27,
+                34, 38, 45
+            ],
+            "deletion lengths drifted from job 21801707"
+        );
+        assert_eq!(
+            DEL_ERROR_LENGTH_COUNTS,
+            [
+                762.0, 135.0, 42.0, 47.0, 11.0, 8.0, 5.0, 9.0, 5.0, 6.0, 2.0, 7.0, 2.0, 2.0, 3.0,
+                1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+            ],
+            "deletion-length counts drifted from job 21801707"
+        );
+        assert_eq!(
+            INS_ERROR_LENGTHS,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 18, 19, 22, 27, 30
+            ],
+            "insertion lengths drifted from job 21801707"
+        );
+        assert_eq!(
+            INS_ERROR_LENGTH_COUNTS,
+            [
+                426.0, 120.0, 22.0, 55.0, 13.0, 8.0, 1.0, 6.0, 1.0, 5.0, 1.0, 2.0, 1.0, 2.0, 1.0,
+                1.0, 1.0, 1.0, 1.0
+            ],
+            "insertion-length counts drifted from job 21801707"
+        );
+        // Totals must match the job's reported class size, or a bin was dropped.
+        assert_eq!(DEL_ERROR_LENGTH_COUNTS.iter().sum::<f64>(), 1058.0);
+        assert_eq!(INS_ERROR_LENGTH_COUNTS.iter().sum::<f64>(), 668.0);
+        assert_eq!(DEL_ERROR_LENGTHS.len(), DEL_ERROR_LENGTH_COUNTS.len());
+        assert_eq!(INS_ERROR_LENGTHS.len(), INS_ERROR_LENGTH_COUNTS.len());
+
+        // The counts must reach the model as a normalized distribution. Expected CDFs are
+        // computed here from the counts, independently of DiscreteDistribution's own
+        // arithmetic, so a normalization bug cannot pass by agreeing with itself.
+        let model = SequencingErrorModel::default().unwrap();
+        let check = |name: &str, counts: &[f64], lengths: Vec<usize>, distro| {
+            let total: f64 = counts.iter().sum();
+            let mut running = 0.0;
+            let expected: Vec<f64> = counts
+                .iter()
+                .map(|c| {
+                    running += c / total;
+                    running
+                })
+                .collect();
+            assert_distribution(
+                distro,
+                lengths,
+                &expected,
+                &format!("measured {name}-length distribution"),
+            );
+        };
+        check(
+            "deletion",
+            &DEL_ERROR_LENGTH_COUNTS,
+            DEL_ERROR_LENGTHS.to_vec(),
+            &model.del_length_distribution,
+        );
+        check(
+            "insertion",
+            &INS_ERROR_LENGTH_COUNTS,
+            INS_ERROR_LENGTHS.to_vec(),
+            &model.ins_length_distribution,
+        );
+    }
+
+    #[test]
+    fn insertions_and_deletions_have_different_measured_shapes() {
+        // They were one distribution cloned twice. The measurement says they differ:
+        // 74.0% of deletions are 1 bp against 64.8% of insertions. A test that only
+        // checked "both are non-empty" would pass on the cloned version.
+        let model = SequencingErrorModel::default().unwrap();
+        let del = model.del_length_distribution.weights().unwrap();
+        let ins = model.ins_length_distribution.weights().unwrap();
+        assert_ne!(
+            del, ins,
+            "deletion and insertion length distributions must not be the same object"
+        );
+        // Computed from the counts, not read off the code under test.
+        let d1 = 762.0 / DEL_ERROR_LENGTH_COUNTS.iter().sum::<f64>();
+        let i1 = 426.0 / INS_ERROR_LENGTH_COUNTS.iter().sum::<f64>();
+        assert!(
+            (del[0] - d1).abs() < 1e-12,
+            "deletion P(1 bp) is {}",
+            del[0]
+        );
+        assert!(
+            (ins[0] - i1).abs() < 1e-12,
+            "insertion P(1 bp) is {}",
+            ins[0]
+        );
+        assert!(
+            d1 > i1,
+            "deletions are more concentrated at 1 bp than insertions: {d1} vs {i1}"
+        );
+    }
+
+    #[test]
+    fn the_model_can_emit_indel_errors_longer_than_two_bases() {
+        // The defect this replaced. NEAT2's [0.999, 0.001] over [1, 2] could not produce a
+        // 3 bp indel error at all, against a measured 16.4% of slippage events at >= 3 bp.
+        // Sampling the distribution directly is the honest test: going through
+        // generate_sequencing_error would need ~100 draws per indel at a 1% indel rate.
+        let model = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec!["indel length spread".to_string()]).unwrap();
+        let mut seen_del = std::collections::BTreeSet::new();
+        let mut seen_ins = std::collections::BTreeSet::new();
+        for _ in 0..20_000 {
+            seen_del.insert(
+                model
+                    .del_length_distribution
+                    .sample(rng.random().unwrap())
+                    .unwrap(),
+            );
+            seen_ins.insert(
+                model
+                    .ins_length_distribution
+                    .sample(rng.random().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert!(
+            seen_del.iter().any(|&l| l >= 3) && seen_ins.iter().any(|&l| l >= 3),
+            "no indel error longer than 2 bp was ever drawn: del {seen_del:?} ins {seen_ins:?}"
+        );
+        // The tail is the part that can produce a candidate breakpoint (#672): a >= 20 bp
+        // clip needs a >= 20 bp indel. Truncating it away would decide that by
+        // construction, so assert it is reachable.
+        assert!(
+            seen_del.iter().any(|&l| l >= 20),
+            "no deletion >= 20 bp was ever drawn in 20k samples; drawn: {seen_del:?}"
+        );
+        // Must not fire: only lengths that were actually OBSERVED, never an interpolation.
+        // DiscreteDistribution samples its value list, so a 14 bp deletion appearing would
+        // mean something invented a length nobody measured.
+        assert!(
+            seen_del.iter().all(|l| DEL_ERROR_LENGTHS.contains(l)),
+            "a deletion length outside the measured set was drawn: {seen_del:?}"
+        );
+        assert!(
+            seen_ins.iter().all(|l| INS_ERROR_LENGTHS.contains(l)),
+            "an insertion length outside the measured set was drawn: {seen_ins:?}"
         );
     }
 
