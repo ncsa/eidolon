@@ -109,6 +109,26 @@ contig lengths).
   moment a token is renamed. Anchor on the token (`sub(/^EIDOLON_VAF=/,"",v)`) or use
   `PREFIX.len()`.
 
+## Writing about models and inherited code
+
+The vetting standard above is deliberately blunt about defects. That applies to **eidolon's
+own behaviour**. It does not extend to attribution.
+
+For any model parameter, docs and comments state three things and stop: **the value, where
+it came from, and whether it has been measured.** Provenance belongs in
+`model_data/README.md`, mentioned once per document rather than restated per paragraph.
+
+- Write "inherited static default, not yet measured", not "placeholder that was never
+  fitted".
+- Name an upstream file when it helps someone reproduce a number. Don't catalogue what
+  upstream left unfinished.
+- State a correction as what is true now — "X and Y were transposed; both now carry their
+  correct values" — rather than narrating how wrong the previous value was.
+- eidolon's context-dependent modelling implements designs anticipated upstream but not
+  shipped. Describe it that way.
+
+This is a standard for CHANGELOGs, issues and PR bodies as much as for code comments.
+
 ## Languages: Rust, bash, and (reluctantly) Python
 - **The shipped artifact is pure Rust** and must stay that way: the binary invokes no
   interpreter, `Cargo.lock` has no `pyo3`/`cpython`, and `conda-recipe/meta.yaml`
