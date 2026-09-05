@@ -129,11 +129,17 @@ it came from, and whether it has been measured.** Provenance belongs in
 
 This is a standard for CHANGELOGs, issues and PR bodies as much as for code comments.
 
-**American spelling throughout** — code, comments, docs, commit messages, issues and PR
-bodies. `behavior` not `behaviour`, `centered` not `centred`, `normalize` not `normalise`,
-`modeling` not `modelling`, `analyze` not `analyse`, `labeled` not `labelled`, `judgment`
-not `judgement`, `defense` not `defence`. Existing identifiers and filenames are left alone
-unless they are being changed for another reason — `indel_context_summarise.awk` stays.
+**American spelling, going forward** — code, comments, docs, commit messages, issues and
+PR bodies. `behavior` not `behaviour`, `centered` not `centred`, `normalize` not
+`normalise`, `modeling` not `modelling`, `analyze` not `analyse`, `labeled` not `labelled`,
+`judgment` not `judgement`, `defense` not `defence`.
+
+Existing prose gets corrected when a file is already being edited for another reason. No
+sweeping rename commits.
+
+**Identifiers and filenames are exempt.** `indel_context_summarise.awk`, its `SUMMARISE`
+override and the `summarise()` helpers in its tests keep their spelling: they are harness
+code, and renaming them would ripple through the sbatch and its test suite for no gain.
 
 ## Languages: Rust, bash, and (reluctantly) Python
 - **The shipped artifact is pure Rust** and must stay that way: the binary invokes no
