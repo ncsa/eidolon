@@ -40,7 +40,7 @@ END {
         # (SequencingErrorModel's ins/del_length_distribution), `high` is variant indel
         # size. Pooling them would hand the error model variant-sized events.
         L = ilen[k] + 0
-        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; }
+        if (f >= hf)     { hi[h]++; thi++; hlen[L]++; hxr[h SUBSEP (L<0?-L:L)]++; }
         else if (f < lf) { lo[h]++; tlo++; llen[L]++; lxr[h SUBSEP (L<0?-L:L)]++; }
         else             { mid[h]++; tmid++ }
     }
@@ -136,38 +136,25 @@ END {
         exit 1
     }
     print ""
-    # ── slippage length CONDITIONED on homopolymer run length ────────────────
-    # Marginals cannot answer whether long indel errors are slippage. #661 already makes
-    # indel errors ~39x more likely inside a 10+-mer while their LENGTH is drawn
-    # independently, so the simulator places long deletions inside homopolymers without
-    # any evidence that real ones sit there. This is the table that decides it.
+    # ── length CONDITIONED on homopolymer run length, per support class ──────
+    # Marginals cannot answer whether long indels sit in long runs. Both classes get the
+    # same table so they can be compared directly: `low` decides whether indel-ERROR
+    # length should depend on run length (#674), `high` decides whether variant indel
+    # PLACEMENT should (#378, and the cand_per_mb question in #672).
+    print_length_by_run("SLIPPAGE INDEL LENGTH BY HOMOPOLYMER RUN LENGTH  (low support)", lxr, mx)
+    print_length_by_run("VARIANT INDEL LENGTH BY HOMOPOLYMER RUN LENGTH  (high support)", hxr, mx)
     print ""
-    print "════════════════════════════════════════════════════════════════"
-    print "SLIPPAGE INDEL LENGTH BY HOMOPOLYMER RUN LENGTH  (low support only)"
-    print ""
-    printf "%-6s", "run"
-    for (b = 1; b <= 6; b++) printf "%8s", b
-    printf "%8s%8s%8s%10s\n", "7-9", "10-19", ">=20", "n"
-    for (h = 1; h <= mx; h++) {
-        rn = 0
-        for (b = 1; b <= 60; b++) rn += lxr[h SUBSEP b] + 0
-        if (rn == 0) continue
-        printf "%-6s", (h == mx ? ">=" mx : h "")
-        for (b = 1; b <= 6; b++) printf "%8d", lxr[h SUBSEP b] + 0
-        s79 = 0;  for (b = 7;  b <= 9;  b++) s79 += lxr[h SUBSEP b] + 0
-        s19 = 0;  for (b = 10; b <= 19; b++) s19 += lxr[h SUBSEP b] + 0
-        s20 = 0;  for (b = 20; b <= 60; b++) s20 += lxr[h SUBSEP b] + 0
-        printf "%8d%8d%8d%10d\n", s79, s19, s20, rn
-    }
-    print ""
-    print "HOW TO READ IT. If slippage length is a function of run length, the mass moves"
-    print "right as run length grows and >=20 bp events sit only in long runs. If the >=20"
-    print "column is populated at run 1-2, those events are not slippage -- they are"
-    print "mapping artifacts or rare somatic events landing in the low-support class, and"
-    print "indel-error length should NOT be conditioned on run length."
+    print "HOW TO READ THEM. If length depends on run length, mass moves right as run"
+    print "length grows and >=20 bp events sit only in long runs. If the >=20 column is"
+    print "populated at run 1-2, those events are not repeat-driven."
     print ""
     print "A deletion longer than its run cannot be slippage by construction: a 3-mer"
     print "cannot lose 10 bases of register. Cells right of the diagonal are that case."
+    print ""
+    print "WHY BOTH. A candidate breakpoint needs a >= 20 bp indel (#672). The low class"
+    print "has none that are repeat-driven, so the error model cannot produce one. The"
+    print "high column says whether VARIANT placement can -- eidolon already emits variant"
+    print "indels to 84 bp (insertions) and 119 bp (deletions) but places them uniformly."
     print ""
     print "WHAT THE low COLUMN IS FOR. It is the measured length distribution of"
     print "sequencing-error indels -- the input to SequencingErrorModel's"
@@ -178,4 +165,27 @@ END {
     print "This job MEASURES. It does not say the simulator is wrong, only where real"
     print "indels are and what kind they are."
     print "════════════════════════════════════════════════════════════════"
+}
+
+# One table per support class, so the two cannot drift apart in formatting or binning.
+# `mx` is passed rather than read globally so the function has no hidden inputs.
+function print_length_by_run(title, arr, cap,    h, b, rn, s79, s19, s20) {
+    print ""
+    print "════════════════════════════════════════════════════════════════"
+    print title
+    print ""
+    printf "%-6s", "run"
+    for (b = 1; b <= 6; b++) printf "%8s", b
+    printf "%8s%8s%8s%10s\n", "7-9", "10-19", ">=20", "n"
+    for (h = 1; h <= cap; h++) {
+        rn = 0
+        for (b = 1; b <= 60; b++) rn += arr[h SUBSEP b] + 0
+        if (rn == 0) continue
+        printf "%-6s", (h == cap ? ">=" cap : h "")
+        for (b = 1; b <= 6; b++) printf "%8d", arr[h SUBSEP b] + 0
+        s79 = 0;  for (b = 7;  b <= 9;  b++) s79 += arr[h SUBSEP b] + 0
+        s19 = 0;  for (b = 10; b <= 19; b++) s19 += arr[h SUBSEP b] + 0
+        s20 = 0;  for (b = 20; b <= 60; b++) s20 += arr[h SUBSEP b] + 0
+        printf "%8d%8d%8d%10d\n", s79, s19, s20, rn
+    }
 }
