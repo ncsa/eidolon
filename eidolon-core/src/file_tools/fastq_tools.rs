@@ -133,6 +133,35 @@ fn homopolymer_run_at(sequence: &[Nucleotide], index: usize, cap: usize) -> usiz
 ///
 /// Positions are 0-based and ends are exclusive. For equal starts, retain R1
 /// as the positive mate, which makes the otherwise ambiguous sign stable.
+/// Offset of the R2 window inside a materialized fragment, or `None` when the fragment
+/// cannot carry one.
+///
+/// R2 covers the right end of the fragment, so its window begins `read_len` bases before the
+/// end. `ref_span` (`end - start`) is the width the fragment was PLANNED at; `fragment_len` is
+/// what could actually be materialized. Those differ whenever the interval was clamped —
+/// `padded_end` is capped at `materializable_len`, so a fragment whose `end` runs past the end
+/// of a haplotype comes back short.
+///
+/// Indexing the fragment with an offset derived from `ref_span` therefore panicked:
+///
+/// ```text
+/// range start index 263 out of range for slice of length 189
+/// ```
+///
+/// Seen on `gen-reads` with an `input_vcf` of Delly SV calls against a draft assembly, in a
+/// worker thread — so the panic killed the thread and silently dropped every remaining read in
+/// its chunk while the run went on to report success.
+///
+/// Returning `None` skips the pair, which is what the sibling "fragment shorter than a read"
+/// case already does; an orphaned R1 desynchronizes the two FASTQ streams and makes BWA-MEM
+/// abort on mismatched read names.
+fn r2_window_offset(ref_span: usize, read_len: usize, fragment_len: usize) -> Option<usize> {
+    let off = ref_span.checked_sub(read_len)?;
+    // Strictly less: an offset equal to the length yields an empty window, which cannot hold
+    // a read and would surface later as a TruncatedRead instead of here.
+    (off < fragment_len).then_some(off)
+}
+
 fn set_observed_template_lengths(r1: &mut ReadRecord, r2: &mut ReadRecord) {
     let left_start = r1.position.min(r2.position);
     let right_end = (r1.position + reference_span(&r1.cigar_ops))
@@ -573,12 +602,22 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             // R2 window starts at (end - effective_read_len); since `fragment`
             // is padded beyond `end`, &fragment[off..] is the window plus the
             // deletion buffer (so R2 deletions don't truncate and drop the pair).
-            let r2_sub: &[Nucleotide] = match (end - start).checked_sub(effective_read_len) {
-                Some(off) => &fragment[off..],
-                // Fragment shorter than a read: skip the pair to avoid an
-                // orphaned R1 (matches the TruncatedRead handling below).
-                None => continue,
+            // Bounds-checked against what was MATERIALIZED, not what was planned: a
+            // clamped `padded_end` makes `fragment` shorter than `end - start`. See
+            // `r2_window_offset`.
+            let Some(r2_off) = r2_window_offset(end - start, effective_read_len, fragment.len())
+            else {
+                // Fragment shorter than a read, or truncated below the R2 window: skip the
+                // pair to avoid an orphaned R1 (matches the TruncatedRead handling below).
+                debug!(
+                    "no R2 window in fragment {frag_idx}: span {} materialized {} read {} — skipping pair",
+                    end - start,
+                    fragment.len(),
+                    effective_read_len
+                );
+                continue;
             };
+            let r2_sub: &[Nucleotide] = &fragment[r2_off..];
             // The mask is sliced by the SAME offset as r2_sub, so index i of one lines up
             // with index i of the other. R2 is generated forward over this window and the
             // record (CIGAR included) is reverse-complemented afterwards, so no reversal
@@ -1294,6 +1333,57 @@ pub fn quality_scores_to_char_vec(array: &[usize]) -> Result<Vec<u8>, FastqTools
 
 #[cfg(test)]
 mod tests {
+    use super::r2_window_offset;
+
+    // ── R2 window bounds ──────────────────────────────────────────────────
+    //
+    // Known answers from arithmetic, sharing nothing with the implementation. The cases
+    // that matter are the ones that must NOT produce an offset: an offset past the end of
+    // what was materialized is the panic this function exists to prevent.
+
+    #[test]
+    fn r2_window_starts_a_read_length_before_the_fragment_end() {
+        // 400 bp planned, 400 bp materialized, 151 bp reads -> window opens at 249.
+        assert_eq!(r2_window_offset(400, 151, 400), Some(249));
+        // A fragment padded beyond its span still opens the window at the same place: the
+        // pad exists so R2 deletions have bases to consume, and must not move R2.
+        assert_eq!(r2_window_offset(400, 151, 551), Some(249));
+    }
+
+    #[test]
+    fn a_fragment_shorter_than_a_read_has_no_window() {
+        assert_eq!(r2_window_offset(100, 151, 100), None);
+        // Exactly one read long: offset 0, the whole fragment.
+        assert_eq!(r2_window_offset(151, 151, 151), Some(0));
+        assert_eq!(r2_window_offset(150, 151, 150), None);
+    }
+
+    #[test]
+    fn a_truncated_fragment_has_no_window_rather_than_a_bad_offset() {
+        // THE regression. Planned 414, materialized 189 because `padded_end` was clamped at
+        // the end of a haplotype. The old code indexed &fragment[263..] into 189 bases and
+        // panicked: "range start index 263 out of range for slice of length 189".
+        assert_eq!(r2_window_offset(414, 151, 189), None);
+        // The second panic from the same run, same shape.
+        assert_eq!(r2_window_offset(404, 151, 218), None);
+    }
+
+    #[test]
+    fn the_boundary_between_a_usable_and_an_unusable_window() {
+        // Offset one short of the length leaves a single base — degenerate but in range, so
+        // it is handled downstream as a truncated read rather than as an index panic.
+        assert_eq!(r2_window_offset(400, 151, 250), Some(249));
+        // Offset EQUAL to the length is an empty window and must be refused here.
+        assert_eq!(r2_window_offset(400, 151, 249), None);
+        assert_eq!(r2_window_offset(400, 151, 248), None);
+    }
+
+    #[test]
+    fn a_zero_length_fragment_never_yields_an_offset() {
+        assert_eq!(r2_window_offset(0, 151, 0), None);
+        assert_eq!(r2_window_offset(400, 151, 0), None);
+    }
+
     use super::*;
     use crate::file_tools::bam_writer::{BamRecordStager, BamWriter, BamWriterError};
     use crate::file_tools::file_io::{VectorBuffer, create_output_file, read_gzip_lines};
