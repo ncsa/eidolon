@@ -62,6 +62,54 @@ impl std::fmt::Display for RealismError {
     }
 }
 
+/// An inclusive read-length band. Records whose SEQ length falls outside it are excluded from
+/// every metric and counted in `RegionMetrics::len_filtered`.
+///
+/// WHY THIS EXISTS. The panel's two arms had different read-length distributions and nothing
+/// asserted they must match: the real BAM came from a trimmed FASTQ and the simulated one did
+/// not. Every clip-derived metric — `cand_per_mb`, `clip_pct` — is sensitive to that, because
+/// a short read carries less unique anchor and clips far more readily. Measured on job
+/// `realism_21830618`: real reads at the measured loci averaged 89.7 bp against a simulated
+/// BAM that was 99.6% exactly 151 bp, and 96.8% of the real side's clips came from reads under
+/// 80 bp. See #672.
+///
+/// `ANY` is the default so the flag has to be asked for; the wrapper asks for it with the same
+/// value on both arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LenBand {
+    pub min: usize,
+    pub max: usize,
+}
+
+impl LenBand {
+    /// No filtering: every read length is inside.
+    pub const ANY: LenBand = LenBand {
+        min: 0,
+        max: usize::MAX,
+    };
+
+    /// Rejects an inverted band rather than silently matching nothing. A band that excludes
+    /// every read would make each region look empty, which `EmptyRegion` would then report as
+    /// an unmeasurable BAM — a confusing way to learn about a typo in a flag.
+    pub fn new(min: usize, max: usize) -> Result<LenBand, String> {
+        if min > max {
+            return Err(format!(
+                "read-length band {min}-{max} is inverted; no read can satisfy it"
+            ));
+        }
+        Ok(LenBand { min, max })
+    }
+
+    pub fn contains(&self, len: usize) -> bool {
+        len >= self.min && len <= self.max
+    }
+
+    /// True when this band excludes nothing, so the wrapper can say whether it is on.
+    pub fn is_open(&self) -> bool {
+        *self == LenBand::ANY
+    }
+}
+
 /// Which alignments contribute to a measurement.
 ///
 /// Split out from `to_aln` because it cannot be exercised through a golden BAM: the simulator
@@ -136,6 +184,7 @@ pub fn measure(
     min_support: usize,
     max_tlen: i64,
     depth_lag: usize,
+    band: LenBand,
     dump: Option<&Path>,
 ) -> Result<Vec<RegionMetrics>, RealismError> {
     let file =
@@ -168,6 +217,9 @@ pub fn measure(
     }
 
     let mut buckets: Vec<Vec<AlnRecord>> = vec![Vec::new(); regions.len()];
+    // Counted per region rather than globally: the band's cost has to be readable beside the
+    // metric it made comparable, not as one number for the whole run.
+    let mut filtered: Vec<usize> = vec![0; regions.len()];
     for result in reader.records() {
         let record =
             result.map_err(|e| RealismError::Io(format!("{}: record: {e}", path.display())))?;
@@ -177,9 +229,17 @@ pub fn measure(
         let Some(Ok(rid)) = record.reference_sequence_id() else {
             continue;
         };
+        // Membership is resolved BEFORE the band is applied, so an excluded read is charged to
+        // the regions it fell in. Filtering first would leave `len_filtered` at zero everywhere
+        // and hide exactly the number rule 4 asks for.
+        let keep = band.contains(aln.query_len());
         for (bi, (want_rid, region)) in want.iter().enumerate() {
             if rid == *want_rid && aln.pos >= region.start && aln.pos < region.end {
-                buckets[bi].push(aln.clone());
+                if keep {
+                    buckets[bi].push(aln.clone());
+                } else {
+                    filtered[bi] += 1;
+                }
             }
         }
     }
@@ -196,10 +256,18 @@ pub fn measure(
     for (bi, region) in regions.iter().enumerate() {
         let v = &buckets[bi];
         if v.is_empty() {
-            return Err(RealismError::EmptyRegion(format!(
-                "{}:{}-{}",
-                region.contig, region.start, region.end
-            )));
+            // Distinguish "no reads here" from "the band took them all". Both leave the region
+            // unmeasurable, but only one is a flag the operator can fix, and reporting the
+            // second as the first would send them looking at the BAM.
+            let detail = if filtered[bi] > 0 {
+                format!(
+                    "{}:{}-{} (read-length band {}-{} excluded all {} reads)",
+                    region.contig, region.start, region.end, band.min, band.max, filtered[bi]
+                )
+            } else {
+                format!("{}:{}-{}", region.contig, region.start, region.end)
+            };
+            return Err(RealismError::EmptyRegion(detail));
         }
         if dump.is_some() {
             for c in candidate_sites(v, min_clip, min_support) {
@@ -227,6 +295,7 @@ pub fn measure(
             min_support,
             max_tlen,
             depth_lag,
+            filtered[bi],
         ));
     }
 
@@ -239,6 +308,7 @@ pub fn measure(
 
 /// Shared summarizer. Both sides of the comparison go through this, so the two can never
 /// drift apart into measuring different things.
+#[allow(clippy::too_many_arguments)]
 pub fn summarize(
     v: &[AlnRecord],
     span: usize,
@@ -247,10 +317,12 @@ pub fn summarize(
     min_support: usize,
     max_tlen: i64,
     depth_lag: usize,
+    len_filtered: usize,
 ) -> RegionMetrics {
     let track = depth_track(v, start, span);
     RegionMetrics {
         reads: v.len(),
+        len_filtered,
         span_bp: span,
         candidate_breakpoints: candidate_breakpoints(v, min_clip, min_support),
         improper_pairs: v.iter().filter(|r| !r.is_proper_pair()).count(),
@@ -267,6 +339,58 @@ pub fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── read-length band (#672) ───────────────────────────────────────────────
+    //
+    // The band's job is to make two arms comparable, so the cases that matter are the ones
+    // that must NOT fire: an open band excludes nothing, and the boundaries are inclusive.
+    // A band that quietly dropped its own endpoints would shrink both arms unevenly, since
+    // the simulated side is a single length and the real side is a distribution.
+
+    #[test]
+    fn the_default_band_excludes_nothing() {
+        let b = LenBand::ANY;
+        assert!(b.is_open(), "the default must be a no-op filter");
+        for len in [0, 1, 36, 56, 151, 10_000, usize::MAX] {
+            assert!(b.contains(len), "the open band must admit {len}");
+        }
+    }
+
+    #[test]
+    fn band_boundaries_are_inclusive_on_both_ends() {
+        let b = LenBand::new(145, 151).unwrap();
+        assert!(!b.is_open(), "a real band is not the open one");
+        assert!(b.contains(145), "the lower bound is inside");
+        assert!(b.contains(151), "the upper bound is inside");
+        assert!(b.contains(148));
+        // Must not fire: one base outside either end is excluded.
+        assert!(!b.contains(144));
+        assert!(!b.contains(152));
+        // The lengths this band was introduced to separate.
+        assert!(
+            !b.contains(56),
+            "a trimmed read is outside a full-length band"
+        );
+        assert!(!b.contains(80));
+    }
+
+    #[test]
+    fn a_single_length_band_admits_only_that_length() {
+        let b = LenBand::new(151, 151).unwrap();
+        assert!(b.contains(151));
+        assert!(!b.contains(150));
+        assert!(!b.contains(152));
+    }
+
+    #[test]
+    fn an_inverted_band_is_refused_rather_than_matching_nothing() {
+        // A band nothing can satisfy would empty every region, which `EmptyRegion` would then
+        // report as a BAM with no reads in it. Failing at parse time names the real cause.
+        let e = LenBand::new(151, 145).unwrap_err();
+        assert!(e.contains("inverted"), "error should say why: {e}");
+        // Must not fire: an equal-bounds band is legal, not inverted.
+        assert!(LenBand::new(151, 151).is_ok());
+    }
 
     /// The flag policy, from literals. A golden BAM cannot exercise this — it has no secondary
     /// or supplementary records — so mutating the filter inside `to_aln` passed the samtools

@@ -39,6 +39,31 @@ fragment-length model carries. Full provenance is in
 This implements sequence-context dependence that the upstream design anticipated but did
 not ship; the parameters were static defaults there.
 
+### Validation harness
+
+**The realism panel now matches read lengths between its two arms (#672).** It had been
+comparing a real BAM built from a trimmed FASTQ against simulated reads that reach the
+aligner untrimmed and uniform, and nothing asserted the two had to match. Clip-derived
+metrics are sensitive to that, because a short read carries less unique anchor and clips
+more readily.
+
+Measured on job 21830618 (HCC1395 normal, GRCh38 chr20/21/22), over the 61 measured loci
+that sit in homopolymer runs of 21 bp or more:
+
+| | real | simulated |
+|---|---|---|
+| soft clip >= 20 bp, all reads | 6.00% | 0.26% |
+| soft clip >= 20 bp, reads 145-151 bp | 0.61% (4 of 651) | 0.26% (10 of 3816) |
+
+96.8% of the real side's clips at those loci came from reads of 40-80 bp. Matched on read
+length the difference is four events, P = 0.094. `cand_per_mb` had been reporting the
+unmatched comparison.
+
+`realism-panel` takes `--min-read-len` / `--max-read-len`, the wrapper builds one band from
+`READ_LEN` and passes it to both arms, and each locus reports `len_filtered` so the band's
+cost is visible beside the metric it made comparable. `MATCH_READ_LEN=0` reproduces a
+pre-#672 run and says so in the banner.
+
 ### Compatibility
 
 **Model files built before this release keep working.** `insertion_fraction` and
@@ -59,9 +84,15 @@ mixed-composition reference. Nine mutation experiments were run against these te
 were killed, one only after a positional test was added — the overall rate was correct
 while placement was not.
 
-**Not yet verified:** `cand_per_mb` moving off 0 toward the real 57.5/Mb is a Delta
-measurement and has not been run. The local tests establish that the mechanism works and
-lands where the curve puts it; they are not the number.
+The panel change is covered by 22 end-to-end assertions driving the real binary over a
+committed BAM, with a known answer built by truncating exactly half its records; five
+mutations of the band logic were run and all were killed. `test_realism_panel.sh` pins that
+both arms receive the same band, verified by four mutations of the wrapper — one of which
+exposed an assertion of its own that was matching the wrong line.
+
+**Not yet verified:** the panel change has not been run on Delta, so the corrected
+`cand_per_mb` figure is not yet in hand. `cand_per_mb` should no longer be read as a
+property of the simulator on any run before this one.
 
 8/31/2026
 =========

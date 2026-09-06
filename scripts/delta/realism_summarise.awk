@@ -48,7 +48,12 @@ function median(k, n,    i, j, t, a, mid) {
 }
 
 END {
-    split("cand_per_mb improper_pct clip_pct mapq0_pct depth_mean depth_vmr depth_excess depth_acf ins_sd ins_skew ins_p99", order, " ")
+    # len_filtered leads because it qualifies every row under it: it is how many reads the
+    # read-length band excluded per locus on each arm. The arms are only comparable when they
+    # were filtered the same way, and a band that took most of one side has traded a known
+    # confound for an unknown one (#672, rule 4). An "inf" gap here is expected and correct --
+    # the simulated arm emits one read length, so a band sized to it drops nothing.
+    split("len_filtered cand_per_mb improper_pct clip_pct mapq0_pct depth_mean depth_vmr depth_excess depth_acf ins_sd ins_skew ins_p99", order, " ")
     printf "%-14s %26s %26s %10s\n", "metric", "REAL (median [min-max])", "SIM (median [min-max])", "gap"
     for (oi = 1; oi in order; oi++) {
         m = order[oi]
