@@ -249,6 +249,32 @@ done
 
 [[ -x "$PANEL_BIN" ]]   || { echo "ERROR: realism-panel not built at $PANEL_BIN — cargo build --release builds the whole workspace, including it." >&2; exit 1; }
 
+# ── The binary must accept the flags this script passes ─────────────────────
+#
+# The sbatch and the binary are two components sharing one contract: the flag set below.
+# Nothing asserted they agreed. Job 21840744 ran with a current checkout and a $PANEL_BIN
+# built before #687, so it generated its reads, aligned BOTH arms, and only then died with
+# `unknown argument --min-read-len` — every expensive step paid for, nothing measured.
+#
+# Checked at job START, where the cost is a resubmit rather than a wasted allocation.
+# `--help` exits non-zero by design (it prints usage), so the status is ignored and the
+# output is what gets read. PANEL_FLAGS is the list `test_realism_panel.sh` cross-checks
+# against the flags actually passed below, so a new flag cannot be added without landing
+# here too.
+PANEL_FLAGS="--min-clip --min-support --max-tlen --depth-lag --min-read-len --max-read-len --dump-candidates"
+panel_help="$("$PANEL_BIN" --help 2>&1 || true)"
+for flag in $PANEL_FLAGS; do
+    case "$panel_help" in
+        *"$flag"*) ;;
+        *) echo "ERROR: $PANEL_BIN does not accept $flag — the binary is older than this script." >&2
+           echo "       This is the stale-binary trap: the checkout updated, the build did not." >&2
+           echo "       Rebuild before resubmitting:" >&2
+           echo "         CARGO_TARGET_DIR=\$SCRATCH/cargo-target/eidolon \\" >&2
+           echo "         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc cargo build --release" >&2
+           exit 1;;
+    esac
+done
+
 mkdir -p "$OUTDIR"
 echo "=== eidolon realism panel: $SLURM_JOB_ID ==="
 echo "Real BAM:   $REAL_BAM"
