@@ -224,6 +224,22 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   baseline (`neat_data` + bwa-mem2 index) **one replicate at a time is all that fits** in a
   500 GB quota (171 + 214 = 385 GB), so serialize with `%1` — `%2` cannot work at any array
   size.
+
+- **The filesystem map, measured 2026-09-06** (`df --output=source,target`, plus `stat -c %i`
+  to settle the aliases). The `/scratch` disagreement noted above is explained by the last row:
+
+  | path | backing | `bhrd` quota | used |
+  |---|---|---|---|
+  | `/projects` | `taiga/nsf/delta` — a **different filesystem** | 500 G | 1.6 G |
+  | `/work/nvme` | `dltawork/nvme`, separate OST pool and quota | 500 G | 494.9 M |
+  | `/work/hdd`, `/scratch` | `dltawork` | **1000 G** | 525.1 G |
+
+  **`$SCRATCH` and `/work/hdd/<proj>` are the same directory** — identical inode, two paths.
+  So scratch's quota is the 1000 G `/work/hdd` row, and `quota` printing no `/scratch` line is
+  not an omission. `/projects` is genuinely separate capacity on Taiga rather than a second
+  view of the same space; `/work/nvme` shares the Lustre instance with scratch but carries its
+  own quota. The one-replicate-at-a-time conclusion above still holds, but from **current
+  usage** (525 of 1000 G) rather than from a 500 G ceiling.
   **A replicate that FAILS keeps all ~214 GB**: its FASTQ prune never runs. Job 20884022 died
   incomplete, held 203 GB indefinitely, and starved array 20904141 — all five tasks failed,
   task 4 spending 8 h 45 m producing 8 KB against a full filesystem. Clear a failed
