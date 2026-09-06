@@ -42,14 +42,19 @@ if [[ "${1:-}" == "--mutate" ]]; then
         exit 0
     fi
     survived=0
-    orig="$(cat "$SRC")"
-    restore() { printf '%s' "$orig" > "$SRC"; }
+    # Backed up as a FILE, not a shell variable. `$(cat f)` strips trailing newlines and
+    # `printf '%s'` does not put them back, so a variable round-trip silently deletes the
+    # file's last byte -- which is a `cargo fmt --check` failure that appears long after this
+    # suite has reported success, in a commit that has nothing to do with formatting.
+    BACKUP="$WORK/reader.rs.orig"
+    cp "$SRC" "$BACKUP"
+    restore() { cp "$BACKUP" "$SRC"; }
     trap 'restore; rm -rf "$WORK"' EXIT
     while IFS='@' read -r label from to; do
         [[ -n "$label" ]] || continue
         restore
         FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/' "$SRC"
-        if [[ "$(cat "$SRC")" == "$orig" ]]; then
+        if cmp -s "$SRC" "$BACKUP"; then
             printf '  ERROR    %-52s mutation did not apply\n' "$label"; survived=$((survived+1)); continue
         fi
         if ! (cd "$ROOT" && cargo build --release -p realism-panel) >/dev/null 2>&1; then
@@ -68,6 +73,13 @@ excluded reads are not counted@                    filtered[bi] += 1;@          
 membership is resolved after the band@        let keep = band.contains(aln.query_len());@        let keep = true;
 MUTATIONS
     restore
+    # The source must come back BYTE-identical. A restore that differs by so much as a
+    # trailing newline leaves the tree dirty in a way that surfaces as an unrelated CI
+    # failure; this is the assertion that says so here instead.
+    if ! cmp -s "$SRC" "$BACKUP"; then
+        printf '  ERROR    %-52s source was not restored byte-for-byte\n' "$(basename "$SRC")"
+        survived=$((survived+1))
+    fi
     (cd "$ROOT" && cargo build --release -p realism-panel) >/dev/null 2>&1
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
