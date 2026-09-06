@@ -100,8 +100,26 @@ jobs:
     # bgzip ships in `tabix`, not in `bcftools`. test_scorer_calibration.sh drives real
     # bcftools/bgzip (only truvari is stubbed), and without bgzip it fails with an
     # indexing error that looks like a bad fixture.
-    - name: Install bcftools and bgzip
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq bcftools tabix
+    # samtools is for test_realism_band.sh, which drives the real realism-panel binary over
+    # a committed BAM. Without it that suite SKIPS, and a skipping suite is indistinguishable
+    # from a passing one in the log.
+    - name: Install bcftools, bgzip and samtools
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq bcftools tabix samtools
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ubuntu-latest-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ubuntu-latest-cargo-
+    # test_realism_band.sh measures with the real binary rather than a stub: the read-length
+    # band it guards is the difference between comparing two BAMs and comparing two
+    # preprocessing pipelines (#672). Its --mutate mode patches this crate and rebuilds, so
+    # cargo has to be usable in this job either way.
+    - name: Build realism-panel
+      run: cargo build --release -p realism-panel
     - name: Shell syntax check
       run: |
         for f in scripts/delta/*.sh scripts/delta/*.sbatch scripts/delta/tests/*.sh; do

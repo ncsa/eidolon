@@ -233,10 +233,55 @@ decision, and every subsequent piece of work is built on it.
 | BND (§6) | PCAWG `TRA` count ⇒ our BND rate | `TRA` is *inter-chromosomal*; the generator emits only same-contig junctions |
 | truvari | "truvari cannot benchmark breakends" | true of v4, reversed in v5.0.0; deployed version was v5.4.0 with `--bnddist` |
 | `bnd_proximity.py` | same belief | an entire helper written to work around a limitation that no longer existed |
+| `cand_per_mb` (#672) | the panel's two arms are comparable | the real BAM came from a trimmed FASTQ, the simulated one did not |
 
 **Detection cost is the problem, not frequency.** The truvari belief produced
 `BND recall = 0.000` across every SV run for two months and was read as a caller
 limitation each time.
+
+#### `cand_per_mb`: a correct investigation of an artifact (2026-09-01)
+
+The longest instance to date, and the one that most resembles `bnd_proximity.py`. The
+realism panel reported `SIM cand_per_mb = 0` against a real 57.5/Mb. That gap drove three
+Delta campaigns and a sequence of hypotheses, each tested and each eliminated: sequencing
+error rate, indel-error length, variant indel placement, structural variants, mappability,
+quality degradation. The work was sound. The premise underneath it was never checked.
+
+The panel compared a real BAM against a simulated one. The real BAM was SEQC2's published
+HCC1395 deliverable, trimmed before alignment; `stage_hcc1395.sh` only region-subsets it.
+eidolon's reads reach the aligner untrimmed and uniform. Nothing in the panel asserted the
+two arms had to carry the same read lengths, and they did not: real reads averaged 89.7 bp
+at the measured loci against a simulated BAM that was 99.6% exactly 151 bp.
+
+Measured on SLURM job 21830618; GIAB v3.6 GRCh38 stratifications; fixed in #687.
+
+| soft clip >= 20 bp, at 61 loci in >= 21 bp homopolymers | real | simulated | |
+|---|---|---|---|
+| all reads | 6.00% | 0.26% | 22.9x |
+| reads 145-151 bp only | 0.61% (4 of 651) | 0.26% (10 of 3816) | 2.3x, P = 0.094 |
+
+96.8% of the real side's clips came from reads of 40-80 bp. Matched on read length the
+difference is four events.
+
+**What made it survive so long.** Every intermediate result was correct and pointed
+somewhere real. Candidates genuinely do concentrate in long homopolymers — 93.8x at runs of
+21 bp or more, against a shuffled background, with a monotone dose-response across the run
+ladder and mappability flat at 1.2x. That finding replicated across two independent data
+reductions. It was simply not a finding about read generation: what concentrates in
+homopolymers is where a quality trimmer cuts, and the trimming happened upstream of anything
+eidolon emits.
+
+**A second-order casualty.** An earlier measurement had reported no quality degradation in
+homopolymers (Q36.7 in-run vs Q36.8 elsewhere) and that was recorded as refuting the
+hypothesis. It was measured on a BAM built from quality-trimmed FASTQ, so the degraded bases
+had been removed before the measurement ran. The question is untested, not refuted — the
+same censored-denominator shape as rule 4, applied to a distribution rather than a count.
+
+**What would have caught it earlier.** One command: the read-length distribution of each
+arm — `samtools view <bam> | awk '{print length($10)}' | sort -n | uniq -c`. It was never asked because "both arms are BAMs of the same reference at the same depth"
+felt like enough. The panel now derives one read-length band and passes it to both arms,
+`test_realism_panel.sh` pins that they receive the same one, and `test_realism_band.sh`
+drives the binary over a real BAM to assert the band does what it claims.
 
 ### 5.2 Cross-component invariant
 

@@ -48,6 +48,28 @@ impl AlnRecord {
             .sum()
     }
 
+    /// Query bases the record carries: `M`, `I`, `S`, `=`, `X`. For a primary alignment this
+    /// is the length of SEQ, which is the read length AFTER any trimming the upstream pipeline
+    /// applied — the number this panel has to match between its two arms.
+    ///
+    /// WHY IT MATTERS. SEQC2's published HCC1395 BAMs were quality-trimmed before alignment;
+    /// eidolon's reads reach the aligner untrimmed and uniform. Measured on panel job
+    /// `realism_21830618` over the 61 loci in `>= 21` bp homopolymers, 96.8% of soft clips on
+    /// the real side came from reads of 40-80 bp. Matched on read length the same comparison
+    /// reads 0.61% (real, 4 of 651) against 0.26% (simulated, 10 of 3816) — P = 0.094, no
+    /// measured gap. Unmatched it reads 22.9x. See #672.
+    ///
+    /// Hard clips are excluded because they do not consume query and are absent from SEQ.
+    /// bwa-mem2 emits them only on supplementary records, which `countable` already drops, so
+    /// this equals SEQ length for everything the panel counts.
+    pub fn query_len(&self) -> usize {
+        self.cigar
+            .iter()
+            .filter(|(op, _)| matches!(op, 'M' | 'I' | 'S' | '=' | 'X'))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     /// Length of a soft clip at the start of the alignment, if any.
     pub fn leading_clip(&self) -> usize {
         match self.cigar.first() {
@@ -76,6 +98,11 @@ impl AlnRecord {
 pub struct RegionMetrics {
     /// Denominator. A rate over an unstated number of reads is not a result (rule 4).
     pub reads: usize,
+    /// Reads inside this region that the read-length band excluded. Reported so a metric is
+    /// never read without knowing how much of the region it covered: the band exists to make
+    /// two arms comparable, and a band that silently drops most of one arm would trade a
+    /// known confound for an unknown one.
+    pub len_filtered: usize,
     pub span_bp: usize,
     pub candidate_breakpoints: usize,
     pub improper_pairs: usize,
@@ -366,6 +393,40 @@ mod tests {
         assert_eq!(rec(0, "50M500D101M", 60, true, 0).reference_span(), 651);
         // H consumes neither.
         assert_eq!(rec(0, "20H131M", 60, true, 0).reference_span(), 131);
+    }
+
+    // ── query length: the number the read-length band is applied to (#672) ────
+
+    #[test]
+    fn query_len_counts_only_query_consuming_ops() {
+        // Known answers computed from the SAM spec, not from the implementation: M, I, S, =
+        // and X consume query; D, N, H and P do not.
+        assert_eq!(rec(0, "151M", 60, true, 0).query_len(), 151);
+        // A soft clip is still part of SEQ, so a clipped read has its full length.
+        assert_eq!(rec(0, "36M20S", 60, true, 0).query_len(), 56);
+        assert_eq!(rec(0, "30S91M30S", 60, true, 0).query_len(), 151);
+        // An insertion consumes query.
+        assert_eq!(rec(0, "50M20I81M", 60, true, 0).query_len(), 151);
+        // A deletion does not — this read is 151 bases spanning 651 of reference.
+        assert_eq!(rec(0, "50M500D101M", 60, true, 0).query_len(), 151);
+        // Hard clips are absent from SEQ.
+        assert_eq!(rec(0, "20H131M", 60, true, 0).query_len(), 131);
+        assert_eq!(rec(0, "20H131M20H", 60, true, 0).query_len(), 131);
+        assert_eq!(rec(0, "100=51X", 60, true, 0).query_len(), 151);
+    }
+
+    #[test]
+    fn query_len_and_reference_span_disagree_exactly_where_they_should() {
+        // The pair of records that motivated the band: a trimmed 56 bp read and a full-length
+        // one both align cleanly, and only `query_len` tells them apart.
+        let trimmed = rec(0, "36M20S", 60, true, 421);
+        let full = rec(0, "151M", 60, true, 421);
+        assert_eq!(trimmed.query_len(), 56);
+        assert_eq!(full.query_len(), 151);
+        // Reference span cannot: the trimmed read's clipped tail consumes no reference, so
+        // spans alone would put these 36 apart rather than 95.
+        assert_eq!(trimmed.reference_span(), 36);
+        assert_eq!(full.reference_span(), 151);
     }
 
     #[test]
@@ -696,6 +757,7 @@ mod tests {
 
         let m = |v: &[AlnRecord]| RegionMetrics {
             reads: v.len(),
+            len_filtered: 0,
             span_bp: 100_000,
             candidate_breakpoints: candidate_breakpoints(v, 20, 3),
             improper_pairs: v.iter().filter(|r| !r.is_proper_pair()).count(),

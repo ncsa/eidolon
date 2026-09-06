@@ -348,10 +348,76 @@ else
     bad "the sites-VCF calibration warning is recorded" "a warning about cohort union" "absent"
 fi
 
+echo "=== both arms get the SAME read-length band (#672) ==="
+# THE two-component invariant. The panel reports a ratio between two BAMs; if the arms are
+# filtered differently the ratio measures the filter. Nothing asserted they had to match
+# before, and the arms ran with different read-length distributions for every run to date.
+#
+# Assert on the shared variable NAME, not on a value: two literal flag lists that happen to
+# agree today are exactly the drift this is meant to prevent.
+inv_real="$(grep -c -- '--dump-candidates "$OUTDIR/real_candidates.tsv"' "$PIPELINE")"
+inv_sim="$(grep -c -- '--dump-candidates "$OUTDIR/sim_candidates.tsv"' "$PIPELINE")"
+[[ "$inv_real" == "1" ]] && ok "there is exactly one REAL panel invocation" \
+  || bad "there is exactly one REAL panel invocation" "1" "$inv_real"
+[[ "$inv_sim" == "1" ]] && ok "there is exactly one SIMULATED panel invocation" \
+  || bad "there is exactly one SIMULATED panel invocation" "1" "$inv_sim"
+
+# Each invocation is a backslash-continued command; join continuations before matching so a
+# flag on a different physical line still counts as part of its own invocation.
+joined="$WORK/pipeline_joined.sh"
+sed -e :a -e '/\\$/N; s/\\\n//; ta' "$PIPELINE" > "$joined"
+band_uses="$(grep -c 'BAND_ARGS\[@\]' "$joined")"
+[[ "$band_uses" == "2" ]] && ok "both panel invocations expand BAND_ARGS" \
+  || bad "both panel invocations expand BAND_ARGS" "2" "$band_uses"
+# And they must be the two panel invocations, not one of them twice.
+real_line="$(grep -n 'dump-candidates "\$OUTDIR/real_candidates.tsv"' "$joined" | cut -d: -f1)"
+sim_line="$(grep -n 'dump-candidates "\$OUTDIR/sim_candidates.tsv"' "$joined" | cut -d: -f1)"
+if [[ -n "$real_line" ]] && sed -n "${real_line}p" "$joined" | grep -q 'BAND_ARGS\[@\]'; then
+    ok "the REAL arm is filtered by the band"
+else
+    bad "the REAL arm is filtered by the band" "BAND_ARGS on the REAL invocation" "absent"
+fi
+if [[ -n "$sim_line" ]] && sed -n "${sim_line}p" "$joined" | grep -q 'BAND_ARGS\[@\]'; then
+    ok "the SIMULATED arm is filtered by the band"
+else
+    bad "the SIMULATED arm is filtered by the band" "BAND_ARGS on the SIMULATED invocation" "absent"
+fi
+# Non-vacuity: the matcher must be able to see an arm that LACKS the band, or the two checks
+# above prove nothing about where BAND_ARGS is.
+stripped="$WORK/pipeline_nobands.sh"
+sed 's/"${BAND_ARGS\[@\]}" //g' "$joined" > "$stripped"
+if sed -n "${real_line}p" "$stripped" | grep -q 'BAND_ARGS\[@\]'; then
+    bad "the band check can detect a missing band" "no match after stripping" "still matched"
+else
+    ok "the band check can detect a missing band"
+fi
+
+echo "=== the band is built once, and reports what it dropped ==="
+# Built from READ_LEN so the two cannot be set independently; a hardcoded 145 would drift the
+# moment someone runs at a different read length.
+grep -q 'BAND_LO=$(( READ_LEN - READ_LEN_TOL ))' "$PIPELINE" \
+  && ok "the band is derived from READ_LEN, not hardcoded" \
+  || bad "the band is derived from READ_LEN, not hardcoded" "BAND_LO from READ_LEN" "absent"
+# Rule 4: a filter that drops data has to say how much.
+grep -q 'len_filtered' "$HERE/../realism/src/main.rs" \
+  && ok "the TSV carries a len_filtered column" \
+  || bad "the TSV carries a len_filtered column" "len_filtered emitted" "absent"
+# MATCH_READ_LEN=0 must be loud, or a historical-mode run reads like a matched one.
+# Anchored on the "Read len:" label: a bare 'NOT MATCHED' also matches the depth-cap banner
+# further down, and a mutation sweep showed the unanchored version passing with this notice
+# deleted.
+grep -q 'Read len:.*NOT MATCHED' "$PIPELINE" \
+  && ok "an unmatched run says so in its banner" \
+  || bad "an unmatched run says so in its banner" "a NOT MATCHED notice" "absent"
+# A lower bound below 1 is a configuration error, not a wide-open band.
+grep -q 'BAND_LO" -ge 1' "$PIPELINE" \
+  && ok "an impossible lower bound is refused" \
+  || bad "an impossible lower bound is refused" "a guard on BAND_LO" "absent"
+
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=71
+MIN_ASSERTIONS=81
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
