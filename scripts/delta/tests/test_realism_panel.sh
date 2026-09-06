@@ -414,10 +414,59 @@ grep -q 'BAND_LO" -ge 1' "$PIPELINE" \
   && ok "an impossible lower bound is refused" \
   || bad "an impossible lower bound is refused" "a guard on BAND_LO" "absent"
 
+echo "=== the binary is checked for the flags this script passes (#672) ==="
+# Job 21840744 generated its reads, aligned BOTH arms, and died at the measurement step on
+# `unknown argument --min-read-len`: a current checkout against a $PANEL_BIN built before
+# #687. The sbatch checked that the binary EXISTED and never that it understood the flags.
+# That is the same two-component drift test_regression_collector.sh pins for the collector.
+#
+# Derived, not restated. The flag list is extracted from the invocations themselves, so a
+# flag added below without being added to PANEL_FLAGS fails here rather than on Delta.
+grep -q '^PANEL_FLAGS=' "$PIPELINE" \
+  && ok "the script declares the flag set it depends on" \
+  || bad "the script declares the flag set it depends on" "a PANEL_FLAGS list" "absent"
+declared="$(grep -m1 '^PANEL_FLAGS=' "$PIPELINE" | cut -d'"' -f2)"
+# Flags actually handed to the binary: the two panel invocations plus the BAND_ARGS array
+# they expand. --bam/--regions/--label are the required arguments and predate any of this.
+passed="$(grep -E 'dump-candidates "\$OUTDIR/(real|sim)_candidates.tsv"|^ *BAND_ARGS=\(--' "$joined" \
+          | grep -oE '\-\-[a-z][a-z-]+' | sort -u | grep -vE '^--(bam|regions|label)$')"
+[[ -n "$passed" ]] && ok "flags were extracted from the invocations" \
+  || bad "flags were extracted from the invocations" "a flag list" "nothing matched"
+unprobed=""
+for f in $passed; do
+    case " $declared " in *" $f "*) ;; *) unprobed="$unprobed $f";; esac
+done
+if [[ -z "$unprobed" ]]; then
+    ok "every flag passed to the binary is one the preflight probes"
+else
+    bad "every flag passed to the binary is one the preflight probes" "no unprobed flags" "unprobed:$unprobed"
+fi
+# Non-vacuity: the comparison must be able to see an unprobed flag at all.
+case " $declared " in
+    *" --a-flag-that-is-not-declared "*) bad "the unprobed check can detect one" "no match" "matched";;
+    *) ok "the unprobed check can detect one";;
+esac
+
+echo "=== and it is checked BEFORE the expensive steps ==="
+# Failing after gen-reads and two alignments costs an allocation; failing at job start costs
+# a resubmit. The guard's position in the file is the whole value of it.
+guard_ln="$(grep -n 'does not accept' "$PIPELINE" | head -1 | cut -d: -f1)"
+work_ln="$(grep -n 'gen-reads -c' "$PIPELINE" | head -1 | cut -d: -f1)"
+if [[ -n "$guard_ln" && -n "$work_ln" && "$guard_ln" -lt "$work_ln" ]]; then
+    ok "the flag preflight runs before gen-reads (line $guard_ln < $work_ln)"
+else
+    bad "the flag preflight runs before gen-reads" "guard before gen-reads" "guard=$guard_ln work=$work_ln"
+fi
+has "the failure names the stale-binary cause" "$(cat "$PIPELINE")" "the binary is older than this script"
+# Anchored on the linker export, which appears only in this hint. A bare
+# "cargo build --release" also occurs in the older "not built" message, and a mutation
+# sweep showed the unanchored version passing with the whole hint deleted.
+has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc cargo build"
+
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=81
+MIN_ASSERTIONS=88
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
