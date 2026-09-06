@@ -39,6 +39,16 @@ frag_model_ceiling() {
 # retry loop and become clipped reads instead; with a trained fragment model that is 0.557%
 # of the mass on HCC1395 normal. Whether that lands near the real 0.19% or overshoots is a
 # measurement, which is the point of exposing the knob rather than picking a value here.
+# SV_RATE_SCALE (default 0.0) multiplies the SV model's per_base_rate. It is exposed
+# because `cand_per_mb` compares a real genome -- which carries structural variants --
+# against a simulation that plants none, so the metric was never measuring the same thing
+# on both sides. See #684.
+#
+# CALIBRATION WARNING. The bundled model's per_base_rate (6.009e-4) is fit as
+# `n / total_reflen_seen` from the gnomAD-SV SITES VCF: 1,832,360 records over ~3.05 Gb.
+# A sites VCF is the UNION across the cohort, not one genome's complement, so scale 1.0
+# asks for ~1.83M SVs in a single simulated genome against a real per-genome count on the
+# order of 1e4. Sweep this empirically; do not assume 1.0 is realistic.
 write_sim_config() {
     local out="$1" reference="$2" outdir="$3" seed="$4" threads="$5" depth="$6" \
           read_len="$7" frag_mean="$8" frag_sd="$9"
@@ -53,7 +63,7 @@ coverage: $depth
 read_len: $read_len
 paired_ended: true
 produce_fastq: true
-sv_rate_scale: 0.0
+sv_rate_scale: ${SV_RATE_SCALE:-0.0}
 YML
 
     # fragment_mean/st_dev and fragment_model are two sources for the same thing, and
@@ -68,7 +78,12 @@ YML
     fi
 
     local pair key val
-    for pair in "gc_bias_model:${GC_BIAS_MODEL:-}" \
+    # INPUT_VCF supplies variants directly rather than through a model. Drawn germline SVs
+    # (tools/draw_gnomad_sv_vcf.sh) go here: cand_per_mb needs breakpoints at real loci, and
+    # supplied variants are ADDED to the de novo mutations rather than replacing them, so the
+    # run still carries the model's SNPs and small indels.
+    for pair in "input_vcf:${INPUT_VCF:-}" \
+                "gc_bias_model:${GC_BIAS_MODEL:-}" \
                 "sequence_error_model:${SEQ_ERROR_MODEL:-}" \
                 "quality_score_model:${QUALITY_MODEL:-}" \
                 "mutation_model:${MUTATION_MODEL:-}" \

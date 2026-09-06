@@ -193,6 +193,8 @@ echo "=== adapters: off by default, and a nested map when set ==="
 )
 hasnt "no adapters key when unset" "$(cat "$WORK/c_noad.yml")" "adapters"
 (
+
+
   unset GC_BIAS_MODEL FRAGMENT_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
   ADAPTERS=truseq write_sim_config "$WORK/c_ad.yml" /ref.fa /out seed 8 30 151 400 90
 )
@@ -304,6 +306,57 @@ echo "=== the frag ceiling vs MAX_TLEN mismatch is reported ==="
 ceil="$(sed -n '/Frag ceiling:/,+14p' "$PIPELINE")"
 has "it warns the gap may be the ceiling" "$ceil" "rather than the simulator"
 has "it offers the alignment knob"        "$ceil" "ALIGN_TLEN=1"
+
+echo "=== INPUT_VCF reaches the config, and is absent when unset ==="
+# Drawn germline SVs arrive this way rather than through a model (#685). Supplied variants
+# are added to the de novo mutations, so the run keeps its SNPs and small indels.
+write_sim_config "$WORK/c_novcf.yml" /ref.fa /out seed 8 30 151 400 90
+hasnt "no input_vcf key when unset" "$(cat "$WORK/c_novcf.yml")" "input_vcf"
+INPUT_VCF=/v/drawn.vcf write_sim_config "$WORK/c_vcf.yml" /ref.fa /out seed 8 30 151 400 90
+has "INPUT_VCF reaches the config" "$(cat "$WORK/c_vcf.yml")" "input_vcf: /v/drawn.vcf"
+# Must-not-fire: supplying a VCF must not silently disable SV generation or anything else.
+has "setting INPUT_VCF leaves sv_rate_scale alone" \
+    "$(cat "$WORK/c_vcf.yml")" "sv_rate_scale: 0.0"
+
+echo "=== SV_RATE_SCALE is overridable, and defaults to off ==="
+# cand_per_mb compares a real genome carrying structural variants against a simulation
+# that plants none. The knob has to exist before that can be tested (#684); it must also
+# stay off by default so every existing panel run is unchanged.
+write_sim_config "$WORK/c_sv_default.yml" /ref.fa /out seed 8 30 151 400 90
+has "sv_rate_scale defaults to 0.0" \
+    "$(cat "$WORK/c_sv_default.yml")" "sv_rate_scale: 0.0"
+SV_RATE_SCALE=0.005 write_sim_config "$WORK/c_sv_on.yml" /ref.fa /out seed 8 30 151 400 90
+has "SV_RATE_SCALE reaches the config" \
+    "$(cat "$WORK/c_sv_on.yml")" "sv_rate_scale: 0.005"
+# Exactly one such key. `hasnt "sv_rate_scale: 0.0"` cannot express this -- that string
+# is a prefix of "sv_rate_scale: 0.005" and matches its own replacement.
+has "the override replaces the default rather than adding a second key" \
+    "$(grep -c '^sv_rate_scale:' "$WORK/c_sv_on.yml")" "1"
+# Must-not-fire: setting it must not disturb anything else in the config.
+if diff -q <(grep -v '^sv_rate_scale:' "$WORK/c_sv_default.yml") \
+           <(grep -v '^sv_rate_scale:' "$WORK/c_sv_on.yml") >/dev/null; then
+    ok "no other key changes when SV_RATE_SCALE is set"
+else
+    bad "no other key changes when SV_RATE_SCALE is set" "identical apart from sv_rate_scale" \
+        "$(diff <(grep -v '^sv_rate_scale:' "$WORK/c_sv_default.yml") \
+                <(grep -v '^sv_rate_scale:' "$WORK/c_sv_on.yml"))"
+fi
+# The calibration warning has to survive, or someone reads 1.0 as realistic.
+if grep -q "UNION across the cohort" "$HERE/../lib_realism_config.sh"; then
+    ok "the sites-VCF calibration warning is recorded"
+else
+    bad "the sites-VCF calibration warning is recorded" "a warning about cohort union" "absent"
+fi
+
+# Floor on how many assertions must execute. This file had none, which is how four
+# assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
+# discarded -- ran without changing the count. Raise it when adding tests.
+MIN_ASSERTIONS=71
+TOTAL=$((PASS + FAIL))
+if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
+    printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
+    FAIL=$((FAIL+1))
+fi
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
