@@ -78,7 +78,12 @@ YML
     fi
 
     local pair key val
-    for pair in "gc_bias_model:${GC_BIAS_MODEL:-}" \
+    # INPUT_VCF supplies variants directly rather than through a model. Drawn germline SVs
+    # (tools/draw_gnomad_sv_vcf.sh) go here: cand_per_mb needs breakpoints at real loci, and
+    # supplied variants are ADDED to the de novo mutations rather than replacing them, so the
+    # run still carries the model's SNPs and small indels.
+    for pair in "input_vcf:${INPUT_VCF:-}" \
+                "gc_bias_model:${GC_BIAS_MODEL:-}" \
                 "sequence_error_model:${SEQ_ERROR_MODEL:-}" \
                 "quality_score_model:${QUALITY_MODEL:-}" \
                 "mutation_model:${MUTATION_MODEL:-}" \

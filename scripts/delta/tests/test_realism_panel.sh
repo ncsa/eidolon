@@ -307,6 +307,17 @@ ceil="$(sed -n '/Frag ceiling:/,+14p' "$PIPELINE")"
 has "it warns the gap may be the ceiling" "$ceil" "rather than the simulator"
 has "it offers the alignment knob"        "$ceil" "ALIGN_TLEN=1"
 
+echo "=== INPUT_VCF reaches the config, and is absent when unset ==="
+# Drawn germline SVs arrive this way rather than through a model (#685). Supplied variants
+# are added to the de novo mutations, so the run keeps its SNPs and small indels.
+write_sim_config "$WORK/c_novcf.yml" /ref.fa /out seed 8 30 151 400 90
+hasnt "no input_vcf key when unset" "$(cat "$WORK/c_novcf.yml")" "input_vcf"
+INPUT_VCF=/v/drawn.vcf write_sim_config "$WORK/c_vcf.yml" /ref.fa /out seed 8 30 151 400 90
+has "INPUT_VCF reaches the config" "$(cat "$WORK/c_vcf.yml")" "input_vcf: /v/drawn.vcf"
+# Must-not-fire: supplying a VCF must not silently disable SV generation or anything else.
+has "setting INPUT_VCF leaves sv_rate_scale alone" \
+    "$(cat "$WORK/c_vcf.yml")" "sv_rate_scale: 0.0"
+
 echo "=== SV_RATE_SCALE is overridable, and defaults to off ==="
 # cand_per_mb compares a real genome carrying structural variants against a simulation
 # that plants none. The knob has to exist before that can be tested (#684); it must also
@@ -340,7 +351,7 @@ fi
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=68
+MIN_ASSERTIONS=71
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
