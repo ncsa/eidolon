@@ -68,33 +68,64 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             Box::new(read_lines(&config.fastq_file)?)
         };
 
-    // Read the first record to determine read_length before allocating transition_counts.
-    for _ in 0..3 {
-        match iter.next() {
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(e.into()),
-            None => {
-                return Err(GenSeqErrorModelError::MalformedFastq(
-                    "FASTQ file has fewer than 4 lines".to_string(),
-                ));
+    // SAMPLE the head of the file for the read length; do not trust one record (#697).
+    //
+    // Taking it from the FIRST record alone let a single short read at the head of a file set
+    // the model's length for the whole run, and `accumulate_qual` then truncated every longer
+    // read to it — silently. Fitting HG002 R2 produced a 168-position model from 250 bp reads,
+    // discarding a third of every read and specifically the 3' end, which is where quality
+    // degrades and therefore the part a quality model most needs. R1 of the same library was
+    // correct only because its first read happened to be full length.
+    //
+    // The MAXIMUM over the sample is the right statistic: it is the instrument's cycle count,
+    // which no read can exceed, and reads shorter than it contribute the positions they cover
+    // (`scores.len().min(read_length)`) rather than being discarded. A mode or percentile would
+    // reintroduce truncation for any read above it.
+    const READ_LENGTH_SAMPLE: usize = 1000;
+    let mut sample_quals: Vec<String> = Vec::with_capacity(READ_LENGTH_SAMPLE);
+    'sample: while sample_quals.len() < READ_LENGTH_SAMPLE {
+        for _ in 0..3 {
+            match iter.next() {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+                None => break 'sample,
             }
         }
-    }
-    let first_qual = match iter.next() {
-        Some(Ok(q)) => q,
-        Some(Err(e)) => return Err(e.into()),
-        None => {
-            return Err(GenSeqErrorModelError::MalformedFastq(
-                "FASTQ file has fewer than 4 lines".to_string(),
-            ));
+        match iter.next() {
+            Some(Ok(q)) => sample_quals.push(q),
+            Some(Err(e)) => return Err(e.into()),
+            None => break 'sample,
         }
-    };
+    }
+    if sample_quals.is_empty() {
+        return Err(GenSeqErrorModelError::MalformedFastq(
+            "FASTQ file has fewer than 4 lines".to_string(),
+        ));
+    }
 
-    let read_length = first_qual.len();
+    let read_length = sample_quals.iter().map(|q| q.len()).max().unwrap_or(0);
     if read_length == 0 {
         return Err(GenSeqErrorModelError::MalformedFastq(
             "Quality line in first record is empty".to_string(),
         ));
+    }
+    let min_sampled = sample_quals.iter().map(|q| q.len()).min().unwrap_or(0);
+    // Rule 4 applied to a setting: the read length conditions every position in the model, so
+    // a run must say which one it used and whether the sample agreed on it.
+    info!(
+        "Model read length: {} bp (max over {} sampled record(s))",
+        read_length,
+        sample_quals.len()
+    );
+    if min_sampled != read_length {
+        warn!(
+            "Read lengths vary across the first {} record(s): {}-{} bp. Using {} bp; shorter \
+             reads contribute only the positions they cover.",
+            sample_quals.len(),
+            min_sampled,
+            read_length,
+            read_length
+        );
     }
 
     let qual_offset = config.qual_offset;
@@ -140,17 +171,23 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
 
     let bins_slice: Option<&[usize]> = config.binned_quality_bins.as_deref();
 
-    if accumulate_qual(
-        &first_qual,
-        qual_offset,
-        read_length,
-        bins_slice,
-        &mut seed_counts,
-        &mut transition_counts,
-        &mut global_counts,
-        &mut total_bases,
-    ) {
-        reads_processed += 1;
+    // The sampled records are real data, not a probe — accumulate them before streaming on.
+    for qual in &sample_quals {
+        if config.max_reads > 0 && reads_processed >= config.max_reads {
+            break;
+        }
+        if accumulate_qual(
+            qual,
+            qual_offset,
+            read_length,
+            bins_slice,
+            &mut seed_counts,
+            &mut transition_counts,
+            &mut global_counts,
+            &mut total_bases,
+        ) {
+            reads_processed += 1;
+        }
     }
 
     'records: loop {
@@ -410,6 +447,122 @@ mod tests {
             bam_file: None,
             transition_matrix_file: None,
         }
+    }
+
+    /// A FASTQ whose FIRST record is short and whose remainder is full length.
+    ///
+    /// Quality is planted so the answer is known without consulting the code: the long reads
+    /// are `hi` for their first half and `lo` for their second. Under the #697 bug the model's
+    /// read length came from the short first record, `accumulate_qual` truncated every long
+    /// read to it, and the entire `lo` half was never seen by the transition tensor — so a
+    /// model built from this file could not emit a `lo` score at any position.
+    fn make_short_first_fastq(
+        path: &PathBuf,
+        n_long: usize,
+        short_len: usize,
+        long_len: usize,
+        hi: u8,
+        lo: u8,
+    ) {
+        use std::io::Write;
+        let mut out = String::new();
+        let seq = |n: usize| -> String { "ACGT".chars().cycle().take(n).collect() };
+        // The offending record: short, and first.
+        out.push_str(&format!(
+            "@short\n{}\n+\n{}\n",
+            seq(short_len),
+            (hi as char).to_string().repeat(short_len)
+        ));
+        let half = long_len / 2;
+        let qual: String = (hi as char).to_string().repeat(half)
+            + &(lo as char).to_string().repeat(long_len - half);
+        for i in 0..n_long {
+            out.push_str(&format!("@long{}\n{}\n+\n{}\n", i, seq(long_len), qual));
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(out.as_bytes()).unwrap();
+    }
+
+    /// THE regression for #697. Fitting HG002 R2 produced a 168-position model from 250 bp
+    /// reads because one short record led the file; a third of every read was discarded, and
+    /// specifically the 3' end where quality degrades.
+    #[test]
+    fn read_length_is_not_taken_from_a_short_first_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("mixed.fastq");
+        // Q40 = 'I', Q10 = '+' at offset 33. Long reads are Q40 for 25 bases then Q10 for 25.
+        make_short_first_fastq(&fastq_path, 200, 10, 50, b'I', b'+');
+        let output_path = temp.path().join("model.json.gz");
+        runner(&make_config(fastq_path, output_path.clone())).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        assert_eq!(
+            q.assumed_read_length, 50,
+            "read length must come from the reads, not from the short first record"
+        );
+        assert_eq!(
+            q.distros_from_one.len(),
+            49,
+            "one transition row per position after the first"
+        );
+
+        // The known answer: the second half of every long read is Q10, so a model that saw
+        // those positions must emit Q10 there. Under the bug it emits Q40 everywhere, because
+        // positions 11-50 contributed no transitions at all.
+        let mut rng = eidolon_core::rng::NeatRng::new_from_seed(&vec!["s697".to_string()]).unwrap();
+        let scores = q.generate_quality_scores(50, &mut rng).unwrap();
+        assert_eq!(scores.len(), 50);
+        let late_low = scores[30..].iter().filter(|&&s| s == 10).count();
+        assert!(
+            late_low >= 15,
+            "positions 31-50 were all Q10 in training; got {} of 20 at Q10: {:?}",
+            late_low,
+            &scores[30..]
+        );
+        // Must not fire: the FIRST half was Q40 and must not have been overwritten by it.
+        let early_high = scores[..25].iter().filter(|&&s| s == 40).count();
+        assert!(
+            early_high >= 20,
+            "positions 1-25 were Q40 in training; got {} of 25: {:?}",
+            early_high,
+            &scores[..25]
+        );
+    }
+
+    /// Must not fire: a uniform-length file is unchanged by the sampling change.
+    #[test]
+    fn a_uniform_length_fastq_still_reports_its_own_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("uniform.fastq");
+        make_test_fastq(&fastq_path, 50, 75);
+        let output_path = temp.path().join("model.json.gz");
+        runner(&make_config(fastq_path, output_path.clone())).unwrap();
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_eq!(model.quality_score_model().assumed_read_length, 75);
+    }
+
+    /// A short record that is NOT first must not shrink the model either — the maximum over
+    /// the sample is what is wanted, not the minimum or the last seen.
+    #[test]
+    fn a_short_record_later_in_the_file_does_not_shrink_the_model() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("late_short.fastq");
+        let seq = |n: usize| -> String { "ACGT".chars().cycle().take(n).collect() };
+        let mut out = String::new();
+        for i in 0..40 {
+            let n = if i == 17 { 12 } else { 60 };
+            out.push_str(&format!("@r{}\n{}\n+\n{}\n", i, seq(n), "I".repeat(n)));
+        }
+        std::fs::File::create(&fastq_path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+        let output_path = temp.path().join("model.json.gz");
+        runner(&make_config(fastq_path, output_path.clone())).unwrap();
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_eq!(model.quality_score_model().assumed_read_length, 60);
     }
 
     #[test]
