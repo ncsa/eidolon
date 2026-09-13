@@ -77,7 +77,18 @@ fn canonical_model_json(path: &Path) -> String {
     decoder
         .read_to_string(&mut raw)
         .expect("model file must decompress to valid UTF-8 JSON");
-    let value: Value = serde_json::from_str(&raw).expect("model file must be valid JSON");
+    let mut value: Value = serde_json::from_str(&raw).expect("model file must be valid JSON");
+    // Drop the provenance stamp before comparing (#708). It carries the eidolon version that
+    // wrote the file, so leaving it in would break every baseline on every version bump -- a
+    // parity test that fails for a reason unrelated to builder output teaches people to bless
+    // baselines reflexively, which is the one habit that would make this test worthless.
+    //
+    // Stripping it also means the baselines below did NOT need re-blessing when the stamp
+    // landed: the canonical JSON still matches byte for byte, which is the evidence that the
+    // stamp is purely additive and changed no model content.
+    if let Some(map) = value.as_object_mut() {
+        map.remove(eidolon_core::models::PROVENANCE_KEY);
+    }
     let canonical = canonicalize(value);
     serde_json::to_string_pretty(&canonical).unwrap()
 }
