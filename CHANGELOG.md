@@ -74,6 +74,12 @@ pre-#672 run and says so in the banner.
 are not byte-comparable across this version. Anything measured against a pre-3.4.0 baseline
 needs re-baselining.
 
+**The reverse does not hold: do not read a 3.4.0 model with an older eidolon.** Model files
+carry no version stamp and unknown fields are ignored silently, so an older binary will load a
+3.4.0 model, discard `indel_context_curve`, and simulate with its own flat default without
+warning that it did. The README's *Versioning and the public API* section now states which
+direction is supported; #708 tracks making the mismatch detectable rather than documented.
+
 ### Evidence
 
 Verified locally: unit tests pin both NEAT2 constants and the curve against their sources;

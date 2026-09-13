@@ -162,7 +162,9 @@ SemVer requires a project to say what its public API is. For eidolon:
 - FASTQ/BAM **read-name (QNAME) format** — the `EIDOLON_generated_` /
   `EIDOLON_chimeric_` prefixes and the positional fields encoded after them
 - CLI subcommand names, flags, and configuration-YAML keys
-- Model-file compatibility (a model built by one version staying readable by the next)
+- Model-file compatibility, **in the backward direction only** — a model built by an
+  older eidolon stays readable by a newer one. See *Model files* below for what that
+  does and does not cover
 
 **Not public API — may change in a MINOR or PATCH release:**
 - The `eidolon-core` Rust library surface; it exists to serve the binary
@@ -170,8 +172,31 @@ SemVer requires a project to say what its public API is. For eidolon:
 - The exact simulated *content* for a given seed — reads are a random draw, so sampler
   and model changes legitimately alter output while preserving the format
 
+**Versioned separately from eidolon itself:**
+- The `compare-vcfs` JSON report carries its own `schema_version` field (currently `1.3.0`),
+  bumped only when a backward-incompatible field change lands. Read that field rather than
+  inferring the report's shape from the eidolon version — the two move independently, so a
+  minor eidolon release can carry a new schema, and a major one need not
+
 If you parse eidolon's output, the first list is what you are relying on, and a major
 version bump is your signal to check this file before upgrading.
+
+### Model files
+
+"Compatible" covers one direction, and neither direction is currently checked automatically.
+
+- **Old model, newer eidolon — supported.** Fields added since the model was written
+  deserialize to their shipped defaults, so the model keeps its previous behavior for
+  anything it does not carry, rather than failing to load.
+- **New model, older eidolon — NOT supported, and NOT detected.** Unrecognized fields are
+  ignored silently. An older binary will read a newer model, discard what it does not
+  understand, and simulate using its own defaults with no warning that it did so. Do not move
+  model files backwards across releases.
+- **Model files carry no version stamp.** A model cannot tell you which eidolon wrote it, so
+  neither direction above can be verified — by you or by eidolon. Tracked in #708.
+
+The practical rule: rebuild models with the eidolon you intend to run, and treat a model file
+as belonging to the version that produced it.
 
 ## Upgrading from 2.0.0
 
