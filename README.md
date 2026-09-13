@@ -1,5 +1,7 @@
 # The eidolon project
 
+[![eidolon-tests](https://github.com/ncsa/eidolon/actions/workflows/eidolon-tests.yml/badge.svg?branch=main)](https://github.com/ncsa/eidolon/actions/workflows/eidolon-tests.yml)
+
 > **Formerly `rusty-neat` / `rneat`** — renamed to `eidolon` in v2.0.0. Same tool, same
 > NEAT lineage; the `rneat` command still works as a deprecated alias for one transition
 > release. See `CHANGELOG.md`.
