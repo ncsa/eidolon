@@ -11,6 +11,11 @@ overwrite_output: false
 max_reads: 0
 # quality score ASCII offset [optional] - 33 for Illumina 1.8+/Sanger, 64 for older Illumina (default: 33)
 qual_offset: 33
+# largest read length to model, in bp [optional] - set to 0 for no limit (default: 1000)
+# The model stores one transition matrix per read position (~69 KiB each), so this bounds
+# memory: 1000 bp is about 67 MiB. A read longer than this is an error rather than being
+# silently truncated; raise this key if your reads really are longer.
+max_model_read_length: 1000
 # binned quality bins [optional] - quantize the learned quality scores to a small bin set.
 # When set, each observed Q-score is snapped to the nearest bin and gen-reads will emit only
 # these values. Example presets: NovaSeq 6000 [2, 12, 23, 37], NextSeq 3-bin [2, 15, 35].
