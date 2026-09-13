@@ -361,6 +361,16 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   Keep using the API when it matters. When
   checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds
   the missed-merge hazard above: both the "did it land" checks can lie in the same direction.)
+- **A merged branch can still look unmerged — use `git cherry`, not ancestry, to decide.**
+  `git merge-base --is-ancestor` and a three-dot `git diff origin/develop...<branch>` both
+  answer "not merged" for a branch whose patch landed under a different SHA, which is every
+  rebase, cherry-pick and squash merge. `git cherry -v origin/develop <branch>` answers
+  correctly: `-` means an equivalent patch is already upstream, `+` means it is genuinely
+  absent. On 2026-09-12 a local `feature/fit_indel_context` read as unpushed work — the
+  three-dot diff showed 2 files, 142 insertions — while its commit `89faa67` was
+  byte-identical to `27f7c3c`, already on `develop` with three commits built on top of it.
+  Ancestry is the right test in the other direction (did MY commit land, above). Here it is
+  the wrong one, and it fails toward opening a duplicate PR.
 - **A broad `git add -A` picks up shell accidents.** An empty file named `=10` reached
   `main` from an unquoted `>=10` in an interactive shell. Before a `develop` -> `main`
   merge, check for empty tracked files and paths with characters outside
