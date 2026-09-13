@@ -14,6 +14,10 @@ use std::path::PathBuf;
 
 const MAX_SCORE: usize = 94;
 
+/// Below this many observations, a position's transition row is noise rather than measurement.
+/// Not a tuned figure -- a round number chosen to make a thin tail visible, which is the point.
+const THIN_POSITION_OBSERVATIONS: usize = 100;
+
 /// Snap a raw quality score to the nearest value in a sorted bin list.
 /// Ties round toward the lower bin (deterministic).
 /// `bins` must be non-empty and sorted ascending.
@@ -68,80 +72,44 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             Box::new(read_lines(&config.fastq_file)?)
         };
 
-    // SAMPLE the head of the file for the read length; do not trust one record (#697).
+    // The transition tensor GROWS to the longest read seen, rather than being sized up front
+    // from a guess and then enforced as a cap (#697, and the review of #698).
     //
-    // Taking it from the FIRST record alone let a single short read at the head of a file set
-    // the model's length for the whole run, and `accumulate_qual` then truncated every longer
-    // read to it — silently. Fitting HG002 R2 produced a 168-position model from 250 bp reads,
-    // discarding a third of every read and specifically the 3' end, which is where quality
-    // degrades and therefore the part a quality model most needs. R1 of the same library was
-    // correct only because its first read happened to be full length.
+    // The previous approach sampled the first 1000 records, took the maximum, and truncated
+    // everything else to it (`scores.len().min(read_length)`). That guess is wrong in both
+    // available directions: too small, and every read past the sample loses its tail exactly
+    // as in #697; too large -- `max_reads` fits fewer records than the length was drawn from --
+    // and the model advertises positions no read ever reached, whose rows fall back to a
+    // uniform distribution. Measured on the latter: a model advertising 100 bp emitted the
+    // trained shape for positions 1-50 and coin-flip noise for 51-100.
     //
-    // The MAXIMUM over the sample is the right statistic: it is the instrument's cycle count,
-    // which no read can exceed, and reads shorter than it contribute the positions they cover
-    // (`scores.len().min(read_length)`) rather than being discarded. A mode or percentile would
-    // reintroduce truncation for any read above it.
-    const READ_LENGTH_SAMPLE: usize = 1000;
-    let mut sample_quals: Vec<String> = Vec::with_capacity(READ_LENGTH_SAMPLE);
-    'sample: while sample_quals.len() < READ_LENGTH_SAMPLE {
-        for _ in 0..3 {
-            match iter.next() {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
-                None => break 'sample,
-            }
-        }
-        match iter.next() {
-            Some(Ok(q)) => sample_quals.push(q),
-            Some(Err(e)) => return Err(e.into()),
-            None => break 'sample,
-        }
-    }
-    if sample_quals.is_empty() {
-        return Err(GenSeqErrorModelError::MalformedFastq(
-            "FASTQ file has fewer than 4 lines".to_string(),
-        ));
-    }
-
-    let read_length = sample_quals.iter().map(|q| q.len()).max().unwrap_or(0);
-    if read_length == 0 {
-        return Err(GenSeqErrorModelError::MalformedFastq(
-            "Quality line in first record is empty".to_string(),
-        ));
-    }
-    let min_sampled = sample_quals.iter().map(|q| q.len()).min().unwrap_or(0);
-    // Rule 4 applied to a setting: the read length conditions every position in the model, so
-    // a run must say which one it used and whether the sample agreed on it.
-    info!(
-        "Model read length: {} bp (max over {} sampled record(s))",
-        read_length,
-        sample_quals.len()
-    );
-    if min_sampled != read_length {
-        warn!(
-            "Read lengths vary across the first {} record(s): {}-{} bp. Using {} bp; shorter \
-             reads contribute only the positions they cover.",
-            sample_quals.len(),
-            min_sampled,
-            read_length,
-            read_length
-        );
-    }
-
+    // Growing on demand removes the guess. `read_length` becomes an OUTPUT of the fit -- the
+    // maximum over records actually accumulated -- so `max_reads` needs no special case and
+    // nothing is ever truncated. One pass, and the peak allocation is what the old code
+    // allocated up front anyway.
+    //
+    // NOTE: truncation was also the only bound on that allocation. A configurable ceiling and
+    // structural validation of the input (#700) both follow in their own PRs; until then a
+    // pathologically long "quality" line is bounded by nothing.
     let qual_offset = config.qual_offset;
     let mut seed_counts = vec![0usize; MAX_SCORE];
-    let mut transition_counts = vec![vec![vec![0usize; MAX_SCORE]; MAX_SCORE]; read_length - 1];
+    let mut transition_counts: Vec<Vec<Vec<usize>>> = Vec::new();
     let mut global_counts = vec![0usize; MAX_SCORE];
     let mut total_bases: usize = 0;
     let mut reads_processed: usize = 0;
 
+    /// Accumulate one quality line into the counts.
+    ///
+    /// Every allocated position carries at least one observation BY CONSTRUCTION: a row exists
+    /// only because some read reached that position, and that read necessarily incremented it.
+    /// An untrained position is therefore unrepresentable rather than merely unlikely, which is
+    /// what `every_position_has_an_observation` pins.
     fn accumulate_qual(
         qual_line: &str,
         qual_offset: usize,
-        read_length: usize,
         bins: Option<&[usize]>,
         seed_counts: &mut [usize],
-        transition_counts: &mut [Vec<Vec<usize>>],
+        transition_counts: &mut Vec<Vec<Vec<usize>>>,
         global_counts: &mut [usize],
         total_bases: &mut usize,
     ) -> bool {
@@ -159,7 +127,10 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             return false;
         }
         seed_counts[scores[0]] += 1;
-        for j in 1..scores.len().min(read_length) {
+        if scores.len() > 1 && transition_counts.len() < scores.len() - 1 {
+            transition_counts.resize(scores.len() - 1, vec![vec![0usize; MAX_SCORE]; MAX_SCORE]);
+        }
+        for j in 1..scores.len() {
             transition_counts[j - 1][scores[j - 1]][scores[j]] += 1;
         }
         for &score in &scores {
@@ -171,24 +142,9 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
 
     let bins_slice: Option<&[usize]> = config.binned_quality_bins.as_deref();
 
-    // The sampled records are real data, not a probe — accumulate them before streaming on.
-    for qual in &sample_quals {
-        if config.max_reads > 0 && reads_processed >= config.max_reads {
-            break;
-        }
-        if accumulate_qual(
-            qual,
-            qual_offset,
-            read_length,
-            bins_slice,
-            &mut seed_counts,
-            &mut transition_counts,
-            &mut global_counts,
-            &mut total_bases,
-        ) {
-            reads_processed += 1;
-        }
-    }
+    // These two errors used to be raised by the sampling block; they belong to the stream now.
+    let mut records_seen: usize = 0;
+    let mut min_qual_len = usize::MAX;
 
     'records: loop {
         if config.max_reads > 0 && reads_processed >= config.max_reads {
@@ -206,10 +162,16 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             Some(Ok(q)) => q,
             Some(Err(e)) => return Err(e.into()),
         };
+        if records_seen == 0 && qual.is_empty() {
+            return Err(GenSeqErrorModelError::MalformedFastq(
+                "Quality line in first record is empty".to_string(),
+            ));
+        }
+        records_seen += 1;
+        min_qual_len = min_qual_len.min(qual.len());
         if accumulate_qual(
             &qual,
             qual_offset,
-            read_length,
             bins_slice,
             &mut seed_counts,
             &mut transition_counts,
@@ -220,10 +182,52 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         }
     }
 
+    if records_seen == 0 {
+        return Err(GenSeqErrorModelError::MalformedFastq(
+            "FASTQ file has fewer than 4 lines".to_string(),
+        ));
+    }
+
+    // The fit's OUTPUT, not an input to it: one row per position after the first.
+    let read_length = transition_counts.len() + 1;
+
     info!(
         "Processed {} reads ({} bases)",
         reads_processed, total_bases
     );
+    info!(
+        "Model read length: {} bp (maximum over {} record(s) accumulated)",
+        read_length, reads_processed
+    );
+    if min_qual_len != usize::MAX && min_qual_len != read_length {
+        warn!(
+            "Read lengths vary across the {} record(s) fitted: {}-{} bp. Every position is \
+             modeled; shorter reads contribute only the positions they cover.",
+            reads_processed, min_qual_len, read_length
+        );
+    }
+
+    // Rule 4: report the denominator, not just the metric. Every position holds at least one
+    // observation by construction, but "at least one" is not "enough" -- a thin tail makes the
+    // late positions noise, and a small `max_reads` is the usual way to get one.
+    if let Some(min_obs) = transition_counts
+        .iter()
+        .map(|row| row.iter().flatten().sum::<usize>())
+        .min()
+    {
+        info!(
+            "Fewest transition observations at any position: {}",
+            min_obs
+        );
+        if min_obs < THIN_POSITION_OBSERVATIONS {
+            warn!(
+                "Some modeled position rests on only {} observation(s) (threshold {}). Those \
+                 positions are noise rather than measurement; fit more reads, or accept that \
+                 the tail of the model is thin.",
+                min_obs, THIN_POSITION_OBSERVATIONS
+            );
+        }
+    }
 
     if total_bases == 0 {
         return Err(GenSeqErrorModelError::MalformedFastq(
@@ -540,6 +544,143 @@ mod tests {
         runner(&make_config(fastq_path, output_path.clone())).unwrap();
         let model = SequencingErrorModel::from_file(&output_path).unwrap();
         assert_eq!(model.quality_score_model().assumed_read_length, 75);
+    }
+
+    /// Write `n_a` records of `len_a` with quality `qual_a`, then `n_b` of `len_b` / `qual_b`.
+    /// Quality strings are supplied whole so the expected model is readable from the fixture.
+    fn write_two_phase_fastq(path: &PathBuf, n_a: usize, qual_a: &str, n_b: usize, qual_b: &str) {
+        use std::io::Write;
+        let mut out = String::new();
+        for (n, qual) in [(n_a, qual_a), (n_b, qual_b)] {
+            for i in 0..n {
+                out.push_str(&format!(
+                    "@r{}_{}\n{}\n+\n{}\n",
+                    qual.len(),
+                    i,
+                    "A".repeat(qual.len()),
+                    qual
+                ));
+            }
+        }
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+    }
+
+    /// Every position of a model must emit what was planted there, across seeds. A position
+    /// whose transition row went untrained falls back to a uniform draw over the option set,
+    /// so with two planted values it lands on the wrong one about half the time.
+    fn assert_positions_match(
+        q: &eidolon_core::models::quality_scores::QualityScoreModel,
+        expected: &str,
+        qual_offset: usize,
+    ) {
+        let want: Vec<usize> = expected.bytes().map(|b| b as usize - qual_offset).collect();
+        for seed in ["a", "b", "c", "d"] {
+            let mut rng =
+                eidolon_core::rng::NeatRng::new_from_seed(&vec![seed.to_string()]).unwrap();
+            let got = q.generate_quality_scores(want.len(), &mut rng).unwrap();
+            assert_eq!(got.len(), want.len());
+            for (pos, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g,
+                    w,
+                    "seed {seed}, position {} emitted Q{g} but Q{w} was planted there; an \
+                     untrained row falls back to a uniform draw",
+                    pos + 1
+                );
+            }
+        }
+    }
+
+    /// THE regression for the first review finding on #698: a read LONGER than everything
+    /// before it, past where the old 1000-record sample stopped looking.
+    ///
+    /// Known answer: the long reads are Q40 for 50 positions then Q10 for 50, so a model that
+    /// saw them must advertise 100 bp and emit Q10 across the tail. Under the sampling code
+    /// `assumed_read_length` was 50 and positions 51-100 were dropped entirely — measured, on
+    /// this exact shape, before the fix.
+    #[test]
+    fn a_long_record_past_the_old_sampling_boundary_is_fitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("late_long.fastq");
+        let short_qual = "I".repeat(50);
+        let long_qual = "I".repeat(50) + &"+".repeat(50);
+        // 1000 short records is exactly the old sample size, so the long ones begin one record
+        // past where it stopped reading.
+        write_two_phase_fastq(&fastq_path, 1000, &short_qual, 200, &long_qual);
+        let output_path = temp.path().join("model.json.gz");
+        runner(&make_config(fastq_path, output_path.clone())).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        assert_eq!(
+            q.assumed_read_length, 100,
+            "the longest read is 100 bp; the model must not stop at the 1000-record boundary"
+        );
+        assert_eq!(q.distros_from_one.len(), 99);
+        // Positions 1-50 are Q40 in BOTH populations and 51-100 are Q10 in the only population
+        // that reaches them, so the whole model is deterministic.
+        assert_positions_match(q, &long_qual, 33);
+    }
+
+    /// THE regression for the second review finding on #698: `max_reads` smaller than the
+    /// window the read length was drawn from.
+    ///
+    /// Known answer: only the ten 50 bp records are fitted, so the model is a 50 bp model.
+    /// Under the sampling code it advertised 100 bp — the length came from records that
+    /// `max_reads` excluded — and positions 51-100 were uniform noise between Q10 and Q40.
+    #[test]
+    fn max_reads_does_not_advertise_positions_it_did_not_fit() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("capped.fastq");
+        let short_qual = "I".repeat(25) + &"+".repeat(25);
+        let long_qual = "I".repeat(50) + &"+".repeat(50);
+        write_two_phase_fastq(&fastq_path, 10, &short_qual, 100, &long_qual);
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.max_reads = 10;
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        assert_eq!(
+            q.assumed_read_length, 50,
+            "only the ten 50 bp records were fitted, so the model describes 50 positions"
+        );
+        assert_eq!(q.distros_from_one.len(), 49);
+        assert_positions_match(q, &short_qual, 33);
+    }
+
+    /// The invariant the growth approach buys: a position row exists only because some read
+    /// reached it, and that read necessarily incremented it, so no modeled position can be
+    /// untrained. Three lengths interleaved, quality alternating by position, so every one of
+    /// the 90 positions has exactly one correct answer and a uniform fallback is visible.
+    #[test]
+    fn every_modeled_position_is_trained() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("ragged.fastq");
+        let full: String = (0..90)
+            .map(|i| if i % 2 == 0 { 'I' } else { '+' })
+            .collect();
+        use std::io::Write;
+        let mut out = String::new();
+        for (i, len) in [30usize, 60, 90].iter().cycle().take(60).enumerate() {
+            let qual = &full[..*len];
+            out.push_str(&format!("@r{}\n{}\n+\n{}\n", i, "A".repeat(*len), qual));
+        }
+        std::fs::File::create(&fastq_path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+
+        let output_path = temp.path().join("model.json.gz");
+        runner(&make_config(fastq_path, output_path.clone())).unwrap();
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        assert_eq!(q.assumed_read_length, 90);
+        assert_positions_match(q, &full, 33);
     }
 
     /// A short record that is NOT first must not shrink the model either — the maximum over
