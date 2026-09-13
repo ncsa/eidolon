@@ -20,6 +20,13 @@ pub struct RunConfiguration {
     /// Optional aligned BAM file to infer the SNP transition matrix from read-vs-reference
     /// mismatches. Requires MD tags. Ignored if transition_matrix_file is also set.
     pub bam_file: Option<PathBuf>,
+    /// Largest read length the model will fit, in bp; 0 disables the limit.
+    ///
+    /// The transition tensor holds one MAX_SCORE x MAX_SCORE count matrix per position, about
+    /// 69 KiB each, so the read length bounds the allocation directly (1000 bp is ~67 MiB).
+    /// A read above this is a hard error rather than a silent truncation, because a silent
+    /// truncation is #697.
+    pub max_model_read_length: usize,
     /// Optional path to a 4×4 TSV specifying a custom SNP transition matrix.
     /// Rows/columns are A/C/G/T. A single header line is ignored.
     /// Takes precedence over bam_file.
@@ -82,6 +89,14 @@ impl RunConfiguration {
             .get("qual_offset")
             .and_then(|v| v.as_u64())
             .unwrap_or(33) as usize;
+
+        // 1000 bp is generous headroom over any short-read platform (2x300 merged is 600) and
+        // costs ~67 MiB. gen-seq-error-model is short-read only today; long-read error models
+        // are #319, and this key is how someone lifts the limit before then.
+        let max_model_read_length = scrape_config
+            .get("max_model_read_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1000) as usize;
 
         let binned_quality_bins = match scrape_config.get("binned_quality_bins") {
             None => None,
@@ -161,6 +176,7 @@ impl RunConfiguration {
             overwrite_output,
             max_reads,
             qual_offset,
+            max_model_read_length,
             binned_quality_bins,
             bam_file,
             transition_matrix_file,
@@ -244,7 +260,22 @@ mod tests {
         let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
         assert_eq!(config.max_reads, 0);
         assert_eq!(config.qual_offset, 33);
+        assert_eq!(config.max_model_read_length, 1000);
         assert!(!config.overwrite_output);
+    }
+
+    #[test]
+    fn max_model_read_length_is_configurable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nmax_model_read_length: 25000\n",
+            fastq.display(),
+            output.display()
+        ));
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert_eq!(config.max_model_read_length, 25000);
     }
 
     #[test]

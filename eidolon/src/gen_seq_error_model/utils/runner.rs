@@ -88,9 +88,9 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     // nothing is ever truncated. One pass, and the peak allocation is what the old code
     // allocated up front anyway.
     //
-    // NOTE: truncation was also the only bound on that allocation. A configurable ceiling and
-    // structural validation of the input (#700) both follow in their own PRs; until then a
-    // pathologically long "quality" line is bounded by nothing.
+    // Truncation was also the only bound on that allocation, so `max_model_read_length` now
+    // supplies one explicitly -- see `accumulate_qual`. Structural validation of the input
+    // (#700) is still outstanding, so a non-FASTQ file is still accepted on its way there.
     let qual_offset = config.qual_offset;
     let mut seed_counts = vec![0usize; MAX_SCORE];
     let mut transition_counts: Vec<Vec<Vec<usize>>> = Vec::new();
@@ -107,12 +107,13 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     fn accumulate_qual(
         qual_line: &str,
         qual_offset: usize,
+        max_model_read_length: usize,
         bins: Option<&[usize]>,
         seed_counts: &mut [usize],
         transition_counts: &mut Vec<Vec<Vec<usize>>>,
         global_counts: &mut [usize],
         total_bases: &mut usize,
-    ) -> bool {
+    ) -> Result<bool, GenSeqErrorModelError> {
         let scores: Vec<usize> = qual_line
             .bytes()
             .map(|b| {
@@ -124,7 +125,26 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             })
             .collect();
         if scores.is_empty() {
-            return false;
+            return Ok(false);
+        }
+        // Growing the tensor removed truncation, and truncation was the only bound on the
+        // allocation. This restores a bound WITHOUT restoring silent data loss: a read above
+        // the ceiling stops the run and says so, rather than being quietly trimmed (#697).
+        if max_model_read_length > 0 && scores.len() > max_model_read_length {
+            let mib = scores.len().saturating_sub(1)
+                * MAX_SCORE
+                * MAX_SCORE
+                * std::mem::size_of::<usize>()
+                / (1024 * 1024);
+            return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                "a read is {} bp, above the {} bp limit set by `max_model_read_length`; \
+                 modeling it would allocate ~{} MiB of transition counts. Raise that key (or \
+                 set it to 0 for no limit) if the input really is this long. Long-read error \
+                 models are tracked in #319.",
+                scores.len(),
+                max_model_read_length,
+                mib,
+            )));
         }
         seed_counts[scores[0]] += 1;
         if scores.len() > 1 && transition_counts.len() < scores.len() - 1 {
@@ -137,7 +157,7 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             global_counts[score] += 1;
         }
         *total_bases += scores.len();
-        true
+        Ok(true)
     }
 
     let bins_slice: Option<&[usize]> = config.binned_quality_bins.as_deref();
@@ -172,12 +192,13 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         if accumulate_qual(
             &qual,
             qual_offset,
+            config.max_model_read_length,
             bins_slice,
             &mut seed_counts,
             &mut transition_counts,
             &mut global_counts,
             &mut total_bases,
-        ) {
+        )? {
             reads_processed += 1;
         }
     }
@@ -447,6 +468,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: None,
@@ -591,6 +613,79 @@ mod tests {
                     pos + 1
                 );
             }
+        }
+    }
+
+    /// Write one record whose quality line is `len` characters.
+    fn write_single_read_fastq(path: &PathBuf, len: usize) {
+        use std::io::Write;
+        let record = format!("@long\n{}\n+\n{}\n", "A".repeat(len), "I".repeat(len));
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(record.as_bytes())
+            .unwrap();
+    }
+
+    /// A read above the ceiling STOPS the run. The limit exists to bound the allocation
+    /// without reintroducing silent truncation, so the failure has to be loud.
+    #[test]
+    fn a_read_above_the_ceiling_is_an_error_not_a_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("toolong.fastq");
+        write_single_read_fastq(&fastq_path, 1500);
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.max_model_read_length = 1000;
+
+        let err = runner(&config).unwrap_err();
+        let msg = err.to_string();
+        // Assert the CONTENT: a reader has to learn the length, the limit, and the way out.
+        assert!(
+            msg.contains("1500"),
+            "error must name the read length: {msg}"
+        );
+        assert!(msg.contains("1000"), "error must name the limit: {msg}");
+        assert!(
+            msg.contains("max_model_read_length"),
+            "error must name the key to raise: {msg}"
+        );
+        assert!(
+            !output_path.exists(),
+            "a refused run must not leave a model file behind"
+        );
+    }
+
+    /// Must not fire: a read exactly AT the ceiling is fitted. An off-by-one here would reject
+    /// legitimate data, which is the failure a limit most easily introduces.
+    #[test]
+    fn a_read_exactly_at_the_ceiling_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("atlimit.fastq");
+        write_single_read_fastq(&fastq_path, 300);
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.max_model_read_length = 300;
+
+        runner(&config).unwrap();
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_eq!(model.quality_score_model().assumed_read_length, 300);
+    }
+
+    /// Raising the key admits the read, and 0 disables the limit — the escape hatch the error
+    /// message points at has to work, or the message is a dead end.
+    #[test]
+    fn the_ceiling_can_be_raised_or_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("long.fastq");
+        write_single_read_fastq(&fastq_path, 1500);
+
+        for (limit, tag) in [(2000usize, "raised"), (0usize, "disabled")] {
+            let output_path = temp.path().join(format!("model_{tag}.json.gz"));
+            let mut config = make_config(fastq_path.clone(), output_path.clone());
+            config.max_model_read_length = limit;
+            runner(&config).unwrap_or_else(|e| panic!("limit {limit} should admit 1500 bp: {e}"));
+            let model = SequencingErrorModel::from_file(&output_path).unwrap();
+            assert_eq!(model.quality_score_model().assumed_read_length, 1500);
         }
     }
 
@@ -952,6 +1047,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: Some(tsv_path),
@@ -1031,6 +1127,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1091,6 +1188,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1201,6 +1299,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1248,6 +1347,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1296,6 +1396,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1355,6 +1456,7 @@ mod tests {
             overwrite_output: true,
             max_reads: 0,
             qual_offset: 33,
+            max_model_read_length: 1000,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: Some(tsv_path),
