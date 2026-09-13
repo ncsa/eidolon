@@ -64,6 +64,91 @@ fn build_transition_matrix_from_counts(
     )?)
 }
 
+/// Shorten a line for an error message. A corrupt "line" can be megabytes.
+fn truncate_for_message(line: &str) -> String {
+    const MAX: usize = 60;
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX).collect();
+    format!("{head}...")
+}
+
+/// Read a non-header line of a record. Unlike the header, running out of input here means the
+/// final record is truncated -- a corrupt file -- rather than a clean end.
+fn next_record_line<I>(
+    iter: &mut I,
+    first_line: usize,
+    this_line: usize,
+) -> Result<String, GenSeqErrorModelError>
+where
+    I: Iterator<Item = std::io::Result<String>>,
+{
+    match iter.next() {
+        Some(Ok(l)) => Ok(l),
+        Some(Err(e)) => Err(e.into()),
+        None => Err(GenSeqErrorModelError::MalformedFastq(format!(
+            "the record starting at line {first_line} is truncated: the file ends before line \
+             {this_line}. A FASTQ record is four lines (header, sequence, '+', quality)."
+        ))),
+    }
+}
+
+/// Structural validation of one FASTQ record.
+///
+/// WHY THIS EXISTS (#700): the reader used to consume records in groups of four and keep only
+/// the fourth line, discarding the other three unexamined. Any file whose line count is a
+/// multiple of four was therefore accepted -- including a FASTA, whose SEQUENCE lines then
+/// landed in the quality accumulator. Every nucleotide decodes to a plausible Phred score under
+/// the offset-33 arithmetic (A->Q32, C->Q34, G->Q38, T->Q51), so the run completed at exit 0 and
+/// wrote a model with an ordinary-looking error_rate. Nothing downstream could tell it apart
+/// from a model fitted on reads.
+///
+/// These are the structural checks `eidolon validate` already applies, minus the per-base IUPAC
+/// test, which is O(n) in the hot loop and buys little once '@' is enforced. That leaves one
+/// known gap: a file with its sequence and quality lines transposed passes all three checks.
+/// `eidolon validate` is the place for that.
+fn validate_record(
+    header: &str,
+    seq: &str,
+    plus: &str,
+    qual: &str,
+    first_line: usize,
+) -> Result<(), GenSeqErrorModelError> {
+    if !header.starts_with('@') {
+        // The common mistake gets its own message rather than the generic one.
+        if header.starts_with('>') {
+            return Err(GenSeqErrorModelError::MalformedFastq(format!(
+                "line {first_line} starts with '>', so this looks like a FASTA, not a FASTQ: \
+                 {:?}. A sequencing-error model is fitted from quality scores, which a FASTA \
+                 does not carry.",
+                truncate_for_message(header)
+            )));
+        }
+        return Err(GenSeqErrorModelError::MalformedFastq(format!(
+            "line {first_line}: a FASTQ record header must start with '@', found {:?}",
+            truncate_for_message(header)
+        )));
+    }
+    if !plus.starts_with('+') {
+        return Err(GenSeqErrorModelError::MalformedFastq(format!(
+            "line {}: the third line of a FASTQ record must start with '+', found {:?}",
+            first_line + 2,
+            truncate_for_message(plus)
+        )));
+    }
+    if seq.len() != qual.len() {
+        return Err(GenSeqErrorModelError::MalformedFastq(format!(
+            "line {}: the quality string is {} character(s) but the sequence on line {} is {}",
+            first_line + 3,
+            qual.len(),
+            first_line + 1,
+            seq.len()
+        )));
+    }
+    Ok(())
+}
+
 pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     let mut iter: Box<dyn Iterator<Item = std::io::Result<String>>> =
         if is_gzipped_file(&config.fastq_file)? {
@@ -170,23 +255,21 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         if config.max_reads > 0 && reads_processed >= config.max_reads {
             break;
         }
-        for _ in 0..3 {
-            match iter.next() {
-                None => break 'records,
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
-            }
-        }
-        let qual = match iter.next() {
-            None => break,
-            Some(Ok(q)) => q,
+        // Line number of this record's header, 1-based, for error messages.
+        let first_line = records_seen * 4 + 1;
+
+        // The header is the ONLY line whose absence is a clean end of file. Missing any of the
+        // other three means the last record is truncated, which is a corrupt file, not an end.
+        let header = match iter.next() {
+            None => break 'records,
+            Some(Ok(l)) => l,
             Some(Err(e)) => return Err(e.into()),
         };
-        if records_seen == 0 && qual.is_empty() {
-            return Err(GenSeqErrorModelError::MalformedFastq(
-                "Quality line in first record is empty".to_string(),
-            ));
-        }
+        let seq = next_record_line(&mut iter, first_line, first_line + 1)?;
+        let plus = next_record_line(&mut iter, first_line, first_line + 2)?;
+        let qual = next_record_line(&mut iter, first_line, first_line + 3)?;
+
+        validate_record(&header, &seq, &plus, &qual, first_line)?;
         records_seen += 1;
         min_qual_len = min_qual_len.min(qual.len());
         if accumulate_qual(
@@ -614,6 +697,186 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE regression for #700. An ordinary 60-column FASTA used to produce a model at exit 0:
+    /// its sequence lines landed in the quality accumulator, and because every nucleotide
+    /// decodes to a plausible Phred score (A->Q32, C->Q34, G->Q38, T->Q51) the output was
+    /// indistinguishable from a real model - `error_rate` 0.000299, quality options
+    /// [32, 34, 38, 51]. Measured, on exactly this fixture.
+    #[test]
+    fn a_fasta_is_rejected_and_says_so() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let fasta_path = temp.path().join("genome.fasta");
+        let mut out = String::from(">chr1 test contig\n");
+        for _ in 0..40 {
+            out.push_str(&format!("{}\n", "ACGT".repeat(15)));
+        }
+        std::fs::File::create(&fasta_path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+
+        let output_path = temp.path().join("model.json.gz");
+        let err = runner(&make_config(fasta_path, output_path.clone())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FASTA"),
+            "the common mistake deserves its own message, got: {msg}"
+        );
+        assert!(msg.contains("line 1"), "error must name the line: {msg}");
+        assert!(
+            !output_path.exists(),
+            "a rejected file must not leave a model behind - writing one is the whole defect"
+        );
+    }
+
+    /// A corrupt record in the MIDDLE of an otherwise good file fails at that record, naming
+    /// its line. Failing at record 1 only would let damage anywhere else through.
+    #[test]
+    fn a_bad_header_mid_file_names_its_line() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("corrupt.fastq");
+        let mut out = String::new();
+        for i in 0..5 {
+            out.push_str(&format!("@r{i}\nACGT\n+\nIIII\n"));
+        }
+        // Record 6 has lost its header. Its first line is at 6*4+1 = 21.
+        out.push_str("r5_no_at\nACGT\n+\nIIII\n");
+        std::fs::File::create(&fastq_path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+
+        let output_path = temp.path().join("model.json.gz");
+        let err = runner(&make_config(fastq_path, output_path.clone())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line 21"),
+            "error must name line 21, got: {msg}"
+        );
+        assert!(
+            msg.contains('@'),
+            "error should say what was expected: {msg}"
+        );
+        assert!(
+            !output_path.exists(),
+            "a corrupt file must not yield a model"
+        );
+    }
+
+    /// The '+' separator and the sequence/quality length agreement each get their own check,
+    /// so each gets its own test.
+    #[test]
+    fn a_bad_separator_and_a_length_mismatch_are_both_caught() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+
+        let bad_plus = temp.path().join("badplus.fastq");
+        std::fs::File::create(&bad_plus)
+            .unwrap()
+            .write_all(b"@r0\nACGT\nNOT_A_PLUS\nIIII\n")
+            .unwrap();
+        let out0 = temp.path().join("m0.json.gz");
+        let msg = runner(&make_config(bad_plus, out0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("line 3"),
+            "separator error names line 3: {msg}"
+        );
+        assert!(
+            msg.contains('+'),
+            "separator error says what was expected: {msg}"
+        );
+
+        let mismatch = temp.path().join("mismatch.fastq");
+        std::fs::File::create(&mismatch)
+            .unwrap()
+            .write_all(b"@r0\nACGTACGT\n+\nIIII\n")
+            .unwrap();
+        let out1 = temp.path().join("m1.json.gz");
+        let msg = runner(&make_config(mismatch, out1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("line 4"),
+            "length error names the quality line: {msg}"
+        );
+        assert!(
+            msg.contains('8') && msg.contains('4'),
+            "length error reports both lengths: {msg}"
+        );
+    }
+
+    /// A truncated final record is corruption, not a clean end of file.
+    #[test]
+    fn a_truncated_final_record_is_an_error() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("truncated.fastq");
+        // Two good records, then a header and sequence with no '+' or quality line.
+        std::fs::File::create(&fastq_path)
+            .unwrap()
+            .write_all(b"@r0\nACGT\n+\nIIII\n@r1\nACGT\n+\nIIII\n@r2\nACGT\n")
+            .unwrap();
+        let output_path = temp.path().join("model.json.gz");
+        let msg = runner(&make_config(fastq_path, output_path))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("line 9") && msg.contains("truncated"),
+            "error must say the record starting at line 9 is truncated: {msg}"
+        );
+    }
+
+    /// MUST NOT FIRE, and this is the case that breaks naive FASTQ parsers: a quality line may
+    /// legitimately begin with '@', because '@' is Q31 under Phred+33. A parser that scanned for
+    /// '@' to find record boundaries would mis-frame this file. Reading fixed four-line records
+    /// does not, and this pins that it stays true.
+    #[test]
+    fn a_quality_line_starting_with_an_at_sign_is_not_a_header() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("at_qual.fastq");
+        let mut out = String::new();
+        for i in 0..50 {
+            // '@' = Q31, 'I' = Q40. First base Q31, the rest Q40.
+            out.push_str(&format!("@r{i}\nACGTACGTAC\n+\n@IIIIIIIII\n"));
+        }
+        std::fs::File::create(&fastq_path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+
+        let output_path = temp.path().join("model.json.gz");
+        runner(&make_config(fastq_path, output_path.clone())).unwrap();
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        assert_eq!(
+            q.assumed_read_length, 10,
+            "all 50 records must have been read"
+        );
+        // The framing is right only if the '@' line was read as QUALITY: '@' is Q31 under
+        // Phred+33, so Q31 must appear in the learned option set. Had the reader mistaken that
+        // line for a record header, the file would have mis-framed and Q31 would be absent.
+        assert!(
+            q.quality_score_options.contains(&31),
+            "the '@' line must have been read as quality (Q31), got options {:?}",
+            q.quality_score_options
+        );
+        assert!(
+            q.quality_score_options.contains(&40),
+            "the 'I' bases are Q40: {:?}",
+            q.quality_score_options
+        );
+        // NOT asserted here: that the model EMITS Q31 at position 1. It deliberately does not --
+        // a quality line must not begin with '@', so position 1 never carries Q31 by design.
+        // The rewrite that enforces that has a bug (#705): it decrements to 30 without checking
+        // 30 is in the option set, which panics on a sparse set like this one. That is a
+        // generation defect, not a parsing one, so it is out of scope here.
     }
 
     /// Write one record whose quality line is `len` characters.
