@@ -107,6 +107,15 @@ and says nothing, so an unapplied edit and a surviving mutant produce identical 
 tell is a "survivor" whose numbers match the baseline *exactly* — thirteen decimal places of
 agreement is not tolerance, it is the same code running twice.
 
+**The second trap, which bit this script itself:** restoring with `cp -p` preserves the
+snapshot's mtime, so the file's timestamp moves *backwards* — behind the build artifact
+compiled from the mutated source. Cargo then decides the crate is unchanged and silently
+reruns **the mutant**. Measured: after a mutation that disabled a bounds check, three
+consecutive `cargo test` runs used the mutated binary and reported a correct test as failing,
+while `cargo` printed `Finished in 0.06s` and the same artifact hash each time. `restore_file`
+now `touch`es the file. **If a test fails right after a mutation run, suspect a stale artifact
+before you suspect your code** — check that cargo actually recompiled.
+
 Record the result in the PR body: which line was mutated, and that the test failed. A
 coverage claim with no mutation experiment behind it is an opinion.
 
@@ -179,6 +188,12 @@ how it is *reported*, not just how it is tested.
   a stale copy of that belief survived one retraction by a day.
 - **Skipping tests for "small" or "obvious" changes.** There is no exemption.
 - **Leaving a mutation in the working tree.** `mutate.sh run` restores automatically; if you
-  mutated by hand, `git diff` before committing.
+  mutated by hand, `git diff` before committing — and `touch` the file, or the next build may
+  not notice it changed back.
+- **Trusting an exit code that came from the end of a pipe.** `cargo test … | grep … | tail`
+  reports *tail's* status, so a failed target reads as success. Capture to a file and check
+  cargo's own status, or the filter that hides the noise will hide the failure: a run that
+  printed `530 passed, 0 failed` also printed `error: 1 target failed`, on a line the filter
+  dropped.
 
 New war stories go in `docs/claude_engineering_audit.md`, not here.

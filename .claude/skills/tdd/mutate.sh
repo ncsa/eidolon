@@ -33,6 +33,19 @@ require_file() {
   [ -f "$1" ] || { echo "mutate: no such file: $1" >&2; exit 2; }
 }
 
+# Restore content WITHOUT restoring the mtime.
+#
+# `cp -p` was the original implementation and it is a trap: it sets the file's mtime back to
+# when the snapshot was taken, which is EARLIER than the build artifact produced from the
+# mutated source. Cargo (and make, and every other mtime-based build system) then decides the
+# crate is unchanged and silently reruns the MUTANT. Measured: after a mutation that disabled
+# a bounds check, three consecutive `cargo test` runs used the mutated binary and reported a
+# genuinely correct test as failing. `touch` forces the rebuild that proves the restore.
+restore_file() {
+  cp "$1" "$2"
+  touch "$2"
+}
+
 require_snapshot() {
   local snap=$1
   [ -f "$snap" ] || {
@@ -66,7 +79,7 @@ case "$cmd" in
   restore)
     file=${1:-}; [ -n "$file" ] || usage
     snap=$(snap_path "$file"); require_snapshot "$snap"
-    cp -p "$snap" "$file"
+    restore_file "$snap" "$file"
     rm -f "$snap"
     echo "mutate: $file restored"
     ;;
@@ -88,7 +101,7 @@ case "$cmd" in
     # Restore on ANY exit path, including a Ctrl-C mid-test or a crash in the reporting
     # below. A mutation left in the tree is how a deliberate break becomes an accidental
     # commit, so the trap goes in BEFORE anything that can fail.
-    trap 'cp -p "$snap" "$file"; rm -f "$snap"; echo; echo "mutate: $file restored"' EXIT
+    trap 'restore_file "$snap" "$file"; rm -f "$snap"; echo; echo "mutate: $file restored"' EXIT
 
     # `diff` exits 1 when the files differ, which is the ONLY case that reaches this line.
     # Unguarded under `set -e` + `pipefail` that aborts the script on success — and the
