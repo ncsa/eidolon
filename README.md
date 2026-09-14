@@ -954,6 +954,16 @@ Validation rules:
 - Value `31` is rejected — under Phred+33 it encodes to `@`, which would corrupt FASTQ output. If you need a bin near Q31, pick 30 or 32.
 - Bins with no observed counts in the training FASTQ are still kept in `quality_score_options`; their transition rows fall back to a uniform distribution, and a warning is logged listing the empty bins.
 
+**Q31 (`@`) and the first quality character:**
+Phred+33 encodes Q31 as `@` — the same byte that begins a FASTQ record header. eidolon never writes it as the **first** character of a quality line, because a reader that scans for `@` to find record boundaries would mis-frame the file. (A reader that consumes fixed four-line records, including eidolon's own, is unaffected.)
+
+What that means depends on the model:
+
+- **Binned models** reject `31` outright, at config time — see the validation rules above.
+- **Continuous models** may legitimately learn Q31, since real data contains it, and will emit it anywhere in a read *except* position 1. There, eidolon substitutes the nearest other quality score the model actually contains, with ties going to the lower score. A model learned over the usual Q0–Q40 range therefore substitutes Q30. The rest of the read is untouched.
+
+This is a deliberate, bounded departure from the fitted model: the distribution at position 1 is shifted off Q31 by design, and nowhere else is affected. A model whose *only* learned score is Q31 has nothing to substitute and is reported as an error rather than emitting a quality line that cannot be read.
+
 Some common platform bin sets (consult your sequencer's documentation for the authoritative list):
 
 | Platform                       | Suggested bins     |

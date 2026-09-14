@@ -42,6 +42,14 @@ use crate::structs::distributions::{DiscreteDistribution, DistributionErrors};
 
 pub const QUALITY_OFFSET: usize = 33;
 
+/// Phred+33 encodes quality 31 as `@`, the same byte that begins a FASTQ record header.
+///
+/// A quality line must not START with it: a reader that scans for `@` to find record
+/// boundaries would mis-frame the file. eidolon's own reader consumes fixed four-line records
+/// and is unaffected (see `a_quality_line_starting_with_an_at_sign_is_not_a_header`), but the
+/// files it writes are read by other tools, so position 1 never carries Q31.
+const AT_SYMBOL_SCORE: usize = 31;
+
 #[derive(Debug, Error)]
 pub enum QualityModelError {
     #[error("Quality model initiation returned a distribution error: {0}")]
@@ -172,9 +180,9 @@ impl QualityScoreModel {
         // sample the scores list with the seed weights applied to generate the first score.
         // Samples an index based on the weights, which then selects the quality score.
         let mut seed_score = self.seed_dist.sample(rng.random()?)?;
-        // We don't want the first score to be 31. That throws off the parser, because it makes an @ symbol
-        if seed_score == 31 {
-            seed_score -= 1
+        // Position 1 must not be Q31 ('@'). See AT_SYMBOL_SCORE.
+        if seed_score == AT_SYMBOL_SCORE {
+            seed_score = self.substitute_for_at_symbol()?;
         }
         // Adding the seed score to the list. This is safe so long as the qual score max is <= 255 (currently 40)
         score_list.push(seed_score);
@@ -193,11 +201,19 @@ impl QualityScoreModel {
 
             // First get the index of the previous score from the original scores list.
             // This will match the index in the score weights table that corresponds to that score.
+            let previous = score_list[current_index - 1];
             let score_position = self
                 .quality_score_options
                 .iter()
-                .position(|&x| x == score_list[current_index - 1])
-                .unwrap();
+                .position(|&x| x == previous)
+                .ok_or_else(|| {
+                    QualityModelError::InvalidConfiguration(format!(
+                        "quality score {previous} at position {current_index} is not in this \
+                         model's option set {:?}, so there is no transition row for it. The \
+                         model is internally inconsistent.",
+                        self.quality_score_options
+                    ))
+                })?;
             // Now we have an index (in the default case 0..<4) of a vector for the position, based
             // on the previous score. We have to subtract one from the index because the first matrix
             // (position 0) corresponds to the second quality score (position 1).
@@ -208,6 +224,30 @@ impl QualityScoreModel {
             current_index += 1;
         }
         Ok(score_list)
+    }
+
+    /// The score to emit at position 1 in place of a sampled Q31: the nearest OTHER member of
+    /// `quality_score_options`, with ties going to the lower score.
+    ///
+    /// Ties going low is not arbitrary. On the dense option set that every model fitted from
+    /// real data has, 30 and 32 are equidistant from 31, and the previous implementation
+    /// produced 30 (`seed_score -= 1`). Keeping that tie-break means this changes nothing for
+    /// such a model; it only stops emitting a score that is not in the option set at all, which
+    /// is what `.position(...).unwrap()` then panicked on (#705).
+    fn substitute_for_at_symbol(&self) -> Result<usize, QualityModelError> {
+        self.quality_score_options
+            .iter()
+            .copied()
+            .filter(|&q| q != AT_SYMBOL_SCORE)
+            .min_by_key(|&q| (q.abs_diff(AT_SYMBOL_SCORE), q))
+            .ok_or_else(|| {
+                QualityModelError::InvalidConfiguration(format!(
+                    "this model's only quality score option is {AT_SYMBOL_SCORE}, which encodes \
+                     to '@' under Phred+33 and cannot begin a quality line, so there is no score \
+                     available for the first position. Fit the model on data with more than one \
+                     distinct quality score."
+                ))
+            })
     }
 
     fn quality_index_remap(&self, length: usize) -> Vec<usize> {
@@ -554,6 +594,97 @@ mod tests {
             result,
             Err(QualityModelError::InvalidConfiguration(_))
         ));
+    }
+
+    /// Build a model over `options` where every transition row is uniform, so generation is
+    /// driven only by the option set and the seed path.
+    fn uniform_model(options: Vec<usize>, read_length: usize) -> QualityScoreModel {
+        let n = options.len();
+        let uniform_row = vec![1.0; n];
+        let trans_weights = vec![vec![uniform_row.clone(); n]; read_length - 1];
+        QualityScoreModel::from_counts(options, read_length, vec![1.0; n], trans_weights, false)
+            .unwrap()
+    }
+
+    /// THE regression for #705. A model whose options contain 31 but NOT 30 used to panic:
+    /// the seed rewrite did `31 - 1`, producing a score absent from the option set, and the
+    /// next iteration's `.position(...).unwrap()` found nothing.
+    ///
+    /// Reproduced from a real fit — a FASTQ of `@IIIIIIIII` quality strings gives options
+    /// [31, 40] — while writing the parser test for #700.
+    #[test]
+    fn a_model_with_thirty_one_but_no_thirty_generates_without_panicking() {
+        let options = vec![31usize, 40usize];
+        let model = uniform_model(options.clone(), 10);
+        let mut rng = NeatRng::new_from_seed(&vec!["705".to_string()]).unwrap();
+        for _ in 0..200 {
+            let scores = model.generate_quality_scores(10, &mut rng).unwrap();
+            for &s in &scores {
+                assert!(
+                    options.contains(&s),
+                    "score {s} is not in the option set {options:?}"
+                );
+            }
+            assert_ne!(
+                scores[0], AT_SYMBOL_SCORE,
+                "position 1 must never be Q31, which encodes to '@'"
+            );
+        }
+    }
+
+    /// MUST NOT FIRE: on the dense option set every real model has, the substitute is 30 —
+    /// exactly what `seed_score -= 1` produced. This change must alter nothing for such models.
+    #[test]
+    fn a_dense_model_substitutes_thirty_exactly_as_before() {
+        let options: Vec<usize> = (0..=40).collect();
+        let model = uniform_model(options, 5);
+        assert_eq!(
+            model.substitute_for_at_symbol().unwrap(),
+            30,
+            "ties go to the lower score, which reproduces the previous behavior"
+        );
+    }
+
+    /// The tie-break is what makes the above true, so pin it directly: 30 and 32 are both one
+    /// away from 31, and the lower one wins.
+    #[test]
+    fn the_substitute_is_the_nearest_option_ties_going_low() {
+        // Both neighbors present: lower wins.
+        assert_eq!(
+            uniform_model(vec![30, 31, 32], 3)
+                .substitute_for_at_symbol()
+                .unwrap(),
+            30
+        );
+        // Only the higher neighbor present: it wins despite being higher.
+        assert_eq!(
+            uniform_model(vec![31, 32, 40], 3)
+                .substitute_for_at_symbol()
+                .unwrap(),
+            32
+        );
+        // Nearest wins over "one less", which is what the old arithmetic assumed.
+        assert_eq!(
+            uniform_model(vec![2, 31, 33], 3)
+                .substitute_for_at_symbol()
+                .unwrap(),
+            33
+        );
+    }
+
+    /// The degenerate case: nothing to substitute. Better a clear error than a score that
+    /// cannot legally begin a quality line.
+    #[test]
+    fn a_model_whose_only_option_is_thirty_one_is_a_clear_error() {
+        let model = uniform_model(vec![31usize], 4);
+        let mut rng = NeatRng::new_from_seed(&vec!["only31".to_string()]).unwrap();
+        let err = model.generate_quality_scores(4, &mut rng).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("31"), "must name the score: {msg}");
+        assert!(
+            msg.contains('@'),
+            "must say why 31 cannot start a quality line: {msg}"
+        );
     }
 
     #[test]
