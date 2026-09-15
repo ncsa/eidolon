@@ -306,6 +306,37 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   the same treatment: **a caller recall of 0 is uninterpretable until you know the evidence was
   there to find.** `PRUNE_BAM=0` keeps the BAMs when a run is specifically diagnostic.
 
+- **The submit rule. If it might take more than five minutes, submit it.**
+  - **A script gets `#SBATCH` directives. Always.** Not "if it looks long" — always. They are
+    comments to bash, so the same file still runs inline for a smoke pass, and a script that
+    lacks them gets worked around with `--wrap` one-liners forever.
+  - **A one-liner that might run long gets wrapped**, including an innocent-looking
+    `samtools`/`zcat`/`gzip` over a real library. Suspicion is enough; the cost of submitting
+    something that would have taken two minutes is nil, and the cost of not submitting is a
+    silent kill at the 30-minute cap.
+  - **`-o` captures both streams.** SLURM merges stderr into `--output` unless `--error` is
+    given separately, so one flag suffices — no redirect inside the `--wrap`.
+  - **`scripts/delta/submit.sh` does the wrapping**, so following this costs one command:
+    `scripts/delta/submit.sh 'samtools fastq -F 0x900 in.bam | gzip -c > out.fq.gz'`.
+    `NAME`/`TIME`/`MEM`/`CPUS` override the defaults; it prints the job id and the `sacct` line
+    to check it with. For a SCRIPT do not use it — give the script its own `#SBATCH` and submit
+    it directly.
+  - **Then check the exit state, not just the log.** A killed job leaves partial output that
+    reads like a short successful run. `sacct -j <id> --format=JobID,State,ExitCode,Elapsed`
+    says `CANCELLED` and a non-zero `ExitCode`; the log does not.
+
+- **A script in `scripts/delta/` carries its own `#SBATCH` directives and is submitted, not run
+  interactively.** Every established script here does; a new one that does not is the odd one
+  out and will be worked around with `sbatch --wrap` one-liners forever. `#SBATCH` lines are
+  comments to bash, so the same file still runs inline for a smoke pass — there is no reason to
+  omit them.
+  **Login nodes cap at 30 minutes.** A full pass over a real library does not fit:
+  `measure_quality_degradation.sh` over HG002 is ~65 billion base iterations, and two runs were
+  killed learning that. The second printed its "done" banner over an empty file, because its
+  only guard lived in an `END` block that a killed process never reaches — a measurement tool
+  reporting success having measured nothing. **A harness must check that its own pass finished**,
+  outside whatever the pass itself prints.
+
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.
@@ -325,6 +356,13 @@ code, and renaming them would ripple through the sbatch and its test suite for n
 - **Model fidelity** (built model file actually shapes gen-reads output) is covered by
   `model_fragment_fidelity.rs` and `model_output_fidelity.rs`; `docs/model_builder_baseline.md`
   records the Delta resource envelope and the fidelity status.
+- **`#[ignore]` means "runs in release-gates", NOT "skipped".** `release-gates.yml` runs
+  `cargo test --workspace -- --ignored` precisely because an ignored test nothing ever runs is
+  not a gate — `gate2_realigned_dup` sat red on both `develop` and `main` through an entire
+  release before anyone ran it by hand (#582). So an ignored test must PASS. A known-failing
+  target, parked until a fix lands, does not belong there; it breaks the job built to catch
+  exactly that. Record the target in the file header and let a characterization test — one that
+  pins the current numbers and fails when they move — be the tripwire.
 - **The toolchain is pinned** in `rust-toolchain.toml`, so `cargo clippy -D warnings` here
   gives the same verdict CI does. It was not always so: three PRs passed clippy locally and
   failed on the runner (#618 `useless_borrows_in_formatting`, 23 sites; #621; #626
