@@ -10,7 +10,7 @@
 //!
 //! | source | tail Q<25 | tail Q<20 |
 //! |---|---|---|
-//! | real | 12.22% | 5.61% |
+//! | real, library-wide | 9.80% | 4.45% |
 //! | simulated, model fitted from those same reads | 0.36% | **0.00%** |
 //!
 //! THIS FILE REPRODUCES THAT LOCALLY, in seconds rather than a Delta campaign, so the fix can
@@ -23,8 +23,8 @@
 //!
 //! | threshold | fixture | generated | local | real HG002 |
 //! |---|---|---|---|---|
-//! | tail Q<25 | 11.61% | 3.61% | 3.2x short | 34x short |
-//! | tail Q<20 |  5.17% | 0.08% | 65x short  | 0.00% generated |
+//! | tail Q<25 | 9.92% | 2.68% | 3.7x short | ~27x short |
+//! | tail Q<20 | 4.43% | 0.06% | 74x short  | 0.00% generated |
 //!
 //! So the DEEP population -- the one that ends up well below Q20 -- is what the chain
 //! destroys, and that reproduces sharply. The milder Q<25 population survives here far better
@@ -44,7 +44,7 @@
 //! when whoever changed them should replace it with the assertion stated here.
 //!
 //! A model fitted on reads where a known fraction carry a collapsed tail must generate reads
-//! carrying that same fraction, within a factor of two at both thresholds. Against a 34x
+//! carrying that same fraction, within a factor of two at both thresholds. Against a ~27x
 //! shortfall, landing anywhere between half and double the fitted rate is a complete success.
 //!
 //! WHAT IS GROUNDED AND WHAT IS NOT. The healthy per-position profile is #694's own measured
@@ -125,9 +125,16 @@ fn healthy_mean(pos: usize) -> f64 {
 
 /// Fixture parameters. Calibrated as a set; changing one without re-checking both rates in
 /// `the_fixture_reproduces_the_measured_degradation_rates` invalidates the calibration.
+// Calibrated against the LIBRARY-WIDE rates, not the head-sample: 9.80% of reads with tail
+// Q<25 and 4.45% with Q<20, measured over 2,007,617 reads drawn at stride 65 across all
+// 130,495,089 records of HG002 R1 (jobs 22080254 / 22080262). The head-sample figures this was
+// first built on -- 12.22% / 5.61% -- were one flowcell tile and ~25% high.
+//
+// DECAY_FLOOR sits at the Q17 that #692 measured for clipped portions; 16.9 rather than 17.0
+// is well inside that measurement, and the ratio between the two thresholds is what pins it.
 const READ_LEN: usize = 250;
-const DEGRADED_FRACTION: f64 = 0.15;
-const DECAY_FLOOR: f64 = 17.0;
+const DEGRADED_FRACTION: f64 = 0.129;
+const DECAY_FLOOR: f64 = 16.9;
 const DIP_RATE: f64 = 0.02;
 const N_FIXTURE_READS: usize = 15_000;
 
@@ -264,24 +271,24 @@ fn the_fixture_reproduces_the_measured_degradation_rates() {
     let (lt25, lt20, n) = tail_collapse_rates(&fixture, 50);
     assert_eq!(n, N_FIXTURE_READS, "every read must be measured");
     assert!(
-        (10.0..14.0).contains(&lt25),
-        "fixture tail Q<25 is {lt25:.2}%, outside the band around HG002's measured 12.22%"
+        (8.5..11.5).contains(&lt25),
+        "fixture tail Q<25 is {lt25:.2}%, outside the band around HG002's measured 9.80%"
     );
     assert!(
-        (4.0..7.5).contains(&lt20),
-        "fixture tail Q<20 is {lt20:.2}%, outside the band around HG002's measured 5.61%"
+        (3.5..5.5).contains(&lt20),
+        "fixture tail Q<20 is {lt20:.2}%, outside the band around HG002's measured 4.45%"
     );
     let ratio = lt25 / lt20;
     assert!(
         (1.7..2.8).contains(&ratio),
-        "fixture splits {ratio:.2} to 1 between the thresholds; HG002 splits 2.18 to 1. A \
+        "fixture splits {ratio:.2} to 1 between the thresholds; HG002 splits 2.20 to 1. A \
          fixture matching one rate but not the ratio has the wrong decay depth."
     );
 }
 
 /// CHARACTERIZATION of the #694 defect as it stands. This passes today and is expected to FAIL
-/// when the two-component model lands -- at which point it should be deleted and the ignored
-/// test below promoted. It exists so the gap cannot silently change size in the meantime.
+/// when the two-component model lands -- at which point it should be replaced by the target
+/// assertion in the file header. It exists so the gap cannot silently change size meanwhile.
 #[test]
 fn quality_model_currently_loses_the_degraded_population() {
     let (_g, work) = fresh_workdir();
@@ -300,8 +307,8 @@ fn quality_model_currently_loses_the_degraded_population() {
         "MEASURED  fixture Q<25 {in25:.2}% Q<20 {in20:.2}%  |  generated Q<25 {out25:.2}% Q<20 {out20:.2}%  n={n_out}"
     );
     // Thresholds set from measurement, not guessed. Measured on this fixture:
-    //   Q<25  11.61% -> 3.61%   (3.2x short; real HG002 is 34x)
-    //   Q<20   5.17% -> 0.08%   (65x short; real HG002 reaches 0.00%)
+    //   Q<25  9.92% -> 2.68%   (3.7x short; real HG002 is ~27x)
+    //   Q<20  4.43% -> 0.06%   (74x short; real HG002 reaches 0.00%)
     // The DEEP population is what the chain destroys, and that reproduces sharply here. The
     // milder Q<25 population survives locally far better than it does on real data, so this
     // fixture understates the defect at that threshold -- see the file header.
@@ -309,7 +316,8 @@ fn quality_model_currently_loses_the_degraded_population() {
         out25 < in25 * 0.5,
         "#694 says the degraded population is lost. Fixture had {in25:.2}% of reads with a \
          collapsed tail; generation produced {out25:.2}%. If this now reads close to the \
-         input, the model has been fixed -- delete this test and un-ignore the one below."
+         input, the model has been fixed -- replace this with the target assertion stated in \
+         the file header, and delete this test."
     );
     assert!(
         out20 < in20 * 0.1,
