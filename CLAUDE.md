@@ -316,6 +316,11 @@ code, and renaming them would ripple through the sbatch and its test suite for n
     silent kill at the 30-minute cap.
   - **`-o` captures both streams.** SLURM merges stderr into `--output` unless `--error` is
     given separately, so one flag suffices — no redirect inside the `--wrap`.
+  - **`scripts/delta/submit.sh` does the wrapping**, so following this costs one command:
+    `scripts/delta/submit.sh 'samtools fastq -F 0x900 in.bam | gzip -c > out.fq.gz'`.
+    `NAME`/`TIME`/`MEM`/`CPUS` override the defaults; it prints the job id and the `sacct` line
+    to check it with. For a SCRIPT do not use it — give the script its own `#SBATCH` and submit
+    it directly.
   - **Then check the exit state, not just the log.** A killed job leaves partial output that
     reads like a short successful run. `sacct -j <id> --format=JobID,State,ExitCode,Elapsed`
     says `CANCELLED` and a non-zero `ExitCode`; the log does not.
