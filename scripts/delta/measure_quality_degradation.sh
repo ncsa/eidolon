@@ -59,6 +59,10 @@ STRIDE="${STRIDE:-1}"
 QUAL_OFFSET="${QUAL_OFFSET:-33}"
 LOW_Q="${LOW_Q:-25}"                # a base at or below this counts as "low"
 TAIL_WINDOW="${TAIL_WINDOW:-50}"    # #694's window
+# Head of the read, used to ask whether reads that END badly were ALREADY worse at the start.
+# 100 sits well before the decline becomes visible in the mean profile, so a difference there
+# cannot be the tail effect leaking backwards.
+HEAD_WINDOW="${HEAD_WINDOW:-100}"
 OUT="${OUT:-quality_degradation.txt}"
 
 [[ -f "$FASTQ" ]] || { echo "FASTQ not found: $FASTQ" >&2; exit 1; }
@@ -78,7 +82,8 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
                           -v max_reads="$MAX_READS" \
                           -v stride="$STRIDE" \
                           -v low_q="$LOW_Q" \
-                          -v win="$TAIL_WINDOW" '
+                          -v win="$TAIL_WINDOW" \
+                          -v head_win="$HEAD_WINDOW" '
     NR % 4 != 0 { next }                       # quality line only
     {
         rec++
@@ -99,38 +104,76 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
         if (tail < 25) lt25++
         if (tail < 20) lt20++
 
-        # ---- sections 2-4: walk the read once ----
+        collapsed = (tail < 25)
+        if (collapsed) coll_reads++; else heal_reads++
+
+        # ---- walk the read once for everything else ----
         run_len = 0; run_sum = 0; run_start = 0
+        longest = 0; longest_start = 0
+        head_sum = 0; head_low = 0; head_runs = 0; head_n = 0
         for (i = 1; i <= n; i++) {
             q = index_of(substr($0, i, 1))
             pos_sum[i] += q; pos_n[i]++
+
+            # section 5: the head of the read, well before any tail effect
+            if (i <= head_win) {
+                head_n++; head_sum += q
+                if (q <= low_q) {
+                    head_low++
+                    if (run_len == 0) head_runs++
+                }
+            }
+            if (i > n - win && q <= low_q) tail_low++   # low bases inside the tail window
+
             if (q <= low_q) {
                 if (run_len == 0) run_start = i
                 run_len++; run_sum += q
             } else if (run_len > 0) {
-                record_run(run_len, run_sum, run_start, 0, n)
+                record_run(run_len, run_sum, run_start)
+                if (run_len > longest) { longest = run_len; longest_start = run_start }
                 run_len = 0; run_sum = 0
             }
         }
-        if (run_len > 0) record_run(run_len, run_sum, run_start, 1, n)
+        if (run_len > 0) {
+            record_run(run_len, run_sum, run_start)
+            if (run_len > longest) { longest = run_len; longest_start = run_start }
+        }
+
+        # section 2: the longest low run this read carries, and where it starts. Replaces the
+        # old "terminal run" metric, which counted any run touching the final base -- with mean
+        # quality at position 250 around Q24, that caught 43% of reads and conflated "ends on a
+        # low base" with "collapsed".
+        if (longest > 0) {
+            lr_n++; lr_sum += longest
+            if (longest > lr_max) lr_max = longest
+            if (longest <= 2) lr[1]++; else if (longest <= 5) lr[2]++
+            else if (longest <= 10) lr[3]++; else if (longest <= 25) lr[4]++
+            else if (longest <= 50) lr[5]++; else lr[6]++
+            b = int((longest_start - 1) * 10 / n); if (b > 9) b = 9
+            onset[b]++
+            if (collapsed) { c_lr_n++; c_lr_sum += longest } else { h_lr_n++; h_lr_sum += longest }
+        }
+
+        # section 5: head-of-read statistics, split by whether the read ends up collapsed.
+        if (head_n > 0) {
+            if (collapsed) {
+                c_head_q += head_sum / head_n; c_head_low += head_low; c_head_runs += head_runs
+                c_head_bases += head_n
+            } else {
+                h_head_q += head_sum / head_n; h_head_low += head_low; h_head_runs += head_runs
+                h_head_bases += head_n
+            }
+        }
         total_bases += n
     }
 
     function index_of(c) { return index(chars, c) - 1 + 0 }
 
-    # terminal = the run reaches the end of the read and never recovers
-    function record_run(len, sum, start, terminal, readlen,   bucket) {
-        if (terminal) {
-            term_n++; term_len_sum += len; term_depth_sum += sum / len
-            bucket = int((start - 1) * 10 / readlen); if (bucket > 9) bucket = 9
-            onset[bucket]++
-            if (len > term_len_max) term_len_max = len
-        } else {
-            trans_n++; trans_len_sum += len; trans_depth_sum += sum / len
-            if (len <= 2) tl[1]++; else if (len <= 5) tl[2]++
-            else if (len <= 10) tl[3]++; else if (len <= 25) tl[4]++; else tl[5]++
-            if (len > trans_len_max) trans_len_max = len
-        }
+    function record_run(len, sum, start) {
+        run_n++; run_len_sum += len; run_depth_sum += sum / len
+        if (len <= 2) tl[1]++; else if (len <= 5) tl[2]++
+        else if (len <= 10) tl[3]++; else if (len <= 25) tl[4]++; else tl[5]++
+        if (len > run_len_max) run_len_max = len
         total_low_bases += len
     }
 
@@ -146,24 +189,45 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
         printf "tail Q<25 (last %d):       %.2f%%  (%d reads)\n", win, 100 * lt25 / reads, lt25
         printf "tail Q<20 (last %d):       %.2f%%  (%d reads)\n\n", win, 100 * lt20 / reads, lt20
 
-        print "--- 2. low runs (base <= Q" low_q "), per read ---"
-        printf "TRANSIENT runs (recover):  %d   (%.3f per read)\n", trans_n, trans_n / reads
-        if (trans_n > 0) {
-            printf "  mean length:             %.2f bases   max: %d\n", trans_len_sum / trans_n, trans_len_max
-            printf "  mean depth:              Q%.1f\n", trans_depth_sum / trans_n
+        print "--- 2. low runs (base <= Q" low_q ") ---"
+        printf "all runs:                  %d   (%.3f per read)\n", run_n, run_n / reads
+        if (run_n > 0) {
+            printf "  mean length:             %.2f bases   max: %d\n", run_len_sum / run_n, run_len_max
+            printf "  mean depth:              Q%.1f\n", run_depth_sum / run_n
             printf "  length 1-2 / 3-5 / 6-10 / 11-25 / 26+:  %d / %d / %d / %d / %d\n",
                    tl[1]+0, tl[2]+0, tl[3]+0, tl[4]+0, tl[5]+0
         }
-        printf "TERMINAL runs (to read end): %d   (%.2f%% of reads)\n", term_n, 100 * term_n / reads
-        if (term_n > 0) {
-            printf "  mean length:             %.2f bases   max: %d\n", term_len_sum / term_n, term_len_max
-            printf "  mean depth:              Q%.1f\n", term_depth_sum / term_n
+        printf "reads with any low run:    %d  (%.2f%%)\n", lr_n, 100 * lr_n / reads
+        if (lr_n > 0) {
+            printf "  LONGEST run per read, mean %.2f bases   max: %d\n", lr_sum / lr_n, lr_max
+            printf "  longest 1-2 / 3-5 / 6-10 / 11-25 / 26-50 / 51+:  %d / %d / %d / %d / %d / %d\n",
+                   lr[1]+0, lr[2]+0, lr[3]+0, lr[4]+0, lr[5]+0, lr[6]+0
+            if (c_lr_n > 0) printf "  longest run, COLLAPSED reads %.2f bases\n", c_lr_sum / c_lr_n
+            if (h_lr_n > 0) printf "  longest run, healthy reads   %.2f bases\n", h_lr_sum / h_lr_n
         }
-        printf "low bases overall:         %.2f%% of %d bases scanned\n\n", 100 * total_low_bases / total_bases, total_bases
+        printf "low bases overall:         %.2f%% of %d bases scanned\n", 100 * total_low_bases / total_bases, total_bases
+        printf "low bases in the last %d:   %.2f%%\n\n", win, 100 * tail_low / (reads * win)
 
-        print "--- 3. onset of TERMINAL runs, by decile of read length ---"
-        if (term_n > 0) for (b = 0; b <= 9; b++)
-            printf "  %3d-%3d%%: %7d  (%.2f%%)\n", b*10, b*10+10, onset[b]+0, 100 * (onset[b]+0) / term_n
+        print "--- 3. start of each read LONGEST low run, by decile of read length ---"
+        if (lr_n > 0) for (b = 0; b <= 9; b++)
+            printf "  %3d-%3d%%: %7d  (%.2f%%)\n", b*10, b*10+10, onset[b]+0, 100 * (onset[b]+0) / lr_n
+        print ""
+
+        print "--- 5. DOES A COLLAPSED READ START BADLY? first " head_win " positions ---"
+        print "  Onset model: a read is normal until it collapses -> these should MATCH."
+        print "  Propensity:  collapsed reads are noisier throughout -> they should DIFFER."
+        printf "  collapsed reads %d   healthy %d\n", coll_reads+0, heal_reads+0
+        if (coll_reads > 0 && heal_reads > 0) {
+            printf "  mean quality   collapsed Q%.2f   healthy Q%.2f   difference %+.2f\n",
+                   c_head_q / coll_reads, h_head_q / heal_reads,
+                   (c_head_q / coll_reads) - (h_head_q / heal_reads)
+            printf "  low bases      collapsed %.3f%%   healthy %.3f%%   ratio %.2fx\n",
+                   100 * c_head_low / c_head_bases, 100 * h_head_low / h_head_bases,
+                   (h_head_low > 0) ? (c_head_low / c_head_bases) / (h_head_low / h_head_bases) : 0
+            printf "  low runs/read  collapsed %.3f    healthy %.3f    ratio %.2fx\n",
+                   c_head_runs / coll_reads, h_head_runs / heal_reads,
+                   (h_head_runs > 0) ? (c_head_runs / coll_reads) / (h_head_runs / heal_reads) : 0
+        }
         print ""
 
         print "--- 4. mean quality by position (every 20th) ---"

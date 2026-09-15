@@ -28,12 +28,16 @@ if [[ "${1:-}" == "--mutate" ]]; then
             printf '  caught   %s\n' "$label"
         fi
     done <<'MUTS'
-terminal runs counted as transient@if (terminal) {@if (0) {
 tail threshold 25 -> 35@if (tail < 25) lt25++@if (tail < 35) lt25++
-onset bucketed by global max, not read length@int((start - 1) * 10 / readlen)@int((start - 1) * 10 / maxlen)
+collapsed classified by the wrong threshold@collapsed = (tail < 25)@collapsed = (tail < 35)
+longest-run start bucketed by global max@int((longest_start - 1) * 10 / n)@int((longest_start - 1) * 10 / maxlen)
 low-base denominator back to reads*maxlen@total_low_bases / total_bases@total_low_bases / (reads * maxlen)
 run continues across a recovery@} else if (run_len > 0) {@} else if (0) {
 stride ignored, head-sampling restored@if (stride > 1 && (rec % stride) != 1) next@if (0) next
+longest run never updated@if (run_len > longest) { longest = run_len; longest_start = run_start }@if (0) { longest = run_len; longest_start = run_start }
+head window ignored, whole read counted as head@if (i <= head_win) {@if (1) {
+collapsed and healthy populations swapped@if (collapsed) coll_reads++; else heal_reads++@if (!collapsed) coll_reads++; else heal_reads++
+tail-window low bases counted everywhere@if (i > n - win && q <= low_q) tail_low++@if (q <= low_q) tail_low++
 MUTS
     echo
     [[ "$survived" -eq 0 ]] && { echo "all mutations caught"; exit 0; } || { echo "$survived survived"; exit 1; }
@@ -42,7 +46,7 @@ fi
 PASS=0; FAIL=0
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads low,
 # an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=24
+MIN_ASSERTIONS=33
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 hasw(){ local h n; h="$(printf '%s' "$2" | tr -d ' ')"; n="$(printf '%s' "$3" | tr -d ' ')"
@@ -78,20 +82,31 @@ make_fastq "$WORK/known.fastq.gz" <<EOF
 3 $(rep I 20)$(rep + 5)$(rep I 75)
 3 $(rep I 60)$(rep + 40)
 EOF
-OUT_KNOWN="$(FASTQ="$WORK/known.fastq.gz" MAX_READS=0 OUT="$WORK/known.txt" bash "$SCRIPT" 2>&1)"
+# HEAD_WINDOW=50 so the head statistics cover positions 1-50 only; at the default 100 the
+# "head" would be the whole 100-base read and could not distinguish a start from an end.
+OUT_KNOWN="$(FASTQ="$WORK/known.fastq.gz" MAX_READS=0 HEAD_WINDOW=50 OUT="$WORK/known.txt" bash "$SCRIPT" 2>&1)"
 
 hasw "scans all 10 reads"                  "$OUT_KNOWN" "reads scanned:            10"
 hasw "read length reported as 100"         "$OUT_KNOWN" "read length (max):        100"
 hasw "tail Q<25 is 30.00%"                 "$OUT_KNOWN" "tail Q<25 (last 50):       30.00%  (3 reads)"
 hasw "tail Q<20 is 30.00%"                 "$OUT_KNOWN" "tail Q<20 (last 50):       30.00%  (3 reads)"
-hasw "3 transient runs"                    "$OUT_KNOWN" "TRANSIENT runs (recover):  3"
-hasw "transient mean length 5.00"          "$OUT_KNOWN" "mean length:             5.00 bases   max: 5"
-hasw "transient depth Q10.0"               "$OUT_KNOWN" "mean depth:              Q10.0"
-hasw "transient length bucket 3-5 holds 3" "$OUT_KNOWN" "1-2 / 3-5 / 6-10 / 11-25 / 26+:  0 / 3 / 0 / 0 / 0"
-hasw "3 terminal runs, 30% of reads"       "$OUT_KNOWN" "TERMINAL runs (to read end): 3   (30.00% of reads)"
-hasw "terminal mean length 40.00"          "$OUT_KNOWN" "mean length:             40.00 bases   max: 40"
+# 3 dips of 5 + 3 collapses of 40 = 6 runs; mean (15+120)/6 = 22.5; buckets 3-5 and 26+.
+hasw "6 low runs in total"                 "$OUT_KNOWN" "all runs:                  6   (0.600 per read)"
+hasw "mean run length 22.50"               "$OUT_KNOWN" "mean length:             22.50 bases   max: 40"
+hasw "run depth Q10.0"                     "$OUT_KNOWN" "mean depth:              Q10.0"
+hasw "run length buckets"                  "$OUT_KNOWN" "1-2 / 3-5 / 6-10 / 11-25 / 26+:  0 / 3 / 0 / 0 / 3"
+hasw "6 of 10 reads carry a low run"       "$OUT_KNOWN" "reads with any low run:    6  (60.00%)"
+hasw "longest-run mean is 22.50"           "$OUT_KNOWN" "LONGEST run per read, mean 22.50 bases   max: 40"
+hasw "longest-run buckets"                 "$OUT_KNOWN" "longest 1-2 / 3-5 / 6-10 / 11-25 / 26-50 / 51+:  0 / 3 / 0 / 0 / 3 / 0"
+# The split is the point: collapsed reads carry the 40-base run, healthy ones the 5-base dip.
+hasw "collapsed reads longest run 40.00"   "$OUT_KNOWN" "longest run, COLLAPSED reads 40.00 bases"
+hasw "healthy reads longest run 5.00"      "$OUT_KNOWN" "longest run, healthy reads   5.00 bases"
 hasw "low bases 13.50% of 1000"            "$OUT_KNOWN" "low bases overall:         13.50% of 1000 bases scanned"
-hasw "onset lands in the 60-70% decile"    "$OUT_KNOWN" "60- 70%:       3  (100.00%)"
+# Only the collapses fall inside the last 50: 3 x 40 of 10 x 50.
+hasw "low bases in the tail window 24.00%" "$OUT_KNOWN" "low bases in the last 50:   24.00%"
+# Longest run starts: dips at 21 -> decile 20-30%, collapses at 61 -> decile 60-70%.
+hasw "dips start in the 20-30% decile"     "$OUT_KNOWN" "20- 30%:       3  (50.00%)"
+hasw "collapses start in the 60-70% decile" "$OUT_KNOWN" "60- 70%:       3  (50.00%)"
 # Position 21 is Q10 in 3 reads and Q40 in 7: (7*40 + 3*10)/10 = 31.0
 hasw "mean at position 21 is Q31.0"        "$OUT_KNOWN" "pos  21: Q31.0"
 hasw "mean at position 1 is Q40.0"         "$OUT_KNOWN" "pos   1: Q40.0"
@@ -101,8 +116,8 @@ make_fastq "$WORK/healthy.fastq.gz" <<EOF
 10 $(rep I 100)
 EOF
 OUT_HEALTHY="$(FASTQ="$WORK/healthy.fastq.gz" MAX_READS=0 OUT="$WORK/healthy.txt" bash "$SCRIPT" 2>&1)"
-hasw "healthy file: no transient runs" "$OUT_HEALTHY" "TRANSIENT runs (recover):  0"
-hasw "healthy file: no terminal runs"  "$OUT_HEALTHY" "TERMINAL runs (to read end): 0"
+hasw "healthy file: no low runs at all" "$OUT_HEALTHY" "all runs:                  0"
+hasw "healthy file: no read carries one" "$OUT_HEALTHY" "reads with any low run:    0"
 hasw "healthy file: tail Q<25 is 0.00%" "$OUT_HEALTHY" "tail Q<25 (last 50):       0.00%"
 
 echo "=== the tail threshold is Q25, not merely 'some threshold' ==="
@@ -116,7 +131,11 @@ OUT_BETWEEN="$(FASTQ="$WORK/between.fastq.gz" MAX_READS=0 OUT="$WORK/between.txt
 hasw "a flat-Q30 read does not count as a collapsed tail" \
      "$OUT_BETWEEN" "tail Q<25 (last 50):       0.00%"
 hasw "and it has no low runs either, being above Q25" \
-     "$OUT_BETWEEN" "TRANSIENT runs (recover):  0"
+     "$OUT_BETWEEN" "all runs:                  0"
+# Q30 sits between the thresholds, so this is what pins the CLASSIFIER rather than just the
+# reported rate: at Q<25 neither read is collapsed; at Q<35 the flat-Q30 one would be.
+hasw "neither read is classified as collapsed at the Q25 threshold" \
+     "$OUT_BETWEEN" "collapsed reads 0   healthy 2"
 
 echo "=== onset decile uses THIS read's length, not the file maximum ==="
 # One 200-base read collapsing at 101 (decile 50-60%) and one 100-base read collapsing at 51
@@ -131,6 +150,30 @@ hasw "both onsets land in the same decile despite different read lengths" \
 # 150 low bases of 300 scanned. Dividing by reads*maxlen (2*200) would report 37.50%.
 hasw "low-base rate divides by bases scanned, not reads x longest read" \
      "$OUT_MIXED" "low bases overall:         50.00% of 300 bases scanned"
+
+echo "=== section 5 separates an onset population from a propensity one ==="
+# ONSET shape: collapsed reads are pristine until they collapse at 61, so their first 50
+# positions must be indistinguishable from a healthy read.
+make_fastq "$WORK/onset.fastq.gz" <<EOF
+6 $(rep I 100)
+4 $(rep I 60)$(rep + 40)
+EOF
+OUT_ONSET="$(FASTQ="$WORK/onset.fastq.gz" MAX_READS=0 HEAD_WINDOW=50 OUT="$WORK/onset.txt" bash "$SCRIPT" 2>&1)"
+hasw "onset fixture: head quality is identical, difference +0.00" \
+     "$OUT_ONSET" "mean quality   collapsed Q40.00   healthy Q40.00   difference +0.00"
+
+# PROPENSITY shape: collapsed reads are noisier from the very start. Same collapse, but their
+# head carries dips the healthy reads do not.
+make_fastq "$WORK/propensity.fastq.gz" <<EOF
+6 $(rep I 100)
+4 $(rep I 10)$(rep + 10)$(rep I 10)$(rep + 10)$(rep I 20)$(rep + 40)
+EOF
+OUT_PROP="$(FASTQ="$WORK/propensity.fastq.gz" MAX_READS=0 HEAD_WINDOW=50 OUT="$WORK/prop.txt" bash "$SCRIPT" 2>&1)"
+# Head of a collapsed read: 30 x Q40 + 20 x Q10 = Q28.0 against Q40.0 healthy.
+hasw "propensity fixture: collapsed reads are already worse by 12 Q" \
+     "$OUT_PROP" "mean quality   collapsed Q28.00   healthy Q40.00   difference -12.00"
+hasw "propensity fixture: and carry low runs the healthy ones do not" \
+     "$OUT_PROP" "low runs/read  collapsed 2.000    healthy 0.000"
 
 echo "=== STRIDE samples across the file, not the head ==="
 # Alternating healthy / collapsed, so the two halves are separable by position. A head-sample
