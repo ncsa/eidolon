@@ -107,6 +107,19 @@ and says nothing, so an unapplied edit and a surviving mutant produce identical 
 tell is a "survivor" whose numbers match the baseline *exactly* — thirteen decimal places of
 agreement is not tolerance, it is the same code running twice.
 
+**The third trap: a filter that matches nothing.** `cargo test <filter>` matches test *NAMES*.
+Pass an integration-test file name and it selects nothing, runs zero tests, and exits 0 — which
+scores as SURVIVOR, the loudest possible wrong answer. For a whole file use `--test <file_stem>`;
+for a module use a path like `mod::tests`. `mutate.sh` now refuses when no tests ran (exit 2),
+but the same trap applies to any `cargo test` you read a verdict from: **check how many tests
+ran, not just whether it passed.**
+
+**And when checking whether a mutation applied, compare BYTES, not a pattern.** `cmp -s` or
+`diff`, never `grep`. A grep whose pattern fails to match reports "unchanged" identically to an
+edit that genuinely did not apply — so a broken check and a broken mutation look the same. This
+bit an ad-hoc check written while fixing the trap above: `grep -c 'if \[ "${ran:-0}" -eq 0 \]'`
+matched zero because of the bracket escaping, while `grep -cF` on the same string matched one.
+
 **The second trap, which bit this script itself:** restoring with `cp -p` preserves the
 snapshot's mtime, so the file's timestamp moves *backwards* — behind the build artifact
 compiled from the mutated source. Cargo then decides the crate is unchanged and silently

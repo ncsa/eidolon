@@ -15,6 +15,7 @@
 #
 # Exit status from `run`: 0 = KILLED (the test caught it, the test is real)
 #                         1 = SURVIVOR (the test did not catch it — fix the test)
+#                         2 = refused: no snapshot, file unchanged, or the filter ran no tests
 
 set -euo pipefail
 
@@ -110,10 +111,28 @@ case "$cmd" in
     { diff -u "$snap" "$file" || true; } | sed -n '/^@@/,$p' | sed 's/^/    /'
     echo
 
+    out=$(mktemp)
     set +e
-    cargo test --workspace --no-fail-fast "$@"
-    rc=$?
+    cargo test --workspace --no-fail-fast "$@" 2>&1 | tee "$out"
+    rc=${PIPESTATUS[0]}
     set -e
+
+    # A filter that matches NOTHING exits 0, which scores as SURVIVOR — the loudest possible
+    # wrong answer from this script. Measured: `mutate.sh run <file> quality_tail_collapse`
+    # matched no test NAME (it is a file name; cargo needs `--test` for that), ran zero tests,
+    # and reported "nothing caught this" about a mutation three tests would have killed.
+    #
+    # Sum what actually ran. `test result:` lines report passed/failed per target, so zero of
+    # both across every target means the filter selected nothing.
+    ran=$(awk '/^test result:/ { p += $4; f += $6 } END { print p + f + 0 }' "$out")
+    rm -f "$out"
+    if [ "${ran:-0}" -eq 0 ]; then
+      echo
+      echo "mutate: NO TESTS RAN — the filter matched nothing, so this says nothing." >&2
+      echo "mutate: a filter selects test NAMES. For a whole integration-test file use" >&2
+      echo "        --test <file_stem>; for a module use a path like mod::tests." >&2
+      exit 2
+    fi
 
     echo
     if [ "$rc" -eq 0 ]; then
