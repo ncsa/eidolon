@@ -38,6 +38,8 @@ longest run never updated@if (run_len > longest) { longest = run_len; longest_st
 head window ignored, whole read counted as head@if (i <= head_win) {@if (1) {
 collapsed and healthy populations swapped@if (collapsed) coll_reads++; else heal_reads++@if (!collapsed) coll_reads++; else heal_reads++
 tail-window low bases counted everywhere@if (i > n - win && q <= low_q) tail_low++@if (q <= low_q) tail_low++
+a killed or truncated pass reports success@if [[ "$awk_status" -ne 0 ]] || ! grep -q "headline rates" "$OUT" 2>/dev/null; then@if false; then
+status swallowed by set -e instead of captured@' > "$OUT" || awk_status=$?@' > "$OUT"; awk_status=$?
 MUTS
     echo
     [[ "$survived" -eq 0 ]] && { echo "all mutations caught"; exit 0; } || { echo "$survived survived"; exit 1; }
@@ -46,7 +48,7 @@ fi
 PASS=0; FAIL=0
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads low,
 # an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=33
+MIN_ASSERTIONS=36
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 hasw(){ local h n; h="$(printf '%s' "$2" | tr -d ' ')"; n="$(printf '%s' "$3" | tr -d ' ')"
@@ -200,6 +202,26 @@ hasw "stride 2 selects only the healthy records" \
      "$OUT_STRIDE" "tail Q<25 (last 50):       0.00%"
 hasw "and reports what it sampled and out of how many" \
      "$OUT_STRIDE" "reads scanned:            5 of 10 records (stride 2)"
+
+echo "=== a pass that does not reach its report is a hard failure ==="
+# A killed awk writes nothing and its END guard never runs. This drives the same path: an
+# input with no records means the pass exits non-zero, and the script must refuse rather than
+# print "done" over an empty file. Measured on the real thing -- 261M reads at stride 1 on a
+# login node was killed partway and the script reported success having measured nothing.
+: | gzip -c > "$WORK/empty.fastq.gz"
+if OUT_EMPTY="$(FASTQ="$WORK/empty.fastq.gz" MAX_READS=0 OUT="$WORK/empty.txt" bash "$SCRIPT" 2>&1)"; then
+    bad "an empty pass must exit non-zero" "non-zero exit" "exit 0"
+else
+    ok "an empty pass exits non-zero"
+fi
+case "$OUT_EMPTY" in
+    *FATAL*) ok "and says FATAL rather than done" ;;
+    *) bad "and says FATAL rather than done" "FATAL in output" "$OUT_EMPTY" ;;
+esac
+case "$OUT_EMPTY" in
+    *"=== done"*) bad "and does NOT claim done" "no done banner" "$OUT_EMPTY" ;;
+    *) ok "and does NOT claim done" ;;
+esac
 
 echo
 printf 'assertions: %d passed, %d failed\n' "$PASS" "$FAIL"

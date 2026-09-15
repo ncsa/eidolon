@@ -78,6 +78,10 @@ echo
 # then aborts a step that succeeded. awk here always drains its input, but the guard costs
 # nothing and this footgun has bitten this repo before (see CLAUDE.md).
 set +o pipefail
+# `awk_status=$?` on the line AFTER the pipeline does not work: `set -e` aborts on the failing
+# pipeline first, so the guard below never runs and the script dies silently. CLAUDE.md
+# documents this exact footgun and prescribes `cmd || rc=$?`, which is what this is.
+awk_status=0
 zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
                           -v max_reads="$MAX_READS" \
                           -v stride="$STRIDE" \
@@ -235,8 +239,26 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
             if (pos_n[i] > 0) printf "  pos %3d: Q%.1f\n", i, pos_sum[i] / pos_n[i]
         if (pos_n[maxlen] > 0) printf "  pos %3d: Q%.1f\n", maxlen, pos_sum[maxlen] / pos_n[maxlen]
     }
-' | tee "$OUT"
+' > "$OUT" || awk_status=$?
 set -o pipefail
 
+# A killed awk writes nothing and its END block -- where the "no reads" guard lives -- never
+# runs. Without this check the script printed "done" over an empty file, which is a measurement
+# tool reporting success having measured nothing.
+#
+# This is how it happened: 260,990,178 reads at stride 1 is ~65 billion base iterations, and a
+# login node killed it partway. Use sbatch, or a stride, or both.
+# One check, not two: a non-zero status and a truncated file are the same failure seen from
+# two sides, and as separate guards each masked the other under mutation -- neither was pinned.
+if [[ "$awk_status" -ne 0 ]] || ! grep -q "headline rates" "$OUT" 2>/dev/null; then
+    echo "FATAL: the measurement pass did not reach its report (awk exit $awk_status)." >&2
+    echo "  Nothing in $OUT can be trusted -- do not read numbers off a partial file." >&2
+    echo "  Most likely killed for running too long: a login node will not carry a" >&2
+    echo "  full-file pass over a large library. 260,990,178 reads at stride 1 is about" >&2
+    echo "  65 billion base iterations. Submit with sbatch, and/or raise STRIDE." >&2
+    exit 1
+fi
+
+cat "$OUT"
 echo
 echo "=== done. Paste $OUT back. ==="
