@@ -306,6 +306,20 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   the same treatment: **a caller recall of 0 is uninterpretable until you know the evidence was
   there to find.** `PRUNE_BAM=0` keeps the BAMs when a run is specifically diagnostic.
 
+- **The submit rule. If it might take more than five minutes, submit it.**
+  - **A script gets `#SBATCH` directives. Always.** Not "if it looks long" — always. They are
+    comments to bash, so the same file still runs inline for a smoke pass, and a script that
+    lacks them gets worked around with `--wrap` one-liners forever.
+  - **A one-liner that might run long gets wrapped**, including an innocent-looking
+    `samtools`/`zcat`/`gzip` over a real library. Suspicion is enough; the cost of submitting
+    something that would have taken two minutes is nil, and the cost of not submitting is a
+    silent kill at the 30-minute cap.
+  - **`-o` captures both streams.** SLURM merges stderr into `--output` unless `--error` is
+    given separately, so one flag suffices — no redirect inside the `--wrap`.
+  - **Then check the exit state, not just the log.** A killed job leaves partial output that
+    reads like a short successful run. `sacct -j <id> --format=JobID,State,ExitCode,Elapsed`
+    says `CANCELLED` and a non-zero `ExitCode`; the log does not.
+
 - **A script in `scripts/delta/` carries its own `#SBATCH` directives and is submitted, not run
   interactively.** Every established script here does; a new one that does not is the odd one
   out and will be worked around with `sbatch --wrap` one-liners forever. `#SBATCH` lines are
