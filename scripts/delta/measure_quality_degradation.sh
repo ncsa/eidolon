@@ -26,19 +26,33 @@
 #   Section 4: mean quality by position, to compare against #694's profile table.
 #
 # USAGE
-#   bash scripts/delta/measure_quality_degradation.sh
-#   FASTQ=/path/to/reads.fastq.gz MAX_READS=2000000 bash scripts/delta/measure_quality_degradation.sh
-#   MAX_READS=0 bash scripts/delta/measure_quality_degradation.sh              # whole file, exact
-#   MAX_READS=2000000 STRIDE=50 bash scripts/delta/...                         # spread across it
+#   sbatch scripts/delta/measure_quality_degradation.sh                        # a real library
+#   FASTQ=/path/reads.fastq.gz STRIDE=65 sbatch scripts/delta/measure_quality_degradation.sh
+#   MAX_READS=20000 bash scripts/delta/measure_quality_degradation.sh          # smoke, inline
 #
-# For a REAL library use MAX_READS=0, or a STRIDE large enough that MAX_READS x STRIDE covers
-# the file. A head-sample is one flowcell tile -- see STRIDE below.
+# SUBMIT IT. Login nodes cap at 30 minutes and this pass does not fit: the full library is
+# ~65 billion base iterations at stride 1. Two runs were killed partway learning that, and the
+# second reported "done" over an empty file, which is why the guard below exists.
+#
+# `bash` still works and is right for a smoke run over a small MAX_READS. For a real library
+# use sbatch, with MAX_READS=0 and a STRIDE large enough to cover the file -- a head-sample is
+# one flowcell tile, see STRIDE below.
 #
 # Defaults to HG002 R1, the library #694 and #695 were measured on. Set FASTQ to do R2, which
 # #695 explicitly asks for and which is systematically worse in paired Illumina data.
 #
-# Runtime is one pass, no alignment, no eidolon build required -- minutes on a login node for
-# a few million reads. It does NOT need to be a SLURM job.
+# One pass, no alignment, no eidolon build required. Read-only; it touches nothing but the
+# input FASTQ.
+
+#SBATCH --job-name=eidolon-qualdeg
+#SBATCH --partition=cpu
+#SBATCH --account=bhrd-delta-cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=04:00:00
+#SBATCH --output=qualdeg-%j.log
 
 set -euo pipefail
 
