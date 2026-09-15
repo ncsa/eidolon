@@ -28,6 +28,11 @@
 # USAGE
 #   bash scripts/delta/measure_quality_degradation.sh
 #   FASTQ=/path/to/reads.fastq.gz MAX_READS=2000000 bash scripts/delta/measure_quality_degradation.sh
+#   MAX_READS=0 bash scripts/delta/measure_quality_degradation.sh              # whole file, exact
+#   MAX_READS=2000000 STRIDE=50 bash scripts/delta/...                         # spread across it
+#
+# For a REAL library use MAX_READS=0, or a STRIDE large enough that MAX_READS x STRIDE covers
+# the file. A head-sample is one flowcell tile -- see STRIDE below.
 #
 # Defaults to HG002 R1, the library #694 and #695 were measured on. Set FASTQ to do R2, which
 # #695 explicitly asks for and which is systematically worse in paired Illumina data.
@@ -39,6 +44,18 @@ set -euo pipefail
 
 FASTQ="${FASTQ:-${DATA_DIR:-$SCRATCH/neat_data/hg002}/hg002_R1.fastq.gz}"
 MAX_READS="${MAX_READS:-2000000}"   # 0 = whole file
+# Take every STRIDE-th record rather than the first MAX_READS.
+#
+# WHY THIS IS NOT OPTIONAL FOR A REAL LIBRARY: Illumina FASTQs are written in flowcell order.
+# Measured on HG002 R1, every one of the first 200,000 records is lane 1, tile 1101 --
+#   zcat R1 | awk 'NR%4==1' | head -200000 | cut -d: -f4,5 | uniq -c
+#   200000 1:1101
+# so a head-sample characterizes one corner of one lane, not the library. With MAX_READS=50000
+# and STRIDE=1 this script reported a 11.77% collapsed-tail rate that is a tile-1101 number.
+#
+# STRIDE=1 (the default) preserves the old behavior for small fixtures and tests, where the
+# input is synthetic and order carries no meaning.
+STRIDE="${STRIDE:-1}"
 QUAL_OFFSET="${QUAL_OFFSET:-33}"
 LOW_Q="${LOW_Q:-25}"                # a base at or below this counts as "low"
 TAIL_WINDOW="${TAIL_WINDOW:-50}"    # #694's window
@@ -48,7 +65,7 @@ OUT="${OUT:-quality_degradation.txt}"
 
 echo "=== measure_quality_degradation ==="
 echo "fastq:       $FASTQ"
-echo "max_reads:   $MAX_READS (0 = all)"
+echo "max_reads:   $MAX_READS (0 = all)   stride: $STRIDE"
 echo "qual_offset: $QUAL_OFFSET   low_q: $LOW_Q   tail_window: $TAIL_WINDOW"
 echo "writing:     $OUT"
 echo
@@ -59,11 +76,14 @@ echo
 set +o pipefail
 zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
                           -v max_reads="$MAX_READS" \
+                          -v stride="$STRIDE" \
                           -v low_q="$LOW_Q" \
                           -v win="$TAIL_WINDOW" '
     NR % 4 != 0 { next }                       # quality line only
-    max_reads > 0 && reads >= max_reads { exit }
     {
+        rec++
+        if (stride > 1 && (rec % stride) != 1) next
+        if (max_reads > 0 && reads >= max_reads) exit
         reads++
         n = length($0)
         if (n < win) { too_short++; next }
@@ -118,7 +138,7 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
 
     END {
         if (reads == 0) { print "FATAL: no reads read"; exit 1 }
-        printf "reads scanned:            %d\n", reads
+        printf "reads scanned:            %d of %d records (stride %d)\n", reads, rec, stride
         printf "reads shorter than window: %d\n", too_short + 0
         printf "read length (max):        %d\n\n", maxlen
 

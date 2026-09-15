@@ -33,6 +33,7 @@ tail threshold 25 -> 35@if (tail < 25) lt25++@if (tail < 35) lt25++
 onset bucketed by global max, not read length@int((start - 1) * 10 / readlen)@int((start - 1) * 10 / maxlen)
 low-base denominator back to reads*maxlen@total_low_bases / total_bases@total_low_bases / (reads * maxlen)
 run continues across a recovery@} else if (run_len > 0) {@} else if (0) {
+stride ignored, head-sampling restored@if (stride > 1 && (rec % stride) != 1) next@if (0) next
 MUTS
     echo
     [[ "$survived" -eq 0 ]] && { echo "all mutations caught"; exit 0; } || { echo "$survived survived"; exit 1; }
@@ -41,7 +42,7 @@ fi
 PASS=0; FAIL=0
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads low,
 # an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=21
+MIN_ASSERTIONS=24
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 hasw(){ local h n; h="$(printf '%s' "$2" | tr -d ' ')"; n="$(printf '%s' "$3" | tr -d ' ')"
@@ -130,6 +131,32 @@ hasw "both onsets land in the same decile despite different read lengths" \
 # 150 low bases of 300 scanned. Dividing by reads*maxlen (2*200) would report 37.50%.
 hasw "low-base rate divides by bases scanned, not reads x longest read" \
      "$OUT_MIXED" "low bases overall:         50.00% of 300 bases scanned"
+
+echo "=== STRIDE samples across the file, not the head ==="
+# Alternating healthy / collapsed, so the two halves are separable by position. A head-sample
+# of a real FASTQ is one flowcell tile (measured: 200,000 of 200,000 head reads on HG002 R1 are
+# tile 1101), which is what STRIDE exists to avoid. Records are 1-indexed: stride 2 takes
+# records 1,3,5,7,9 -- every healthy one, and no collapsed one.
+make_fastq "$WORK/alternating.fastq.gz" <<EOF
+1 $(rep I 100)
+1 $(rep I 50)$(rep + 50)
+1 $(rep I 100)
+1 $(rep I 50)$(rep + 50)
+1 $(rep I 100)
+1 $(rep I 50)$(rep + 50)
+1 $(rep I 100)
+1 $(rep I 50)$(rep + 50)
+1 $(rep I 100)
+1 $(rep I 50)$(rep + 50)
+EOF
+OUT_ALL="$(FASTQ="$WORK/alternating.fastq.gz" MAX_READS=0 OUT="$WORK/all.txt" bash "$SCRIPT" 2>&1)"
+hasw "stride 1 sees both populations: half the reads collapse" \
+     "$OUT_ALL" "tail Q<25 (last 50):       50.00%"
+OUT_STRIDE="$(FASTQ="$WORK/alternating.fastq.gz" MAX_READS=0 STRIDE=2 OUT="$WORK/stride.txt" bash "$SCRIPT" 2>&1)"
+hasw "stride 2 selects only the healthy records" \
+     "$OUT_STRIDE" "tail Q<25 (last 50):       0.00%"
+hasw "and reports what it sampled and out of how many" \
+     "$OUT_STRIDE" "reads scanned:            5 of 10 records (stride 2)"
 
 echo
 printf 'assertions: %d passed, %d failed\n' "$PASS" "$FAIL"
