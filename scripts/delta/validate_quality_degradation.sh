@@ -46,6 +46,10 @@ set -euo pipefail
 
 REPO="${REPO:-/projects/bhrd/jallen17/eidolon}"
 FASTQ="${FASTQ:-${DATA_DIR:-/work/nvme/bhrd/jallen17/hg002}/hg002_R1.fastq.gz}"
+# Delta does not export $SCRATCH to jobs and this runs under `set -u`: lib_report.sh
+# resolves it (and RESULTS_DIR) the way every other job here does. Source before any use.
+source "$REPO/scripts/delta/lib_report.sh"
+
 NAME="${NAME:-r1}"
 STRIDE="${STRIDE:-65}"          # ~2M reads from a 130M-record library
 READ_LEN="${READ_LEN:-250}"
