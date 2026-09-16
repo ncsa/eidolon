@@ -494,6 +494,15 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                 config.degradation_tail_cut
             )));
         }
+        if n_healthy == 0 {
+            return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                "fit_quality_degradation is set, but all {classified} classified reads fall \
+                 below the Q{} tail cut, so there is no healthy population to fit. \
+                 `degradation_tail_cut` is above this library's quality range. Unset \
+                 fit_quality_degradation to fit a single population.",
+                config.degradation_tail_cut
+            )));
+        }
         let read_fraction = n_degraded as f64 / classified as f64;
 
         let seed_weights_deg: Vec<f64> = quality_score_options
@@ -1228,6 +1237,38 @@ mod tests {
         assert!(
             msg.contains("no degraded population"),
             "the error must say what was not found: {msg}"
+        );
+        assert!(
+            msg.contains("100"),
+            "and over what denominator, so the reader can judge it: {msg}"
+        );
+        assert!(
+            !output_path.exists(),
+            "a refused fit must not leave a model file behind"
+        );
+    }
+
+    /// The mirror of the test above. `n_degraded == 0` was a hard error from the start;
+    /// `n_healthy == 0` was not, so a cut above the library's range classified every read as
+    /// degraded and left the HEALTHY tensor empty, which falls back to uniform. That is the
+    /// same garbage the end-to-end test was written to catch, on the other population.
+    #[test]
+    fn a_library_with_no_healthy_reads_is_an_error_not_an_empty_population() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("all_degraded.fastq");
+        let healthy = "I".repeat(100); // Q40 throughout
+        write_two_phase_fastq(&fastq_path, 100, &healthy, 0, &healthy);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.fit_quality_degradation = true;
+        config.degradation_tail_cut = 45; // above Q40, so every read classifies as degraded
+
+        let err = runner(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no healthy population"),
+            "the error must say which population was not found: {msg}"
         );
         assert!(
             msg.contains("100"),

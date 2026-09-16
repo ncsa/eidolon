@@ -77,13 +77,15 @@ SUB="$WORK/subsample.fastq.gz"
 if [[ ! -s "$SUB" ]]; then
     echo "[1/5] subsampling: keeping 1 record in $STRIDE ..."
     # Rename on success only: a killed job leaves a truncated but non-empty .gz, which the
-    # `-s` cache above would accept. pipefail off around the pipe: see CLAUDE.md on SIGPIPE.
-    set +o pipefail
+    # `-s` cache above would accept. pipefail STAYS ON: awk and gzip both read to EOF, so
+    # there is no early consumer and no SIGPIPE here. With it off, a truncated input makes
+    # zcat fail while awk and gzip succeed, the pipeline reports 0, and the script caches and
+    # fits the partial sample. Measured on a half-truncated fixture: rc 0, 2448.25 reads
+    # cached -- a fractional count, so even the final record was cut in half.
     rc=0
     zcat -f -- "$FASTQ" \
       | awk -v s="$STRIDE" 'NR%4==1 { rec++ } ((rec - 1) % s) == 0' \
       | gzip -c > "$SUB.part" || rc=$?
-    set -o pipefail
     [[ "$rc" -eq 0 ]] || { echo "FATAL: subsample failed (rc $rc)" >&2; rm -f "$SUB.part"; exit 1; }
     mv -f "$SUB.part" "$SUB"
 fi
@@ -98,7 +100,16 @@ for mode in plain degraded; do
     printf 'fastq_file: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: %s\ndegradation_tail_cut: %s\n' \
         "$SUB" "$WORK/model_$mode.json.gz" "$flag" "$TAIL_CUT" > "$cfg"
     echo "[2/5] fitting $mode ..."
-    "$EIDOLON" gen-seq-error-model -c "$cfg" 2>&1 | grep -E "Degraded population|Separability|error_rate|read length" || true
+    # Status first, filter second. Ending the pipeline with `| grep ... || true` hid a failed
+    # fit, and because WORK is reused the previous run's model_$mode.json.gz survives it, so
+    # step 3 would generate from a stale model and step 5 would print a plausible, invalid
+    # comparison. The `|| true` on the grep is still needed: no matching lines is exit 1.
+    if ! "$EIDOLON" gen-seq-error-model -c "$cfg" > "$WORK/fit_$mode.log" 2>&1; then
+        echo "FATAL: fitting $mode failed. Last 20 lines of $WORK/fit_$mode.log:" >&2
+        tail -20 "$WORK/fit_$mode.log" >&2
+        exit 1
+    fi
+    grep -E "Degraded population|Separability|error_rate|read length" "$WORK/fit_$mode.log" || true
 done
 
 # ── 3. generate from each ───────────────────────────────────────────────────────
