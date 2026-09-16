@@ -16,6 +16,18 @@ qual_offset: 33
 # memory: 1000 bp is about 67 MiB. A read longer than this is an error rather than being
 # silently truncated; raise this key if your reads really are longer.
 max_model_read_length: 1000
+# fit a second, degraded quality population [optional] - default false
+# Real Illumina data is bimodal: about one read in ten collapses toward the 3' end and stays
+# collapsed, and a single transition model cannot represent that. With this on, the fit
+# classifies each read and learns two populations. OPT-IN while it is unvalidated against real
+# data; a model fitted without it behaves exactly as every model before it.
+fit_quality_degradation: false
+# window at the 3' end used to classify a read, in bases [optional] - default 50
+# degradation_tail_window: 50
+# a read whose last window averages below this Q is degraded [optional] - default 25
+# This is a tuning knob. The fit logs the resulting fraction at this cut and at two Q either
+# side, so you can see whether the populations separate or the cut is halving one distribution.
+# degradation_tail_cut: 25
 # binned quality bins [optional] - quantize the learned quality scores to a small bin set.
 # When set, each observed Q-score is snapped to the nearest bin and gen-reads will emit only
 # these values. Example presets: NovaSeq 6000 [2, 12, 23, 37], NextSeq 3-bin [2, 15, 35].

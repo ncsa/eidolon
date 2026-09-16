@@ -359,12 +359,17 @@ fn head_stats(path: &Path, head_win: usize, tail_win: usize) -> (f64, f64, f64, 
 
 /// Fit a model on the fixture, generate reads with it, and return the generated R1 path.
 fn fit_and_generate(work: &Path, fixture: &Path) -> PathBuf {
+    fit_and_generate_with(work, fixture, false)
+}
+
+/// `degradation` fits the two-population model (#694) rather than one.
+fn fit_and_generate_with(work: &Path, fixture: &Path, degradation: bool) -> PathBuf {
     let model = work.join("model.json.gz");
     let cfg = work.join("fit.yml");
     std::fs::write(
         &cfg,
         format!(
-            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\n",
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: {degradation}\n",
             fixture.display(),
             model.display()
         ),
@@ -449,6 +454,64 @@ fn the_fixture_degraded_population_is_a_propensity_not_an_onset() {
         "collapsed reads carry {c_low:.3}% low bases in their first 100 positions against \
          {h_low:.3}% for healthy, a {ratio:.1}x ratio; HG002 measures 20.6x. Near 1x means the \
          fixture has reverted to an onset shape."
+    );
+}
+
+/// THE TARGET for #694, end to end: fit the fixture with the two-population model and the
+/// generated reads must carry the degraded population the fixture planted.
+///
+/// This is the whole chain -- fixture, fitter, model file, generation -- rather than any one
+/// layer. The single-population fit of the same fixture is the characterization test below, and
+/// it reads about 1.8% against a planted 9.8%.
+#[test]
+fn a_two_population_fit_reproduces_the_degraded_population() {
+    let (_g, work) = fresh_workdir();
+    let fixture = work.join("fixture.fastq.gz");
+    write_fixture(&fixture, N_FIXTURE_READS, 694);
+    let (in25, in20, _) = tail_collapse_rates(&fixture, 50);
+
+    let generated = fit_and_generate_with(&work, &fixture, true);
+    let (out25, out20, n_out) = tail_collapse_rates(&generated, 50);
+
+    assert!(
+        n_out > 5_000,
+        "only {n_out} reads generated; too few to rate"
+    );
+    eprintln!(
+        "TWO-POPULATION  fixture Q<25 {in25:.2}% Q<20 {in20:.2}%  |  generated Q<25 {out25:.2}% Q<20 {out20:.2}%  n={n_out}"
+    );
+    assert!(
+        out25 > in25 / 2.0 && out25 < in25 * 2.0,
+        "tail Q<25: fixture {in25:.2}%, generated {out25:.2}%. Against a single-population fit \
+         at about 1.8%, landing between half and double the planted rate is the target."
+    );
+    assert!(
+        out20 > in20 / 2.0 && out20 < in20 * 2.0,
+        "tail Q<20: fixture {in20:.2}%, generated {out20:.2}%"
+    );
+
+    // The rate alone is NOT sufficient, and a mutation proved it: routing the degraded reads
+    // into the healthy tensor leaves the degraded one empty, which falls back to uniform over
+    // the option set. Uniform averages about Q21, so those reads collapse too and the rates
+    // above still pass. It is garbage emitted at the right frequency.
+    //
+    // So assert the SHAPE. A fitted degraded population looks like the reads it was fitted
+    // from: noisy at the head but nowhere near uniform. The fixture's collapsed reads run about
+    // Q35 over their first 100 positions; uniform would be about Q21.
+    let (c_mean, h_mean, c_low, h_low) = head_stats(&generated, 100, 50);
+    eprintln!(
+        "TWO-POPULATION  head: collapsed Q{c_mean:.2} ({c_low:.2}% low), healthy Q{h_mean:.2} ({h_low:.2}% low)"
+    );
+    assert!(
+        c_mean > 30.0,
+        "generated degraded reads average Q{c_mean:.2} over their first 100 positions. The \
+         fixture's run about Q35; a uniform draw over the option set runs about Q21, which is \
+         what an EMPTY degraded tensor falls back to. This reads like fallback, not a fit."
+    );
+    assert!(
+        c_mean < h_mean,
+        "degraded reads must still be worse than healthy ones at the head: collapsed \
+         Q{c_mean:.2} against healthy Q{h_mean:.2}"
     );
 }
 

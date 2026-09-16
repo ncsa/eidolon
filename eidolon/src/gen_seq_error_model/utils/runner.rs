@@ -251,6 +251,20 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     let mut records_seen: usize = 0;
     let mut min_qual_len = usize::MAX;
 
+    // The degraded population (#694), accumulated separately when requested. `global_counts`
+    // stays POOLED across both: the two populations share one `quality_score_options` list,
+    // because generation indexes a single list and a tensor built against its own options would
+    // index the wrong scores.
+    let mut seed_counts_deg = vec![0usize; MAX_SCORE];
+    let mut transition_counts_deg: Vec<Vec<Vec<usize>>> = Vec::new();
+    let mut n_degraded: usize = 0;
+    let mut n_healthy: usize = 0;
+    let mut n_unclassifiable: usize = 0;
+    // The same count at two Q either side of the cut, so the fit can report whether the two
+    // populations are separable or whether the threshold is slicing one distribution in half.
+    let mut n_deg_low_cut: usize = 0;
+    let mut n_deg_high_cut: usize = 0;
+
     'records: loop {
         if config.max_reads > 0 && reads_processed >= config.max_reads {
             break;
@@ -272,13 +286,56 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         validate_record(&header, &seq, &plus, &qual, first_line)?;
         records_seen += 1;
         min_qual_len = min_qual_len.min(qual.len());
+
+        // Classify BEFORE accumulating, so the read's counts go to one population or the other.
+        // A read shorter than the window cannot be classified; it is counted as healthy and
+        // reported separately rather than silently folded in.
+        let window = config.degradation_tail_window;
+        // Tracked separately from `degraded`: a read too short to classify is accumulated into
+        // the healthy tensor, because its bases are still data, but it must NOT enter the
+        // denominator of the reported fraction. Counting it as healthy understated the fraction
+        // (30 of 120 rather than 30 of 100) until a fixture with short reads caught it.
+        let mut classifiable = config.fit_quality_degradation;
+        let degraded = if !config.fit_quality_degradation {
+            false
+        } else if qual.len() < window {
+            n_unclassifiable += 1;
+            classifiable = false;
+            false
+        } else {
+            let tail: f64 = qual.as_bytes()[qual.len() - window..]
+                .iter()
+                .map(|&b| (b as usize).saturating_sub(qual_offset) as f64)
+                .sum::<f64>()
+                / window as f64;
+            if tail < (config.degradation_tail_cut as f64 - 2.0) {
+                n_deg_low_cut += 1;
+            }
+            if tail < (config.degradation_tail_cut as f64 + 2.0) {
+                n_deg_high_cut += 1;
+            }
+            tail < config.degradation_tail_cut as f64
+        };
+        if classifiable {
+            if degraded {
+                n_degraded += 1;
+            } else {
+                n_healthy += 1;
+            }
+        }
+
+        let (seed_target, trans_target) = if degraded {
+            (&mut seed_counts_deg, &mut transition_counts_deg)
+        } else {
+            (&mut seed_counts, &mut transition_counts)
+        };
         if accumulate_qual(
             &qual,
             qual_offset,
             config.max_model_read_length,
             bins_slice,
-            &mut seed_counts,
-            &mut transition_counts,
+            seed_target,
+            trans_target,
             &mut global_counts,
             &mut total_bases,
         )? {
@@ -293,7 +350,16 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     }
 
     // The fit's OUTPUT, not an input to it: one row per position after the first.
-    let read_length = transition_counts.len() + 1;
+    // Both populations describe the same read length, so the shorter tensor is padded rather
+    // than left ragged. A degraded population made only of short reads would otherwise produce
+    // a tensor that cannot cover the positions the model advertises.
+    let empty_row = vec![vec![0usize; MAX_SCORE]; MAX_SCORE];
+    let positions = transition_counts.len().max(transition_counts_deg.len());
+    transition_counts.resize(positions, empty_row.clone());
+    if config.fit_quality_degradation {
+        transition_counts_deg.resize(positions, empty_row);
+    }
+    let read_length = positions + 1;
 
     info!(
         "Processed {} reads ({} bases)",
@@ -399,12 +465,88 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         .collect();
 
     let quality_score_model = QualityScoreModel::from_counts(
-        quality_score_options,
+        quality_score_options.clone(),
         read_length,
         seed_weights,
         trans_weights,
         is_binned,
     )?;
+
+    // Attach the degraded population, re-indexed against the SAME option set.
+    let quality_score_model = if config.fit_quality_degradation {
+        let classified = n_degraded + n_healthy;
+        // Rule 4: a rate over an unknown denominator is not a result, and an empty population
+        // is a hard failure rather than a warning. A fit that was ASKED for two populations and
+        // found one has not produced a two-population model; saying so beats emitting a model
+        // whose degraded tensor is entirely uniform fallback.
+        if classified == 0 {
+            return Err(GenSeqErrorModelError::MalformedFastq(
+                "no reads could be classified, so no degraded population could be fitted"
+                    .to_string(),
+            ));
+        }
+        if n_degraded == 0 {
+            return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                "fit_quality_degradation is set, but none of {classified} classified reads fall \
+                 below the Q{} tail cut, so there is no degraded population to fit. Either this \
+                 library has none, or `degradation_tail_cut` is too low. Unset \
+                 fit_quality_degradation to fit a single population.",
+                config.degradation_tail_cut
+            )));
+        }
+        let read_fraction = n_degraded as f64 / classified as f64;
+
+        let seed_weights_deg: Vec<f64> = quality_score_options
+            .iter()
+            .map(|&q| seed_counts_deg[q] as f64)
+            .collect();
+        let trans_weights_deg: Vec<Vec<Vec<f64>>> = (0..read_length - 1)
+            .map(|pos| {
+                (0..n_scores)
+                    .map(|p| {
+                        let prev_raw = quality_score_options[p];
+                        (0..n_scores)
+                            .map(|c| {
+                                let curr_raw = quality_score_options[c];
+                                transition_counts_deg[pos][prev_raw][curr_raw] as f64
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        info!(
+            "Degraded population: {} of {} classified reads ({:.2}%), {} unclassifiable (shorter \
+             than the {} base window)",
+            n_degraded,
+            classified,
+            100.0 * read_fraction,
+            n_unclassifiable,
+            config.degradation_tail_window,
+        );
+        // The separability check #694 asks for, reported rather than assumed. If moving the cut
+        // by two Q moves the fraction by a large factor, the cut is slicing one distribution
+        // rather than separating two.
+        let (lo, hi) = (
+            100.0 * n_deg_low_cut as f64 / classified as f64,
+            100.0 * n_deg_high_cut as f64 / classified as f64,
+        );
+        info!(
+            "Separability: Q{} -> {:.2}%, Q{} -> {:.2}%, Q{} -> {:.2}%. A large swing across \
+             this range means the two populations are not cleanly separable at this cut.",
+            config.degradation_tail_cut - 2,
+            lo,
+            config.degradation_tail_cut,
+            100.0 * read_fraction,
+            config.degradation_tail_cut + 2,
+            hi,
+        );
+
+        quality_score_model.with_degradation(read_fraction, seed_weights_deg, trans_weights_deg)?
+    } else {
+        quality_score_model
+    };
 
     // Determine transition matrix: TSV > BAM inference > defaults from original Python NEAT
     // (see https://github.com/ncsa/NEAT/blob/main/neat/model_sequencing_error/runner.py)
@@ -552,6 +694,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: None,
@@ -952,6 +1097,183 @@ mod tests {
         }
     }
 
+    /// THE criterion for the #694 fitter: the fraction it reports is the fraction that is
+    /// there.
+    ///
+    /// Known answer by construction. 30 of 100 reads carry a tail of Q10 over their last 50
+    /// bases and 70 carry Q40, so the classifier's answer is 0.30 whatever the code computes.
+    #[test]
+    fn the_fitter_recovers_the_planted_degraded_fraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("bimodal.fastq");
+        let healthy = "I".repeat(100);
+        let degraded = "I".repeat(50) + &"+".repeat(50);
+        write_two_phase_fastq(&fastq_path, 70, &healthy, 30, &degraded);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.fit_quality_degradation = true;
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        let d = q
+            .degradation
+            .as_ref()
+            .expect("a two-population fit must produce a degraded population");
+        assert!(
+            (0.28..0.32).contains(&d.read_fraction),
+            "planted 30 of 100 reads degraded; fitted read_fraction {:.4}",
+            d.read_fraction
+        );
+        // The two populations share one option set, so the degraded tensor must cover the same
+        // positions as the healthy one. A ragged pair indexes the wrong scores at generation.
+        assert_eq!(
+            d.degraded_distros.len(),
+            q.distros_from_one.len(),
+            "both populations describe the same read length"
+        );
+    }
+
+    /// Rule 4, pinned: the reported fraction is over the reads that could be CLASSIFIED, not
+    /// over every read seen.
+    ///
+    /// Every other fixture here has reads longer than the window, so the two denominators are
+    /// identical and neither is pinned. Found by mutation: dividing by records seen instead of
+    /// reads classified passed every test above. Here 20 of 120 reads are too short to classify,
+    /// so the two answers are 0.30 and 0.25 and only one of them is right.
+    #[test]
+    fn reads_too_short_to_classify_are_out_of_the_denominator() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("ragged.fastq");
+        let mut out = String::new();
+        for i in 0..70 {
+            out.push_str(&format!(
+                "@h{i}\n{}\n+\n{}\n",
+                "A".repeat(100),
+                "I".repeat(100)
+            ));
+        }
+        for i in 0..30 {
+            let q = "I".repeat(50) + &"+".repeat(50);
+            out.push_str(&format!("@d{i}\n{}\n+\n{q}\n", "A".repeat(100)));
+        }
+        // Shorter than the 50 base window, so unclassifiable in either direction.
+        for i in 0..20 {
+            out.push_str(&format!(
+                "@s{i}\n{}\n+\n{}\n",
+                "A".repeat(30),
+                "I".repeat(30)
+            ));
+        }
+        std::fs::File::create(&fastq_path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.fit_quality_degradation = true;
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let d = model.quality_score_model().degradation.clone().unwrap();
+        assert!(
+            (0.28..0.32).contains(&d.read_fraction),
+            "30 degraded of 100 CLASSIFIABLE reads is 0.30; over all 120 records it would read \
+             0.25. Got {:.4}",
+            d.read_fraction
+        );
+    }
+
+    /// MUST NOT FIRE: the same bimodal input with the fit switched off produces a
+    /// single-population model, unchanged from every model before #694.
+    #[test]
+    fn without_the_flag_the_same_input_fits_one_population() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("bimodal.fastq");
+        let healthy = "I".repeat(100);
+        let degraded = "I".repeat(50) + &"+".repeat(50);
+        write_two_phase_fastq(&fastq_path, 70, &healthy, 30, &degraded);
+
+        let output_path = temp.path().join("model.json.gz");
+        let config = make_config(fastq_path, output_path.clone());
+        assert!(!config.fit_quality_degradation, "default must be off");
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert!(
+            model.quality_score_model().degradation.is_none(),
+            "opt-in means opt-in: an unflagged fit must not attach a degraded population"
+        );
+    }
+
+    /// MUST NOT FIRE, and a hard failure rather than a warning: asked for two populations on a
+    /// library that has one, the fit refuses instead of emitting a degraded tensor made
+    /// entirely of uniform fallback.
+    #[test]
+    fn a_library_with_no_degraded_reads_is_an_error_not_an_empty_population() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("healthy.fastq");
+        let healthy = "I".repeat(100);
+        write_two_phase_fastq(&fastq_path, 100, &healthy, 0, &healthy);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.fit_quality_degradation = true;
+
+        let err = runner(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no degraded population"),
+            "the error must say what was not found: {msg}"
+        );
+        assert!(
+            msg.contains("100"),
+            "and over what denominator, so the reader can judge it: {msg}"
+        );
+        assert!(
+            !output_path.exists(),
+            "a refused fit must not leave a model file behind"
+        );
+    }
+
+    /// The cut is a tuning knob, so moving it must move the fitted fraction. A classifier that
+    /// ignored its threshold would pass every test above.
+    #[test]
+    fn the_tail_cut_actually_selects_the_population() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("mid.fastq");
+        // Tails at Q30: above a Q25 cut, below a Q35 cut. Nothing else distinguishes them.
+        let healthy = "I".repeat(100);
+        let midling = "I".repeat(50) + &"?".repeat(50);
+        write_two_phase_fastq(&fastq_path, 60, &healthy, 40, &midling);
+
+        // At Q25 the Q30 tails are healthy, so there is no degraded population at all.
+        let out_low = temp.path().join("low.json.gz");
+        let mut low = make_config(fastq_path.clone(), out_low);
+        low.fit_quality_degradation = true;
+        assert!(
+            runner(&low).is_err(),
+            "at a Q25 cut nothing is degraded, which is an error, not a 0% population"
+        );
+
+        // At Q35 they are degraded, and the fraction is the planted 40 of 100.
+        let out_high = temp.path().join("high.json.gz");
+        let mut high = make_config(fastq_path, out_high.clone());
+        high.fit_quality_degradation = true;
+        high.degradation_tail_cut = 35;
+        runner(&high).unwrap();
+        let model = SequencingErrorModel::from_file(&out_high).unwrap();
+        let d = model.quality_score_model().degradation.clone().unwrap();
+        assert!(
+            (0.38..0.42).contains(&d.read_fraction),
+            "at a Q35 cut the planted 40 of 100 are degraded; got {:.4}",
+            d.read_fraction
+        );
+    }
+
     /// THE regression for the first review finding on #698: a read LONGER than everything
     /// before it, past where the old 1000-record sample stopped looking.
     ///
@@ -1311,6 +1633,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: Some(tsv_path),
@@ -1391,6 +1716,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1452,6 +1780,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1563,6 +1894,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1611,6 +1945,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1660,6 +1997,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
@@ -1720,6 +2060,9 @@ mod tests {
             max_reads: 0,
             qual_offset: 33,
             max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: Some(tsv_path),
