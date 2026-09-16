@@ -13,6 +13,11 @@
 # three: the real subsample, and the two simulated arms. The control arm matters as much as the
 # test arm -- without it, a number from the test arm has nothing to sit against.
 #
+# REBUILD THE BINARY FIRST. $EIDOLON is a build artifact in $SCRATCH, not the repo
+# checkout: pulling the branch does not rebuild it, and gen-seq-error-model reads its
+# config by key lookup, so an older binary ignores fit_quality_degradation rather than
+# rejecting it -- both arms then silently become the control.
+#
 # WHY IT SUBSAMPLES HERE, WHICH IS INTERIM. `gen-seq-error-model`'s own `max_reads` takes the
 # FIRST N records, and Illumina FASTQs are written in flowcell order: every one of the first
 # 200,000 records in HG002 R1 is lane 1, tile 1101. Capping the fit without spanning the file
@@ -67,14 +72,16 @@ echo
 SUB="$WORK/subsample.fastq.gz"
 if [[ ! -s "$SUB" ]]; then
     echo "[1/5] subsampling: keeping 1 record in $STRIDE ..."
-    # zcat into awk, then gzip. pipefail off around it: see CLAUDE.md on SIGPIPE.
+    # Rename on success only: a killed job leaves a truncated but non-empty .gz, which the
+    # `-s` cache above would accept. pipefail off around the pipe: see CLAUDE.md on SIGPIPE.
     set +o pipefail
     rc=0
     zcat -f -- "$FASTQ" \
       | awk -v s="$STRIDE" 'NR%4==1 { rec++ } ((rec - 1) % s) == 0' \
-      | gzip -c > "$SUB" || rc=$?
+      | gzip -c > "$SUB.part" || rc=$?
     set -o pipefail
-    [[ "$rc" -eq 0 ]] || { echo "FATAL: subsample failed (rc $rc)" >&2; exit 1; }
+    [[ "$rc" -eq 0 ]] || { echo "FATAL: subsample failed (rc $rc)" >&2; rm -f "$SUB.part"; exit 1; }
+    mv -f "$SUB.part" "$SUB"
 fi
 n_sub=$(zcat -f -- "$SUB" | awk 'END { print NR/4 }')
 [[ "${n_sub%.*}" -gt 1000 ]] || { echo "FATAL: subsample holds only $n_sub reads" >&2; exit 1; }
