@@ -41,6 +41,11 @@ done
 python3 - "$@" <<'PY'
 import gzip, json, sys
 
+# Phred+33 encodes 31 as '@'. eidolon never emits it as the FIRST character of a quality line
+# (README, "Q31 and the first quality character"), substituting the nearest other option. That
+# is a deliberate, bounded departure from the fitted model, and this reports its size.
+AT_SYMBOL = 31
+
 def qsm_of(m):
     # Accepts either a full SequencingErrorModel or a bare QualityScoreModel, because the
     # shipped default is stored as the latter and a fitted model as the former. Guessing
@@ -68,6 +73,24 @@ for path in sys.argv[1:]:
     if not contiguous:
         print(f"  option values        {opts}")
     print(f"  transition positions {len(q['distros_from_one'])}")
+    # Position 1, which is where the Q31 -> '@' suppression acts. `weights` is a stored CDF
+    # (starts at 0.0, ends at 1.0), so the mass on a value is its step, and the first value's
+    # mass is its own entry. Getting that off by one would misreport the size of the deviation,
+    # which is the whole point of printing it.
+    sd = q["seed_dist"]
+    vals, cdf = sd["values"], sd["weights"]
+    mass = [cdf[0]] + [b - a for a, b in zip(cdf, cdf[1:])]
+    top = sorted(zip(mass, vals), reverse=True)[:4]
+    print("  seed (position 1)    " + ", ".join(f"Q{v} {100*m:.2f}%" for m, v in top))
+    if AT_SYMBOL in vals:
+        at = mass[vals.index(AT_SYMBOL)]
+        sub = min((v for v in vals if v != AT_SYMBOL),
+                  key=lambda v: (abs(v - AT_SYMBOL), v), default=None)
+        print(f"  Q{AT_SYMBOL} at position 1     {100*at:.3f}% of reads, rewritten to Q{sub}"
+              f"  <- the deviation from the fit")
+    else:
+        print(f"  Q{AT_SYMBOL} at position 1     not an option; the rewrite never fires")
+
     deg = q.get("degradation")
     if deg is not None:
         print(f"  degradation          present, read_fraction {deg['read_fraction']:.4f}, "
