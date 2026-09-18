@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Print the SHAPE of one or more sequencing error models: option set, read length, binning.
+#
+# WHY. #677 asks whether the shipped default quality model still describes a current
+# instrument. The shipped default is 101 bp with 42 continuous scores (0-41) and
+# `binned_scores: false`; modern instruments commonly emit BINNED scores at 151 bp or more.
+# #677's suggested first step is "build a quality model from a modern library and compare its
+# shape against the shipped default" -- and #720 already did exactly that, twice, on HG002 R1
+# and R2. This reads those models rather than fitting anything new.
+#
+# It answers the structural half only. The per-cycle quality PROFILE of the real library is
+# already measured (measure_quality_degradation.sh section 4); what is missing is what the
+# fitted MODEL's option set looks like, which is what decides whether a binned default is the
+# representative one.
+#
+# Read-only. Reads the model files and writes nothing.
+#
+# USAGE
+#   bash scripts/delta/describe_quality_model.sh $SCRATCH/qualdeg_r1/model_degraded.json.gz ...
+#
+# Compare against the shipped default, which is in the repo:
+#   bash scripts/delta/describe_quality_model.sh eidolon-core/src/models/model_data/default_quality_score_model.json.gz
+
+#SBATCH --job-name=eidolon-modelshape
+#SBATCH --partition=cpu
+#SBATCH --account=bhrd-delta-cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=8G
+#SBATCH --time=00:20:00
+#SBATCH --output=modelshape-%j.log
+
+set -euo pipefail
+
+[[ $# -ge 1 ]] || { echo "usage: describe_quality_model.sh <model.json.gz> [...]" >&2; exit 1; }
+for f in "$@"; do
+    [[ -f "$f" ]] || { echo "FATAL: not a file: $f" >&2; exit 1; }
+done
+
+python3 - "$@" <<'PY'
+import gzip, json, sys
+
+def qsm_of(m):
+    # Accepts either a full SequencingErrorModel or a bare QualityScoreModel, because the
+    # shipped default is stored as the latter and a fitted model as the former. Guessing
+    # wrong would silently describe the wrong object, so key on a field only the outer
+    # struct has.
+    if "quality_score_model" in m:
+        return m["quality_score_model"], m
+    return m, None
+
+for path in sys.argv[1:]:
+    with gzip.open(path, "rt") as fh:
+        raw = json.load(fh)
+    q, outer = qsm_of(raw)
+    opts = q["quality_score_options"]
+    n = len(opts)
+    contiguous = opts == list(range(opts[0], opts[0] + n))
+    gaps = [b - a for a, b in zip(opts, opts[1:])]
+
+    print(f"=== {path}")
+    print(f"  kind                 {'SequencingErrorModel' if outer else 'QualityScoreModel (bare)'}")
+    print(f"  assumed_read_length  {q['assumed_read_length']}")
+    print(f"  binned_scores flag   {q.get('binned_scores')}")
+    print(f"  options              {n} values, Q{opts[0]}-Q{opts[-1]}")
+    print(f"  contiguous?          {contiguous}" + ("" if contiguous else f"   gaps: {sorted(set(gaps))}"))
+    if not contiguous:
+        print(f"  option values        {opts}")
+    print(f"  transition positions {len(q['distros_from_one'])}")
+    deg = q.get("degradation")
+    if deg is not None:
+        print(f"  degradation          present, read_fraction {deg['read_fraction']:.4f}, "
+              f"{len(deg['degraded_distros'])} positions")
+    else:
+        print(f"  degradation          none")
+    if outer is not None:
+        print(f"  error_rate           {outer.get('error_rate')}")
+        print(f"  indel_probability    {outer.get('indel_probability')}")
+    print()
+PY
