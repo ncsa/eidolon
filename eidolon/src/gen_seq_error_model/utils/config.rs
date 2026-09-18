@@ -27,6 +27,21 @@ pub struct RunConfiguration {
     /// A read above this is a hard error rather than a silent truncation, because a silent
     /// truncation is #697.
     pub max_model_read_length: usize,
+    /// Fit a second, degraded quality population alongside the main one (#694).
+    ///
+    /// OPT-IN, and default false, because it is not yet validated against real data. A model
+    /// fitted with this on generates a bimodal quality profile; one fitted without it behaves
+    /// exactly as every model before it. Flip the default once a fitted model has been measured
+    /// against the library it came from.
+    pub fit_quality_degradation: bool,
+    /// Window at the 3' end used to classify a read as degraded, in bases.
+    pub degradation_tail_window: usize,
+    /// A read whose last `degradation_tail_window` bases average below this is degraded.
+    ///
+    /// A tuning knob, and treated as one: the fit reports the resulting fraction at this cut and
+    /// at two Q either side, so a reader can see whether the two populations are actually
+    /// separable or whether the cut is just slicing one distribution in half.
+    pub degradation_tail_cut: usize,
     /// Optional path to a 4×4 TSV specifying a custom SNP transition matrix.
     /// Rows/columns are A/C/G/T. A single header line is ignored.
     /// Takes precedence over bam_file.
@@ -97,6 +112,42 @@ impl RunConfiguration {
             .get("max_model_read_length")
             .and_then(|v| v.as_u64())
             .unwrap_or(1000) as usize;
+
+        let fit_quality_degradation = scrape_config
+            .get("fit_quality_degradation")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let degradation_tail_window = scrape_config
+            .get("degradation_tail_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+
+        let degradation_tail_cut = scrape_config
+            .get("degradation_tail_cut")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(25) as usize;
+
+        // Floors, checked only when the feature is on so an inert stale key cannot make an
+        // existing config unloadable. A zero window makes the tail mean 0.0/0.0 = NaN and every
+        // comparison against it false, which surfaces as "this library has no degraded
+        // population" -- a true statement about the wrong thing. A cut below 2 underflows
+        // `cut - 2` in the separability report.
+        if fit_quality_degradation {
+            if degradation_tail_window == 0 {
+                return Err(GenSeqErrorModelError::ConfigurationError(
+                    "degradation_tail_window must be at least 1: a zero-length tail has no mean \
+                     to compare against the cut"
+                        .to_string(),
+                ));
+            }
+            if degradation_tail_cut < 2 {
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "degradation_tail_cut must be at least 2, got {degradation_tail_cut}: the \
+                     separability report quotes the fraction two Q below the cut"
+                )));
+            }
+        }
 
         let binned_quality_bins = match scrape_config.get("binned_quality_bins") {
             None => None,
@@ -177,6 +228,9 @@ impl RunConfiguration {
             max_reads,
             qual_offset,
             max_model_read_length,
+            fit_quality_degradation,
+            degradation_tail_window,
+            degradation_tail_cut,
             binned_quality_bins,
             bam_file,
             transition_matrix_file,
@@ -261,7 +315,93 @@ mod tests {
         assert_eq!(config.max_reads, 0);
         assert_eq!(config.qual_offset, 33);
         assert_eq!(config.max_model_read_length, 1000);
+        assert!(
+            !config.fit_quality_degradation,
+            "degradation fitting is opt-in"
+        );
+        assert_eq!(config.degradation_tail_window, 50);
+        assert_eq!(config.degradation_tail_cut, 25);
         assert!(!config.overwrite_output);
+    }
+
+    /// A zero window makes the tail mean 0.0/0.0 = NaN, and every comparison against NaN is
+    /// false, so no read is ever classified degraded and the fit dies complaining that the
+    /// library has no degraded population. The config is what is wrong, so say that instead.
+    #[test]
+    fn a_zero_tail_window_is_refused_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nfit_quality_degradation: true\n\
+             degradation_tail_window: 0\n",
+            fastq.display(),
+            output.display()
+        ));
+        let err = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap_err();
+        assert!(
+            err.to_string().contains("degradation_tail_window"),
+            "the message must name the option that is wrong: {err}"
+        );
+    }
+
+    /// The separability report prints the fraction at the cut and two Q either side, so a cut
+    /// below 2 underflows `cut - 2` on a usize. Reachable only with near-zero-quality reads,
+    /// which is exactly the kind of input a fixture supplies.
+    #[test]
+    fn a_tail_cut_below_two_is_refused_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nfit_quality_degradation: true\n\
+             degradation_tail_cut: 1\n",
+            fastq.display(),
+            output.display()
+        ));
+        let err = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap_err();
+        assert!(
+            err.to_string().contains("degradation_tail_cut"),
+            "the message must name the option that is wrong: {err}"
+        );
+    }
+
+    /// Must NOT fire: the validation is a floor, not a straitjacket. A window of 1 and a cut of
+    /// 2 are the smallest legal values and have to survive, or the check is just a narrower bug.
+    #[test]
+    fn the_smallest_legal_degradation_settings_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nfit_quality_degradation: true\n\
+             degradation_tail_window: 1\ndegradation_tail_cut: 2\n",
+            fastq.display(),
+            output.display()
+        ));
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert_eq!(config.degradation_tail_window, 1);
+        assert_eq!(config.degradation_tail_cut, 2);
+    }
+
+    /// And the floors must not apply when the feature is off, or every existing config that
+    /// happens to carry a stale key becomes unloadable.
+    #[test]
+    fn the_degradation_floors_do_not_apply_when_the_feature_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\ndegradation_tail_window: 0\n\
+             degradation_tail_cut: 0\n",
+            fastq.display(),
+            output.display()
+        ));
+        assert!(RunConfiguration::from(&tmp.path().to_path_buf()).is_ok());
     }
 
     #[test]

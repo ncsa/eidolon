@@ -306,6 +306,14 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   the same treatment: **a caller recall of 0 is uninterpretable until you know the evidence was
   there to find.** `PRUNE_BAM=0` keeps the BAMs when a run is specifically diagnostic.
 
+- **Say "rebuild first" every time a Delta job exercises code that is not yet on `develop`.**
+  The binary at `$SCRATCH/cargo-target/eidolon/release/eidolon` is a build artifact, not the
+  checkout: `git pull` on Delta updates the scripts and leaves the binary alone. Config is read
+  by key lookup rather than a strict struct, so a binary predating a new option **ignores it
+  instead of rejecting it** — the job runs to completion and quietly measures the old behavior.
+  Submitting instructions without the rebuild line has cost a round trip; it is not the user's
+  job to remember which commits are compiled in.
+
 - **The submit rule. If it might take more than five minutes, submit it.**
   - **A script gets `#SBATCH` directives. Always.** Not "if it looks long" — always. They are
     comments to bash, so the same file still runs inline for a smoke pass, and a script that
