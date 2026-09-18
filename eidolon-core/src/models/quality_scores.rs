@@ -148,6 +148,13 @@ static DATA_FILE: &[u8] = include_bytes!("model_data/default_quality_score_model
 ///
 /// Shared by both populations deliberately. The healthy and degraded tensors have to treat an
 /// unseen previous score the same way, and the surest way to guarantee that is one function.
+///
+/// The uniform fallback below is for a single unseen PREVIOUS SCORE within a position, which is
+/// ordinary: a score that appears nowhere as a transition source still needs a row, and binned
+/// models create them on purpose. It is not a policy for a position that was never observed at
+/// all. A whole position of zeros would make every read draw uniform quality there, and
+/// `gen-seq-error-model` refuses to emit such a model rather than letting this fill it in --
+/// see the coverage check in its runner, which is what keeps that case from reaching here.
 fn build_distros(
     trans_weights: &[Vec<Vec<f64>>],
     n_scores: usize,

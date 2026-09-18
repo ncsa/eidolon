@@ -21,6 +21,11 @@ max_model_read_length: 1000
 # collapsed, and a single transition model cannot represent that. With this on, the fit
 # classifies each read and learns two populations. OPT-IN while it is unvalidated against real
 # data; a model fitted without it behaves exactly as every model before it.
+#
+# Both populations must reach the model's read length: the fit refuses a library where, say,
+# every degraded read is 60 bp and every healthy one is 100 bp, because the positions the short
+# population never reached could only be filled with invented values. Trim or filter to a
+# common read length if your library is ragged that way.
 fit_quality_degradation: false
 # window at the 3' end used to classify a read, in bases [optional] - default 50
 # degradation_tail_window: 50

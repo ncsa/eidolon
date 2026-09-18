@@ -73,6 +73,18 @@ STRIDE="${STRIDE:-1}"
 QUAL_OFFSET="${QUAL_OFFSET:-33}"
 LOW_Q="${LOW_Q:-25}"                # a base at or below this counts as "low"
 TAIL_WINDOW="${TAIL_WINDOW:-50}"    # #694's window
+# The per-read tail thresholds, and DISTINCT from LOW_Q: LOW_Q classifies a single base for the
+# run statistics, these classify a whole read by the mean of its last TAIL_WINDOW bases.
+#
+# TAIL_CUT is the threshold `gen-seq-error-model` calls `degradation_tail_cut`, and the two must
+# carry the same value or the fit and the measurement are answering different questions -- a
+# model fitted at Q<30 presented against a Q<25 rate is not a result about that model.
+# validate_quality_degradation.sh passes one value to both for exactly that reason.
+#
+# TAIL_CUT_DEEP is the second, stricter rate: how far below the cut the collapsed reads sit. It
+# tracks TAIL_CUT five Q down, so the defaults are the 25/20 pair #694 quotes.
+TAIL_CUT="${TAIL_CUT:-25}"
+TAIL_CUT_DEEP="${TAIL_CUT_DEEP:-$((TAIL_CUT - 5))}"
 # Head of the read, used to ask whether reads that END badly were ALREADY worse at the start.
 # 100 sits well before the decline becomes visible in the mean profile, so a difference there
 # cannot be the tail effect leaking backwards.
@@ -80,11 +92,19 @@ HEAD_WINDOW="${HEAD_WINDOW:-100}"
 OUT="${OUT:-quality_degradation.txt}"
 
 [[ -f "$FASTQ" ]] || { echo "FASTQ not found: $FASTQ" >&2; exit 1; }
+# Both rates are printed unconditionally, so a nonsensical pair would be presented as a
+# measurement rather than refused. A cut at or below zero can never fire, and a deep cut at or
+# above the main one makes the two rows non-monotonic, which reads as a defect in the data.
+[[ "$TAIL_CUT" -gt 0 ]] || { echo "TAIL_CUT must be above 0, got $TAIL_CUT" >&2; exit 1; }
+[[ "$TAIL_CUT_DEEP" -gt 0 && "$TAIL_CUT_DEEP" -lt "$TAIL_CUT" ]] || {
+    echo "TAIL_CUT_DEEP must be above 0 and below TAIL_CUT ($TAIL_CUT), got $TAIL_CUT_DEEP" >&2
+    exit 1; }
 
 echo "=== measure_quality_degradation ==="
 echo "fastq:       $FASTQ"
 echo "max_reads:   $MAX_READS (0 = all)   stride: $STRIDE"
 echo "qual_offset: $QUAL_OFFSET   low_q: $LOW_Q   tail_window: $TAIL_WINDOW"
+echo "tail_cut:    Q<$TAIL_CUT (matches degradation_tail_cut)   deep: Q<$TAIL_CUT_DEEP"
 echo "writing:     $OUT"
 echo
 
@@ -101,7 +121,9 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
                           -v stride="$STRIDE" \
                           -v low_q="$LOW_Q" \
                           -v win="$TAIL_WINDOW" \
-                          -v head_win="$HEAD_WINDOW" '
+                          -v head_win="$HEAD_WINDOW" \
+                          -v cut="$TAIL_CUT" \
+                          -v deep="$TAIL_CUT_DEEP" '
     NR % 4 != 0 { next }                       # quality line only
     {
         rec++
@@ -119,10 +141,10 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
             tail += q
         }
         tail /= win
-        if (tail < 25) lt25++
-        if (tail < 20) lt20++
+        if (tail < cut) lt_cut++
+        if (tail < deep) lt_deep++
 
-        collapsed = (tail < 25)
+        collapsed = (tail < cut)
         if (collapsed) coll_reads++; else heal_reads++
 
         # ---- walk the read once for everything else ----
@@ -203,9 +225,11 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
         printf "reads shorter than window: %d\n", too_short + 0
         printf "read length (max):        %d\n\n", maxlen
 
-        print "--- 1. #694 headline rates (expect ~12.22% and ~5.61% on HG002 R1) ---"
-        printf "tail Q<25 (last %d):       %.2f%%  (%d reads)\n", win, 100 * lt25 / reads, lt25
-        printf "tail Q<20 (last %d):       %.2f%%  (%d reads)\n\n", win, 100 * lt20 / reads, lt20
+        printf "--- 1. headline rates: collapsed tail at Q<%d and Q<%d ---\n", cut, deep
+        if (cut == 25 && deep == 20)
+            print "    (#694 measured 12.22% and 5.61% on HG002 R1 at these cuts)"
+        printf "tail Q<%d (last %d):       %.2f%%  (%d reads)\n", cut, win, 100 * lt_cut / reads, lt_cut
+        printf "tail Q<%d (last %d):       %.2f%%  (%d reads)\n\n", deep, win, 100 * lt_deep / reads, lt_deep
 
         print "--- 2. low runs (base <= Q" low_q ") ---"
         printf "all runs:                  %d   (%.3f per read)\n", run_n, run_n / reads
@@ -232,6 +256,7 @@ zcat -f -- "$FASTQ" | awk -v offset="$QUAL_OFFSET" \
         print ""
 
         print "--- 5. DOES A COLLAPSED READ START BADLY? first " head_win " positions ---"
+        print "  (collapsed = mean of the last " win " bases below Q" cut ")"
         print "  Onset model: a read is normal until it collapses -> these should MATCH."
         print "  Propensity:  collapsed reads are noisier throughout -> they should DIFFER."
         printf "  collapsed reads %d   healthy %d\n", coll_reads+0, heal_reads+0

@@ -54,7 +54,17 @@ NAME="${NAME:-r1}"
 STRIDE="${STRIDE:-65}"          # ~2M reads from a 130M-record library
 READ_LEN="${READ_LEN:-250}"
 COVERAGE="${COVERAGE:-4}"
+# One value, two consumers. TAIL_CUT is `degradation_tail_cut` for the fitter AND the
+# collapsed-tail threshold the measurement below reports at; TAIL_WINDOW likewise is
+# `degradation_tail_window` and the measurement's window. Letting them drift is how a run at
+# TAIL_CUT=30 would present a Q<25 rate as though it said something about a model fitted at
+# Q<30. The measurement helper defaults to 25/50 on its own, which is why this was invisible
+# at the defaults and only wrong when overridden.
 TAIL_CUT="${TAIL_CUT:-25}"
+TAIL_WINDOW="${TAIL_WINDOW:-50}"
+# The second, stricter rate the measurement reports. Tracks TAIL_CUT five Q down, matching that
+# script's own default, so the defaults stay the 25/20 pair #694 quotes.
+TAIL_CUT_DEEP="${TAIL_CUT_DEEP:-$((TAIL_CUT - 5))}"
 WORK="${WORK:-$SCRATCH/qualdeg_$NAME}"
 EIDOLON="${EIDOLON:-$SCRATCH/cargo-target/eidolon/release/eidolon}"
 REFERENCE="${REFERENCE:-$REPO/eidolon/test_data/references/ecoli.fa}"
@@ -67,6 +77,7 @@ REFERENCE="${REFERENCE:-$REPO/eidolon/test_data/references/ecoli.fa}"
 mkdir -p "$WORK"
 echo "=== validate_quality_degradation ($NAME) ==="
 echo "repo:     $REPO ($(cd "$REPO" && git rev-parse --short HEAD))"
+echo "cut:      Q<$TAIL_CUT over the last $TAIL_WINDOW bases (fit and measurement both)"
 echo "binary:   $EIDOLON"
 echo "fastq:    $FASTQ   stride $STRIDE"
 echo "work:     $WORK"
@@ -97,8 +108,8 @@ echo "      $n_sub reads"
 for mode in plain degraded; do
     flag=false; [[ "$mode" == degraded ]] && flag=true
     cfg="$WORK/fit_$mode.yml"
-    printf 'fastq_file: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: %s\ndegradation_tail_cut: %s\n' \
-        "$SUB" "$WORK/model_$mode.json.gz" "$flag" "$TAIL_CUT" > "$cfg"
+    printf 'fastq_file: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: %s\ndegradation_tail_cut: %s\ndegradation_tail_window: %s\n' \
+        "$SUB" "$WORK/model_$mode.json.gz" "$flag" "$TAIL_CUT" "$TAIL_WINDOW" > "$cfg"
     echo "[2/5] fitting $mode ..."
     # Status first, filter second. Ending the pipeline with `| grep ... || true` hid a failed
     # fit, and because WORK is reused the previous run's model_$mode.json.gz survives it, so
@@ -124,10 +135,26 @@ done
 # ── 4. measure all three arms ───────────────────────────────────────────────────
 echo "[4/5] measuring ..."
 measure() {  # <label> <fastq>
+    # The SAME cut and window the fit used. Reporting a rate at a threshold the model was not
+    # fitted at is not a result about that model.
     FASTQ="$2" MAX_READS=0 OUT="$WORK/meas_$1.txt" \
+        TAIL_CUT="$TAIL_CUT" TAIL_CUT_DEEP="$TAIL_CUT_DEEP" TAIL_WINDOW="$TAIL_WINDOW" \
         bash "$REPO/scripts/delta/measure_quality_degradation.sh" >/dev/null
-    awk -v l="$1" '/tail Q<25/{a=$5} /tail Q<20/{b=$5} /mean quality  *collapsed/{c=$4}
-        END { printf "  %-22s Q<25 %-8s Q<20 %-8s head-collapsed %s\n", l, a, b, c }' "$WORK/meas_$1.txt"
+    # Match on the cut VALUE rather than a literal Q<25. This is also the check that the
+    # override reached the helper: if it were dropped, the helper would report Q<25/Q<20 rows,
+    # no row would match, and this aborts. Without the END guard an unmatched row prints as a
+    # blank column, which reads as "measured, and small" rather than "not measured".
+    awk -v l="$1" -v cut="$TAIL_CUT" -v deep="$TAIL_CUT_DEEP" '
+        $1 == "tail" && $2 == "Q<" cut  { a = $5 }
+        $1 == "tail" && $2 == "Q<" deep { b = $5 }
+        /mean quality  *collapsed/      { h = $4 }
+        END {
+            if (a == "" || b == "") {
+                printf "FATAL: no Q<%s / Q<%s row in the measurement of %s\n", cut, deep, l > "/dev/stderr"
+                exit 1
+            }
+            printf "  %-22s Q<%-3s %-8s Q<%-3s %-8s head-collapsed %s\n", l, cut, a, deep, b, h
+        }' "$WORK/meas_$1.txt"
 }
 
 # ── 5. the comparison ───────────────────────────────────────────────────────────

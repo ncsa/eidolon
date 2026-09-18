@@ -28,8 +28,12 @@ if [[ "${1:-}" == "--mutate" ]]; then
             printf '  caught   %s\n' "$label"
         fi
     done <<'MUTS'
-tail threshold 25 -> 35@if (tail < 25) lt25++@if (tail < 35) lt25++
-collapsed classified by the wrong threshold@collapsed = (tail < 25)@collapsed = (tail < 35)
+tail threshold hardcoded at 25 again@if (tail < cut) lt_cut++@if (tail < 25) lt_cut++
+deep threshold hardcoded at 20 again@if (tail < deep) lt_deep++@if (tail < 20) lt_deep++
+collapsed classified by the wrong threshold@collapsed = (tail < cut)@collapsed = (tail < 25)
+the reported label ignores the cut it used@"tail Q<%d (last %d):       %.2f%%  (%d reads)\n", cut, win@"tail Q<25 (last %d):       %.2f%%  (%d reads)\n", win
+TAIL_CUT override silently dropped@TAIL_CUT="${TAIL_CUT:-25}"@TAIL_CUT=25
+a deep cut above the main one is accepted@[[ "$TAIL_CUT_DEEP" -gt 0 && "$TAIL_CUT_DEEP" -lt "$TAIL_CUT" ]]@[[ 1 -eq 1 ]]
 longest-run start bucketed by global max@int((longest_start - 1) * 10 / n)@int((longest_start - 1) * 10 / maxlen)
 low-base denominator back to reads*maxlen@total_low_bases / total_bases@total_low_bases / (reads * maxlen)
 run continues across a recovery@} else if (run_len > 0) {@} else if (0) {
@@ -48,7 +52,7 @@ fi
 PASS=0; FAIL=0
 # Floor on how many assertions must execute. Raise it when adding tests; if it ever reads low,
 # an assertion stopped running rather than started failing.
-MIN_ASSERTIONS=36
+MIN_ASSERTIONS=44
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
 hasw(){ local h n; h="$(printf '%s' "$2" | tr -d ' ')"; n="$(printf '%s' "$3" | tr -d ' ')"
@@ -68,7 +72,7 @@ make_fastq() {
     gzip -cf "$WORK/plain.fastq" > "$out"
 }
 
-# Q40 = 'I', Q10 = '+', Q30 = '?'  (Phred+33)
+# Q40 = 'I', Q10 = '+', Q30 = '?', Q25 = ':'  (Phred+33)
 rep() { printf "%${2}s" | tr ' ' "$1"; }
 
 echo "=== known-answer fixture: 4 healthy, 3 with one transient dip, 3 that collapse ==="
@@ -138,6 +142,48 @@ hasw "and it has no low runs either, being above Q25" \
 # reported rate: at Q<25 neither read is collapsed; at Q<35 the flat-Q30 one would be.
 hasw "neither read is classified as collapsed at the Q25 threshold" \
      "$OUT_BETWEEN" "collapsed reads 0   healthy 2"
+
+echo "=== TAIL_CUT moves the classifier and relabels both rows ==="
+# The same flat-Q30 read, read at a different cut. This is the passthrough
+# validate_quality_degradation.sh depends on: it fits at `degradation_tail_cut` and reports
+# here, and before TAIL_CUT existed this script answered at a hardcoded Q<25 whatever the fit
+# used -- a Q<25 rate presented as a result about a model fitted at Q<30.
+#
+# Three flat reads at Q40, Q30 and Q25, which is what separates every threshold in play. At
+# TAIL_CUT=35 the Q30 and Q25 reads are collapsed (2 of 3, 66.67%); TAIL_CUT_DEEP follows five
+# Q down to 30, where only the Q25 read counts (1 of 3, 33.33%). A cut hardcoded at 25 reads
+# 0.00% on the first row, and a deep cut hardcoded at 20 reads 0.00% on the second -- so each
+# row pins its own threshold rather than sharing one.
+make_fastq "$WORK/three_levels.fastq.gz" <<EOF
+1 $(rep I 100)
+1 $(rep '?' 100)
+1 $(rep ':' 100)
+EOF
+OUT_CUT35="$(FASTQ="$WORK/three_levels.fastq.gz" MAX_READS=0 TAIL_CUT=35 OUT="$WORK/cut35.txt" bash "$SCRIPT" 2>&1)"
+hasw "at TAIL_CUT=35 the Q30 and Q25 reads count as collapsed" \
+     "$OUT_CUT35" "tail Q<35 (last 50):       66.67%  (2 reads)"
+hasw "the deep row follows to Q<30, where only the Q25 read counts" \
+     "$OUT_CUT35" "tail Q<30 (last 50):       33.33%  (1 reads)"
+hasw "and section 5 splits the populations at the same cut" \
+     "$OUT_CUT35" "collapsed reads 2   healthy 1"
+hasw "the run echoes the cut it used" "$OUT_CUT35" "tail_cut:    Q<35"
+# The reference numbers in the header are only true at 25/20 and must not be printed at 35/30,
+# where they would read as an expectation for this run.
+case "$OUT_CUT35" in
+    *"12.22%"*) bad "the HG002 reference rates are not quoted at a custom cut" "no 12.22%" "$OUT_CUT35" ;;
+    *) ok "the HG002 reference rates are not quoted at a custom cut" ;;
+esac
+hasw "the default run still quotes them" "$OUT_KNOWN" "(#694 measured 12.22% and 5.61%"
+
+# TAIL_CUT_DEEP is settable on its own, and is checked rather than trusted: a deep cut above
+# the main one would print two rows whose order contradicts their thresholds.
+OUT_DEEP="$(FASTQ="$WORK/three_levels.fastq.gz" MAX_READS=0 TAIL_CUT=25 TAIL_CUT_DEEP=40 OUT="$WORK/deep.txt" bash "$SCRIPT" 2>&1)" \
+    && bad "a deep cut above the main cut is refused" "non-zero exit" "exit 0" \
+    || ok "a deep cut above the main cut is refused"
+case "$OUT_DEEP" in
+    *"must be above 0 and below TAIL_CUT"*) ok "and says which knob is wrong" ;;
+    *) bad "and says which knob is wrong" "a message naming TAIL_CUT_DEEP" "$OUT_DEEP" ;;
+esac
 
 echo "=== onset decile uses THIS read's length, not the file maximum ==="
 # One 200-base read collapsing at 101 (decile 50-60%) and one 100-base read collapsing at 51

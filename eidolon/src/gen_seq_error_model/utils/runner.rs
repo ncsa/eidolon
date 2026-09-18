@@ -18,6 +18,20 @@ const MAX_SCORE: usize = 94;
 /// Not a tuned figure -- a round number chosen to make a thin tail visible, which is the point.
 const THIN_POSITION_OBSERVATIONS: usize = 100;
 
+/// How many leading positions of a transition tensor were actually trained.
+///
+/// A position whose whole count matrix is zero was never observed. `build_distros` turns such a
+/// row into a UNIFORM draw over the option set, which is a fabricated quality profile that
+/// nothing downstream can distinguish from a fitted one -- so the fitter refuses to emit one
+/// rather than reporting it. Counting from the front (rather than totalling zeros) is what the
+/// caller needs: it converts directly to the longest read that population carried.
+fn trained_positions(counts: &[Vec<Vec<usize>>]) -> usize {
+    counts
+        .iter()
+        .position(|row| row.iter().flatten().sum::<usize>() == 0)
+        .unwrap_or(counts.len())
+}
+
 /// Snap a raw quality score to the nearest value in a sorted bin list.
 /// Ties round toward the lower bin (deterministic).
 /// `bins` must be non-empty and sorted ascending.
@@ -349,17 +363,84 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         ));
     }
 
-    // The fit's OUTPUT, not an input to it: one row per position after the first.
-    // Both populations describe the same read length, so the shorter tensor is padded rather
-    // than left ragged. A degraded population made only of short reads would otherwise produce
-    // a tensor that cannot cover the positions the model advertises.
-    let empty_row = vec![vec![0usize; MAX_SCORE]; MAX_SCORE];
+    // The fit's OUTPUT, not an input to it: one row per position after the first. Both
+    // populations describe the same read length, because `generate_quality_scores` indexes one
+    // position list for either of them.
     let positions = transition_counts.len().max(transition_counts_deg.len());
-    transition_counts.resize(positions, empty_row.clone());
-    if config.fit_quality_degradation {
-        transition_counts_deg.resize(positions, empty_row);
-    }
     let read_length = positions + 1;
+
+    // Rule 4: a rate over an unknown denominator is not a result, and an empty population is a
+    // hard failure rather than a warning. A fit that was ASKED for two populations and found
+    // one has not produced a two-population model; saying so beats emitting a model whose
+    // degraded tensor is entirely uniform fallback.
+    //
+    // These run BEFORE the coverage check below. An empty population has an empty tensor, so it
+    // trips that check too, and "covers 1 bp of 100" is a true but unhelpful way to say "this
+    // library has no degraded reads at this cut".
+    let classified = n_degraded + n_healthy;
+    if config.fit_quality_degradation {
+        if classified == 0 {
+            return Err(GenSeqErrorModelError::MalformedFastq(
+                "no reads could be classified, so no degraded population could be fitted"
+                    .to_string(),
+            ));
+        }
+        if n_degraded == 0 {
+            return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                "fit_quality_degradation is set, but none of {classified} classified reads fall \
+                 below the Q{} tail cut, so there is no degraded population to fit. Either this \
+                 library has none, or `degradation_tail_cut` is too low. Unset \
+                 fit_quality_degradation to fit a single population.",
+                config.degradation_tail_cut
+            )));
+        }
+        if n_healthy == 0 {
+            return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                "fit_quality_degradation is set, but all {classified} classified reads fall \
+                 below the Q{} tail cut, so there is no healthy population to fit. \
+                 `degradation_tail_cut` is above this library's quality range. Unset \
+                 fit_quality_degradation to fit a single population.",
+                config.degradation_tail_cut
+            )));
+        }
+    }
+
+    // The shorter population is REFUSED, not padded.
+    //
+    // `every_modeled_position_is_trained` pins the invariant for a single population: a
+    // position row exists only because some read reached it, and that read necessarily trained
+    // it. A second population breaks it -- padding the shorter tensor to the common length
+    // leaves all-zero rows, and `build_distros` turns an all-zero row into a UNIFORM draw over
+    // the option set. 60 bp degraded reads against 100 bp healthy ones would then hand the
+    // degraded population invented quality from base 62 to base 100, and no consumer of the
+    // model could tell that from a fit. Rule 4: a zero denominator is a hard failure, not a
+    // warning, and here it is a hard failure BEFORE the number is fabricated.
+    //
+    // Checked on observations rather than on tensor lengths. The two agree today -- a read of
+    // length L trains every position below L -- but the length is a proxy and the observation
+    // count is the thing that matters, so an untrained position cannot reappear through some
+    // later change to how counts are accumulated.
+    if config.fit_quality_degradation {
+        for (label, counts) in [
+            ("healthy", &transition_counts),
+            ("degraded", &transition_counts_deg),
+        ] {
+            let trained = trained_positions(counts);
+            if trained < positions {
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "the {label} population covers {} bp, but the model covers \
+                     {read_length} bp: positions {} to {read_length} carry no {label} \
+                     observation at all. Filling them would give that population a uniform \
+                     quality distribution -- fabricated data a reader cannot distinguish \
+                     from a fit. Both populations must reach the model's read length: trim \
+                     or filter the library so the two carry the same read lengths, or unset \
+                     fit_quality_degradation to fit a single population.",
+                    trained + 1,
+                    trained + 2,
+                )));
+            }
+        }
+    }
 
     info!(
         "Processed {} reads ({} bases)",
@@ -378,22 +459,27 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     }
 
     // Rule 4: report the denominator, not just the metric. Every position holds at least one
-    // observation by construction, but "at least one" is not "enough" -- a thin tail makes the
-    // late positions noise, and a small `max_reads` is the usual way to get one.
-    if let Some(min_obs) = transition_counts
-        .iter()
-        .map(|row| row.iter().flatten().sum::<usize>())
-        .min()
-    {
-        info!(
-            "Fewest transition observations at any position: {}",
-            min_obs
-        );
+    // observation -- by construction for a single population, and by the refusal above for
+    // two -- but "at least one" is not "enough": a thin tail makes the late positions noise,
+    // and a small `max_reads` is the usual way to get one. Reported per population, because
+    // the degraded one is a minority of the library and so thins out first.
+    for (label, counts) in [
+        ("healthy population", &transition_counts),
+        ("degraded population", &transition_counts_deg),
+    ] {
+        let Some(min_obs) = counts
+            .iter()
+            .map(|row| row.iter().flatten().sum::<usize>())
+            .min()
+        else {
+            continue; // no degraded population was fitted
+        };
+        info!("Fewest transition observations at any position ({label}): {min_obs}");
         if min_obs < THIN_POSITION_OBSERVATIONS {
             warn!(
-                "Some modeled position rests on only {} observation(s) (threshold {}). Those \
-                 positions are noise rather than measurement; fit more reads, or accept that \
-                 the tail of the model is thin.",
+                "Some modeled position of the {label} rests on only {} observation(s) \
+                 (threshold {}). Those positions are noise rather than measurement; fit more \
+                 reads, or accept that the tail of the model is thin.",
                 min_obs, THIN_POSITION_OBSERVATIONS
             );
         }
@@ -474,35 +560,6 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
 
     // Attach the degraded population, re-indexed against the SAME option set.
     let quality_score_model = if config.fit_quality_degradation {
-        let classified = n_degraded + n_healthy;
-        // Rule 4: a rate over an unknown denominator is not a result, and an empty population
-        // is a hard failure rather than a warning. A fit that was ASKED for two populations and
-        // found one has not produced a two-population model; saying so beats emitting a model
-        // whose degraded tensor is entirely uniform fallback.
-        if classified == 0 {
-            return Err(GenSeqErrorModelError::MalformedFastq(
-                "no reads could be classified, so no degraded population could be fitted"
-                    .to_string(),
-            ));
-        }
-        if n_degraded == 0 {
-            return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                "fit_quality_degradation is set, but none of {classified} classified reads fall \
-                 below the Q{} tail cut, so there is no degraded population to fit. Either this \
-                 library has none, or `degradation_tail_cut` is too low. Unset \
-                 fit_quality_degradation to fit a single population.",
-                config.degradation_tail_cut
-            )));
-        }
-        if n_healthy == 0 {
-            return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                "fit_quality_degradation is set, but all {classified} classified reads fall \
-                 below the Q{} tail cut, so there is no healthy population to fit. \
-                 `degradation_tail_cut` is above this library's quality range. Unset \
-                 fit_quality_degradation to fit a single population.",
-                config.degradation_tail_cut
-            )));
-        }
         let read_fraction = n_degraded as f64 / classified as f64;
 
         let seed_weights_deg: Vec<f64> = quality_score_options
@@ -1192,6 +1249,126 @@ mod tests {
             (0.28..0.32).contains(&d.read_fraction),
             "30 degraded of 100 CLASSIFIABLE reads is 0.30; over all 120 records it would read \
              0.25. Got {:.4}",
+            d.read_fraction
+        );
+    }
+
+    /// Write a FASTQ from `(count, quality-string)` groups. The quality string sets the read
+    /// length, so this is how a fixture gives the two populations DIFFERENT lengths.
+    fn write_groups(path: &PathBuf, groups: &[(usize, String)]) {
+        use std::io::Write;
+        let mut out = String::new();
+        for (gi, (n, qual)) in groups.iter().enumerate() {
+            for i in 0..*n {
+                out.push_str(&format!(
+                    "@g{gi}_r{i}\n{}\n+\n{qual}\n",
+                    "A".repeat(qual.len())
+                ));
+            }
+        }
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(out.as_bytes())
+            .unwrap();
+    }
+
+    /// A population that cannot cover the model's read length must be REFUSED, not padded.
+    ///
+    /// `every_modeled_position_is_trained` pins the invariant for a single population: a
+    /// position row exists only because a read reached it and that read trained it. Two
+    /// populations break it -- the shorter one's tensor has to be padded to the common length,
+    /// and `build_distros` turns an all-zero row into a UNIFORM distribution. So 60 bp degraded
+    /// reads against 100 bp healthy ones would give the degraded population a fabricated,
+    /// uniform quality profile from base 62 on, indistinguishable downstream from a fit.
+    ///
+    /// The short reads here are 60 bp, longer than the 50 base classification window, so they
+    /// ARE classified. That is what separates this from
+    /// `reads_too_short_to_classify_are_out_of_the_denominator`, where the short reads are
+    /// unclassifiable and never reach the degraded tensor at all.
+    #[test]
+    fn a_degraded_population_too_short_to_cover_the_model_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("short_degraded.fastq");
+        write_groups(
+            &fastq_path,
+            &[
+                (70, "I".repeat(100)),
+                (30, "I".repeat(10) + &"+".repeat(50)),
+            ],
+        );
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path);
+        config.fit_quality_degradation = true;
+        let err = runner(&config).expect_err(
+            "a degraded population covering 60 of 100 positions must be refused, not padded \
+             with uniform rows",
+        );
+        let msg = err.to_string();
+        for needle in ["degraded", "60", "100"] {
+            assert!(
+                msg.contains(needle),
+                "the error must name the population and both lengths; missing {needle:?} in: {msg}"
+            );
+        }
+    }
+
+    /// The mirror: the HEALTHY population is the short one. Symmetric by construction -- either
+    /// tensor can be the one that gets padded -- and an asymmetric guard would fabricate the
+    /// healthy profile instead of the degraded one.
+    #[test]
+    fn a_healthy_population_too_short_to_cover_the_model_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("short_healthy.fastq");
+        write_groups(
+            &fastq_path,
+            &[(70, "I".repeat(50) + &"+".repeat(50)), (30, "I".repeat(60))],
+        );
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path);
+        config.fit_quality_degradation = true;
+        let err = runner(&config)
+            .expect_err("a healthy population covering 60 of 100 positions must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("healthy") && msg.contains("60") && msg.contains("100"),
+            "the error must name the population and both lengths: {msg}"
+        );
+    }
+
+    /// MUST NOT FIRE: ragged read lengths are fine as long as BOTH populations reach the
+    /// model's read length. The guard is about a population that cannot cover the model, not
+    /// about variable lengths, which every real library has.
+    #[test]
+    fn ragged_lengths_are_accepted_when_both_populations_reach_the_model_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("ragged_both.fastq");
+        write_groups(
+            &fastq_path,
+            &[
+                (40, "I".repeat(100)),
+                (20, "I".repeat(60)),
+                (30, "I".repeat(50) + &"+".repeat(50)),
+                (10, "I".repeat(10) + &"+".repeat(50)),
+            ],
+        );
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.fit_quality_degradation = true;
+        runner(&config).expect("both populations reach 100 bp, so this must fit");
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q = model.quality_score_model();
+        assert_eq!(q.assumed_read_length, 100);
+        let d = q
+            .degradation
+            .as_ref()
+            .expect("two populations were asked for");
+        assert!(
+            (0.38..0.42).contains(&d.read_fraction),
+            "40 of 100 classified reads are degraded; got {:.4}",
             d.read_fraction
         );
     }
