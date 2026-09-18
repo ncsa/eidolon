@@ -166,6 +166,19 @@ pub struct SequencingErrorModel {
     insertion_bias: DiscreteDistribution<Nucleotide>,
     transition_distros: TransitionMatrix,
     quality_score_model: QualityScoreModel,
+    /// The R2 mate's quality model, when the fit was given both mates (#723).
+    ///
+    /// `None` means one model serves both mates, which is every model written before this
+    /// field existed. `skip_serializing_if` so such a model writes the SAME BYTES it wrote
+    /// before -- the same requirement, for the same reason, as `QualityScoreModel::degradation`
+    /// (#694): without it every model file gains `"quality_score_model_r2": null` and the
+    /// frozen baselines all move.
+    ///
+    /// Both mates are indexed against ONE `quality_score_options` list. A model whose two
+    /// halves carried their own option sets would index the wrong scores at generation, which
+    /// is why the fitter pools its counts rather than fitting the mates independently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality_score_model_r2: Option<QualityScoreModel>,
 }
 
 impl SequencingErrorModel {
@@ -201,6 +214,7 @@ impl SequencingErrorModel {
             insertion_bias: default_insertion_bias,
             transition_distros: default_transition_distros,
             quality_score_model,
+            quality_score_model_r2: None,
         })
     }
 
@@ -236,7 +250,43 @@ impl SequencingErrorModel {
             )?,
             transition_distros,
             quality_score_model,
+            quality_score_model_r2: None,
         })
+    }
+
+    /// Attach the R2 mate's quality model (#723).
+    ///
+    /// The caller must have built it against the SAME `quality_score_options` as the R1 model;
+    /// that is checked here rather than trusted, because the failure it prevents is silent —
+    /// generation indexes one option list, so a mismatched pair emits plausible scores drawn
+    /// from the wrong distribution.
+    pub fn with_mate_r2(mut self, r2: QualityScoreModel) -> Result<Self, SeqModelError> {
+        if r2.quality_score_options != self.quality_score_model.quality_score_options {
+            return Err(SeqModelError::QualModelError(
+                QualityModelError::InvalidConfiguration(format!(
+                    "the two mates carry different quality score option sets ({} values for R1, \
+                     {} for R2); generation indexes one list, so they must share it",
+                    self.quality_score_model.quality_score_options.len(),
+                    r2.quality_score_options.len()
+                )),
+            ));
+        }
+        if r2.assumed_read_length != self.quality_score_model.assumed_read_length {
+            return Err(SeqModelError::QualModelError(
+                QualityModelError::InvalidConfiguration(format!(
+                    "the two mates were fitted at different read lengths ({} bp for R1, {} bp \
+                     for R2); both describe the same run",
+                    self.quality_score_model.assumed_read_length, r2.assumed_read_length
+                )),
+            ));
+        }
+        self.quality_score_model_r2 = Some(r2);
+        Ok(self)
+    }
+
+    /// The R2 quality model, when this model carries one.
+    pub fn quality_score_model_r2(&self) -> Option<&QualityScoreModel> {
+        self.quality_score_model_r2.as_ref()
     }
 
     pub fn error_rate(&self) -> f64 {
@@ -459,6 +509,7 @@ mod tests {
             )
             .unwrap(),
             quality_score_model: QualityScoreModel::default().unwrap(),
+            quality_score_model_r2: None,
         };
         let mut rng = make_rng();
         let mut saw_insertion = false;

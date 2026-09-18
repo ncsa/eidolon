@@ -9,7 +9,6 @@ use eidolon_core::{
     structs::transition_matrix::TransitionMatrix,
 };
 use log::{info, warn};
-#[cfg(test)]
 use std::path::PathBuf;
 
 const MAX_SCORE: usize = 94;
@@ -163,128 +162,139 @@ fn validate_record(
     Ok(())
 }
 
-pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
-    let mut iter: Box<dyn Iterator<Item = std::io::Result<String>>> =
-        if is_gzipped_file(&config.fastq_file)? {
-            Box::new(read_gzip_lines(&config.fastq_file)?)
-        } else {
-            Box::new(read_lines(&config.fastq_file)?)
-        };
+/// Everything ONE mate's fit accumulates.
+///
+/// `global_counts` and `total_bases` are deliberately NOT here: they stay pooled across both
+/// mates, so `quality_score_options` is the UNION over the pair. That is the same constraint
+/// the healthy and degraded populations already live under -- `generate_quality_scores`
+/// indexes a single option list, and a tensor built against its own options indexes the wrong
+/// scores (#723, and NEAT2 enforced the parallel rule at `SequenceContainer.py:678`).
+struct MateCounts {
+    seed_counts: Vec<usize>,
+    transition_counts: Vec<Vec<Vec<usize>>>,
+    seed_counts_deg: Vec<usize>,
+    transition_counts_deg: Vec<Vec<Vec<usize>>>,
+    n_degraded: usize,
+    n_healthy: usize,
+    n_unclassifiable: usize,
+    n_deg_low_cut: usize,
+    n_deg_high_cut: usize,
+    records_seen: usize,
+    min_qual_len: usize,
+}
 
-    // The transition tensor GROWS to the longest read seen, rather than being sized up front
-    // from a guess and then enforced as a cap (#697, and the review of #698).
-    //
-    // The previous approach sampled the first 1000 records, took the maximum, and truncated
-    // everything else to it (`scores.len().min(read_length)`). That guess is wrong in both
-    // available directions: too small, and every read past the sample loses its tail exactly
-    // as in #697; too large -- `max_reads` fits fewer records than the length was drawn from --
-    // and the model advertises positions no read ever reached, whose rows fall back to a
-    // uniform distribution. Measured on the latter: a model advertising 100 bp emitted the
-    // trained shape for positions 1-50 and coin-flip noise for 51-100.
-    //
-    // Growing on demand removes the guess. `read_length` becomes an OUTPUT of the fit -- the
-    // maximum over records actually accumulated -- so `max_reads` needs no special case and
-    // nothing is ever truncated. One pass, and the peak allocation is what the old code
-    // allocated up front anyway.
-    //
-    // Truncation was also the only bound on that allocation, so `max_model_read_length` now
-    // supplies one explicitly -- see `accumulate_qual`. Structural validation of the input
-    // (#700) is still outstanding, so a non-FASTQ file is still accepted on its way there.
-    let qual_offset = config.qual_offset;
-    let mut seed_counts = vec![0usize; MAX_SCORE];
-    let mut transition_counts: Vec<Vec<Vec<usize>>> = Vec::new();
-    let mut global_counts = vec![0usize; MAX_SCORE];
-    let mut total_bases: usize = 0;
-    let mut reads_processed: usize = 0;
-
-    /// Accumulate one quality line into the counts.
-    ///
-    /// Every allocated position carries at least one observation BY CONSTRUCTION: a row exists
-    /// only because some read reached that position, and that read necessarily incremented it.
-    /// An untrained position is therefore unrepresentable rather than merely unlikely, which is
-    /// what `every_position_has_an_observation` pins.
-    fn accumulate_qual(
-        qual_line: &str,
-        qual_offset: usize,
-        max_model_read_length: usize,
-        bins: Option<&[usize]>,
-        seed_counts: &mut [usize],
-        transition_counts: &mut Vec<Vec<Vec<usize>>>,
-        global_counts: &mut [usize],
-        total_bases: &mut usize,
-    ) -> Result<bool, GenSeqErrorModelError> {
-        let scores: Vec<usize> = qual_line
-            .bytes()
-            .map(|b| {
-                let raw = (b as usize).saturating_sub(qual_offset).min(MAX_SCORE - 1);
-                match bins {
-                    Some(bins) => snap_to_bin(raw, bins),
-                    None => raw,
-                }
-            })
-            .collect();
-        if scores.is_empty() {
-            return Ok(false);
+impl MateCounts {
+    fn new() -> Self {
+        Self {
+            seed_counts: vec![0usize; MAX_SCORE],
+            transition_counts: Vec::new(),
+            seed_counts_deg: vec![0usize; MAX_SCORE],
+            transition_counts_deg: Vec::new(),
+            n_degraded: 0,
+            n_healthy: 0,
+            n_unclassifiable: 0,
+            n_deg_low_cut: 0,
+            n_deg_high_cut: 0,
+            records_seen: 0,
+            min_qual_len: usize::MAX,
         }
-        // Growing the tensor removed truncation, and truncation was the only bound on the
-        // allocation. This restores a bound WITHOUT restoring silent data loss: a read above
-        // the ceiling stops the run and says so, rather than being quietly trimmed (#697).
-        if max_model_read_length > 0 && scores.len() > max_model_read_length {
-            let mib = scores.len().saturating_sub(1)
-                * MAX_SCORE
-                * MAX_SCORE
-                * std::mem::size_of::<usize>()
+    }
+
+    /// Positions this mate's healthy tensor covers. The degraded one is checked separately.
+    fn positions(&self) -> usize {
+        self.transition_counts
+            .len()
+            .max(self.transition_counts_deg.len())
+    }
+}
+
+/// Accumulate one quality line into the counts.
+///
+/// Every allocated position carries at least one observation BY CONSTRUCTION: a row exists
+/// only because some read reached that position, and that read necessarily incremented it.
+/// An untrained position is therefore unrepresentable rather than merely unlikely, which is
+/// what `every_position_has_an_observation` pins.
+fn accumulate_qual(
+    qual_line: &str,
+    qual_offset: usize,
+    max_model_read_length: usize,
+    bins: Option<&[usize]>,
+    seed_counts: &mut [usize],
+    transition_counts: &mut Vec<Vec<Vec<usize>>>,
+    global_counts: &mut [usize],
+    total_bases: &mut usize,
+) -> Result<bool, GenSeqErrorModelError> {
+    let scores: Vec<usize> = qual_line
+        .bytes()
+        .map(|b| {
+            let raw = (b as usize).saturating_sub(qual_offset).min(MAX_SCORE - 1);
+            match bins {
+                Some(bins) => snap_to_bin(raw, bins),
+                None => raw,
+            }
+        })
+        .collect();
+    if scores.is_empty() {
+        return Ok(false);
+    }
+    // Growing the tensor removed truncation, and truncation was the only bound on the
+    // allocation. This restores a bound WITHOUT restoring silent data loss: a read above
+    // the ceiling stops the run and says so, rather than being quietly trimmed (#697).
+    if max_model_read_length > 0 && scores.len() > max_model_read_length {
+        let mib =
+            scores.len().saturating_sub(1) * MAX_SCORE * MAX_SCORE * std::mem::size_of::<usize>()
                 / (1024 * 1024);
-            return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                "a read is {} bp, above the {} bp limit set by `max_model_read_length`; \
+        return Err(GenSeqErrorModelError::ConfigurationError(format!(
+            "a read is {} bp, above the {} bp limit set by `max_model_read_length`; \
                  modeling it would allocate ~{} MiB of transition counts. Raise that key (or \
                  set it to 0 for no limit) if the input really is this long. Long-read error \
                  models are tracked in #319.",
-                scores.len(),
-                max_model_read_length,
-                mib,
-            )));
-        }
-        seed_counts[scores[0]] += 1;
-        if scores.len() > 1 && transition_counts.len() < scores.len() - 1 {
-            transition_counts.resize(scores.len() - 1, vec![vec![0usize; MAX_SCORE]; MAX_SCORE]);
-        }
-        for j in 1..scores.len() {
-            transition_counts[j - 1][scores[j - 1]][scores[j]] += 1;
-        }
-        for &score in &scores {
-            global_counts[score] += 1;
-        }
-        *total_bases += scores.len();
-        Ok(true)
+            scores.len(),
+            max_model_read_length,
+            mib,
+        )));
     }
+    seed_counts[scores[0]] += 1;
+    if scores.len() > 1 && transition_counts.len() < scores.len() - 1 {
+        transition_counts.resize(scores.len() - 1, vec![vec![0usize; MAX_SCORE]; MAX_SCORE]);
+    }
+    for j in 1..scores.len() {
+        transition_counts[j - 1][scores[j - 1]][scores[j]] += 1;
+    }
+    for &score in &scores {
+        global_counts[score] += 1;
+    }
+    *total_bases += scores.len();
+    Ok(true)
+}
 
-    let bins_slice: Option<&[usize]> = config.binned_quality_bins.as_deref();
-
-    // These two errors used to be raised by the sampling block; they belong to the stream now.
-    let mut records_seen: usize = 0;
-    let mut min_qual_len = usize::MAX;
-
-    // The degraded population (#694), accumulated separately when requested. `global_counts`
-    // stays POOLED across both: the two populations share one `quality_score_options` list,
-    // because generation indexes a single list and a tensor built against its own options would
-    // index the wrong scores.
-    let mut seed_counts_deg = vec![0usize; MAX_SCORE];
-    let mut transition_counts_deg: Vec<Vec<Vec<usize>>> = Vec::new();
-    let mut n_degraded: usize = 0;
-    let mut n_healthy: usize = 0;
-    let mut n_unclassifiable: usize = 0;
-    // The same count at two Q either side of the cut, so the fit can report whether the two
-    // populations are separable or whether the threshold is slicing one distribution in half.
-    let mut n_deg_low_cut: usize = 0;
-    let mut n_deg_high_cut: usize = 0;
-
+/// Read one mate's FASTQ into its own `MateCounts`, pooling the option-set and base counts.
+///
+/// `max_reads` applies PER MATE rather than across the pair: a shared budget would spend it
+/// all on R1 and fit R2 from whatever was left, which is nothing at the default of 0-means-all
+/// and is silently lopsided otherwise.
+fn accumulate_one_file(
+    path: &PathBuf,
+    config: &RunConfiguration,
+    bins_slice: Option<&[usize]>,
+    m: &mut MateCounts,
+    global_counts: &mut [usize],
+    total_bases: &mut usize,
+    reads_processed: &mut usize,
+) -> Result<(), GenSeqErrorModelError> {
+    let mut iter: Box<dyn Iterator<Item = std::io::Result<String>>> = if is_gzipped_file(path)? {
+        Box::new(read_gzip_lines(path)?)
+    } else {
+        Box::new(read_lines(path)?)
+    };
+    let qual_offset = config.qual_offset;
+    let mate_start = *reads_processed;
     'records: loop {
-        if config.max_reads > 0 && reads_processed >= config.max_reads {
+        if config.max_reads > 0 && (*reads_processed) - mate_start >= config.max_reads {
             break;
         }
         // Line number of this record's header, 1-based, for error messages.
-        let first_line = records_seen * 4 + 1;
+        let first_line = m.records_seen * 4 + 1;
 
         // The header is the ONLY line whose absence is a clean end of file. Missing any of the
         // other three means the last record is truncated, which is a corrupt file, not an end.
@@ -298,8 +308,8 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         let qual = next_record_line(&mut iter, first_line, first_line + 3)?;
 
         validate_record(&header, &seq, &plus, &qual, first_line)?;
-        records_seen += 1;
-        min_qual_len = min_qual_len.min(qual.len());
+        m.records_seen += 1;
+        m.min_qual_len = m.min_qual_len.min(qual.len());
 
         // Classify BEFORE accumulating, so the read's counts go to one population or the other.
         // A read shorter than the window cannot be classified; it is counted as healthy and
@@ -313,7 +323,7 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         let degraded = if !config.fit_quality_degradation {
             false
         } else if qual.len() < window {
-            n_unclassifiable += 1;
+            m.n_unclassifiable += 1;
             classifiable = false;
             false
         } else {
@@ -323,25 +333,32 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                 .sum::<f64>()
                 / window as f64;
             if tail < (config.degradation_tail_cut as f64 - 2.0) {
-                n_deg_low_cut += 1;
+                m.n_deg_low_cut += 1;
             }
             if tail < (config.degradation_tail_cut as f64 + 2.0) {
-                n_deg_high_cut += 1;
+                m.n_deg_high_cut += 1;
             }
             tail < config.degradation_tail_cut as f64
         };
         if classifiable {
             if degraded {
-                n_degraded += 1;
+                m.n_degraded += 1;
             } else {
-                n_healthy += 1;
+                m.n_healthy += 1;
             }
         }
 
+        let MateCounts {
+            ref mut seed_counts,
+            ref mut transition_counts,
+            ref mut seed_counts_deg,
+            ref mut transition_counts_deg,
+            ..
+        } = *m;
         let (seed_target, trans_target) = if degraded {
-            (&mut seed_counts_deg, &mut transition_counts_deg)
+            (seed_counts_deg, transition_counts_deg)
         } else {
-            (&mut seed_counts, &mut transition_counts)
+            (seed_counts, transition_counts)
         };
         if accumulate_qual(
             &qual,
@@ -350,12 +367,65 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             bins_slice,
             seed_target,
             trans_target,
-            &mut global_counts,
-            &mut total_bases,
+            global_counts,
+            total_bases,
         )? {
-            reads_processed += 1;
+            (*reads_processed) += 1;
         }
     }
+    Ok(())
+}
+
+pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
+    let mut global_counts = vec![0usize; MAX_SCORE];
+    let mut total_bases: usize = 0;
+    let mut reads_processed: usize = 0;
+    let bins_slice: Option<&[usize]> = config.binned_quality_bins.as_deref();
+
+    // One pass per mate, sharing `global_counts` so the option set is the union over the pair.
+    // Fitting them separately and stapling the results together would give each its own option
+    // list, which generation cannot index.
+    let mut r1 = MateCounts::new();
+    accumulate_one_file(
+        &config.fastq_file,
+        config,
+        bins_slice,
+        &mut r1,
+        &mut global_counts,
+        &mut total_bases,
+        &mut reads_processed,
+    )?;
+    let r2 = match &config.fastq_file_r2 {
+        Some(path) => {
+            let mut m = MateCounts::new();
+            accumulate_one_file(
+                path,
+                config,
+                bins_slice,
+                &mut m,
+                &mut global_counts,
+                &mut total_bases,
+                &mut reads_processed,
+            )?;
+            Some(m)
+        }
+        None => None,
+    };
+
+    // Keep the R1 names the rest of this function already uses.
+    let MateCounts {
+        seed_counts,
+        transition_counts,
+        seed_counts_deg,
+        transition_counts_deg,
+        n_degraded,
+        n_healthy,
+        n_unclassifiable,
+        n_deg_low_cut,
+        n_deg_high_cut,
+        records_seen,
+        min_qual_len,
+    } = r1;
 
     if records_seen == 0 {
         return Err(GenSeqErrorModelError::MalformedFastq(
@@ -366,7 +436,10 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     // The fit's OUTPUT, not an input to it: one row per position after the first. Both
     // populations describe the same read length, because `generate_quality_scores` indexes one
     // position list for either of them.
-    let positions = transition_counts.len().max(transition_counts_deg.len());
+    let positions = transition_counts
+        .len()
+        .max(transition_counts_deg.len())
+        .max(r2.as_ref().map_or(0, |m| m.positions()));
     let read_length = positions + 1;
 
     // Rule 4: a rate over an unknown denominator is not a result, and an empty population is a
@@ -420,11 +493,22 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     // length L trains every position below L -- but the length is a proxy and the observation
     // count is the thing that matters, so an untrained position cannot reappear through some
     // later change to how counts are accumulated.
-    if config.fit_quality_degradation {
-        for (label, counts) in [
-            ("healthy", &transition_counts),
-            ("degraded", &transition_counts_deg),
-        ] {
+    {
+        let mut populations: Vec<(&str, &Vec<Vec<Vec<usize>>>)> = Vec::new();
+        // R1's healthy tensor is checked only when there is a second population to be ragged
+        // against. On its own it defines `positions` and cannot fall short of itself.
+        if config.fit_quality_degradation {
+            populations.push(("healthy", &transition_counts));
+            populations.push(("degraded", &transition_counts_deg));
+        }
+        if let Some(m) = r2.as_ref() {
+            populations.push(("R1", &transition_counts));
+            populations.push(("R2", &m.transition_counts));
+            if config.fit_quality_degradation {
+                populations.push(("R2 degraded", &m.transition_counts_deg));
+            }
+        }
+        for (label, counts) in populations {
             let trained = trained_positions(counts);
             if trained < positions {
                 return Err(GenSeqErrorModelError::ConfigurationError(format!(
@@ -527,28 +611,36 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
 
     let n_scores = quality_score_options.len();
 
-    // Re-index seed counts
-    let seed_weights: Vec<f64> = quality_score_options
-        .iter()
-        .map(|&q| seed_counts[q] as f64)
-        .collect();
+    // Re-index raw MAX_SCORE-indexed counts onto the shared option list. Every population --
+    // R1, its degraded half, R2 and its degraded half -- goes through THESE two closures, so
+    // they cannot drift in how they are built. A pair built two different ways would index
+    // different scores while looking identical.
+    let reindex_seed = |counts: &[usize]| -> Vec<f64> {
+        quality_score_options
+            .iter()
+            .map(|&q| counts[q] as f64)
+            .collect()
+    };
+    let reindex_trans = |counts: &[Vec<Vec<usize>>]| -> Vec<Vec<Vec<f64>>> {
+        (0..read_length - 1)
+            .map(|pos| {
+                (0..n_scores)
+                    .map(|p| {
+                        let prev_raw = quality_score_options[p];
+                        (0..n_scores)
+                            .map(|c| {
+                                let curr_raw = quality_score_options[c];
+                                counts[pos][prev_raw][curr_raw] as f64
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    };
 
-    // Re-index transition counts
-    let trans_weights: Vec<Vec<Vec<f64>>> = (0..read_length - 1)
-        .map(|pos| {
-            (0..n_scores)
-                .map(|p| {
-                    let prev_raw = quality_score_options[p];
-                    (0..n_scores)
-                        .map(|c| {
-                            let curr_raw = quality_score_options[c];
-                            transition_counts[pos][prev_raw][curr_raw] as f64
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
+    let seed_weights = reindex_seed(&seed_counts);
+    let trans_weights = reindex_trans(&transition_counts);
 
     let quality_score_model = QualityScoreModel::from_counts(
         quality_score_options.clone(),
@@ -562,25 +654,8 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     let quality_score_model = if config.fit_quality_degradation {
         let read_fraction = n_degraded as f64 / classified as f64;
 
-        let seed_weights_deg: Vec<f64> = quality_score_options
-            .iter()
-            .map(|&q| seed_counts_deg[q] as f64)
-            .collect();
-        let trans_weights_deg: Vec<Vec<Vec<f64>>> = (0..read_length - 1)
-            .map(|pos| {
-                (0..n_scores)
-                    .map(|p| {
-                        let prev_raw = quality_score_options[p];
-                        (0..n_scores)
-                            .map(|c| {
-                                let curr_raw = quality_score_options[c];
-                                transition_counts_deg[pos][prev_raw][curr_raw] as f64
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
+        let seed_weights_deg = reindex_seed(&seed_counts_deg);
+        let trans_weights_deg = reindex_trans(&transition_counts_deg);
 
         info!(
             "Degraded population: {} of {} classified reads ({:.2}%), {} unclassifiable (shorter \
@@ -659,6 +734,43 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         quality_score_model,
         snp_transition_matrix,
     )?;
+
+    // Attach R2, re-indexed against the SAME option set as R1 (#723).
+    let model = match r2 {
+        None => model,
+        Some(m) => {
+            let r2_model = QualityScoreModel::from_counts(
+                quality_score_options.clone(),
+                read_length,
+                reindex_seed(&m.seed_counts),
+                reindex_trans(&m.transition_counts),
+                is_binned,
+            )?;
+            let r2_model = if config.fit_quality_degradation {
+                let classified_r2 = m.n_degraded + m.n_healthy;
+                info!(
+                    "R2 degraded population: {} of {} classified reads ({:.2}%), {} \
+                     unclassifiable",
+                    m.n_degraded,
+                    classified_r2,
+                    100.0 * m.n_degraded as f64 / classified_r2 as f64,
+                    m.n_unclassifiable,
+                );
+                r2_model.with_degradation(
+                    m.n_degraded as f64 / classified_r2 as f64,
+                    reindex_seed(&m.seed_counts_deg),
+                    reindex_trans(&m.transition_counts_deg),
+                )?
+            } else {
+                r2_model
+            };
+            info!(
+                "Fitted a separate R2 quality model over {} record(s)",
+                m.records_seen
+            );
+            model.with_mate_r2(r2_model)?
+        }
+    };
     model.write_model(&config.output_file)?;
 
     info!("Wrote sequencing error model to {:?}", config.output_file);
@@ -755,6 +867,7 @@ mod tests {
     fn make_config(fastq: PathBuf, output: PathBuf) -> RunConfiguration {
         RunConfiguration {
             fastq_file: fastq,
+            fastq_file_r2: None,
             output_file: output,
             overwrite_output: true,
             max_reads: 0,
@@ -1846,6 +1959,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path.clone(),
             overwrite_output: true,
             max_reads: 0,
@@ -1929,6 +2043,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path.clone(),
             overwrite_output: true,
             max_reads: 0,
@@ -1993,6 +2108,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path.clone(),
             overwrite_output: true,
             max_reads: 0,
@@ -2107,6 +2223,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path.clone(),
             overwrite_output: true,
             max_reads: 0,
@@ -2158,6 +2275,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path,
             overwrite_output: true,
             max_reads: 0,
@@ -2210,6 +2328,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path.clone(),
             overwrite_output: true,
             max_reads: 0,
@@ -2273,6 +2392,7 @@ mod tests {
 
         let config = RunConfiguration {
             fastq_file: fastq_path,
+            fastq_file_r2: None,
             output_file: output_path.clone(),
             overwrite_output: true,
             max_reads: 0,

@@ -16,6 +16,12 @@ qual_offset: 33
 # memory: 1000 bp is about 67 MiB. A read longer than this is an error rather than being
 # silently truncated; raise this key if your reads really are longer.
 max_model_read_length: 1000
+# the R2 mate's FASTQ [optional] - default unset
+# When given, R1 and R2 are fitted into ONE model file as two quality populations sharing a
+# single quality-score option set, and gen-reads draws each mate from its own. Leave it unset
+# and one model serves both mates, exactly as before. HG002 measures R2 about 2.3x worse than
+# R1 on collapsed tails, so a paired library is not well described by one model.
+# fastq_file_r2: /path/to/reads_R2.fastq.gz
 # fit a second, degraded quality population [optional] - default false
 # Real Illumina data is bimodal: about one read in ten collapses toward the 3' end and stays
 # collapsed, and a single transition model cannot represent that. With this on, the fit
