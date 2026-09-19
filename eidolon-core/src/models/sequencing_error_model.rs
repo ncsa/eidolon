@@ -153,6 +153,18 @@ pub const INDEL_CONTEXT_RUN_CAP: usize = DEFAULT_INDEL_CONTEXT_CURVE.len();
 pub struct SequencingErrorModel {
     // Neat only dealt with 2 types of sequencing errors: snps and small indels.
     // We will retain that idea and assume it is accurate.
+    /// A fitted SUMMARY of the quality histogram, and NOT read during generation (#724).
+    ///
+    /// The fitter computes it as `sum(10^(-q/10) * count[q]) / total_bases` and records it.
+    /// Nothing in `gen-reads` consumes it: errors are injected per base from that base's own
+    /// quality score via `convert_score`, so the quality model IS the error rate and this is a
+    /// description of it. Three models differing only in this field — including 0.0 and 0.5 —
+    /// generate byte-identical FASTQ.
+    ///
+    /// It is kept because it is good provenance: it is what makes a fitted model's rate
+    /// comparable against the shipped default's, which is the whole of #695. The name reads
+    /// like a knob, which is how a harness came to pin it expecting the output to move, so:
+    /// **to change how many errors a run produces, change the quality model.**
     error_rate: f64,
     del_length_distribution: DiscreteDistribution<usize>,
     ins_length_distribution: DiscreteDistribution<usize>,

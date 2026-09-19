@@ -17,10 +17,15 @@
 # the cause. The script is kept because the A/B is the right shape for the next candidate;
 # change the field it patches and the guidance below still applies.
 #
-# BOTH arms share one quality-score model -- the same built file, copied and patched -- so
-# the only difference between them is the field under test. Neither arm uses the model
-# compiled into the binary, and that is deliberate: an A/B against the built-in default
-# would differ in the quality model as well and prove nothing about indel_probability.
+# BOTH arms share one quality-score model -- the SHIPPED one, swapped into the built model --
+# so the only difference between them is the field under test, and both sit at the operating
+# point the tier baseline was measured at. The arms must not differ in the quality model, or
+# the comparison says nothing about indel_probability.
+#
+# This previously pinned `error_rate` to the shipped value instead, which did nothing at all:
+# that field is a fitted summary and generation never reads it (#724). Both arms ran at the
+# built model's much quieter distribution, so the guard against an underpowered null was not
+# in effect for the run recorded above.
 #
 # Usage:
 #   bash scripts/delta/make_indel_probability_ab.sh <training.fastq.gz> <outdir>
@@ -53,9 +58,12 @@ echo "[1/3] building the shared base model from $FASTQ ..."
 [[ -s "$BASE" ]] || { echo "ERROR: gen-seq-error-model produced nothing" >&2; exit 1; }
 
 echo "[2/3] writing the two arms ..."
-python3 - "$BASE" "$OUTDIR" <<'PY'
+SHIPPED_QSM="$REPO_ROOT/eidolon-core/src/models/model_data/default_quality_score_model.json.gz"
+[[ -f "$SHIPPED_QSM" ]] || { echo "ERROR: shipped quality model not found: $SHIPPED_QSM" >&2; exit 1; }
+
+python3 - "$BASE" "$OUTDIR" "$SHIPPED_QSM" <<'PY'
 import gzip, json, sys
-base, outdir = sys.argv[1], sys.argv[2]
+base, outdir, shipped_qsm = sys.argv[1], sys.argv[2], sys.argv[3]
 with gzip.open(base, "rt") as fh:
     model = json.load(fh)
 
@@ -66,15 +74,34 @@ if "indel_probability" not in model:
 built = model["indel_probability"]
 print(f"       built model carries indel_probability = {built}")
 
-# Both arms are pinned to the shipped error_rate. A model built from a modern library
-# lands far quieter than the inherited default -- 0.000392 against 0.006638 on HCC1395
-# normal, ~17x -- so arms built straight from real reads would run well below the
-# operating point where the effect appears, and a null result could not be told apart
-# from an underpowered one.
-SHIPPED_ERROR_RATE = 0.006638164688495656
+# Both arms are put at the shipped OPERATING POINT by giving them the shipped quality model.
+# A model built from a modern library lands far quieter than the inherited default --
+# 0.000392 against 0.006638 on HCC1395 normal, ~17x -- so arms built straight from real reads
+# would run well below the point where the effect appears, and a null result could not be told
+# apart from an underpowered one.
+#
+# THIS USED TO PIN `error_rate` INSTEAD, WHICH DID NOTHING (#724). That field is a fitted
+# summary of the quality histogram and is never read during generation: errors are injected per
+# base from the base's own quality score. Both arms therefore ran at the BUILT model's quiet
+# distribution, which is exactly what the pin was meant to correct for -- so the guard against
+# an underpowered null was not in effect for jobs 21823970 / 21823971 (#680).
+#
+# The quality model is what sets the rate, so swap that. `error_rate` is recomputed to stay a
+# true description of the model it now describes rather than of the one it came from.
 built_rate = model.get("error_rate")
+with gzip.open(shipped_qsm, "rt") as fh:
+    model["quality_score_model"] = json.load(fh)
+qsm = model["quality_score_model"]
+# The field now has to describe the model that just replaced it. That value is known exactly --
+# it is the shipped default's own summary, recorded in model_data/README.md -- so it is copied
+# rather than re-derived. Re-deriving the whole-histogram rate means marginalizing the
+# transition tensor over positions, and a position-1 approximation written into a field
+# documented as the histogram's summary would be a wrong number rather than a missing one.
+SHIPPED_ERROR_RATE = 0.006638164688495656
 print(f"       built model error_rate = {built_rate}")
-print(f"       pinning both arms to the shipped {SHIPPED_ERROR_RATE}")
+print(f"       swapped in the shipped quality model "
+      f"({qsm['assumed_read_length']} bp, {len(qsm['quality_score_options'])} options)")
+print(f"       error_rate set to the shipped model's own {SHIPPED_ERROR_RATE}")
 model["error_rate"] = SHIPPED_ERROR_RATE
 
 for value, tag in ((0.01, "p0.01"), (0.40, "p0.40")):
@@ -121,9 +148,11 @@ import csv,sys
 r={(x.get('type') or '').strip().lower():x for x in csv.DictReader(open(sys.argv[1]))}
 print(r['snvs']['recall'], r['snvs']['precision'])" <outdir>/scored.stats.csv
 
-COMPARE THE TWO ARMS TO EACH OTHER, not to the tier baseline. Both arms use a quality
-model built from your FASTQ rather than the one compiled into the binary, so their
-absolute recall will not line up with historical runs. Only the difference is meaningful.
+COMPARE THE TWO ARMS TO EACH OTHER. Both arms now carry the SHIPPED quality model, so
+they sit at the operating point the tier baseline was measured at -- which is the point of
+the swap in step 2, and is what the old `error_rate` pin was trying and failing to do.
+Everything else in the model still comes from your FASTQ, so treat a comparison against
+historical runs as indicative and the arm-to-arm difference as the result.
 
   arms differ materially  -> indel_probability affects somatic calling at this operating
                              point, and the question becomes which value is right.

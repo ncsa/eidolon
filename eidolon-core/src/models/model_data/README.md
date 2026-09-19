@@ -60,6 +60,17 @@ Fitted, unlike the constants below. It is the `avgError` of NEAT2's bundled
 `errorModel_toy.p`, computed from the sequencing data that model was built on. The
 originating sample is not recorded upstream.
 
+**It is a summary, not a setting.** `gen-reads` never reads it. Sequencing errors are
+injected per base from that base's own quality score (`convert_score`, `10^(-q/10)`), so
+the quality model is what determines the rate and this field describes it. Measured: three
+models differing only in this field, including `0.0` and `0.5`, generate byte-identical
+FASTQ.
+
+It is recorded because it makes models comparable — the shipped 0.006638 against HG002 R1
+at 0.002261 and R2 at 0.004454 (#695) is a statement about three quality models. **To
+change how many errors a run produces, change the quality model**; there is no runtime
+scale factor, and #725 scopes what one would have to be.
+
 ### Inherited constants (#660)
 
 We initially tried to match NEAT2 as closely as possible. NEAT2 shipped the following
