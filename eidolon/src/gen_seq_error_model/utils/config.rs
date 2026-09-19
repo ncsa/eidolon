@@ -27,6 +27,14 @@ pub struct RunConfiguration {
     /// A read above this is a hard error rather than a silent truncation, because a silent
     /// truncation is #697.
     pub max_model_read_length: usize,
+    /// The R2 mate's FASTQ, fitted into the SAME model file as a second quality population
+    /// (#723).
+    ///
+    /// Optional, and absent means today's behavior: one quality model serving both mates.
+    /// NEAT2 carried the same option as `genSeqErrorModel.py -i2`, writing one pickle holding
+    /// `initQ/probQ` for R1 and `initQ2/probQ2` for R2 with the score set shared between them.
+    /// The shape here is the same, for the same reason: generation indexes one option list.
+    pub fastq_file_r2: Option<PathBuf>,
     /// Fit a second, degraded quality population alongside the main one (#694).
     ///
     /// OPT-IN, and default false, because it is not yet validated against real data. A model
@@ -86,6 +94,21 @@ impl RunConfiguration {
                     )
                 })?,
         );
+
+        // Read by key like every other option, so an older binary IGNORES this rather than
+        // rejecting it -- which is why a Delta job needs a rebuilt binary, not just a pull.
+        let fastq_file_r2 = match scrape_config.get("fastq_file_r2").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => {
+                let path = PathBuf::from(s);
+                if !path.is_file() {
+                    return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                        "fastq_file_r2 not found: {path:?}"
+                    )));
+                }
+                Some(path)
+            }
+        };
 
         let overwrite_output = scrape_config
             .get("overwrite_output")
@@ -223,6 +246,7 @@ impl RunConfiguration {
 
         Ok(RunConfiguration {
             fastq_file,
+            fastq_file_r2,
             output_file,
             overwrite_output,
             max_reads,

@@ -83,6 +83,9 @@ pub struct GenReadsConfig {
     pub produce_vcf: bool,
     pub rng_seed: String,
     pub sequence_error_model: Option<PathBuf>,
+    /// An explicit `quality_score_model:` override, which applies to the whole run and
+    /// deliberately suppresses a per-mate split (#723).
+    pub quality_score_model: Option<PathBuf>,
     pub num_threads: Option<usize>,
     pub chunk_size: Option<usize>,
     pub input_vcf: Option<PathBuf>,
@@ -105,6 +108,7 @@ impl GenReadsConfig {
             produce_vcf: false,
             rng_seed: "integration phase two".to_string(),
             sequence_error_model: None,
+            quality_score_model: None,
             num_threads: None,
             chunk_size: None,
             input_vcf: None,
@@ -125,6 +129,10 @@ impl GenReadsConfig {
         };
         let model_section = match &self.sequence_error_model {
             Some(p) => format!("sequence_error_model: {}\n", p.display()),
+            None => String::new(),
+        };
+        let quality_model_section = match &self.quality_score_model {
+            Some(p) => format!("quality_score_model: {}\n", p.display()),
             None => String::new(),
         };
         let threads_section = match self.num_threads {
@@ -163,7 +171,7 @@ impl GenReadsConfig {
              output_filename: {name}\n\
              overwrite_output: true\n\
              rng_seed: {seed}\n\
-             {pair}{model}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}",
+             {pair}{model}{qmodel}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}",
             ref_ = self.reference.display(),
             rl = self.read_len,
             cov = self.coverage,
@@ -175,6 +183,7 @@ impl GenReadsConfig {
             seed = self.rng_seed,
             pair = pair_section,
             model = model_section,
+            qmodel = quality_model_section,
             threads = threads_section,
             chunksz = chunk_size_section,
             ivcf = input_vcf_section,
