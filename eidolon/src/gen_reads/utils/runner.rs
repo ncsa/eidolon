@@ -65,6 +65,10 @@ struct ContigContext<'a> {
     fragment_length_model: &'a FragmentLengthModel,
     gc_bias_model: &'a GcBiasModel,
     quality_score_model: &'a QualityScoreModel,
+    /// The R2 mate's quality model (#723), when the fitted model carries one AND the user did
+    /// not name a `quality_score_model:` by hand. An explicit override applies to the whole
+    /// run, so it deliberately suppresses the per-mate split rather than serving R1 only.
+    quality_score_model_r2: Option<&'a QualityScoreModel>,
     seq_error_model: &'a SequencingErrorModel,
     working_dir: &'a std::path::Path,
     base_rng: NeatRng,
@@ -139,6 +143,18 @@ pub fn run_neat(
             None => seq_error_model.quality_score_model().clone(),
         }
     };
+
+    // Per-mate quality (#723). Only when the model carries an R2 population and the user did
+    // not override the quality model wholesale: an explicit `quality_score_model:` names one
+    // model for the run, and silently applying it to R1 while R2 came from somewhere else
+    // would be a surprise, not a feature.
+    let quality_score_model_r2: Option<&QualityScoreModel> = match &config.quality_score_model {
+        Some(_) => None,
+        None => seq_error_model.quality_score_model_r2(),
+    };
+    if quality_score_model_r2.is_some() {
+        info!("Sequencing error model carries a separate R2 quality population; using it for R2");
+    }
 
     let gc_bias_model = match &config.gc_bias_model {
         Some(path) => {
@@ -350,6 +366,7 @@ pub fn run_neat(
         fragment_length_model: &fragment_length_model,
         gc_bias_model: &gc_bias_model,
         quality_score_model: &quality_score_model,
+        quality_score_model_r2,
         seq_error_model: &seq_error_model,
         working_dir: working_dir.path(),
         base_rng: *rng,
@@ -1198,6 +1215,7 @@ fn process_chunk(
                 keep_short,
                 &read_name_prefix,
                 ctx.quality_score_model,
+                ctx.quality_score_model_r2,
                 ctx.seq_error_model,
                 &mut rng,
                 bam_stager,
@@ -1224,6 +1242,7 @@ fn process_chunk(
                 keep_short,
                 &read_name_prefix,
                 ctx.quality_score_model,
+                ctx.quality_score_model_r2,
                 ctx.seq_error_model,
                 &mut rng,
                 bam_stager,
@@ -1257,6 +1276,7 @@ fn process_chunk(
             keep_short,
             &read_name_prefix,
             ctx.quality_score_model,
+            ctx.quality_score_model_r2,
             ctx.seq_error_model,
             &mut rng,
             bam_stager,

@@ -239,6 +239,11 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     keep_short: bool,
     read_name_prefix: &str,
     quality_score_model: &QualityScoreModel,
+    // The R2 mate's quality model (#723). `None` means one model serves both mates, which is
+    // every model written before that field existed and also what an explicit
+    // `quality_score_model:` override means -- a model the user named by hand applies to the
+    // whole run, not to R1 only.
+    quality_score_model_r2: Option<&QualityScoreModel>,
     sequencing_error_model: &SequencingErrorModel,
     rng: &mut NeatRng,
     mut bam_writer: Option<&mut dyn BamRecordStager>,
@@ -587,8 +592,9 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // seq_index past the deleted bases and exhausts the buffer for
         // long deletions near a fragment edge.
         let mut r2_record = if paired_ended {
-            let quality_scores_2 =
-                quality_score_model.generate_quality_scores(effective_read_len, rng)?;
+            // R2 draws from the R2 fit when the model carries one (#723).
+            let qsm_r2 = r2_quality_model(quality_score_model, quality_score_model_r2);
+            let quality_scores_2 = qsm_r2.generate_quality_scores(effective_read_len, rng)?;
             let r2_pos = r2_ref_pos
                 .or(r1_ref_pos)
                 .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
@@ -678,7 +684,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                             rec,
                             r2_adapter,
                             read_length,
-                            quality_score_model,
+                            r2_quality_model(quality_score_model, quality_score_model_r2),
                             sequencing_error_model,
                             rng,
                         )?;
@@ -817,6 +823,19 @@ pub struct HaplotypePairedFragment {
     pub template_length: i32,
 }
 
+/// The quality model R2 draws from: its own when the fit produced one, R1's otherwise (#723).
+///
+/// One helper for all three R2 sites — the paired writer, the haplotype paired writer, and the
+/// R2 adapter readthrough — so they cannot drift. Three copies of `unwrap_or` is three chances
+/// for one of them to keep using R1 after the others stopped, and every aggregate measure over
+/// the pair would still look right.
+fn r2_quality_model<'a>(
+    r1: &'a QualityScoreModel,
+    r2: Option<&'a QualityScoreModel>,
+) -> &'a QualityScoreModel {
+    r2.unwrap_or(r1)
+}
+
 /// Write paired-end reads from expanded-coordinate haplotype windows. R2 is
 /// generated in forward orientation, annotated with its baseline operations,
 /// then reverse-complemented so the two records share the same construction
@@ -829,6 +848,11 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
     read_name_prefix: &str,
     contig_name: &str,
     quality_score_model: &QualityScoreModel,
+    // The R2 mate's quality model (#723). `None` means one model serves both mates, which is
+    // every model written before that field existed and also what an explicit
+    // `quality_score_model:` override means -- a model the user named by hand applies to the
+    // whole run, not to R1 only.
+    quality_score_model_r2: Option<&QualityScoreModel>,
     sequencing_error_model: &SequencingErrorModel,
     rng: &mut NeatRng,
     mut bam_writer: Option<&mut dyn BamRecordStager>,
@@ -873,7 +897,8 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         };
         apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
 
-        let r2_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let r2_quality = r2_quality_model(quality_score_model, quality_score_model_r2)
+            .generate_quality_scores(read_length, rng)?;
         let mut r2 = match generate_read(
             &fragment.r2_sequence,
             // Chimeric reads are stitched from reference pieces: every base is 'M', and
@@ -1578,6 +1603,7 @@ mod tests {
             "hap",
             "chr1",
             &quality_model,
+            None,
             &error_model,
             &mut rng,
             None,
@@ -1627,6 +1653,7 @@ mod tests {
                 "hap",
                 "chr1",
                 &quality_model,
+                None,
                 &error_model,
                 &mut rng,
                 Some(&mut captured),
@@ -1906,6 +1933,7 @@ mod tests {
             false, // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -2002,6 +2030,7 @@ mod tests {
             false, // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -2096,6 +2125,7 @@ mod tests {
             true,  // keep_short (adapters on → short fragments kept)
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -2193,6 +2223,7 @@ mod tests {
             true,  // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -2931,6 +2962,7 @@ mod tests {
             false, // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             stager,
