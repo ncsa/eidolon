@@ -1556,6 +1556,60 @@ mod tests {
         assert_eq!(r2.assumed_read_length, 100);
     }
 
+    /// The fourth population. A fully loaded fit carries R1/R2 x healthy/degraded, and
+    /// `R2 degraded` is the one label that sits on both axes -- so its refusal has to name
+    /// both, and a run that trimmed only its R2 mate needs to hear about the mate files as
+    /// well as the flag.
+    ///
+    /// This drives the four-tensor path far enough to pin the refusal. It is NOT a fidelity
+    /// test of a four-population model: that a loaded fit reproduces all four distributions is
+    /// still unmeasured.
+    #[test]
+    fn a_short_r2_degraded_population_is_refused_and_names_both_axes() {
+        let temp = tempfile::tempdir().unwrap();
+        let r1_path = temp.path().join("both_ok_r1.fastq");
+        let r2_path = temp.path().join("short_deg_r2.fastq");
+        // R1: healthy and degraded both reach 100 bp.
+        write_groups(
+            &r1_path,
+            &[
+                (40, "I".repeat(100)),
+                (30, "I".repeat(50) + &"+".repeat(50)),
+            ],
+        );
+        // R2: healthy reaches 100 bp, degraded stops at 60.
+        write_groups(
+            &r2_path,
+            &[
+                (40, "I".repeat(100)),
+                (30, "I".repeat(10) + &"+".repeat(50)),
+            ],
+        );
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(r1_path, output_path.clone());
+        config.fastq_file_r2 = Some(r2_path);
+        config.fit_quality_degradation = true;
+        let err = runner(&config)
+            .expect_err("R2's degraded population covers 60 of 100 positions and must be refused");
+        let msg = err.to_string();
+        for needle in ["R2 degraded", "60", "100"] {
+            assert!(
+                msg.contains(needle),
+                "the error must name the population and both lengths; missing {needle:?} in: \
+                 {msg}"
+            );
+        }
+        assert!(
+            msg.contains("mate files") && msg.contains("fit_quality_degradation"),
+            "this label sits on both axes, so its remedy must name both: {msg}"
+        );
+        assert!(
+            !output_path.exists(),
+            "a refused run must not leave a model file behind"
+        );
+    }
+
     /// `max_reads` applies PER MATE (#723). A shared budget spends it all on R1 and fits R2
     /// from what is left -- nothing -- which the ragged refusal above would turn into an error
     /// rather than a silent lopsided fit, but the declared semantics are that each mate gets
