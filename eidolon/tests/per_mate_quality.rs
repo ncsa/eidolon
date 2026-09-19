@@ -70,12 +70,23 @@ fn fit(work: &Path, r1: &Path, r2: Option<&Path>, tag: &str) -> PathBuf {
 
 /// Generate paired reads from `model` and return (R1 lines, R2 lines).
 fn generate(work: &Path, model: &Path, tag: &str) -> (Vec<String>, Vec<String>) {
+    generate_with_override(work, model, None, tag)
+}
+
+/// As `generate`, with an optional explicit `quality_score_model:` for the whole run.
+fn generate_with_override(
+    work: &Path,
+    model: &Path,
+    quality_override: Option<&Path>,
+    tag: &str,
+) -> (Vec<String>, Vec<String>) {
     let mut cfg = GenReadsConfig::new(h1n1_reference(), work.to_path_buf(), &format!("gen_{tag}"));
     cfg.paired_ended = true;
     cfg.read_len = READ_LEN;
     cfg.coverage = 6;
     cfg.rng_seed = "723".to_string();
     cfg.sequence_error_model = Some(model.to_path_buf());
+    cfg.quality_score_model = quality_override.map(|p| p.to_path_buf());
     let yaml = cfg.write_yaml();
     let out = eidolon()
         .args(["gen-reads", "-c"])
@@ -189,5 +200,71 @@ fn a_single_fastq_fit_still_serves_both_mates() {
     assert!(
         (m1 - 40.0).abs() < 0.5 && (m2 - 40.0).abs() < 0.5,
         "with one fitted library both mates must carry it: R1 Q{m1:.3}, R2 Q{m2:.3}"
+    );
+}
+
+/// Lift a fitted model's R1 quality model out into a standalone file -- what
+/// `quality_score_model:` takes. The provenance stamp is left behind with the rest of the
+/// enclosing model, which a reader treats as a pre-stamp file and loads.
+fn extract_r1_quality_model(model: &Path, out: &Path) {
+    let decoder = flate2::read::GzDecoder::new(std::fs::File::open(model).unwrap());
+    let parsed: serde_json::Value = serde_json::from_reader(decoder).unwrap();
+    let quality = parsed
+        .get("quality_score_model")
+        .expect("a fitted sequencing-error model carries a quality model")
+        .clone();
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(out).unwrap(),
+        flate2::Compression::default(),
+    );
+    serde_json::to_writer(&mut encoder, &quality).unwrap();
+    encoder.finish().unwrap();
+}
+
+/// MUST NOT FIRE: an explicit `quality_score_model:` names ONE model for the run, so it
+/// suppresses the per-mate split rather than serving R1 while R2 comes from somewhere the user
+/// did not ask for.
+///
+/// KNOWN ANSWER. The model fitted here is the Q40/Q20 pair, and the override handed back is its
+/// own R1 half — so both output FASTQs must read Q40. Q20 on R2 means the model's R2 population
+/// won over the override on one mate only, which is the half-applied case that every aggregate
+/// measure over the pair would pass.
+#[test]
+fn an_explicit_quality_model_override_applies_to_both_mates() {
+    let (_g, work) = fresh_workdir();
+    let r1_fq = work.join("ovr_r1.fastq");
+    let r2_fq = work.join("ovr_r2.fastq");
+    write_flat_fastq(&r1_fq, 200, R1_QUAL);
+    write_flat_fastq(&r2_fq, 200, R2_QUAL);
+
+    let model = fit(&work, &r1_fq, Some(&r2_fq), "ovr");
+    let quality_only = work.join("r1_quality_only.json.gz");
+    extract_r1_quality_model(&model, &quality_only);
+
+    // The control: with no override, this same model splits the mates.
+    let (split1, split2) = generate(&work, &model, "ovr_split");
+    let (sm1, _) = mean_quality(&split1);
+    let (sm2, _) = mean_quality(&split2);
+    assert!(
+        (sm1 - 40.0).abs() < 0.5 && (sm2 - 20.0).abs() < 0.5,
+        "the model under test must split the mates when nothing overrides it: \
+         R1 Q{sm1:.3}, R2 Q{sm2:.3}"
+    );
+
+    let (out1, out2) = generate_with_override(&work, &model, Some(&quality_only), "ovr_named");
+    let (m1, n1) = mean_quality(&out1);
+    let (m2, n2) = mean_quality(&out2);
+    eprintln!("override R1 Q{m1:.3} ({n1} reads), R2 Q{m2:.3} ({n2} reads)");
+    assert!(n1 > 50 && n2 > 50, "too few reads to rate: {n1} / {n2}");
+
+    assert!(
+        (m1 - 40.0).abs() < 0.5,
+        "R1 must come from the named model: Q{m1:.3}"
+    );
+    assert!(
+        (m2 - 40.0).abs() < 0.5,
+        "an explicit quality_score_model: applies to the whole run, so R2 must come from it \
+         too; Q{m2:.3} (Q20 means the model's R2 population overrode the user's choice on one \
+         mate)"
     );
 }

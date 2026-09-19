@@ -494,21 +494,39 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
     // count is the thing that matters, so an untrained position cannot reappear through some
     // later change to how counts are accumulated.
     {
-        let mut populations: Vec<(&str, &Vec<Vec<Vec<usize>>>)> = Vec::new();
+        // The remedy names the axis the populations came from. A run that never set
+        // `fit_quality_degradation` was once told to unset it, because one message served
+        // every label.
+        const DEGRADED_REMEDY: &str = "trim or filter the library so the two carry the same \
+                                       read lengths, or unset fit_quality_degradation to fit \
+                                       a single population.";
+        const MATE_REMEDY: &str = "trim or filter the two mate files so they carry the same \
+                                   read lengths, or drop fastq_file_r2 to fit one quality \
+                                   model for both mates.";
+        const MATE_DEGRADED_REMEDY: &str = "trim or filter the two mate files so they carry \
+                                            the same read lengths, or unset \
+                                            fit_quality_degradation to fit one population per \
+                                            mate.";
+
+        let mut populations: Vec<(&str, &Vec<Vec<Vec<usize>>>, &str)> = Vec::new();
         // R1's healthy tensor is checked only when there is a second population to be ragged
         // against. On its own it defines `positions` and cannot fall short of itself.
         if config.fit_quality_degradation {
-            populations.push(("healthy", &transition_counts));
-            populations.push(("degraded", &transition_counts_deg));
+            populations.push(("healthy", &transition_counts, DEGRADED_REMEDY));
+            populations.push(("degraded", &transition_counts_deg, DEGRADED_REMEDY));
         }
         if let Some(m) = r2.as_ref() {
-            populations.push(("R1", &transition_counts));
-            populations.push(("R2", &m.transition_counts));
+            populations.push(("R1", &transition_counts, MATE_REMEDY));
+            populations.push(("R2", &m.transition_counts, MATE_REMEDY));
             if config.fit_quality_degradation {
-                populations.push(("R2 degraded", &m.transition_counts_deg));
+                populations.push((
+                    "R2 degraded",
+                    &m.transition_counts_deg,
+                    MATE_DEGRADED_REMEDY,
+                ));
             }
         }
-        for (label, counts) in populations {
+        for (label, counts, remedy) in populations {
             let trained = trained_positions(counts);
             if trained < positions {
                 return Err(GenSeqErrorModelError::ConfigurationError(format!(
@@ -516,9 +534,8 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                      {read_length} bp: positions {} to {read_length} carry no {label} \
                      observation at all. Filling them would give that population a uniform \
                      quality distribution -- fabricated data a reader cannot distinguish \
-                     from a fit. Both populations must reach the model's read length: trim \
-                     or filter the library so the two carry the same read lengths, or unset \
-                     fit_quality_degradation to fit a single population.",
+                     from a fit. Every population must reach the model's read length: \
+                     {remedy}",
                     trained + 1,
                     trained + 2,
                 )));
@@ -1447,6 +1464,144 @@ mod tests {
         assert!(
             msg.contains("healthy") && msg.contains("60") && msg.contains("100"),
             "the error must name the population and both lengths: {msg}"
+        );
+    }
+
+    /// #723: the same refusal on the MATE axis. R2 covering 60 of the model's 100 positions
+    /// must be refused, not padded -- `build_distros` turns a padded all-zero row into a
+    /// UNIFORM draw, so R2 would carry invented quality from base 62 on, and nothing
+    /// downstream could tell that from a fit.
+    ///
+    /// Reachable only through this path. `with_mate_r2`'s own length guard cannot fire from
+    /// here, because the fitter hands both mates one `read_length` by construction; the unit
+    /// tests in `sequencing_error_model.rs` cover that guard for a library caller.
+    #[test]
+    fn a_short_r2_is_refused_rather_than_padded() {
+        let temp = tempfile::tempdir().unwrap();
+        let r1_path = temp.path().join("long_r1.fastq");
+        let r2_path = temp.path().join("short_r2.fastq");
+        write_groups(&r1_path, &[(20, "I".repeat(100))]);
+        write_groups(&r2_path, &[(20, "I".repeat(60))]);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(r1_path, output_path.clone());
+        config.fastq_file_r2 = Some(r2_path);
+        let err = runner(&config).expect_err(
+            "an R2 covering 60 of the model's 100 positions must be refused, not padded with \
+             uniform rows",
+        );
+        let msg = err.to_string();
+        for needle in ["R2", "60", "100"] {
+            assert!(
+                msg.contains(needle),
+                "the error must name the mate and both lengths; missing {needle:?} in: {msg}"
+            );
+        }
+        // The remedy must name the axis this run actually used. One shared message told a run
+        // that never set `fit_quality_degradation` to unset it.
+        assert!(
+            msg.contains("fastq_file_r2") && !msg.contains("fit_quality_degradation"),
+            "a mate-length refusal must point at the mate inputs, not at a flag this run \
+             never set: {msg}"
+        );
+        assert!(
+            !output_path.exists(),
+            "a refused run must not leave a model file behind"
+        );
+    }
+
+    /// The mirror. Either mate can be the short one, and an asymmetric guard would fabricate
+    /// R1's profile instead of R2's.
+    #[test]
+    fn a_short_r1_is_refused_when_the_mate_is_longer() {
+        let temp = tempfile::tempdir().unwrap();
+        let r1_path = temp.path().join("short_r1.fastq");
+        let r2_path = temp.path().join("long_r2.fastq");
+        write_groups(&r1_path, &[(20, "I".repeat(60))]);
+        write_groups(&r2_path, &[(20, "I".repeat(100))]);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(r1_path, output_path);
+        config.fastq_file_r2 = Some(r2_path);
+        let err = runner(&config)
+            .expect_err("an R1 covering 60 of the model's 100 positions must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("R1") && msg.contains("60") && msg.contains("100"),
+            "the error must name the mate and both lengths: {msg}"
+        );
+    }
+
+    /// MUST NOT FIRE: two mates that reach the same length are accepted, and the model carries
+    /// both. The guard is about a population that cannot cover the model, not about the mates
+    /// differing -- which is the entire point of fitting them separately.
+    #[test]
+    fn mates_that_both_reach_the_model_length_are_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let r1_path = temp.path().join("r1.fastq");
+        let r2_path = temp.path().join("r2.fastq");
+        write_groups(&r1_path, &[(20, "I".repeat(100))]);
+        write_groups(&r2_path, &[(20, "5".repeat(100))]);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(r1_path, output_path.clone());
+        config.fastq_file_r2 = Some(r2_path);
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let r2 = model
+            .quality_score_model_r2()
+            .expect("a two-FASTQ fit must carry an R2 population");
+        assert_eq!(model.quality_score_model().assumed_read_length, 100);
+        assert_eq!(r2.assumed_read_length, 100);
+    }
+
+    /// `max_reads` applies PER MATE (#723). A shared budget spends it all on R1 and fits R2
+    /// from what is left -- nothing -- which the ragged refusal above would turn into an error
+    /// rather than a silent lopsided fit, but the declared semantics are that each mate gets
+    /// its own N.
+    ///
+    /// KNOWN ANSWER, computable from the fixtures: each file's first 10 records carry one
+    /// quality value and its remaining 90 carry another. With a per-mate budget of 10 the
+    /// union option set is exactly {Q20, Q40} -- the two capped-in values -- and Q30/Q10 never
+    /// enter the model. An ignored budget admits all four; a shared budget starves R2.
+    #[test]
+    fn max_reads_applies_to_each_mate() {
+        let temp = tempfile::tempdir().unwrap();
+        let r1_path = temp.path().join("capped_r1.fastq");
+        let r2_path = temp.path().join("capped_r2.fastq");
+        // 'I' = Q40, '?' = Q30, '5' = Q20, '+' = Q10 under Phred+33.
+        write_groups(&r1_path, &[(10, "I".repeat(50)), (90, "?".repeat(50))]);
+        write_groups(&r2_path, &[(10, "5".repeat(50)), (90, "+".repeat(50))]);
+
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(r1_path, output_path.clone());
+        config.fastq_file_r2 = Some(r2_path);
+        config.max_reads = 10;
+        runner(&config).unwrap();
+
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let q1 = model.quality_score_model();
+        let q2 = model
+            .quality_score_model_r2()
+            .expect("R2 must be fitted from its own 10 records, not from R1's leftovers");
+        assert_eq!(
+            q1.quality_score_options,
+            vec![20, 40],
+            "the option set is the union over the two capped mates; Q30 or Q10 here means \
+             `max_reads` did not apply"
+        );
+
+        let mut rng = eidolon_core::rng::NeatRng::new_from_seed(&vec!["723".to_string()]).unwrap();
+        let s1 = q1.generate_quality_scores(50, &mut rng).unwrap();
+        let s2 = q2.generate_quality_scores(50, &mut rng).unwrap();
+        assert!(
+            s1.iter().all(|&s| s == 40),
+            "R1 was capped to its 10 all-Q40 records: {s1:?}"
+        );
+        assert!(
+            s2.iter().all(|&s| s == 20),
+            "R2 was capped to its 10 all-Q20 records: {s2:?}"
         );
     }
 
