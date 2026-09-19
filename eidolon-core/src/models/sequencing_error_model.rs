@@ -178,6 +178,19 @@ pub struct SequencingErrorModel {
     insertion_bias: DiscreteDistribution<Nucleotide>,
     transition_distros: TransitionMatrix,
     quality_score_model: QualityScoreModel,
+    /// The R2 mate's quality model, when the fit was given both mates (#723).
+    ///
+    /// `None` means one model serves both mates, which is every model written before this
+    /// field existed. `skip_serializing_if` so such a model writes the SAME BYTES it wrote
+    /// before -- the same requirement, for the same reason, as `QualityScoreModel::degradation`
+    /// (#694): without it every model file gains `"quality_score_model_r2": null` and the
+    /// frozen baselines all move.
+    ///
+    /// Both mates are indexed against ONE `quality_score_options` list. A model whose two
+    /// halves carried their own option sets would index the wrong scores at generation, which
+    /// is why the fitter pools its counts rather than fitting the mates independently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality_score_model_r2: Option<QualityScoreModel>,
 }
 
 impl SequencingErrorModel {
@@ -213,6 +226,7 @@ impl SequencingErrorModel {
             insertion_bias: default_insertion_bias,
             transition_distros: default_transition_distros,
             quality_score_model,
+            quality_score_model_r2: None,
         })
     }
 
@@ -248,7 +262,43 @@ impl SequencingErrorModel {
             )?,
             transition_distros,
             quality_score_model,
+            quality_score_model_r2: None,
         })
+    }
+
+    /// Attach the R2 mate's quality model (#723).
+    ///
+    /// The caller must have built it against the SAME `quality_score_options` as the R1 model;
+    /// that is checked here rather than trusted, because the failure it prevents is silent —
+    /// generation indexes one option list, so a mismatched pair emits plausible scores drawn
+    /// from the wrong distribution.
+    pub fn with_mate_r2(mut self, r2: QualityScoreModel) -> Result<Self, SeqModelError> {
+        if r2.quality_score_options != self.quality_score_model.quality_score_options {
+            return Err(SeqModelError::QualModelError(
+                QualityModelError::InvalidConfiguration(format!(
+                    "the two mates carry different quality score option sets ({} values for R1, \
+                     {} for R2); generation indexes one list, so they must share it",
+                    self.quality_score_model.quality_score_options.len(),
+                    r2.quality_score_options.len()
+                )),
+            ));
+        }
+        if r2.assumed_read_length != self.quality_score_model.assumed_read_length {
+            return Err(SeqModelError::QualModelError(
+                QualityModelError::InvalidConfiguration(format!(
+                    "the two mates were fitted at different read lengths ({} bp for R1, {} bp \
+                     for R2); both describe the same run",
+                    self.quality_score_model.assumed_read_length, r2.assumed_read_length
+                )),
+            ));
+        }
+        self.quality_score_model_r2 = Some(r2);
+        Ok(self)
+    }
+
+    /// The R2 quality model, when this model carries one.
+    pub fn quality_score_model_r2(&self) -> Option<&QualityScoreModel> {
+        self.quality_score_model_r2.as_ref()
     }
 
     pub fn error_rate(&self) -> f64 {
@@ -471,6 +521,7 @@ mod tests {
             )
             .unwrap(),
             quality_score_model: QualityScoreModel::default().unwrap(),
+            quality_score_model_r2: None,
         };
         let mut rng = make_rng();
         let mut saw_insertion = false;
@@ -1102,5 +1153,100 @@ mod tests {
                 );
             }
         }
+    }
+    /// A quality model over `options` at `read_length` bp, whose seed puts all its weight on
+    /// `seed_weights` and whose every transition row keeps the previous score. A read from it
+    /// therefore carries one value end to end, so "which mate produced this" is readable off
+    /// the output.
+    fn mate_model(
+        options: Vec<usize>,
+        read_length: usize,
+        seed_weights: Vec<f64>,
+    ) -> QualityScoreModel {
+        let n = options.len();
+        let stay: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect();
+        QualityScoreModel::from_counts(
+            options,
+            read_length,
+            seed_weights,
+            vec![stay; read_length - 1],
+            false,
+        )
+        .unwrap()
+    }
+
+    /// #723: the two mates must be built against ONE option set, because
+    /// `generate_quality_scores` indexes a single list -- a mate carrying its own list would
+    /// index the wrong scores and emit plausible values from the wrong distribution.
+    ///
+    /// `gen-seq-error-model` cannot reach this: it builds both mates from the union of
+    /// `global_counts` by construction. The guard exists for any other caller, and an
+    /// unreachable guard with no test is a guard nobody knows still works.
+    #[test]
+    fn mates_built_against_different_option_sets_are_refused() {
+        let r1 = mate_model(vec![20, 40], 10, vec![0.0, 1.0]);
+        let r2 = mate_model(vec![20, 30, 40], 10, vec![1.0, 0.0, 0.0]);
+        let model = SequencingErrorModel::from_raw_data(0.001, r1, None).unwrap();
+
+        let err = model
+            .with_mate_r2(r2)
+            .expect_err("mates carrying different option sets must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("option sets") && msg.contains('2') && msg.contains('3'),
+            "the refusal must name the mismatch and both sizes: {msg}"
+        );
+    }
+
+    /// The other half of the same guard: one read length describes one run, and a mate fitted
+    /// at a different length would be indexed past its own tensor.
+    #[test]
+    fn mates_fitted_at_different_read_lengths_are_refused() {
+        let r1 = mate_model(vec![20, 40], 10, vec![0.0, 1.0]);
+        let r2 = mate_model(vec![20, 40], 12, vec![1.0, 0.0]);
+        let model = SequencingErrorModel::from_raw_data(0.001, r1, None).unwrap();
+
+        let err = model
+            .with_mate_r2(r2)
+            .expect_err("mates fitted at different read lengths must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read lengths") && msg.contains("10") && msg.contains("12"),
+            "the refusal must name both lengths: {msg}"
+        );
+    }
+
+    /// MUST NOT FIRE: an agreeing pair attaches, and the attached model is R2's rather than a
+    /// second copy of R1's. Asserted on what the two models EMIT -- storing R1 twice passes
+    /// any check that only asks whether an R2 population is present.
+    #[test]
+    fn an_agreeing_pair_of_mates_attaches_and_keeps_them_apart() {
+        let r1 = mate_model(vec![20, 40], 10, vec![0.0, 1.0]);
+        let r2 = mate_model(vec![20, 40], 10, vec![1.0, 0.0]);
+        let model = SequencingErrorModel::from_raw_data(0.001, r1, None)
+            .unwrap()
+            .with_mate_r2(r2)
+            .expect("mates agreeing on option set and read length must be accepted");
+
+        let mut rng = make_rng();
+        let s1 = model
+            .quality_score_model()
+            .generate_quality_scores(10, &mut rng)
+            .unwrap();
+        let s2 = model
+            .quality_score_model_r2()
+            .expect("the pair was accepted, so an R2 population must be present")
+            .generate_quality_scores(10, &mut rng)
+            .unwrap();
+        assert!(
+            s1.iter().all(|&q| q == 40),
+            "R1's seed put all its weight on Q40: {s1:?}"
+        );
+        assert!(
+            s2.iter().all(|&q| q == 20),
+            "R2's seed put all its weight on Q20; Q40 here means R1 was stored twice: {s2:?}"
+        );
     }
 }
