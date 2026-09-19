@@ -20,3 +20,6 @@
 
 # Test drift dumps (written by model_parity when a baseline mismatches)
 *.canonical.actual.json
+
+# mdBook build output
+docs-site/book/
