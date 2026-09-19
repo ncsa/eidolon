@@ -23,6 +23,20 @@
 # Usage:
 #   sbatch scripts/delta/stage_hg002.sh
 #   CHUNKS="L001:001 L001:002" MAX_PAIRS=20000000 sbatch scripts/delta/stage_hg002.sh
+#
+#   # reads only, for a quality-model fit -- no reference, no index, no alignment
+#   ALIGN=0 sbatch scripts/delta/stage_hg002.sh
+#
+#   # a different GIAB library: give the directory and the two filename shapes
+#   ALIGN=0 BASE=https://.../SOME_DATASET/reads \
+#     R1_PATTERN='PREFIX_{lane}_R1_{id}.fastq.gz' \
+#     R2_PATTERN='PREFIX_{lane}_R2_{id}.fastq.gz' \
+#     DATA_DIR=$SCRATCH/neat_data/hg002_other sbatch scripts/delta/stage_hg002.sh
+#
+# The default library is NIST's 2x250, which is HiSeq 2500-era continuous quality scoring.
+# There is no NovaSeq dataset under the GIAB AshkenazimTrio HG002 path -- its Illumina sets are
+# NIST_Illumina_2x250bps and NIST_HiSeq_HG002_Homogeneity, both HiSeq. Staging a binned-quality
+# library means pointing this at a dataset hosted elsewhere (#730).
 
 #SBATCH --job-name=eidolon-stagehg002
 #SBATCH --partition=cpu
@@ -48,15 +62,39 @@ VCF="${HG002_VCF:-$D/HG002_GRCh38_v4.2.1_benchmark.vcf.gz}"
 CHUNKS="${CHUNKS:-L001:001}"
 MAX_PAIRS="${MAX_PAIRS:-0}"                 # 0 = use all downloaded reads; else subsample
 THREADS="${SLURM_CPUS_PER_TASK:-16}"
-BASE="https://ftp-trace.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG002_NA24385_son/NIST_Illumina_2x250bps/reads"
+
+# WHICH GIAB LIBRARY. Defaults to NIST's 2x250, which is what this script has always fetched.
+# That set is HiSeq 2500-era CONTINUOUS quality scoring -- measured on the fitted model: 31
+# options spanning Q2-Q40, near-contiguous, not binned (#677). Point BASE and the two patterns
+# at another GIAB dataset to stage a different chemistry; the naming differs per dataset, so
+# both the directory and the filename shape are parameters rather than one guessed template.
+# `{lane}` and `{id}` are substituted from each CHUNKS entry.
+BASE="${BASE:-https://ftp-trace.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG002_NA24385_son/NIST_Illumina_2x250bps/reads}"
+R1_PATTERN="${R1_PATTERN:-D1_S1_{lane}_R1_{id}.fastq.gz}"
+R2_PATTERN="${R2_PATTERN:-D1_S1_{lane}_R2_{id}.fastq.gz}"
+
+# ALIGN=0 stages the READS ONLY -- no reference index, no alignment, no BAM.
+#
+# `gen-seq-error-model` reads FASTQ and nothing else, so fitting a quality model needs none of
+# section 2 or 3 below. Those exist for the model builders, which want a BAM. Skipping them
+# turns a job that spends 1-2 h aligning (plus a one-time ~64 GB-RAM bwa-mem2 index) into a
+# download, which is the difference between a plausible experiment and an expensive one.
+ALIGN="${ALIGN:-1}"
 
 mkdir -p "$D"
-module load samtools/1.22-cce19.0.0
-setup_conda
-conda_activate bioinf                       # bwa-mem2
+# Only the align path needs these. A reads-only run is wget and gzip, so loading them would
+# make the job fail on an environment it never uses.
+if [[ "$ALIGN" -eq 1 ]]; then
+    module load samtools/1.22-cce19.0.0
+    setup_conda
+    conda_activate bioinf                   # bwa-mem2
+fi
 
-[[ -f "$REF" ]] || { echo "GRCh38 reference not staged: $REF" >&2; exit 1; }
-echo "=== stage HG002: chunks=[$CHUNKS]  ref=$REF  max_pairs=$MAX_PAIRS  threads=$THREADS ==="
+[[ "$ALIGN" -ne 1 || -f "$REF" ]] || { echo "GRCh38 reference not staged: $REF" >&2; exit 1; }
+echo "=== stage HG002: chunks=[$CHUNKS]  max_pairs=$MAX_PAIRS  threads=$THREADS ==="
+echo "    source: $BASE"
+echo "    align:  $ALIGN  (0 = reads only, no BAM)"
+[[ "$ALIGN" -eq 1 ]] && echo "    ref:    $REF"
 
 # ── 1. download + concatenate read chunks (GIAB FTP, resumable) ─────────────────
 R1="$D/hg002_R1.fastq.gz"; R2="$D/hg002_R2.fastq.gz"
@@ -64,7 +102,8 @@ if [[ ! -s "$R1" || ! -s "$R2" ]]; then
     : > "$R1"; : > "$R2"
     for spec in $CHUNKS; do
         lane="${spec%%:*}"; id="${spec##*:}"
-        f1="D1_S1_${lane}_R1_${id}.fastq.gz"; f2="D1_S1_${lane}_R2_${id}.fastq.gz"
+        f1="${R1_PATTERN//\{lane\}/$lane}"; f1="${f1//\{id\}/$id}"
+        f2="${R2_PATTERN//\{lane\}/$lane}"; f2="${f2//\{id\}/$id}"
         echo "downloading $f1 / $f2 ..."
         wget -c -O "$D/$f1" "$BASE/$f1"
         wget -c -O "$D/$f2" "$BASE/$f2"
@@ -84,44 +123,63 @@ if [[ "$MAX_PAIRS" -gt 0 && ! -s "$D/sub_1.fastq.gz" ]]; then
 fi
 [[ "$MAX_PAIRS" -gt 0 ]] && { R1="$D/sub_1.fastq.gz"; R2="$D/sub_2.fastq.gz"; }
 
-# ── 2. index reference (bwa-mem2 + faidx); -s guard against a 0-byte stub ────────
-[[ -f "$REF.fai" ]] || samtools faidx "$REF"
-if [[ ! -s "$REF.bwt.2bit.64" ]]; then
-    echo "building bwa-mem2 index for GRCh38 (one-time, ~64 GB RAM, ~30 GB disk)..."
-    bwa-mem2 index "$REF"
-fi
+# Sections 2-4 build the BAM the model builders want. A quality-model fit needs none of it.
+VCF_OK=0
+if [[ "$ALIGN" -eq 1 ]]; then
+    # ── 2. index reference (bwa-mem2 + faidx); -s guard against a 0-byte stub ────────
+    [[ -f "$REF.fai" ]] || samtools faidx "$REF"
+    if [[ ! -s "$REF.bwt.2bit.64" ]]; then
+        echo "building bwa-mem2 index for GRCh38 (one-time, ~64 GB RAM, ~30 GB disk)..."
+        bwa-mem2 index "$REF"
+    fi
 
-# ── 3. align → coordinate-sorted BAM ─────────────────────────────────────────────
-if [[ ! -s "$D/hg002.bam" ]]; then
-    echo "aligning HG002 reads to GRCh38..."
-    bwa-mem2 mem -t "$THREADS" "$REF" "$R1" "$R2" 2> "$D/bwa.log" \
-        | samtools sort -@ "$THREADS" -o "$D/hg002.bam" -
-    samtools index "$D/hg002.bam"
-fi
+    # ── 3. align → coordinate-sorted BAM ─────────────────────────────────────────────
+    if [[ ! -s "$D/hg002.bam" ]]; then
+        echo "aligning HG002 reads to GRCh38..."
+        bwa-mem2 mem -t "$THREADS" "$REF" "$R1" "$R2" 2> "$D/bwa.log" \
+            | samtools sort -@ "$THREADS" -o "$D/hg002.bam" -
+        samtools index "$D/hg002.bam"
+    fi
 
-# ── 4. sanity: does the truth VCF's contig naming match the reference? ──────────
-# gen-mut-model silently produces nothing if the VCF's contigs aren't in the FASTA
-# (the classic 'chr1' vs '1' trap). Warn loudly rather than let mut_model no-op.
-VCF_OK=1
-if [[ -s "$VCF" ]]; then
-    vcf_ctg=$(zcat "$VCF" | grep -v '^#' | head -1 | cut -f1)
-    if ! cut -f1 "$REF.fai" | grep -qxF "$vcf_ctg"; then
-        echo "WARNING: truth VCF contig '$vcf_ctg' not found in $REF.fai — gen-mut-model" >&2
-        echo "         would see zero variants. Check GRCh38 contig naming (chr-prefix?)." >&2
+    # ── 4. sanity: does the truth VCF's contig naming match the reference? ──────────
+    # gen-mut-model silently produces nothing if the VCF's contigs aren't in the FASTA
+    # (the classic 'chr1' vs '1' trap). Warn loudly rather than let mut_model no-op.
+    VCF_OK=1
+    if [[ -s "$VCF" ]]; then
+        vcf_ctg=$(zcat "$VCF" | grep -v '^#' | head -1 | cut -f1)
+        if ! cut -f1 "$REF.fai" | grep -qxF "$vcf_ctg"; then
+            echo "WARNING: truth VCF contig '$vcf_ctg' not found in $REF.fai — gen-mut-model" >&2
+            echo "         would see zero variants. Check GRCh38 contig naming (chr-prefix?)." >&2
+            VCF_OK=0
+        fi
+    else
+        echo "WARNING: truth VCF not found at $VCF — run: DATA=hg002 bash scripts/delta/fetch_validation_data.sh" >&2
         VCF_OK=0
     fi
-else
-    echo "WARNING: truth VCF not found at $VCF — run: DATA=hg002 bash scripts/delta/fetch_validation_data.sh" >&2
-    VCF_OK=0
 fi
 
 nreads=$(( $(zcat "$R1" | wc -l) / 4 ))
 echo
 echo "════════════════════════════════════════════════════════════════"
-echo "HG002 staged: $nreads read pairs aligned to GRCh38"
-echo "Run the model-builders (human-scale stress; expect gc_bias/bam_models RSS in the GB range):"
-echo "  REFERENCE=$REF INPUT_BAM=$D/hg002.bam \\"
-echo "  INPUT_FASTQ=$R1 \\"
-[[ "$VCF_OK" -eq 1 ]] && echo "  INPUT_VCF=$VCF \\" || echo "  # (INPUT_VCF omitted — see contig-naming warning above; mut_model will be skipped)"
-echo "    sbatch scripts/delta/model_builders.sbatch"
+if [[ "$ALIGN" -eq 1 ]]; then
+    echo "HG002 staged: $nreads read pairs aligned to GRCh38"
+    echo "Run the model-builders (human-scale stress; expect gc_bias/bam_models RSS in the GB range):"
+    echo "  REFERENCE=$REF INPUT_BAM=$D/hg002.bam \\"
+    echo "  INPUT_FASTQ=$R1 \\"
+    [[ "$VCF_OK" -eq 1 ]] && echo "  INPUT_VCF=$VCF \\" || echo "  # (INPUT_VCF omitted — see contig-naming warning above; mut_model will be skipped)"
+    echo "    sbatch scripts/delta/model_builders.sbatch"
+else
+    echo "HG002 reads staged: $nreads pairs (no BAM — ALIGN=0)"
+    echo "  R1: $R1"
+    echo "  R2: $R2"
+    echo
+    echo "Fit ONE model carrying both mates (#723). REBUILD THE BINARY FIRST: fastq_file_r2 is"
+    echo "read by key lookup, so a binary predating it ignores the key and fits R1 twice."
+    echo "  printf 'fastq_file: %s\\nfastq_file_r2: %s\\noutput_file: %s\\noverwrite_output: true\\nmax_reads: 0\\nqual_offset: 33\\n' \\"
+    echo "    $R1 $R2 $D/hg002_qual.json.gz > $D/fit.yml"
+    echo "  \$EIDOLON gen-seq-error-model -c $D/fit.yml"
+    echo
+    echo "Then read its shape against the shipped default:"
+    echo "  bash scripts/delta/describe_quality_model.sh $D/hg002_qual.json.gz"
+fi
 echo "════════════════════════════════════════════════════════════════"
