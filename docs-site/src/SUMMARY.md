@@ -12,7 +12,7 @@
 
 # Getting started
 
-- [Prerequisites](getting-started/installation.md)
+- [Installing eidolon](getting-started/installation.md)
 
 # Generating reads
 

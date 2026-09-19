@@ -1,17 +1,54 @@
-# Prerequisites
+# Installing eidolon
 
-The easiest way to install `eidolon` is via [Bioconda](https://bioconda.github.io/):
+Three routes. The first two need no Rust toolchain at all.
+
+## Bioconda
 
 ```
 conda install -c bioconda eidolon
 ```
 
-This pulls a prebuilt binary with all dependencies handled — no Rust toolchain
-required. If you prefer to build from source or grab a release binary, read on.
+A prebuilt binary with dependencies handled. This is the easiest route on a workstation
+and works on a cluster wherever you already have conda.
 
-You will need to install the rust toolchain to compile `eidolon`, including `cargo`. Check the cargo documentation for instructions (https://doc.rust-lang.org/cargo/getting-started/installation.html). Alternatively, you can try one of the binaries on the release page. Select the one that matches your system and let us know if you run into errors. During compilation, you may run into errors, such as cmake not found. Some of the packages `eidolon` uses have these dependencies. For Debian/Ubuntu this should be a simple `sudo apt install cmake` and for RHEL/Rocky type distros this should be `sudo dnf install cmake`. There may be some other requirements. Drop a comment if you need specific help.
+## A release binary
 
-Download the executable in the release (current version 3.2.0).
+Each release publishes binaries on the
+[releases page](https://github.com/ncsa/eidolon/releases). Pick the one matching your
+system:
+
+| asset | for |
+|---|---|
+| `eidolon-x86_64-unknown-linux-gnu` | most Linux distributions |
+| `eidolon-x86_64-unknown-linux-gnu-rhel8` | RHEL 8 and derivatives, where the general Linux build's glibc is too new |
+| `eidolon-aarch64-unknown-linux-gnu-rhel8` | 64-bit ARM on RHEL 8 |
+| `eidolon-x86_64-apple-darwin` | macOS on Intel |
+| `eidolon-x86_64-pc-windows-msvc.exe` | Windows |
+
+The binary is self-contained — it needs nothing beyond a standard C library, so there is
+no environment to set up. Download it, make it executable, and run it. Let us know if one
+of these does not work on your system.
+
+## Building from source
+
+You will need the Rust toolchain including `cargo`; see the
+[cargo installation guide](https://doc.rust-lang.org/cargo/getting-started/installation.html).
+You will also need `git`.
+
+```bash
+git clone git@github.com:ncsa/eidolon.git
+cd eidolon
+cargo build --release
+```
+
+Compilation may stop on a missing system dependency — `cmake` is the usual one, since some
+of the crates `eidolon` depends on need it. On Debian/Ubuntu that is
+`sudo apt install cmake`; on RHEL/Rocky, `sudo dnf install cmake`. There may be others
+depending on your system. Drop a comment on an issue if you need specific help.
+
+Build from source when you are testing a change: a released binary is, by construction,
+not the code you are working on. See [Running on HPC](../hpc/running-on-hpc.md) for
+building on a cluster.
 
 ```bash
 $ eidolon --help

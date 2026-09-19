@@ -86,3 +86,15 @@ Single-threaded; streams TLEN fields from the BAM. A full human genome BAM at 30
 - The `eidolon` binary has no runtime dependencies beyond a standard C library (glibc), which is present on all Linux HPC systems.
 - No module loads or conda environments are required — copy the release binary to your scratch or project directory and run it directly.
 - If you compile from source on the cluster, ensure `cmake` is available (`module load cmake` on most systems) before running `cargo build --release`.
+- **You do not need a Rust module from your administrators.** If the site has no `rust`
+  module, `rustup` installs a toolchain into `$HOME/.cargo` as an ordinary user, and it
+  persists across jobs:
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  source "$HOME/.cargo/env"
+  ```
+- If you do build on the cluster, send the artifacts to scratch:
+  `export CARGO_TARGET_DIR="$SCRATCH/cargo-target/eidolon"`. The toolchain itself is
+  modest, but a release build's `target/` directory runs to several GB of crate artifacts
+  against a ~5 MB binary, and an HPC home quota is usually small enough that this is what
+  fills it.

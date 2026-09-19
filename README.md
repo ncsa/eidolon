@@ -76,7 +76,7 @@ The pages are plain Markdown and readable directly on GitHub. Start at
 
 | | |
 |---|---|
-| [Prerequisites and first run](docs-site/src/getting-started/installation.md) | install, build from source, the CLI tour |
+| [Installing eidolon](docs-site/src/getting-started/installation.md) | install, build from source, the CLI tour |
 | [Scope: germline is general, somatic is human](docs-site/src/overview/scope.md) | what is and is not claimed |
 | [How `eidolon` compares to NEAT](docs-site/src/overview/comparison-with-neat.md) | feature, speed and memory comparison |
 | [Cancer simulation how-to](docs/cancer_howto.md) | copy-paste tumor/normal guide |
