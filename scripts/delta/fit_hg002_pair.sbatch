@@ -201,11 +201,30 @@ sed 's/\x1b\[[0-9;]*m//g' "$WORK/fit_pair.log" \
   | grep -E "[Dd]egraded population|Separability|error_rate|read length|R2 " || true
 echo
 
-# ── 4. generate paired reads from the four-population model ─────────────────────
-echo "[4/6] generating paired reads from the four-population model ..."
-printf 'reference: %s\noutput_dir: %s\noutput_filename: gen_pair\noverwrite_output: true\nread_len: %s\ncoverage: %s\npaired_ended: true\nfragment_mean: %s.0\nfragment_st_dev: 60.0\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\nmutation_rate: 0.0\nrng_seed: hg002pair\nsequence_error_model: %s\n' \
-    "$REFERENCE" "$WORK" "$READ_LEN" "$COVERAGE" "$FRAGMENT_MEAN" "$WORK/model_pair.json.gz" > "$WORK/gen_pair.yml"
-"$EIDOLON" gen-reads -c "$WORK/gen_pair.yml" > "$WORK/gen_pair.log" 2>&1
+# ── 3b. THE CONTROL: the same pair, one population per mate ─────────────────────
+# Without this row the test arm has nothing to sit against. #694's shortfall is the whole
+# claim being tested, and "the two-population model reproduces the library" is only a
+# statement if a one-population fit of the SAME subsample, by the SAME binary, does not.
+# Quoting a historical 0.36% measured on a different subsample by an older build would be
+# comparing two things that differ in more ways than the one under test.
+cfg="$WORK/fit_pair_plain.yml"
+printf 'fastq_file: %s\nfastq_file_r2: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\n' \
+    "$WORK/sub_r1.fastq.gz" "$WORK/sub_r2.fastq.gz" "$WORK/model_pair_plain.json.gz" > "$cfg"
+echo "[3b/6] fitting both mates with ONE population each (the control) ..."
+if ! "$EIDOLON" gen-seq-error-model -c "$cfg" > "$WORK/fit_pair_plain.log" 2>&1; then
+    echo "FATAL: control fit failed. Last 20 lines:" >&2; tail -20 "$WORK/fit_pair_plain.log" >&2; exit 1
+fi
+echo
+
+# ── 4. generate paired reads from each model ────────────────────────────────────
+generate() {  # <tag> <model>
+    printf 'reference: %s\noutput_dir: %s\noutput_filename: gen_%s\noverwrite_output: true\nread_len: %s\ncoverage: %s\npaired_ended: true\nfragment_mean: %s.0\nfragment_st_dev: 60.0\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\nmutation_rate: 0.0\nrng_seed: hg002pair\nsequence_error_model: %s\n' \
+        "$REFERENCE" "$WORK" "$1" "$READ_LEN" "$COVERAGE" "$FRAGMENT_MEAN" "$2" > "$WORK/gen_$1.yml"
+    "$EIDOLON" gen-reads -c "$WORK/gen_$1.yml" > "$WORK/gen_$1.log" 2>&1
+}
+echo "[4/6] generating paired reads from both models ..."
+generate pair  "$WORK/model_pair.json.gz"
+generate plain "$WORK/model_pair_plain.json.gz"
 
 # ── 5. model shapes and the fitted rates ────────────────────────────────────────
 echo "[5/6] model shapes ..."
@@ -259,15 +278,18 @@ sed 's/\x1b\[[0-9;]*m//g' "$WORK/fit_pair.log" \
   | grep -E "[Dd]egraded population: [0-9]+ of|Separability" | sed 's/^/        /' \
   || echo "        (none reported)"
 echo
-echo "-- collapsed-tail rate: real against simulated, per mate"
-measure "real R1 (subsample)"  "$WORK/sub_r1.fastq.gz"
-measure "sim  R1"              "$WORK/gen_pair_r1.fastq.gz"
-measure "real R2 (subsample)"  "$WORK/sub_r2.fastq.gz"
-measure "sim  R2"              "$WORK/gen_pair_r2.fastq.gz"
+echo "-- collapsed-tail rate: real against simulated, per mate, with the control"
+measure "real R1 (subsample)"   "$WORK/sub_r1.fastq.gz"
+measure "sim  R1  two-pop"      "$WORK/gen_pair_r1.fastq.gz"
+measure "sim  R1  ONE-pop CTRL" "$WORK/gen_plain_r1.fastq.gz"
 echo
-echo "READ IT THIS WAY. The two real rows are the target and their RATIO is what #723 rests on"
-echo "(HG002 measured R2 at 2.34x R1). The two sim rows should reproduce each mate's own rate,"
-echo "and #694 predicts they will fall short -- the question this job answers is by how much,"
-echo "per mate, on real data rather than a fixture."
+measure "real R2 (subsample)"   "$WORK/sub_r2.fastq.gz"
+measure "sim  R2  two-pop"      "$WORK/gen_pair_r2.fastq.gz"
+measure "sim  R2  ONE-pop CTRL" "$WORK/gen_plain_r2.fastq.gz"
+echo
+echo "READ IT THIS WAY. Each mate's real row is its target, and the ONE-pop CTRL row is what"
+echo "the same subsample and the same binary produce WITHOUT the degraded population. The"
+echo "two-pop row means something only in the gap between those two: matching the target is a"
+echo "result if the control falls far short of it, and is not one if the control matches too."
 echo
 echo "Outputs in $WORK. Paste the RESULT block back, with the repo SHA from the header."
