@@ -42,6 +42,10 @@ pub enum RealismError {
     UnknownContig(String),
     /// Likewise: a region that matched no reads at all cannot be reported as 0.0 artifacts.
     EmptyRegion(String),
+    /// The read-length band removed most of an arm. `EmptyRegion` does not cover this: it
+    /// fires only at exactly zero, and a handful of survivors spread across the regions
+    /// leaves every one of them non-empty while the arm as a whole is unmeasured.
+    BandExcludedMost(String),
 }
 
 impl std::fmt::Display for RealismError {
@@ -53,6 +57,7 @@ impl std::fmt::Display for RealismError {
                 "region names contig '{c}', which is not in the BAM header — the region was \
                  not measured, and an unmeasured region must not be reported as a clean one"
             ),
+            RealismError::BandExcludedMost(m) => write!(f, "{m}"),
             RealismError::EmptyRegion(r) => write!(
                 f,
                 "region {r} contained no reads. Zero artifacts and zero reads look identical \
@@ -220,6 +225,8 @@ pub fn measure(
     // Counted per region rather than globally: the band's cost has to be readable beside the
     // metric it made comparable, not as one number for the whole run.
     let mut filtered: Vec<usize> = vec![0; regions.len()];
+    // Longest read the band rejected, per region. See RegionMetrics::max_excluded_query_len.
+    let mut max_excluded: Vec<usize> = vec![0; regions.len()];
     for result in reader.records() {
         let record =
             result.map_err(|e| RealismError::Io(format!("{}: record: {e}", path.display())))?;
@@ -239,6 +246,10 @@ pub fn measure(
                     buckets[bi].push(aln.clone());
                 } else {
                     filtered[bi] += 1;
+                    let qlen = aln.query_len();
+                    if qlen > max_excluded[bi] {
+                        max_excluded[bi] = qlen;
+                    }
                 }
             }
         }
@@ -296,6 +307,7 @@ pub fn measure(
             max_tlen,
             depth_lag,
             filtered[bi],
+            max_excluded[bi],
         ));
     }
 
@@ -318,10 +330,12 @@ pub fn summarize(
     max_tlen: i64,
     depth_lag: usize,
     len_filtered: usize,
+    max_excluded_query_len: usize,
 ) -> RegionMetrics {
     let track = depth_track(v, start, span);
     RegionMetrics {
         reads: v.len(),
+        max_excluded_query_len,
         len_filtered,
         span_bp: span,
         candidate_breakpoints: candidate_breakpoints(v, min_clip, min_support),
@@ -336,6 +350,75 @@ pub fn summarize(
     }
 }
 
+/// An arm may lose at most this fraction of its reads to the read-length band before the
+/// measurement is refused.
+///
+/// Set from the three regimes actually measured, not picked round:
+///
+/// | situation | excluded |
+/// |---|---|
+/// | a legitimately trimmed library (HG002 baseline) | 2.8% |
+/// | `test_realism_band.sh`'s deliberately balanced fixture | 50.04% |
+/// | `READ_LEN` wrong for the library (job 22237471) | 99.95% |
+///
+/// 0.9 clears all three. A tighter 0.5 was tried first and tripped on the test fixture by
+/// four hundredths of a percent, which is a threshold sitting on top of a known case rather
+/// than between the cases it has to tell apart.
+pub const MAX_BAND_EXCLUDED_FRACTION: f64 = 0.9;
+
+/// Refuse an arm whose read-length band removed most of its reads.
+///
+/// WHY. The band exists to make the two arms comparable (#672). One that drops nearly
+/// everything has not made them comparable — it has replaced one arm with a handful of
+/// survivors, and every metric still computes, so the table looks finished. Job 22237471 kept
+/// **161 of 344,771** real reads, reported `depth_mean` 0.01 against a simulated 21.06, and
+/// archived the result: the band was 145-151 against a 2x250 library, because `READ_LEN` was
+/// left at its 151 default.
+///
+/// `EmptyRegion` does not cover it. That fires only when a region holds exactly zero reads,
+/// and 161 reads spread over ten regions leaves every one of them non-empty.
+///
+/// `longest_excluded` is reported because it is the answer, not just the diagnosis: when the
+/// band is too low for the library, the longest excluded read IS the read length to set.
+pub fn check_band_coverage(
+    label: &str,
+    kept: usize,
+    filtered: usize,
+    longest_excluded: usize,
+    band: &LenBand,
+) -> Result<(), RealismError> {
+    let total = kept + filtered;
+    if total == 0 || filtered == 0 {
+        return Ok(());
+    }
+    let excluded = filtered as f64 / total as f64;
+    if excluded <= MAX_BAND_EXCLUDED_FRACTION {
+        return Ok(());
+    }
+    // Reported in BOTH directions. A band can be too low for the library (the excluded reads
+    // are longer, as on job 22237471) or too high (they are shorter), and in either case the
+    // longest excluded read is the length to set. Gating this on `longest_excluded > band.max`
+    // covered only the first and stayed silent on the second.
+    let hint = if longest_excluded > 0 {
+        format!(
+            " The longest excluded read is {longest_excluded} bp against a band of {}-{}; if \
+             that is this library's read length, set READ_LEN={longest_excluded}.",
+            band.min, band.max
+        )
+    } else {
+        String::new()
+    };
+    Err(RealismError::BandExcludedMost(format!(
+        "read-length band {}-{} excluded {filtered} of {total} reads ({:.1}%) on the {label} \
+         arm, leaving {kept}. The band is there to make the two arms comparable, so one that \
+         removes most of an arm has not measured it -- and every metric below would still \
+         compute, over almost nothing.{hint}",
+        band.min,
+        band.max,
+        100.0 * excluded
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +429,75 @@ mod tests {
     // that must NOT fire: an open band excludes nothing, and the boundaries are inclusive.
     // A band that quietly dropped its own endpoints would shrink both arms unevenly, since
     // the simulated side is a single length and the real side is a distribution.
+
+    // ── the band must not silently replace an arm with its survivors ──────────
+
+    /// The failure that cost 105 core-hours on job 22237471: a 145-151 band against a 2x250
+    /// library. Numbers are that job's.
+    #[test]
+    fn a_band_that_excludes_almost_everything_is_refused() {
+        let band = LenBand::new(145, 151).unwrap();
+        let err = check_band_coverage("REAL", 161, 344_610, 250, &band)
+            .expect_err("keeping 161 of 344,771 reads is not a measurement");
+        let msg = err.to_string();
+        for needle in ["REAL", "161", "344771", "100.0%"] {
+            assert!(
+                msg.contains(needle),
+                "the refusal must name the arm and both counts; missing {needle:?} in: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("READ_LEN=250"),
+            "the longest excluded read is the answer, not just the diagnosis: {msg}"
+        );
+    }
+
+    /// MUST NOT FIRE: a legitimately trimmed library loses a few percent. The HG002 baseline
+    /// lost about 2.8%, and a guard that tripped on that would be worse than none.
+    #[test]
+    fn the_ordinary_trimmed_loss_is_accepted() {
+        let band = LenBand::new(244, 250).unwrap();
+        check_band_coverage("REAL", 33_000, 950, 243, &band)
+            .expect("2.8% exclusion is what a trimmed library looks like");
+    }
+
+    /// MUST NOT FIRE: the open band filters nothing, so there is nothing to judge.
+    #[test]
+    fn an_open_band_is_never_refused() {
+        check_band_coverage("SIMULATED", 561_485, 0, 0, &LenBand::ANY)
+            .expect("an open band excludes nothing");
+    }
+
+    /// An arm with no reads at all is `EmptyRegion`'s business, not this guard's. Two errors
+    /// for one condition would send the operator looking in the wrong place.
+    #[test]
+    fn an_arm_with_no_reads_is_left_to_the_empty_region_check() {
+        check_band_coverage("REAL", 0, 0, 0, &LenBand::new(145, 151).unwrap())
+            .expect("zero reads is a different failure with a different fix");
+    }
+
+    /// The boundary, asserted on both sides so the comparison cannot drift from `<=` to `<`.
+    #[test]
+    fn the_threshold_is_inclusive_at_its_exact_value() {
+        let band = LenBand::new(145, 151).unwrap();
+        check_band_coverage("REAL", 100, 900, 250, &band)
+            .expect("exactly the threshold is allowed");
+        assert!(
+            check_band_coverage("REAL", 99, 901, 250, &band).is_err(),
+            "just over the threshold must be refused"
+        );
+    }
+
+    /// MUST NOT FIRE: `test_realism_band.sh` builds a fixture split 1273/1275 and runs bands
+    /// that admit one class, so it excludes 50.04% by construction. A threshold that tripped
+    /// on a deliberately balanced fixture would be sitting on a known case instead of between
+    /// the cases it exists to separate -- which a 0.5 threshold did, by 0.04 of a percent.
+    #[test]
+    fn a_deliberately_balanced_fixture_is_not_refused() {
+        let band = LenBand::new(100, 100).unwrap();
+        check_band_coverage("T", 1273, 1275, 60, &band)
+            .expect("a 50/50 split is a fixture, not a broken band");
+    }
 
     #[test]
     fn the_default_band_excludes_nothing() {

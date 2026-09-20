@@ -103,6 +103,10 @@ pub struct RegionMetrics {
     /// two arms comparable, and a band that silently drops most of one arm would trade a
     /// known confound for an unknown one.
     pub len_filtered: usize,
+    /// The longest read the band excluded in this region, or 0 if it excluded none. When a
+    /// band is too low for the library this IS the read length to set, so it is carried up to
+    /// the guard rather than left for the operator to infer from a percentage.
+    pub max_excluded_query_len: usize,
     pub span_bp: usize,
     pub candidate_breakpoints: usize,
     pub improper_pairs: usize,
@@ -758,6 +762,7 @@ mod tests {
         let m = |v: &[AlnRecord]| RegionMetrics {
             reads: v.len(),
             len_filtered: 0,
+            max_excluded_query_len: 0,
             span_bp: 100_000,
             candidate_breakpoints: candidate_breakpoints(v, 20, 3),
             improper_pairs: v.iter().filter(|r| !r.is_proper_pair()).count(),
