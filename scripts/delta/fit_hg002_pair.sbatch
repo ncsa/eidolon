@@ -54,12 +54,21 @@
 set -euo pipefail
 
 REPO="${REPO:-/projects/bhrd/jallen17/eidolon}"
-DATA_DIR="${DATA_DIR:-/work/nvme/bhrd/jallen17/hg002}"
-R1="${R1:-$DATA_DIR/hg002_R1.fastq.gz}"
-R2="${R2:-$DATA_DIR/hg002_R2.fastq.gz}"
+# lib_report.sh resolves $SCRATCH, and this runs under `set -u`, so it is sourced BEFORE any
+# path that mentions it -- which is every path below.
 source "$REPO/scripts/delta/lib_report.sh"
 
-STRIDE="${STRIDE:-65}"            # ~2M reads from a 130M-record library
+# Defaults match where `stage_hg002.sh` WRITES, so the two scripts compose with no wiring:
+#   ALIGN=0 sbatch scripts/delta/stage_hg002.sh
+# puts hg002_R1/R2.fastq.gz in $SCRATCH/neat_data/hg002. (#695's earlier R1 fit read from
+# /work/nvme/bhrd/jallen17/hg002 instead; pass DATA_DIR= to point at a library staged there.)
+DATA_DIR="${DATA_DIR:-$SCRATCH/neat_data/hg002}"
+R1="${R1:-$DATA_DIR/hg002_R1.fastq.gz}"
+R2="${R2:-$DATA_DIR/hg002_R2.fastq.gz}"
+
+# ~2M reads from the full 130M-record library. One chunk staged by stage_hg002.sh is ~20M
+# pairs, where STRIDE=10 gives the same ~2M -- the script reports the count it actually got.
+STRIDE="${STRIDE:-65}"
 READ_LEN="${READ_LEN:-250}"
 COVERAGE="${COVERAGE:-4}"
 FRAGMENT_MEAN="${FRAGMENT_MEAN:-600}"
