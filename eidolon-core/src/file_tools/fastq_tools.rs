@@ -594,7 +594,8 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut r2_record = if paired_ended {
             // R2 draws from the R2 fit when the model carries one (#723).
             let qsm_r2 = r2_quality_model(quality_score_model, quality_score_model_r2);
-            let quality_scores_2 = qsm_r2.generate_quality_scores(effective_read_len, rng)?;
+            let quality_scores_2 =
+                laid_down_for_the_flip(qsm_r2.generate_quality_scores(effective_read_len, rng)?);
             let r2_pos = r2_ref_pos
                 .or(r1_ref_pos)
                 .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
@@ -897,8 +898,10 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         };
         apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
 
-        let r2_quality = r2_quality_model(quality_score_model, quality_score_model_r2)
-            .generate_quality_scores(read_length, rng)?;
+        let r2_quality = laid_down_for_the_flip(
+            r2_quality_model(quality_score_model, quality_score_model_r2)
+                .generate_quality_scores(read_length, rng)?,
+        );
         let mut r2 = match generate_read(
             &fragment.r2_sequence,
             // Chimeric reads are stitched from reference pieces: every base is 'M', and
@@ -1258,8 +1261,31 @@ pub fn apply_haplotype_baseline_cigar(
     Ok(())
 }
 
+/// Lay R2's cycle-ordered quality down backwards, so the flip lands it forwards (#734).
+///
+/// `generate_quality_scores` returns CYCLE order: index 0 is cycle 1, and quality falls from
+/// there. R2 is generated forward over the fragment's right-end window and then flipped by
+/// `reverse_complement_record`, and for R2 that window's LAST base is the first one sequenced.
+/// So cycle order has to be written in reverse here for the flip to leave it in cycle order on
+/// the emitted read.
+///
+/// WHY HERE AND NOT AFTER THE FLIP. The per-base sequencing error is rolled from the quality at
+/// the same index during forward generation (`convert_score`, below), so base and quality are
+/// paired the moment the read is built. Un-reversing the emitted string afterwards would fix
+/// the profile and leave every base carrying a quality its error did not come from -- the reads
+/// would look right and their errors would still sit at the wrong end.
+fn laid_down_for_the_flip(mut quality: Vec<usize>) -> Vec<usize> {
+    quality.reverse();
+    quality
+}
+
 /// Turn a forward-generated read into its reverse-strand mate: reverse-complement
-/// the sequence and reverse the per-base CIGAR ops and qualities. R2 is generated
+/// the sequence and reverse the per-base CIGAR ops and qualities.
+///
+/// Reversing the qualities is correct ONLY because R2's array was laid down backwards to
+/// begin with — see `laid_down_for_the_flip`. Removing the reversal here looks like a fix for
+/// #734 and is not: it corrects the emitted profile while leaving each base carrying a quality
+/// its sequencing error did not come from. R2 is generated
 /// forward over the fragment's right-end window (so SNP/insertion/deletion handling
 /// is identical to R1 and correct) and flipped here — this avoids the
 /// reverse-walk indel hazards (insertion base order, deletion anchor) that

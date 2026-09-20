@@ -218,11 +218,18 @@ fn dump_path() -> Option<PathBuf> {
 /// Write a FASTQ whose degraded reads are noisier THROUGHOUT and worst at the 3' end, and whose
 /// healthy reads dip rarely and briefly.
 fn write_fixture(path: &Path, n_reads: usize, seed: u64) {
+    write_fixture_at(path, n_reads, seed, DEGRADED_FRACTION)
+}
+
+/// As `write_fixture`, with the degraded fraction chosen by the caller. The two mates of a
+/// real library carry different fractions -- HG002 measures R2 at 2.34x R1 on collapsed-tail
+/// rate -- and a four-population test needs them to differ or it cannot tell the mates apart.
+fn write_fixture_at(path: &Path, n_reads: usize, seed: u64, degraded_fraction: f64) {
     let mut rng = Lcg::new(seed);
     let file = std::fs::File::create(path).unwrap();
     let mut gz = GzEncoder::new(file, Compression::default());
     for i in 0..n_reads {
-        let degraded = rng.unit() < DEGRADED_FRACTION;
+        let degraded = rng.unit() < degraded_fraction;
         // Per-read severity. A degraded read is not "collapsed" or not -- reads differ in how
         // noisy they are, which is what the head-window measurement showed (#694): reads that
         // end badly carry 20x the low-base rate of a healthy read a hundred positions earlier.
@@ -400,6 +407,54 @@ fn fit_and_generate_with(work: &Path, fixture: &Path, degradation: bool) -> Path
     work.join("gen_r1.fastq.gz")
 }
 
+/// Fit BOTH mates into one model with the degraded population on -- four tensors, R1/R2 x
+/// healthy/degraded -- then generate PAIRED reads and return both output FASTQs.
+fn fit_pair_and_generate(work: &Path, r1: &Path, r2: &Path) -> (PathBuf, PathBuf) {
+    let model = work.join("model_pair.json.gz");
+    let cfg = work.join("fit_pair.yml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "fastq_file: {}\nfastq_file_r2: {}\noutput_file: {}\noverwrite_output: true\n\
+             max_reads: 0\nqual_offset: 33\nfit_quality_degradation: true\n",
+            r1.display(),
+            r2.display(),
+            model.display()
+        ),
+    )
+    .unwrap();
+    eidolon()
+        .args(["gen-seq-error-model", "-c", cfg.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let reference = PathBuf::from(format!(
+        "{}/test_data/references/ecoli.fa",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    let mut reads_cfg = GenReadsConfig::new(reference, work.to_path_buf(), "genpair");
+    reads_cfg.read_len = READ_LEN;
+    reads_cfg.coverage = 2;
+    reads_cfg.paired_ended = true;
+    // A fragment must hold both mates. The helper's 200 bp default is shorter than one
+    // 250 bp read, which would make this a test of adapter readthrough instead.
+    reads_cfg.fragment_mean = Some(600.0);
+    reads_cfg.fragment_st_dev = Some(60.0);
+    reads_cfg.produce_fastq = true;
+    reads_cfg.rng_seed = "q694pair".to_string();
+    reads_cfg.sequence_error_model = Some(model);
+    let gen_cfg = reads_cfg.write_yaml();
+    eidolon()
+        .args(["gen-reads", "-c", gen_cfg.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    (
+        work.join("genpair_r1.fastq.gz"),
+        work.join("genpair_r2.fastq.gz"),
+    )
+}
+
 /// The fixture itself must match what was measured on HG002, or nothing downstream means
 /// anything. Both rates, because one does not constrain the shape: an earlier fixture hit
 /// Q<25 while putting nearly every collapsed read below Q20, where real data splits 2.18 to 1.
@@ -553,4 +608,96 @@ fn quality_model_currently_loses_the_degraded_population() {
         "the Q<20 population all but disappears (real HG002: 0.00%); got {out20:.2}% against \
          a fixture carrying {in20:.2}%"
     );
+}
+
+/// FOUR POPULATIONS: R1/R2 x healthy/degraded, which #723 and #694 produce together and
+/// which neither of them measured. #723 shipped a tested REFUSAL on this path and said
+/// plainly that a loaded fit's fidelity was untested; this is that test.
+///
+/// KNOWN ANSWER, computable from the fixtures. Two libraries are planted with deliberately
+/// different degraded fractions -- R2 at 2.34x R1, the ratio HG002 measures between its mates
+/// -- and each generated mate must carry its OWN planted rate.
+///
+/// It is FALSIFIED three ways, and the last is the reason the test is shaped around the pair:
+///
+/// * both mates land on one rate -> one quality model is still serving both
+/// * the mates' rates are swapped -> the mates are wired backwards
+/// * both mates lose the degraded population -> the degradation split did not survive being
+///   fitted per mate, which is exactly the interaction neither feature tested alone
+#[test]
+fn a_four_population_fit_keeps_the_mates_and_the_populations_apart() {
+    let (_g, work) = fresh_workdir();
+    let r1_fixture = work.join("fixture_r1.fastq.gz");
+    let r2_fixture = work.join("fixture_r2.fastq.gz");
+    // HG002 measures R2 at 2.34x R1 on collapsed-tail rate.
+    write_fixture_at(&r1_fixture, N_FIXTURE_READS, 694, DEGRADED_FRACTION);
+    write_fixture_at(&r2_fixture, N_FIXTURE_READS, 723, DEGRADED_FRACTION * 2.34);
+
+    let (in1_25, in1_20, _) = tail_collapse_rates(&r1_fixture, 50);
+    let (in2_25, in2_20, _) = tail_collapse_rates(&r2_fixture, 50);
+    assert!(
+        in2_25 > in1_25 * 1.5,
+        "the fixtures must differ before anything downstream means anything: R1 {in1_25:.2}%, \
+         R2 {in2_25:.2}%"
+    );
+
+    let (gen1, gen2) = fit_pair_and_generate(&work, &r1_fixture, &r2_fixture);
+    let (out1_25, out1_20, n1) = tail_collapse_rates(&gen1, 50);
+    let (out2_25, out2_20, n2) = tail_collapse_rates(&gen2, 50);
+
+    eprintln!(
+        "FOUR-POPULATION  R1 fixture Q<25 {in1_25:.2}% Q<20 {in1_20:.2}% -> generated \
+         {out1_25:.2}% / {out1_20:.2}% (n={n1})"
+    );
+    eprintln!(
+        "FOUR-POPULATION  R2 fixture Q<25 {in2_25:.2}% Q<20 {in2_20:.2}% -> generated \
+         {out2_25:.2}% / {out2_20:.2}% (n={n2})"
+    );
+    assert!(
+        n1 > 5_000 && n2 > 5_000,
+        "too few reads to rate: {n1} / {n2}"
+    );
+
+    // Each mate carries its own planted rate, to the same factor-of-two bar the
+    // two-population test uses.
+    assert!(
+        out1_25 > in1_25 / 2.0 && out1_25 < in1_25 * 2.0,
+        "R1 tail Q<25: fixture {in1_25:.2}%, generated {out1_25:.2}%"
+    );
+    assert!(
+        out2_25 > in2_25 / 2.0 && out2_25 < in2_25 * 2.0,
+        "R2 tail Q<25: fixture {in2_25:.2}%, generated {out2_25:.2}%. Landing near R1's \
+         {out1_25:.2}% instead means one quality model is serving both mates."
+    );
+
+    // THE DECISION ASSERTION. The mates must stay ordered. One model for both, or the mates
+    // wired backwards, both pass every aggregate measure over the pair.
+    assert!(
+        out2_25 > out1_25 * 1.5,
+        "R2 was planted 2.34x worse than R1 and must generate worse: R1 {out1_25:.2}%, R2 \
+         {out2_25:.2}%. Equal rates mean one model serves both; reversed means the mates are \
+         wired backwards."
+    );
+
+    // And the degraded population must be a FIT, not the uniform fallback an empty tensor
+    // produces -- the mutation that caught this on the two-population test applies to each of
+    // the four tensors independently.
+    for (label, path) in [("R1", &gen1), ("R2", &gen2)] {
+        let (c_mean, h_mean, c_low, h_low) = head_stats(path, 100, 50);
+        eprintln!(
+            "FOUR-POPULATION  {label} head: collapsed Q{c_mean:.2} ({c_low:.2}% low), healthy \
+             Q{h_mean:.2} ({h_low:.2}% low)"
+        );
+        assert!(
+            c_mean > 30.0,
+            "{label} degraded reads average Q{c_mean:.2} over their first 100 positions. A \
+             uniform draw over the option set runs about Q21, which is what an EMPTY degraded \
+             tensor falls back to. This reads like fallback, not a fit."
+        );
+        assert!(
+            c_mean < h_mean,
+            "{label} degraded reads must still be worse at the head: collapsed Q{c_mean:.2}, \
+             healthy Q{h_mean:.2}"
+        );
+    }
 }

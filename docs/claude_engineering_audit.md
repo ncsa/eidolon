@@ -313,6 +313,55 @@ largest single number in the ACCESS report's fix table (SNP recall 0.0004 → 0.
 
 The same shape produced #451 (truth VCF and reads disagreeing about geometry).
 
+#### R2's quality in the wrong coordinate system (2026-09-19)
+
+A variant of the same shape, where the two "components" are a per-base array and the
+coordinate system it is indexed in. `reverse_complement_record` flips a forward-generated
+read into its reverse mate by reversing `sequence`, `cigar_ops` and `quality_scores`
+together. The first two are reference-coordinate properties and the reversal is right. The
+third is not: a quality score belongs to a **sequencing cycle**, which is fixed by the read
+and not by which strand it aligns to.
+
+The result: every paired FASTQ eidolon produced carried R2's per-cycle quality profile
+backwards. Measured on the shipped default model, ecoli, 150 bp paired, n=30,935 per mate:
+
+| | cycle 1 | cycle 150 |
+|---|---|---|
+| R1 | 35.49 | 28.34 |
+| R2 | **28.50** | **35.47** |
+
+Because errors are injected from each base's own quality, R2's sequencing errors were
+mirrored with it — concentrated at the 5' end, where a real R2 is cleanest.
+
+**Why it survived: every local invariant held.** Each base kept its own quality. The CIGAR
+matched the sequence. The golden BAM correctly mirrored the FASTQ, per SAM §1.4. A test of
+R2 in isolation passes either way, because nothing about a single mate says which end
+should be worse. Only the *profile along the emitted read, compared against R1's*, is
+wrong, and no test compared them.
+
+**The fix is not where it looks, and a mutation proved it.** Removing the reversal from
+`reverse_complement_record` corrects the emitted quality string, keeps the BAM mirror
+intact, and **leaves the errors mirrored** — because the error is rolled from the quality at
+the same index during forward generation, before the flip. Applied as a mutation, that
+"fix" passes the quality assertion and the BAM assertion and is caught only by the
+per-cycle error-rate assertion. The real fix lays R2's array down backwards at the two
+sites that build it, so the existing flip lands it in cycle order and base and quality stay
+paired throughout.
+
+**The rule this earns:** when a value is copied between coordinate systems, the test has to
+compare the two systems against each other. Asserting the shape of R2 alone cannot fail.
+Asserting that R2 degrades *like R1 does* is the assertion that can.
+
+It also earns a footnote on mutation discipline. The first attempt at reverting the fix
+reported SURVIVOR: `cargo fmt` had rewrapped one of the two call sites, so the edit matched
+only the other — the haplotype writer, which the test does not exercise. The file genuinely
+changed, so a checksum guard passed, and the verdict was still wrong. **Mutate the single
+function the call sites share, not the call sites**, when the alternative is an edit that
+can partially apply.
+
+Tracked in [#734](https://github.com/ncsa/eidolon/issues/734), fixed in
+[#735](https://github.com/ncsa/eidolon/pull/735).
+
 ### 5.3 Verification theatre
 
 Tests and harnesses that report success without being able to report failure.
