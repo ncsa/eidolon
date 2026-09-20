@@ -210,6 +210,19 @@ fn main() -> ExitCode {
              ({pct:.1}% excluded)",
             args.label, args.band.min, args.band.max
         );
+        // Reporting that percentage is not the same as acting on it. Job 22237471 printed
+        // "100.0% excluded" and went on to emit a full table over 161 reads.
+        let longest_excluded = measured
+            .iter()
+            .map(|m| m.max_excluded_query_len)
+            .max()
+            .unwrap_or(0);
+        if let Err(e) =
+            reader::check_band_coverage(&args.label, kept, dropped, longest_excluded, &args.band)
+        {
+            eprintln!("realism-panel: {e}");
+            return ExitCode::FAILURE;
+        }
     }
 
     println!(

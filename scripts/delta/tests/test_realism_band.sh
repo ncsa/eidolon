@@ -71,6 +71,8 @@ the lower bound is exclusive@        len >= self.min && len <= self.max@        
 the upper bound is exclusive@        len >= self.min && len <= self.max@        len >= self.min && len < self.max
 excluded reads are not counted@                    filtered[bi] += 1;@                    let _ = bi;
 membership is resolved after the band@        let keep = band.contains(aln.query_len());@        let keep = true;
+the most-of-an-arm guard never fires@pub const MAX_BAND_EXCLUDED_FRACTION: f64 = 0.9;@pub const MAX_BAND_EXCLUDED_FRACTION: f64 = 1.1;
+the guard forgets what READ_LEN should be@    let hint = if longest_excluded > 0 {@    let hint = if false {
 MUTATIONS
     restore
     # The source must come back BYTE-identical. A restore that differs by so much as a
@@ -185,6 +187,47 @@ else
 fi
 has "and says the band was the cause" "$(cat "$WORK/err")" "excluded all"
 has "and names the band"              "$(cat "$WORK/err")" "61-99"
+
+echo "=== a band that excludes MOST of an arm is also a hard failure ==="
+# The gap the all-excluding case above does NOT cover. `EmptyRegion` fires only at exactly
+# zero reads in a region, so a handful of survivors spread across the regions leaves every
+# one of them non-empty and the run completes over almost nothing. Job 22237471 kept 161 of
+# 344,771 real reads, reported depth_mean 0.01 against a simulated 21.06, and archived it --
+# because READ_LEN was left at 151 against a 2x250 library.
+#
+# Fixture: 19 of every 20 records truncated, so a band admitting only the full-length class
+# excludes ~95% and still leaves every region populated. Known by construction.
+samtools view -h "$FIXTURE" \
+  | awk 'BEGIN{OFS="\t"} /^@/{print; next} {n++; if(n%20!=0){$10=substr($10,1,60); $11=substr($11,1,60); $6="60M"}; print}' \
+  > "$WORK/skew.sam"
+samtools view -b "$WORK/skew.sam" > "$WORK/skew.bam" 2>/dev/null
+samtools index "$WORK/skew.bam"
+S_FULL="$(samtools view -F 0x904 "$WORK/skew.bam" | awk 'length($10)==100' | wc -l | tr -d ' ')"
+S_SHORT="$(samtools view -F 0x904 "$WORK/skew.bam" | awk 'length($10)==60' | wc -l | tr -d ' ')"
+# Assert the fixture is what the test needs before drawing any conclusion from it: a split
+# that drifted under the threshold would make the refusal below silently untested.
+if [[ "$S_FULL" -lt 20 ]] || [[ $((S_SHORT * 100 / (S_FULL + S_SHORT))) -lt 91 ]]; then
+    echo "FATAL: skew fixture is $S_FULL full / $S_SHORT short, not the >90% split this needs" >&2
+    exit 1
+fi
+echo "    skew fixture: $S_FULL full, $S_SHORT short"
+if "$BIN" --bam "$WORK/skew.bam" --regions "$WORK/r.bed" --label REAL \
+      --min-read-len 100 --max-read-len 100 >/dev/null 2>"$WORK/err2"; then
+    bad "a band excluding most of an arm exits non-zero" "failure" "exit 0"
+else
+    ok "a band excluding most of an arm exits non-zero"
+fi
+has "and says most of the arm went"  "$(cat "$WORK/err2")" "excluded"
+has "and names the arm"              "$(cat "$WORK/err2")" "REAL"
+has "and says what to set READ_LEN to" "$(cat "$WORK/err2")" "READ_LEN=60"
+# MUST NOT FIRE on the same fixture with the band the other way round: admitting the 95%
+# class excludes only 5%, which is an ordinary trimmed-library loss.
+if "$BIN" --bam "$WORK/skew.bam" --regions "$WORK/r.bed" --label REAL \
+      --min-read-len 60 --max-read-len 60 >/dev/null 2>&1; then
+    ok "the same fixture with the majority class admitted is fine"
+else
+    bad "the same fixture with the majority class admitted is fine" "exit 0" "failure"
+fi
 
 echo "=== an inverted band is refused before any measurement ==="
 if "$BIN" --bam "$WORK/mixed.bam" --regions "$WORK/r.bed" \
