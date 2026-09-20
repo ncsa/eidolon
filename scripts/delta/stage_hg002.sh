@@ -70,8 +70,30 @@ THREADS="${SLURM_CPUS_PER_TASK:-16}"
 # both the directory and the filename shape are parameters rather than one guessed template.
 # `{lane}` and `{id}` are substituted from each CHUNKS entry.
 BASE="${BASE:-https://ftp-trace.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG002_NA24385_son/NIST_Illumina_2x250bps/reads}"
-R1_PATTERN="${R1_PATTERN:-D1_S1_{lane}_R1_{id}.fastq.gz}"
-R2_PATTERN="${R2_PATTERN:-D1_S1_{lane}_R2_{id}.fastq.gz}"
+# NOT `${R1_PATTERN:-...}`. A `${VAR:-default}` ends at the FIRST unescaped `}`, so a default
+# CONTAINING braces is cut off there. `${R1_PATTERN:-D1_S1_{lane}_R1_{id}.fastq.gz}` yields
+# `D1_S1_{lane` plus the literal tail `_R1_{id}.fastq.gz}` -- `{lane}` then never exists to be
+# substituted, `{id}` survives and IS substituted, and a stray `}` lands on the end. Measured:
+# the URL fetched was `D1_S1_{lane_R1_001.fastq.gz}`, a 404 that reads like a moved dataset.
+# Assigning conditionally keeps every brace out of an expansion.
+[[ -n "${R1_PATTERN:-}" ]] || R1_PATTERN='D1_S1_{lane}_R1_{id}.fastq.gz'
+[[ -n "${R2_PATTERN:-}" ]] || R2_PATTERN='D1_S1_{lane}_R2_{id}.fastq.gz'
+
+# Substitution as a function so a test can reach it. The defaults above are the part that
+# broke, and a test that cannot see them is not a test of them -- PRINT_URLS below exposes
+# both together.
+expand_pattern() {  # <pattern> <lane> <id>
+    local p="$1"
+    p="${p//\{lane\}/$2}"
+    p="${p//\{id\}/$3}"
+    # Refuse a name still holding a placeholder rather than asking the server about it. A 404
+    # from a mangled name is indistinguishable from a dataset that moved, which is how the
+    # brace bug above cost a submit round trip to diagnose.
+    case "$p" in
+        *[{}]*) echo "FATAL: unsubstituted placeholder in '$p' (from '$1'). Patterns take {lane} and {id}; CHUNKS entries are LANE:ID." >&2; return 1 ;;
+    esac
+    printf '%s' "$p"
+}
 
 # ALIGN=0 stages the READS ONLY -- no reference index, no alignment, no BAM.
 #
@@ -80,6 +102,22 @@ R2_PATTERN="${R2_PATTERN:-D1_S1_{lane}_R2_{id}.fastq.gz}"
 # turns a job that spends 1-2 h aligning (plus a one-time ~64 GB-RAM bwa-mem2 index) into a
 # download, which is the difference between a plausible experiment and an expensive one.
 ALIGN="${ALIGN:-1}"
+
+# PRINT_URLS=1 prints what would be downloaded and exits, touching no filesystem and no
+# network. Worth having on its own -- the failure this guards against was a 404 whose cause
+# was invisible in the URL until it was percent-decoded.
+if [[ -n "${PRINT_URLS:-}" ]]; then
+    for spec in $CHUNKS; do
+        lane="${spec%%:*}"; id="${spec##*:}"
+        # Assigned first: a command substitution that fails inside `echo`'s arguments does not
+        # abort under `set -e`, so the guard in expand_pattern would be advisory there.
+        u1="$(expand_pattern "$R1_PATTERN" "$lane" "$id")"
+        u2="$(expand_pattern "$R2_PATTERN" "$lane" "$id")"
+        echo "$BASE/$u1"
+        echo "$BASE/$u2"
+    done
+    exit 0
+fi
 
 mkdir -p "$D"
 # Only the align path needs these. A reads-only run is wget and gzip, so loading them would
@@ -102,8 +140,8 @@ if [[ ! -s "$R1" || ! -s "$R2" ]]; then
     : > "$R1"; : > "$R2"
     for spec in $CHUNKS; do
         lane="${spec%%:*}"; id="${spec##*:}"
-        f1="${R1_PATTERN//\{lane\}/$lane}"; f1="${f1//\{id\}/$id}"
-        f2="${R2_PATTERN//\{lane\}/$lane}"; f2="${f2//\{id\}/$id}"
+        f1="$(expand_pattern "$R1_PATTERN" "$lane" "$id")"
+        f2="$(expand_pattern "$R2_PATTERN" "$lane" "$id")"
         echo "downloading $f1 / $f2 ..."
         wget -c -O "$D/$f1" "$BASE/$f1"
         wget -c -O "$D/$f2" "$BASE/$f2"
