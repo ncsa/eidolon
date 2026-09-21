@@ -618,6 +618,28 @@ mod tests {
         );
     }
 
+    /// The shipped asset, pinned BY DIGEST.
+    ///
+    /// `the_shipped_default_is_the_hg002_fit` checks the model's metadata — read length,
+    /// option set, degraded fractions, error rate. All of that can be right while the
+    /// transition tensor underneath it is a different model entirely, and the tensor is the
+    /// part that actually shapes output. A digest covers the bytes, so a file swapped by
+    /// accident fails here even when every field still reads correctly.
+    ///
+    /// Regenerate deliberately, never to make this pass:
+    ///     sha256sum eidolon-core/src/models/model_data/default_sequencing_error_model.json.gz
+    #[test]
+    fn the_shipped_default_asset_is_byte_for_byte_the_fitted_model() {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(DEFAULT_MODEL_FILE));
+        assert_eq!(
+            got, "824c8c5d957dab862e52369e485daa733fa02222d856f38632b6b63476f1bc6c",
+            "the shipped model asset is not the one fitted from GIAB HG002 \
+             (job 22233888). If the replacement is intentional, update this digest AND the \
+             provenance block in model_data/README.md in the same commit."
+        );
+    }
+
     #[test]
     fn test_sequencing_error_model_file_round_trip() {
         use tempfile::tempdir;

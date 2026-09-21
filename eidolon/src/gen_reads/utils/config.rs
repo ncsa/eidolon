@@ -1208,6 +1208,28 @@ mod tests {
         yaml
     }
 
+    /// The value a user actually gets from a config file that omits `read_len`.
+    ///
+    /// WHAT THIS DOES AND DOES NOT ADD over asserting on `RunConfiguration::default()`. The
+    /// parser starts from that default and overwrites only the keys the YAML carries, so the
+    /// two are not independent paths and this cannot catch a parser-side fallback — there
+    /// isn't one. What it does catch is a missing key being treated as an ERROR rather than a
+    /// default, and anything between parsing and use resetting the field.
+    ///
+    /// 250 because that is the length the shipped model is fitted at: taking both defaults
+    /// uses the model natively, with no rescaling (#742).
+    #[test]
+    fn a_config_omitting_read_len_parses_as_the_model_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = write_cfg(dir.path(), "");
+        let cfg = RunConfiguration::from_yaml_file(&yaml).unwrap();
+        assert_eq!(
+            cfg.read_len, 250,
+            "a config with no read_len must parse as 250, matching the shipped model"
+        );
+        assert_eq!(cfg.read_len, RunConfiguration::default().read_len);
+    }
+
     #[test]
     fn test_adapters_default_disabled() {
         // Default preserves pre-adapter behavior: disabled.
