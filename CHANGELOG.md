@@ -1,12 +1,93 @@
 9/2/2026
 =========
-## eidolon v3.4.0 (unreleased) — sequencing-error indels
+## eidolon v3.4.0 (unreleased) — a quality model measured from real, named data
 
-Sequencing-error indels were being generated about 40x too often, uniformly across the
-genome. Two inherited constants are corrected, and the indel share now depends on local
-homopolymer run length, which is where slippage occurs.
+The shipped sequencing-error model no longer comes from a sample nobody recorded. It is
+fitted from a public GIAB library, it carries the two mates separately because they are
+measurably different, and it reproduces the collapsed-tail reads that real Illumina data has
+and eidolon previously could not produce at all. Separately, sequencing-error indels were
+being generated about 40x too often and uniformly across the genome; that is corrected and
+now depends on local homopolymer run length.
 
-### What changed for you
+### The default model is fitted from data you can download
+
+Until now the default was NEAT2's bundled `errorModel_toy.p`, converted. It was a real fit,
+but its originating sample was never recorded upstream, so nothing about it could be
+reproduced or checked.
+
+The default is now fitted from **GIAB HG002, `NIST_Illumina_2x250bps`** — public and
+downloadable. `eidolon-core/src/models/model_data/README.md` records the chunk, the sampling
+stride, the read count, the degraded-population cut and the job that produced it.
+
+| | |
+|---|---|
+| Read length | 250 bp (`read_len` now defaults to 250 to match) |
+| Quality scores | 31 observed levels, Q2–Q40, **continuous** |
+| Reads fitted | 3,391,610 per mate, taken 1-in-10 across the file |
+| `error_rate` | 0.003774, against the inherited 0.006638 |
+
+**What it is not.** HiSeq 2500 is 2020-era chemistry and its scores are continuous; current
+instruments commonly emit binned scores. GIAB's HG002 path has no NovaSeq library at all, so
+this is the best provenanced option from that source rather than the most modern one (#730).
+
+**And it is a starting point, not a description of your data.** Fit your own with
+`gen-seq-error-model` whenever you can — that is what it is for. Generating at a read length
+the model was not fitted at rescales the curve to fit, which is an approximation inherited
+from NEAT2 (#742).
+
+### Reads now degrade the way real reads do (#694, #720)
+
+Real Illumina data is bimodal: about one read in ten loses signal toward the 3' end and stays
+collapsed. eidolon's quality model is a first-order chain over (position, previous score),
+which has no per-read state, so a pooled fit landed on the average of the two populations and
+produced essentially none of them.
+
+Measured on HG002, against a single-population fit of the same reads by the same build:
+
+| | real | v3.4.0 | single population |
+|---|---|---|---|
+| R1, last 50 bases below Q25 | 11.12% | 11.95% | 0.54% |
+| R1, below Q20 | 4.92% | 5.91% | **0.00%** |
+| R2, below Q25 | 26.22% | 26.36% | 11.74% |
+| R2, below Q20 | 12.48% | 14.00% | 0.32% |
+
+`gen-seq-error-model` fits this with `fit_quality_degradation: true`; the shipped default
+already carries it.
+
+### R1 and R2 are modelled separately (#723)
+
+HG002's two mates are different distributions, not a perturbation of one: **2.07x** on fitted
+error rate and **2.36x** on collapsed-tail rate. Drawing both from one model always
+misrepresented one of them.
+
+`gen-seq-error-model` takes `fastq_file_r2:` and writes both mates into one model file;
+`gen-reads` draws R2 from the second. Single-ended runs are unaffected — that path never asks
+for R2. Fitting one FASTQ still writes the same bytes it did before.
+
+### Fixed: R2's quality scores were emitted backwards (#734)
+
+**This affected every paired FASTQ eidolon has ever produced.** R2's per-cycle quality
+profile ran in reverse — reads got *better* toward the 3' end where real reads get worse — and
+because errors are injected from each base's own quality, R2's sequencing errors were mirrored
+with it, concentrated at the 5' end instead of the 3'.
+
+Measured on the shipped model at 150 bp, before and after:
+
+| | cycle 1 | cycle 150 |
+|---|---|---|
+| R1 | 35.49 | 28.34 |
+| R2, before | **28.50** | **35.47** |
+| R2, after | 35.54 | 28.48 |
+
+A quality score belongs to a sequencing cycle, and the flip that turns a forward-generated
+read into its reverse mate was reversing it along with the sequence and the CIGAR, where that
+is correct.
+
+**Output for a given seed changes, including R1's.** Fragment placement is untouched, but a
+sequencing error consumes extra random draws, so changing which R2 bases error shifts the
+stream for every read after it. Per-seed content has never been part of the public API.
+
+### Sequencing-error indels
 
 **Two corrected constants (#660).** `indel_probability` (the odds a sequencing error is an
 indel) and `insertion_fraction` (the odds such an indel is an insertion) had been
@@ -80,6 +161,32 @@ carry no version stamp and unknown fields are ignored silently, so an older bina
 warning that it did. The README's *Versioning and the public API* section now states which
 direction is supported; #708 tracks making the mismatch detectable rather than documented.
 
+### Model files now say what wrote them (#708, #711)
+
+Every model eidolon writes carries a provenance stamp: the format version and the eidolon
+that produced it. A file from a *newer* eidolon is now refused instead of being loaded with
+its unrecognized fields silently discarded. Files written before this release have no stamp;
+they load, and the absence is logged rather than treated as an error.
+
+### Other changes
+
+- **`gen-seq-error-model` takes its read length from the reads** rather than from the first
+  record (#698). A short first record used to truncate the whole model to its length, dropping
+  the 3' end where quality degrades. `max_model_read_length` bounds memory and rejects a
+  longer read instead of silently truncating it (#701).
+- **FASTQ input is validated structurally as it is read** (#706): a malformed header, a bad
+  separator, a length mismatch or a truncated final record is an error naming its line, not a
+  model built from nonsense.
+- **A seed quality of Q31 is replaced with a valid neighbouring score** rather than
+  decremented (#712). Phred+33 encodes 31 as `@`, which must not begin a quality line.
+- **`error_rate` is documented as what it is** (#729): a fitted summary of the quality
+  histogram, not a knob. Generation injects errors from each base's own quality score and
+  never reads it.
+- **`gen-reads` no longer panics when a fragment is materialized short** (#690).
+- **Documentation is now a site.** The 1,275-line README is split into a navigable mdBook
+  under `docs-site/` with a sidebar and search, published to GitHub Pages (#703). The README
+  keeps the pitch, install and a minimal example.
+
 ### Evidence
 
 Verified locally: unit tests pin both NEAT2 constants and the curve against their sources;
@@ -96,9 +203,20 @@ mutations of the band logic were run and all were killed. `test_realism_panel.sh
 both arms receive the same band, verified by four mutations of the wrapper — one of which
 exposed an assertion of its own that was matching the wrong line.
 
-**Not yet verified:** the panel change has not been run on Delta, so the corrected
-`cand_per_mb` figure is not yet in hand. `cand_per_mb` should no longer be read as a
-property of the simulator on any run before this one.
+The quality-model work is evidenced differently. The degraded population and the per-mate
+split are measured on **real HG002 data**, each against a control differing in one variable,
+and the numbers are in the tables above. Locally, known-answer fixtures pin that each mate is
+drawn from its own fit, that swapping the two inputs swaps the two outputs, and that a
+four-population model keeps the mates and the populations apart; every one was checked by
+mutation.
+
+**Not yet verified.** The panel change has not been run on Delta, so the corrected
+`cand_per_mb` figure is not in hand; `cand_per_mb` should not be read as a property of the
+simulator on any run before this one. The new default has been shown to reproduce the library
+it was fitted from — that is self-consistency, and it is not the same as generalizing to a
+library it has not seen, which is unmeasured (#745). Whether a more faithful quality model
+changes what a variant caller does is also unmeasured: the realism panel does not move on
+quality changes, because its metrics are clip- and pair-derived.
 
 8/31/2026
 =========

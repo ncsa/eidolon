@@ -10,9 +10,14 @@ use crate::{
         transition_matrix::{TransitionMatrix, TransitionMatrixError},
     },
 };
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf};
 use thiserror::Error;
+
+/// The shipped default model, fitted from GIAB HG002 2x250. See `SequencingErrorModel::default`.
+pub(crate) static DEFAULT_MODEL_FILE: &[u8] =
+    include_bytes!("model_data/default_sequencing_error_model.json.gz");
 
 #[derive(Debug, Error)]
 pub enum SeqModelError {
@@ -28,6 +33,8 @@ pub enum SeqModelError {
     MissingRngError,
     #[error("Sequencing Error model return an IO error: {0}")]
     IoError(#[from] io::Error),
+    #[error("Error reading the shipped default sequencing error model: {0}")]
+    SerdeError(serde_json::Error),
     #[error("Error initializing Quality Score model: {0}")]
     QualModelError(#[from] QualityModelError),
 }
@@ -197,37 +204,29 @@ impl SequencingErrorModel {
     // Returns Result because it builds distributions that can fail; std::Default
     // requires infallible `fn default() -> Self`, which doesn't fit.
     #[allow(clippy::should_implement_trait)]
+    /// The shipped default, deserialized whole from a model FITTED ON REAL DATA.
+    ///
+    /// Until v3.4.0 this was assembled from constants plus a bare quality model whose
+    /// originating sample was never recorded (NEAT2's `errorModel_toy.p`). It is now one
+    /// file, fitted from GIAB HG002 `NIST_Illumina_2x250bps` — a named, public, downloadable
+    /// library. Provenance, including what it is NOT, is in `model_data/README.md`.
+    ///
+    /// WHY THE WHOLE MODEL AND NOT JUST THE QUALITY PART. The fit carries two mates (#723)
+    /// and a degraded population per mate (#694), and only the first of those fits inside a
+    /// bare `QualityScoreModel`: `quality_score_model_r2` is a field out here on the outer
+    /// struct. Loading the file whole is what lets the default use both.
+    ///
+    /// The non-quality fields in the file are the same values this function used to hardcode
+    /// — the fit ran without `bam_file` or `transition_matrix_file`, so it recorded the
+    /// default substitution matrix, `indel_probability` 0.01, `insertion_fraction` 0.4 and
+    /// the shipped indel-context curve. Swapping to the file therefore changes the quality
+    /// model and `error_rate`, and nothing else.
+    ///
+    /// The provenance stamp (`_eidolon`) is ignored rather than checked: this file ships
+    /// inside the binary that reads it, so the two cannot disagree.
     pub fn default() -> Result<Self, SeqModelError> {
-        // Static defaults inherited from NEAT2, plus measured values where we have them;
-        // provenance for each is in model_data/README.md.
-        // Note that this was originally in a file, and we could have done it the way we did
-        // the other defaults, but it was so small, I just included it in full here.
-        let default_transition_distros = TransitionMatrix::from(
-            [0.0, 0.4918, 0.3377, 0.1705],
-            [0.5238, 0.0, 0.2661, 0.2101],
-            [0.3754, 0.2355, 0.0, 0.389],
-            [0.2505, 0.2552, 0.4942, 0.0],
-        )?;
-        let default_error_rate = 0.006638164688495656;
-        let (default_ins_distr, default_del_distr) = indel_error_length_distributions()?;
-        let default_indel_probability = 0.01;
-        // default is no bias
-        let default_insertion_bias =
-            DiscreteDistribution::new(&vec![1.0, 1.0, 1.0, 1.0], &ALLOWED_NUCS.to_vec())?;
-        let quality_score_model = QualityScoreModel::default()?;
-
-        Ok(SequencingErrorModel {
-            error_rate: default_error_rate,
-            del_length_distribution: default_del_distr,
-            ins_length_distribution: default_ins_distr,
-            indel_probability: default_indel_probability,
-            insertion_fraction: default_insertion_fraction(),
-            indel_context_curve: default_indel_context_curve(),
-            insertion_bias: default_insertion_bias,
-            transition_distros: default_transition_distros,
-            quality_score_model,
-            quality_score_model_r2: None,
-        })
+        let reader = GzDecoder::new(DEFAULT_MODEL_FILE);
+        serde_json::from_reader(reader).map_err(SeqModelError::SerdeError)
     }
 
     pub fn from_file(filename: &PathBuf) -> Result<Self, SeqModelError> {
@@ -554,6 +553,90 @@ mod tests {
         assert!(
             saw_deletion,
             "should have seen at least one deletion in 20 calls"
+        );
+    }
+
+    /// WHAT SHIPS, pinned.
+    ///
+    /// The default is now a fitted file rather than an assembly of constants, so what it
+    /// carries is a fact about that file. This test exists because the thing it replaced was
+    /// a model whose originating sample nobody recorded — the whole point of the change is
+    /// that the default is knowable, and a silent swap would undo that without failing
+    /// anything else.
+    ///
+    /// The numbers are from the fit: GIAB HG002 `NIST_Illumina_2x250bps`, job 22233888.
+    #[test]
+    fn the_shipped_default_is_the_hg002_fit() {
+        let model = SequencingErrorModel::default().unwrap();
+        let q = model.quality_score_model();
+
+        assert_eq!(q.assumed_read_length, 250, "fitted from a 2x250 library");
+        assert_eq!(q.quality_score_options.len(), 31);
+        assert_eq!(q.quality_score_options[0], 2);
+        assert_eq!(*q.quality_score_options.last().unwrap(), 40);
+        assert!(
+            !q.binned_scores,
+            "HiSeq 2500 era: continuous scoring, not binned. A binned default is #730."
+        );
+
+        let deg = q
+            .degradation
+            .as_ref()
+            .expect("the default carries a degraded population (#694)");
+        assert!(
+            (deg.read_fraction - 0.1102).abs() < 5e-4,
+            "R1 degraded fraction {} is not the fitted 0.1102",
+            deg.read_fraction
+        );
+
+        let r2 = model
+            .quality_score_model_r2()
+            .expect("the default carries a separate R2 mate (#723)");
+        assert_eq!(r2.assumed_read_length, 250);
+        let deg2 = r2
+            .degradation
+            .as_ref()
+            .expect("R2 carries its own degraded population");
+        assert!(
+            (deg2.read_fraction - 0.2598).abs() < 5e-4,
+            "R2 degraded fraction {} is not the fitted 0.2598",
+            deg2.read_fraction
+        );
+        // The measured asymmetry is the reason per-mate exists at all. If these two ever come
+        // out equal, the default has lost its R2 half and both mates are drawing from one fit.
+        assert!(
+            deg2.read_fraction > deg.read_fraction * 2.0,
+            "R2 should be materially worse than R1: {} vs {}",
+            deg2.read_fraction,
+            deg.read_fraction
+        );
+
+        assert!(
+            (model.error_rate() - 0.003774).abs() < 1e-5,
+            "error_rate {} is not the fitted 0.003774",
+            model.error_rate()
+        );
+    }
+
+    /// The shipped asset, pinned BY DIGEST.
+    ///
+    /// `the_shipped_default_is_the_hg002_fit` checks the model's metadata — read length,
+    /// option set, degraded fractions, error rate. All of that can be right while the
+    /// transition tensor underneath it is a different model entirely, and the tensor is the
+    /// part that actually shapes output. A digest covers the bytes, so a file swapped by
+    /// accident fails here even when every field still reads correctly.
+    ///
+    /// Regenerate deliberately, never to make this pass:
+    ///     sha256sum eidolon-core/src/models/model_data/default_sequencing_error_model.json.gz
+    #[test]
+    fn the_shipped_default_asset_is_byte_for_byte_the_fitted_model() {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(DEFAULT_MODEL_FILE));
+        assert_eq!(
+            got, "824c8c5d957dab862e52369e485daa733fa02222d856f38632b6b63476f1bc6c",
+            "the shipped model asset is not the one fitted from GIAB HG002 \
+             (job 22233888). If the replacement is intentional, update this digest AND the \
+             provenance block in model_data/README.md in the same commit."
         );
     }
 

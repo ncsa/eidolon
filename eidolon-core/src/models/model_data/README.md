@@ -12,12 +12,12 @@ repeatability.
 | model / parameter | source | measured |
 |---|---|---|
 | `default_fragment_length_model.json.gz` | HCC1395 normal | yes |
-| `error_rate` | NEAT2 `errorModel_toy.p` | yes, upstream |
+| `error_rate` | GIAB HG002 2x250, fitted | yes — 0.003774, measured |
 | `indel_probability` | NEAT2 static default | no |
 | `insertion_fraction` | NEAT2 static default | yes — confirmed at 0.387 |
 | indel-error lengths | HCC1395 normal | yes |
 | homopolymer context curve | HCC1395 normal | yes |
-| `default_quality_score_model.json.gz` | NEAT2 `errorModel_toy.p` | yes, upstream |
+| `default_sequencing_error_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
 | `default_mutation_model.json.gz` (+ `_bkup`) | unrecorded | no |
 | `default_indel_model.json.gz` | unrecorded | no |
 | `default_trinuc_model.json.gz` | unrecorded | no |
@@ -157,19 +157,62 @@ homopolymers shows less slippage overall.
 This is the sequencing-error curve. Variants carry their own, steeper propensity — 60.44x
 at runs ≥10 against 39.20x here — which belongs to variant placement (#378).
 
-## `default_quality_score_model.json.gz`
+## `default_sequencing_error_model.json.gz`
+
+The shipped default, as of v3.4.0. `SequencingErrorModel::default()` deserializes this file
+whole; `QualityScoreModel::default()` takes its R1 half, so the two cannot drift.
 
 | | |
 |---|---|
-| **Source** | NEAT2's bundled `errorModel_toy.p`, converted |
-| **Verified** | `initQ1` and `probQ1` agree to floating-point epsilon (max abs diff 5.6e-16) |
-| **Origin sample** | not recorded upstream |
+| **Source** | GIAB HG002, `NIST_Illumina_2x250bps`, chunk `L001:001` |
+| **URL** | `ftp-trace.ncbi.nlm.nih.gov/giab/ftp/data/AshkenazimTrio/HG002_NA24385_son/NIST_Illumina_2x250bps/reads/` |
+| **Instrument** | HiSeq 2500. **Continuous quality scoring, not binned.** |
+| **Reads fitted** | 3,391,610 per mate, taken 1-in-10 across the file |
+| **Degraded cut** | Q<25 averaged over the last 50 bases |
+| **Fitted by** | `scripts/delta/fit_hg002_pair.sbatch`, job 22233888 |
 
-Shape: 101 bp reads, 42 continuous scores (0–41), and a 100 × 42 × 42
-position-by-previous-score transition tensor.
+### Shape
 
-That describes an older chemistry. Current instruments commonly emit binned quality scores
-at 151 bp; the model supports both, and this default exercises neither. Tracked in #677.
+250 bp reads; 31 observed scores spanning Q2–Q40, non-contiguous (gaps of 1, 2 and 8); a
+249-position transition tensor. Both mates are present, each with its own degraded
+population: R1 `read_fraction` 0.1102, R2 0.2598. Fitted `error_rate` 0.003774.
+
+R2 is measurably worse than R1 — 2.07x on fitted error rate, 2.36x on degraded fraction —
+which is why the model carries the two separately (#723).
+
+### What has been measured
+
+The two-population fit reproduces the library it was fitted from. Generated against the same
+subsample, with a one-population fit of the same reads by the same binary as the control:
+
+| | real | this model | one-population control |
+|---|---|---|---|
+| R1 tail Q<25 | 11.12% | 11.95% | 0.54% |
+| R1 tail Q<20 | 4.92% | 5.91% | **0.00%** |
+| R2 tail Q<25 | 26.22% | 26.36% | 11.74% |
+| R2 tail Q<20 | 12.48% | 14.00% | 0.32% |
+
+### What it is NOT
+
+**Not current chemistry.** HiSeq 2500 is 2020-era, and its scores are continuous. Modern
+instruments commonly emit binned scores. GIAB's HG002 path has no NovaSeq library at all —
+its Illumina sets are 2x250 HiSeq, HiSeq homogeneity, a mate-pair set and an exome — so this
+is the best provenanced option available from that source, not the most modern one. Sourcing
+a binned/current-chemistry library is #730.
+
+**Not a claim about your data.** It is a starting point. Fit your own model with
+`gen-seq-error-model` whenever you can; that is what the tooling is for.
+
+**Fitted at 250 bp.** Generating at another read length rescales the curve to fit, which is
+what NEAT2 did and is an approximation — NEAT2 warned about it and eidolon does not yet
+(#742). `read_len` defaults to 250 so that taking both defaults needs no rescaling.
+
+Measured cost of rescaling, R1 at 151 bp against this model's native 250 bp: the per-cycle
+shape is preserved to a tenth of a Q at the 25%, 50% and 75% marks, and only the end of the
+read moves — the last cycle reads Q30.6 instead of Q23.2, and reads whose last 50 bases
+average below Q20 fall from 5.70% to 1.28%. The direction is conservative: a rescaled read is
+cleaner than a native one, never dirtier. For comparison, the pre-v3.4.0 default produced
+0.00% of those reads at any length. A 151 bp model is #744.
 
 ## Models with unrecorded provenance
 

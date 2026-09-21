@@ -34,6 +34,9 @@ libdeflater = "1.25.2"
 
 [dev-dependencies]
 proptest = "1"
+# TEST ONLY. Pins the shipped model asset by digest; never reaches the binary, so the
+# "no runtime requirements" guarantee is unaffected.
+sha2 = "0.10"
 
 # Inherit the workspace clippy gate (#616); the allow-list lives in the root Cargo.toml.
 [lints]
