@@ -58,8 +58,10 @@ echo "[1/3] building the shared base model from $FASTQ ..."
 [[ -s "$BASE" ]] || { echo "ERROR: gen-seq-error-model produced nothing" >&2; exit 1; }
 
 echo "[2/3] writing the two arms ..."
-SHIPPED_QSM="$REPO_ROOT/eidolon-core/src/models/model_data/default_quality_score_model.json.gz"
-[[ -f "$SHIPPED_QSM" ]] || { echo "ERROR: shipped quality model not found: $SHIPPED_QSM" >&2; exit 1; }
+# The shipped default is one whole sequencing-error model as of v3.4.0; its quality half is a
+# field inside it rather than its own file.
+SHIPPED_QSM="$REPO_ROOT/eidolon-core/src/models/model_data/default_sequencing_error_model.json.gz"
+[[ -f "$SHIPPED_QSM" ]] || { echo "ERROR: shipped model not found: $SHIPPED_QSM" >&2; exit 1; }
 
 python3 - "$BASE" "$OUTDIR" "$SHIPPED_QSM" <<'PY'
 import gzip, json, sys
@@ -90,14 +92,18 @@ print(f"       built model carries indel_probability = {built}")
 # true description of the model it now describes rather than of the one it came from.
 built_rate = model.get("error_rate")
 with gzip.open(shipped_qsm, "rt") as fh:
-    model["quality_score_model"] = json.load(fh)
+    shipped = json.load(fh)
+# v3.4.0 made the shipped default a whole SequencingErrorModel, so take its quality half.
+if "quality_score_model" not in shipped:
+    sys.exit("ERROR: shipped model has no quality_score_model field")
+model["quality_score_model"] = shipped["quality_score_model"]
 qsm = model["quality_score_model"]
 # The field now has to describe the model that just replaced it. That value is known exactly --
 # it is the shipped default's own summary, recorded in model_data/README.md -- so it is copied
 # rather than re-derived. Re-deriving the whole-histogram rate means marginalizing the
 # transition tensor over positions, and a position-1 approximation written into a field
 # documented as the histogram's summary would be a wrong number rather than a missing one.
-SHIPPED_ERROR_RATE = 0.006638164688495656
+SHIPPED_ERROR_RATE = shipped.get("error_rate", 0.003774138199848705)
 print(f"       built model error_rate = {built_rate}")
 print(f"       swapped in the shipped quality model "
       f"({qsm['assumed_read_length']} bp, {len(qsm['quality_score_options'])} options)")

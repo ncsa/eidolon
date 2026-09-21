@@ -155,7 +155,12 @@ impl Default for RunConfiguration {
     fn default() -> Self {
         RunConfiguration {
             reference: PathBuf::new(),
-            read_len: 151,
+            // Matches the shipped default sequencing-error model, which is fitted at 250 bp
+            // (GIAB HG002 2x250). A run that takes both defaults therefore uses the model at
+            // the length it was measured at, with no rescaling. Ask for another read length
+            // and the model is rescaled to it -- which is what NEAT2 did too, and is an
+            // approximation; prefer fitting a model at your own read length (#730, #742).
+            read_len: 250,
             coverage: 10,
             mutation_rate: None,
             ploidy: 2,
@@ -1026,7 +1031,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = RunConfiguration::default();
-        assert_eq!(config.read_len, 151);
+        assert_eq!(config.read_len, 250);
         assert_eq!(config.coverage, 10);
         assert!(!config.paired_ended);
         assert!(config.produce_fastq);

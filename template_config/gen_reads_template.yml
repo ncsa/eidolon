@@ -12,8 +12,8 @@ reference: /path/to/reference.fa
 
 # --------------- read parameters ---------------
 
-# Length of each simulated read in bases. (default: 151)
-read_len: 151
+# Length of each simulated read in bases. (default: 250, matching the shipped model)
+read_len: 250
 
 # Target mean read depth across the reference. (default: 10)
 coverage: 10

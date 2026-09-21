@@ -142,8 +142,6 @@ impl Display for QualityScoreModel {
     }
 }
 
-static DATA_FILE: &[u8] = include_bytes!("model_data/default_quality_score_model.json.gz");
-
 /// Turn per-position transition weights into sampling distributions.
 ///
 /// Shared by both populations deliberately. The healthy and degraded tensors have to treat an
@@ -185,20 +183,27 @@ impl QualityScoreModel {
     // Returns Result because it builds distributions that can fail; std::Default
     // requires infallible `fn default() -> Self`, which doesn't fit.
     #[allow(clippy::should_implement_trait)]
+    /// The R1 half of the shipped default sequencing-error model.
+    ///
+    /// ONE SOURCE OF TRUTH. The default used to be its own file, fitted from a sample nobody
+    /// recorded. It is now a slice of `model_data/default_sequencing_error_model.json.gz`,
+    /// which is fitted from GIAB HG002 2x250 and also carries the R2 mate and the degraded
+    /// populations — neither of which fits in a bare `QualityScoreModel`. Taking the R1 half
+    /// here keeps the two defaults from drifting apart.
+    ///
+    /// Read through `Value` rather than through `SequencingErrorModel` so this module does not
+    /// have to depend on the one that depends on it.
     pub fn default() -> Result<Self, QualityModelError> {
-        // This generates the default quality score model based on the original NEAT default.
-        // the parameters are sort of outdated now:
-        //  - quality_score_options: 0 - 41
-        //  - binned_scores: false
-        //  - assumed_read_length: 101
-        // I won't list all the NEAT calculated weights. zcat the model file if you are interested, but
-        // it's a lot of data.
-
-        // this map_err thing I had help on. I feel like this is something rust-analyzer should have known.
-        let reader = GzDecoder::new(DATA_FILE);
-        let data: QualityScoreModel =
+        let reader = GzDecoder::new(crate::models::sequencing_error_model::DEFAULT_MODEL_FILE);
+        let value: serde_json::Value =
             serde_json::from_reader(reader).map_err(QualityModelError::SerdeError)?;
-        Ok(data)
+        let quality = value.get("quality_score_model").ok_or_else(|| {
+            QualityModelError::InvalidConfiguration(
+                "the shipped default sequencing-error model carries no quality_score_model"
+                    .to_string(),
+            )
+        })?;
+        serde_json::from_value(quality.clone()).map_err(QualityModelError::SerdeError)
     }
 
     /// we will write subutilities that use these features, eventually
@@ -482,16 +487,30 @@ mod tests {
         let mut temp_file = PathBuf::from(temp_dir.path());
         temp_file.push("test.json.gz");
         let model: QualityScoreModel = QualityScoreModel::default().unwrap();
-        assert_eq!(model.assumed_read_length, 101);
+        assert_eq!(model.assumed_read_length, 250);
         let result = model.write_to_file(&temp_file);
         assert_eq!(result.unwrap(), ());
         temp_dir.close().unwrap();
     }
 
     #[test]
+    /// The bare quality default must BE the R1 half of the shipped sequencing-error model,
+    /// not a second copy that can drift from it. That is the whole reason this function reads
+    /// the same file rather than its own.
     fn test_model_default() {
+        use crate::models::sequencing_error_model::SequencingErrorModel;
         let model = QualityScoreModel::default().unwrap();
-        assert_eq!(model.assumed_read_length, 101)
+        let from_seq_model = SequencingErrorModel::default().unwrap();
+        let r1 = from_seq_model.quality_score_model();
+        assert_eq!(model.assumed_read_length, 250);
+        assert_eq!(model.assumed_read_length, r1.assumed_read_length);
+        assert_eq!(model.quality_score_options, r1.quality_score_options);
+        assert_eq!(model.binned_scores, r1.binned_scores);
+        assert_eq!(
+            model.degradation.is_some(),
+            r1.degradation.is_some(),
+            "the degraded population must come through both paths"
+        );
     }
 
     #[test]

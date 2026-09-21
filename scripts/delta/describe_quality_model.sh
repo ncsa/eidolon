@@ -19,7 +19,7 @@
 #   bash scripts/delta/describe_quality_model.sh $SCRATCH/qualdeg_r1/model_degraded.json.gz ...
 #
 # Compare against the shipped default, which is in the repo:
-#   bash scripts/delta/describe_quality_model.sh eidolon-core/src/models/model_data/default_quality_score_model.json.gz
+#   bash scripts/delta/describe_quality_model.sh eidolon-core/src/models/model_data/default_sequencing_error_model.json.gz
 
 #SBATCH --job-name=eidolon-modelshape
 #SBATCH --partition=cpu
