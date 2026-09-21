@@ -207,6 +207,13 @@ a binned/current-chemistry library is #730.
 what NEAT2 did and is an approximation — NEAT2 warned about it and eidolon does not yet
 (#742). `read_len` defaults to 250 so that taking both defaults needs no rescaling.
 
+Measured cost of rescaling, R1 at 151 bp against this model's native 250 bp: the per-cycle
+shape is preserved to a tenth of a Q at the 25%, 50% and 75% marks, and only the end of the
+read moves — the last cycle reads Q30.6 instead of Q23.2, and reads whose last 50 bases
+average below Q20 fall from 5.70% to 1.28%. The direction is conservative: a rescaled read is
+cleaner than a native one, never dirtier. For comparison, the pre-v3.4.0 default produced
+0.00% of those reads at any length. A 151 bp model is #744.
+
 ## Models with unrecorded provenance
 
 These predate the Rust port. Round-trip serialization is the only property currently
