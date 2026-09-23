@@ -16,8 +16,18 @@
 #
 # chr22_wall_s was PASSING at 64.04 against a 68.60 limit and is re-frozen anyway, for
 # consistency with the other three from the same job and because "re-freeze on each release"
-# is this file's stated practice. Note what that costs: its limit moves 68.60 -> 76.85, so the
-# gate is looser than it was. If that is not wanted, revert this one row to 57.17.
+# is this file's stated practice. It costs looseness: the limit moves 68.60 -> 76.85.
+#
+# DECIDED 2026-09-22: keep 76.85, and tighten later if the evidence supports it. These are all
+# single-job observations, so a row could be re-frozen high simply because this job ran on a
+# busy node. Job 22302963's observed values, recorded so a later run has something to compare
+# against rather than re-deriving them from a log that will be purged:
+#
+#   ecoli_wall_s 10.93   ecoli_rss_mb 101.1   chr22_wall_s 64.04   chr22_rss_mb 295.5
+#
+# If subsequent runs read consistently lower, re-freeze down to them. Do not tighten on one
+# lower reading -- that is the same single-job mistake in the other direction, and #671 is
+# about exactly that.
 #
 # somatic_snv_recall is deliberately NOT re-frozen. It is failing (#680), it has read 0.8397
 # on four builds now, and freezing it at the observed value would convert an open question
