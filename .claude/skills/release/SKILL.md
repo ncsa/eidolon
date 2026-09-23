@@ -8,10 +8,10 @@ description: "Use when cutting an eidolon release or fixing one that shipped wro
 Run these without being asked to enumerate them. The user should say "cut a release" or
 "fix the release" and get the whole sequence, including the follow-ups.
 
-**Nothing here is done until the assets are verified on the release page.** A pushed tag is
-not evidence, a green workflow run is not evidence — `gh release view` listing all five
-binaries is. This whole procedure exists because v3.2.0 was declared shipped while it was
-missing its macOS asset.
+**Nothing here is done until the assets are verified on the release page and the docs site
+answers.** A pushed tag is not evidence, a green workflow run is not evidence — `gh release
+view` listing all five binaries is, and an HTTP 200 on a deep docs page is. This whole
+procedure exists because v3.2.0 was declared shipped while it was missing its macOS asset.
 
 ## Which branch
 
@@ -78,14 +78,34 @@ opening the PR and state the file count in the PR body.
    deliberate so one broken target does not take out the others — which also means the run
    can go green-ish while an asset is missing. Count them.
 
-8. **Conda sha256 follow-up** — the tarball only exists once the tag is pushed, so this is
+8. **Verify the docs site actually serves.** `docs.yml` deploys to GitHub Pages on push to
+   `main`, so this fires on the MERGE, not on the tag — it has usually already run by the
+   time you are counting binaries. A green run is not evidence here either: the workflow can
+   succeed and the site still 404, and a stale deploy looks identical to a fresh one.
+   ```bash
+   gh run list --workflow docs.yml --branch main --limit 1
+   curl -sS -o /dev/null -w 'index %{http_code}\n' https://ncsa.github.io/eidolon/
+   curl -sS -o /dev/null -w 'deep  %{http_code}\n' \
+     https://ncsa.github.io/eidolon/getting-started/installation.html
+   curl -sS https://ncsa.github.io/eidolon/ | grep -c 'eidolon'
+   ```
+   Check a DEEP page, not just the index: a broken `SUMMARY.md` entry or a bad `{{#include}}`
+   takes out individual chapters while the landing page renders fine. Pages also caches, so a
+   200 on its own does not prove the deploy that just ran is the one being served — if the
+   content looks stale, check the run's completion time against the release.
+
+   The build-side guards run inside `docs.yml` (`check_book.py` before and after the build,
+   plus a grep of mdbook's log for `ERROR`/`WARN`), so a chapter that vanished should fail
+   there. This step is the other half: that what those guards passed is what is on the web.
+
+9. **Conda sha256 follow-up** — the tarball only exists once the tag is pushed, so this is
    always a second PR:
    ```bash
    curl -sL https://github.com/ncsa/eidolon/archive/refs/tags/vX.Y.Z.tar.gz | sha256sum
    ```
    Put it in `conda-recipe/meta.yaml`, PR to `main`.
 
-9. **Merge back so `develop` has the bump**, or its next release cut starts from a stale
+10. **Merge back so `develop` has the bump**, or its next release cut starts from a stale
    version. **Then run `cargo check --workspace` and commit whatever it does to
    `Cargo.lock`** — a workspace member that exists only on `develop` inherits the workspace
    version but is absent from the branch that bumped it, so the merge leaves its lock entry
@@ -96,7 +116,8 @@ opening the PR and state the file count in the PR body.
    git status --short   # a modified Cargo.lock here means it is not committed yet
    ```
 
-10. **Report** the tag, the asset count, and anything not verified.
+11. **Report** the tag, the asset count, whether the docs site serves, and anything not
+    verified.
 
 ## Gotchas that have actually bitten
 
