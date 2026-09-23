@@ -21,7 +21,7 @@ stride, the read count, the degraded-population cut and the job that produced it
 
 | | |
 |---|---|
-| Read length | 250 bp (`read_len` now defaults to 250 to match) |
+| Read length | 250 bp (`gen-reads`' `read_len` now defaults to 250 to match) |
 | Quality scores | 31 observed levels, Q2–Q40, **continuous** |
 | Reads fitted | 3,391,610 per mate, taken 1-in-10 across the file |
 | `error_rate` | 0.003774, against the inherited 0.006638 |
@@ -34,6 +34,19 @@ this is the best provenanced option from that source rather than the most modern
 `gen-seq-error-model` whenever you can — that is what it is for. Generating at a read length
 the model was not fitted at rescales the curve to fit, which is an approximation inherited
 from NEAT2 (#742).
+
+### Upgrading: check `fragment_mean` against `read_len`
+
+`gen-reads`' `read_len` default moves 151 → 250. **`gen-cancer-reads` is unchanged at 151**, so
+a cancer config that omits `read_len` rescales the 250 bp model rather than using it natively.
+
+If you have a paired-end `gen-reads` config that **omits `read_len`** and sets a small
+`fragment_mean`, set `read_len: 151` explicitly or raise `fragment_mean`. Paired-end fragment
+sampling rejects any fragment below `read_len + 10`, so a config written for 151 bp reads with
+`fragment_mean: 200` now discards most of its draws: the run still completes, with a single
+`WARN` about insert-size diversity and a realized insert distribution nothing like the one
+configured. Configs derived from `template_config/gen_reads_template.yml` set `read_len`
+explicitly and are unaffected.
 
 ### Reads now degrade the way real reads do (#694, #720)
 
@@ -54,7 +67,7 @@ Measured on HG002, against a single-population fit of the same reads by the same
 `gen-seq-error-model` fits this with `fit_quality_degradation: true`; the shipped default
 already carries it.
 
-### R1 and R2 are modelled separately (#723)
+### R1 and R2 are modeled separately (#723)
 
 HG002's two mates are different distributions, not a perturbation of one: **2.07x** on fitted
 error rate and **2.36x** on collapsed-tail rate. Drawing both from one model always
@@ -63,6 +76,11 @@ misrepresented one of them.
 `gen-seq-error-model` takes `fastq_file_r2:` and writes both mates into one model file;
 `gen-reads` draws R2 from the second. Single-ended runs are unaffected — that path never asks
 for R2. Fitting one FASTQ still writes the same bytes it did before.
+
+**Not yet on every path.** The four structural-variant junction writers (BND, INV, DEL, DUP in
+`gen_reads/utils/runner.rs`) still draw both mates from the R1 model, so on a run with
+`sv_rate_scale > 0` the junction reads — precisely the ones an SV caller uses — carry R1's
+error rate and degraded fraction rather than R2's. Tracked separately.
 
 ### Fixed: R2's quality scores were emitted backwards (#734)
 
