@@ -1,6 +1,6 @@
-9/2/2026
+9/22/2026
 =========
-## eidolon v3.4.0 (unreleased) — a quality model measured from real, named data
+## eidolon v3.4.0 — a quality model measured from real, named data
 
 The shipped sequencing-error model no longer comes from a sample nobody recorded. It is
 fitted from a public GIAB library, it carries the two mates separately because they are
