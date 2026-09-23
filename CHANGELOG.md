@@ -35,18 +35,16 @@ this is the best provenanced option from that source rather than the most modern
 the model was not fitted at rescales the curve to fit, which is an approximation inherited
 from NEAT2 (#742).
 
-### Upgrading: check `fragment_mean` against `read_len`
+### Upgrading: the read-length default moved
 
-`gen-reads`' `read_len` default moves 151 → 250. **`gen-cancer-reads` is unchanged at 151**, so
-a cancer config that omits `read_len` rescales the 250 bp model rather than using it natively.
+`gen-reads`' `read_len` default moves 151 → 250, matching the shipped model so the two agree
+out of the box. **`gen-cancer-reads` is unchanged at 151**, so a cancer config that omits
+`read_len` rescales the 250 bp model rather than using it natively.
 
-If you have a paired-end `gen-reads` config that **omits `read_len`** and sets a small
-`fragment_mean`, set `read_len: 151` explicitly or raise `fragment_mean`. Paired-end fragment
-sampling rejects any fragment below `read_len + 10`, so a config written for 151 bp reads with
-`fragment_mean: 200` now discards most of its draws: the run still completes, with a single
-`WARN` about insert-size diversity and a realized insert distribution nothing like the one
-configured. Configs derived from `template_config/gen_reads_template.yml` set `read_len`
-explicitly and are unaffected.
+If you relied on that default and set `fragment_mean`, check it still suits 250 bp reads.
+Paired-end fragments have always had to exceed the read length — that constraint is unchanged
+and only the default moved, so a config that no longer matches will say so. Configs derived
+from `template_config/gen_reads_template.yml` set `read_len` explicitly and are unaffected.
 
 ### Reads now degrade the way real reads do (#694, #720)
 
