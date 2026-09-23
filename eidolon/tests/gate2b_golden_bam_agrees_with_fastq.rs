@@ -136,6 +136,9 @@ fn golden_bam_sequences_match_the_reference_on_both_strands() {
 
     let mut checked = (0usize, 0usize); // (forward, reverse)
     let mut worst = (1.0f64, String::new());
+    // Smallest gap between "SEQ agrees with the reference" and "its reverse complement does".
+    // Positive on every record means no record is stored in the wrong orientation.
+    let mut orientation_margin = (f64::MAX, String::new());
     for result in reader.records() {
         let record = result.unwrap();
         let Some(Ok(start)) = record.alignment_start() else {
@@ -194,6 +197,22 @@ fn golden_bam_sequences_match_the_reference_on_both_strands() {
             .to_uppercase();
 
         let id = matched as f64 / compared_bases as f64;
+        // The failure this test exists for is SEQ being stored in READ orientation when 0x10
+        // is set (#550). Compare the two orientations DIRECTLY rather than inferring it from
+        // an absolute identity threshold: a threshold also moves when the sequencing-error
+        // model changes, and the shipped default now carries a degraded population (#694), so
+        // the noisiest legitimate read is much noisier than it used to be. The orientation
+        // margin does not move with read quality at all.
+        let rc = revcomp(&seq);
+        let rc_matched = expected
+            .bytes()
+            .zip(rc.bytes())
+            .filter(|(r, q)| r.eq_ignore_ascii_case(q))
+            .count();
+        let rc_id = rc_matched as f64 / expected.len().max(1) as f64;
+        if id - rc_id < orientation_margin.0 {
+            orientation_margin = (id - rc_id, format!("{ref_name}:{}", usize::from(start)));
+        }
         let reverse = record.flags().is_reverse_complemented();
         if reverse {
             checked.1 += 1;
@@ -221,10 +240,24 @@ fn golden_bam_sequences_match_the_reference_on_both_strands() {
         checked.0,
         checked.1
     );
-    // 0.90 leaves room for the sequencing-error model (~0.99 in practice) while sitting far above
-    // a reverse-complement mismatch, which lands near 0.14 — the two are not close.
+    // THE ORIENTATION ASSERTION. Every record must agree with the reference better than its own
+    // reverse complement does. This is what #550 was about, and unlike an absolute identity
+    // floor it is unaffected by how noisy the reads are.
     assert!(
-        worst.0 > 0.90,
+        orientation_margin.0 > 0.0,
+        "a golden BAM record matches its own reverse complement at least as well as it matches \
+         the reference ({} at margin {:.3}) — SEQ is stored in READ orientation, and SAM 1.4 \
+         requires REFERENCE orientation when 0x10 is set (#550).",
+        orientation_margin.1,
+        orientation_margin.0
+    );
+    // A loose floor, kept only to catch gross corruption. It was 0.90 when the shipped model had
+    // no degraded population and the noisiest read still read ~0.99; that model now collapses
+    // about one read in nine by design (#694), so the worst legitimate record is far noisier.
+    // The orientation check above is the real guard; a reverse-complement mismatch lands near
+    // 0.14, nowhere near this.
+    assert!(
+        worst.0 > 0.60,
         "a golden BAM record disagrees with the reference it is aligned to (identity {:.2}).\n  \
          {}\n  If `rc` matches `ref` and `SEQ` does not, SEQ is in READ orientation and SAM 1.4 \
          requires REFERENCE orientation when 0x10 is set (#550).",

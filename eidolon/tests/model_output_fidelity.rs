@@ -568,7 +568,7 @@ fn built_gc_bias_model_depletes_disfavored_gc_in_output() {
 /// checked that quality varies with cycle at all.
 ///
 /// Real Illumina quality decays along the read, and callers weight bases by it, so a
-/// simulator that emits flat quality is not modelling the thing it claims to.
+/// simulator that emits flat quality is not modeling the thing it claims to.
 #[test]
 fn built_seq_error_model_reproduces_the_positional_quality_profile() {
     let tmp = tempfile::tempdir().unwrap();
@@ -751,12 +751,17 @@ fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usi
 /// (0.4918 C / 0.3377 G / 0.1705 T), one with the A row forced entirely to T.
 ///
 /// This is differential rather than absolute because a forced run does NOT reach 100% T.
-/// The model's `indel_probability` is 0.4 and its `insertion_bias` is uniform over ACGT, so
-/// roughly 40% of sequencing errors are indels whose inserted bases never consult the
-/// transition matrix. That floor puts a few hundred C and G into the output no matter what
-/// the matrix says — which is correct behavior, and the reason an absolute `>98% T`
+/// `insertion_bias` is uniform over ACGT, so indel errors put inserted bases into the
+/// output that never consult the transition matrix. That floor is a few hundred C and G no
+/// matter what the matrix says — correct behavior, and the reason an absolute `>98% T`
 /// assertion would fail on working code. The control run pins where the substitution
 /// spectrum sits without the override, so the comparison isolates the matrix's effect.
+///
+/// **Why the floor is ~39% here and not the model's 1%.** `simulate_over_polya` uses a
+/// 20,000-base all-A reference — a homopolymer past the #661 curve's cap, so its most
+/// enriched case: 0.01 x 39.20 = 0.392. Before #660 this figure was ~40% for an unrelated
+/// reason (`indel_probability` was 0.4), so the number is coincidentally similar. A
+/// homopolymer-free fixture would have a ~0.6% floor instead.
 #[test]
 fn built_seq_error_transition_matrix_decides_the_substituted_base() {
     let tmp = tempfile::tempdir().unwrap();

@@ -83,6 +83,13 @@ pub struct GenReadsConfig {
     pub produce_vcf: bool,
     pub rng_seed: String,
     pub sequence_error_model: Option<PathBuf>,
+    /// An explicit `quality_score_model:` override, which applies to the whole run and
+    /// deliberately suppresses a per-mate split (#723).
+    pub quality_score_model: Option<PathBuf>,
+    /// Paired-end fragment length. Defaults to 200/30, which is too short for a read length
+    /// above ~100 bp — a fragment shorter than two reads is all adapter readthrough.
+    pub fragment_mean: Option<f64>,
+    pub fragment_st_dev: Option<f64>,
     pub num_threads: Option<usize>,
     pub chunk_size: Option<usize>,
     pub input_vcf: Option<PathBuf>,
@@ -105,6 +112,9 @@ impl GenReadsConfig {
             produce_vcf: false,
             rng_seed: "integration phase two".to_string(),
             sequence_error_model: None,
+            quality_score_model: None,
+            fragment_mean: None,
+            fragment_st_dev: None,
             num_threads: None,
             chunk_size: None,
             input_vcf: None,
@@ -119,12 +129,20 @@ impl GenReadsConfig {
     pub fn write_yaml(&self) -> tempfile::NamedTempFile {
         let mut f = tempfile::Builder::new().suffix(".yml").tempfile().unwrap();
         let pair_section = if self.paired_ended {
-            "paired_ended: true\nfragment_mean: 200.0\nfragment_st_dev: 30.0\n"
+            format!(
+                "paired_ended: true\nfragment_mean: {}\nfragment_st_dev: {}\n",
+                self.fragment_mean.unwrap_or(200.0),
+                self.fragment_st_dev.unwrap_or(30.0),
+            )
         } else {
-            "paired_ended: false\n"
+            "paired_ended: false\n".to_string()
         };
         let model_section = match &self.sequence_error_model {
             Some(p) => format!("sequence_error_model: {}\n", p.display()),
+            None => String::new(),
+        };
+        let quality_model_section = match &self.quality_score_model {
+            Some(p) => format!("quality_score_model: {}\n", p.display()),
             None => String::new(),
         };
         let threads_section = match self.num_threads {
@@ -163,7 +181,7 @@ impl GenReadsConfig {
              output_filename: {name}\n\
              overwrite_output: true\n\
              rng_seed: {seed}\n\
-             {pair}{model}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}",
+             {pair}{model}{qmodel}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}",
             ref_ = self.reference.display(),
             rl = self.read_len,
             cov = self.coverage,
@@ -175,6 +193,7 @@ impl GenReadsConfig {
             seed = self.rng_seed,
             pair = pair_section,
             model = model_section,
+            qmodel = quality_model_section,
             threads = threads_section,
             chunksz = chunk_size_section,
             ivcf = input_vcf_section,

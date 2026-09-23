@@ -42,6 +42,14 @@ use crate::structs::distributions::{DiscreteDistribution, DistributionErrors};
 
 pub const QUALITY_OFFSET: usize = 33;
 
+/// Phred+33 encodes quality 31 as `@`, the same byte that begins a FASTQ record header.
+///
+/// A quality line must not START with it: a reader that scans for `@` to find record
+/// boundaries would mis-frame the file. eidolon's own reader consumes fixed four-line records
+/// and is unaffected (see `a_quality_line_starting_with_an_at_sign_is_not_a_header`), but the
+/// files it writes are read by other tools, so position 1 never carries Q31.
+const AT_SYMBOL_SCORE: usize = 31;
+
 #[derive(Debug, Error)]
 pub enum QualityModelError {
     #[error("Quality model initiation returned a distribution error: {0}")]
@@ -54,6 +62,30 @@ pub enum QualityModelError {
     SerdeError(#[from] serde_json::Error),
     #[error("Invalid quality model configuration: {0}")]
     InvalidConfiguration(String),
+}
+
+/// A second quality-score population, for reads that sequence badly.
+///
+/// WHY THIS EXISTS (#694). Real Illumina data is bimodal: about one read in ten collapses
+/// toward the 3' end and stays collapsed, and `distros_from_one` cannot represent that. It is a
+/// first-order chain over (position, previous score) with no per-read state, so a pooled fit
+/// lands on the average of the two populations, which is mean reversion. Measured on HG002 R1:
+/// 9.80% of real reads carry a tail below Q25, against essentially none simulated.
+///
+/// MEASURED SHAPE. The degraded population is a per-read PROPENSITY, not a collapse that begins
+/// partway through. Reads that end badly are already noisy at position 1 to 100, carrying 20x
+/// the low-base rate of a healthy read. So this carries a whole-read tensor and its own seed,
+/// and there is deliberately no onset position: an earlier design had one, and the measurement
+/// says there is nothing for it to model.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityDegradation {
+    /// Fraction of reads drawn from the degraded population, in [0, 1].
+    pub read_fraction: f64,
+    /// Seed distribution for position 1 of a degraded read.
+    pub degraded_seed: DiscreteDistribution<usize>,
+    /// Transition tensor for a degraded read. Same shape as `distros_from_one`, used for the
+    /// whole read rather than from an onset.
+    pub degraded_distros: Vec<Vec<DiscreteDistribution<usize>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,6 +108,24 @@ pub struct QualityScoreModel {
     // the original design in NEAT. Previous attempts to simplify this have not been able to
     // successfully reproduce quality scores.
     pub distros_from_one: Vec<Vec<DiscreteDistribution<usize>>>,
+    /// The degraded population, when the model carries one (#694).
+    ///
+    /// `None` must be byte-identical to a model that predates this field, which is why the
+    /// per-read class draw is inside the `Some` branch of `generate_quality_scores`: an
+    /// unconditional draw would consume an RNG value and shift every frozen baseline.
+    ///
+    /// No `#[serde(default)]` here, unlike the `#[serde(default = "...")]` fields on
+    /// `SequencingErrorModel`. Serde already treats a missing `Option` field as `None`, so the
+    /// attribute would be a no-op. That was confirmed by mutation: removing it changed nothing,
+    /// and a model file written before this field still loads. The distinction matters because
+    /// a NON-optional field added later does need the attribute.
+    ///
+    /// `skip_serializing_if` so a model with no degraded population writes the SAME BYTES it
+    /// wrote before this field existed. Without it every model file gains `"degradation": null`
+    /// and `seq_error_model_matches_baseline` fails, which is how this was caught. The frozen
+    /// baselines then needed no re-blessing, and that is the evidence the change is additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degradation: Option<QualityDegradation>,
 }
 
 impl Display for QualityScoreModel {
@@ -92,7 +142,40 @@ impl Display for QualityScoreModel {
     }
 }
 
-static DATA_FILE: &[u8] = include_bytes!("model_data/default_quality_score_model.json.gz");
+/// Turn per-position transition weights into sampling distributions.
+///
+/// Shared by both populations deliberately. The healthy and degraded tensors have to treat an
+/// unseen previous score the same way, and the surest way to guarantee that is one function.
+///
+/// The uniform fallback below is for a single unseen PREVIOUS SCORE within a position, which is
+/// ordinary: a score that appears nowhere as a transition source still needs a row, and binned
+/// models create them on purpose. It is not a policy for a position that was never observed at
+/// all. A whole position of zeros would make every read draw uniform quality there, and
+/// `gen-seq-error-model` refuses to emit such a model rather than letting this fill it in --
+/// see the coverage check in its runner, which is what keeps that case from reaching here.
+fn build_distros(
+    trans_weights: &[Vec<Vec<f64>>],
+    n_scores: usize,
+) -> Result<Vec<Vec<DiscreteDistribution<usize>>>, QualityModelError> {
+    let score_indices: Vec<usize> = (0..n_scores).collect();
+    let uniform = vec![1.0f64; n_scores];
+    let mut distros: Vec<Vec<DiscreteDistribution<usize>>> = Vec::new();
+    for pos_weights in trans_weights {
+        let mut row: Vec<DiscreteDistribution<usize>> = Vec::new();
+        for prev_weights in pos_weights {
+            // A prev_score that never appeared as a transition source has all-zero weights.
+            // Fall back to uniform so sample() doesn't always return the lowest score.
+            let weights = if prev_weights.iter().all(|&w| w == 0.0) {
+                &uniform
+            } else {
+                prev_weights
+            };
+            row.push(DiscreteDistribution::new(weights, &score_indices)?);
+        }
+        distros.push(row);
+    }
+    Ok(distros)
+}
 
 impl QualityScoreModel {
     // methods for QualityScoreModel objects
@@ -100,20 +183,27 @@ impl QualityScoreModel {
     // Returns Result because it builds distributions that can fail; std::Default
     // requires infallible `fn default() -> Self`, which doesn't fit.
     #[allow(clippy::should_implement_trait)]
+    /// The R1 half of the shipped default sequencing-error model.
+    ///
+    /// ONE SOURCE OF TRUTH. The default used to be its own file, fitted from a sample nobody
+    /// recorded. It is now a slice of `model_data/default_sequencing_error_model.json.gz`,
+    /// which is fitted from GIAB HG002 2x250 and also carries the R2 mate and the degraded
+    /// populations — neither of which fits in a bare `QualityScoreModel`. Taking the R1 half
+    /// here keeps the two defaults from drifting apart.
+    ///
+    /// Read through `Value` rather than through `SequencingErrorModel` so this module does not
+    /// have to depend on the one that depends on it.
     pub fn default() -> Result<Self, QualityModelError> {
-        // This generates the default quality score model based on the original NEAT default.
-        // the parameters are sort of outdated now:
-        //  - quality_score_options: 0 - 41
-        //  - binned_scores: false
-        //  - assumed_read_length: 101
-        // I won't list all the NEAT calculated weights. zcat the model file if you are interested, but
-        // it's a lot of data.
-
-        // this map_err thing I had help on. I feel like this is something rust-analyzer should have known.
-        let reader = GzDecoder::new(DATA_FILE);
-        let data: QualityScoreModel =
+        let reader = GzDecoder::new(crate::models::sequencing_error_model::DEFAULT_MODEL_FILE);
+        let value: serde_json::Value =
             serde_json::from_reader(reader).map_err(QualityModelError::SerdeError)?;
-        Ok(data)
+        let quality = value.get("quality_score_model").ok_or_else(|| {
+            QualityModelError::InvalidConfiguration(
+                "the shipped default sequencing-error model carries no quality_score_model"
+                    .to_string(),
+            )
+        })?;
+        serde_json::from_value(quality.clone()).map_err(QualityModelError::SerdeError)
     }
 
     /// we will write subutilities that use these features, eventually
@@ -158,6 +248,47 @@ impl QualityScoreModel {
         )
     }
 
+    /// Attach a degraded population fitted from the SAME option set as this model.
+    ///
+    /// The option set is shared rather than fitted separately because `generate_quality_scores`
+    /// indexes one list: a degraded tensor built against its own options would index the wrong
+    /// scores. The weights passed here must therefore already be re-indexed against
+    /// `self.quality_score_options`.
+    pub fn with_degradation(
+        mut self,
+        read_fraction: f64,
+        seed_weights: Vec<f64>,
+        trans_weights: Vec<Vec<Vec<f64>>>,
+    ) -> Result<Self, QualityModelError> {
+        if !(0.0..=1.0).contains(&read_fraction) || read_fraction.is_nan() {
+            return Err(QualityModelError::InvalidConfiguration(format!(
+                "degraded read_fraction must be in [0, 1], got {read_fraction}"
+            )));
+        }
+        if trans_weights.len() != self.distros_from_one.len() {
+            return Err(QualityModelError::InvalidConfiguration(format!(
+                "degraded tensor covers {} positions but the model has {}; both populations \
+                 describe the same read length",
+                trans_weights.len(),
+                self.distros_from_one.len()
+            )));
+        }
+        let n_scores = self.quality_score_options.len();
+        if seed_weights.len() != n_scores {
+            return Err(QualityModelError::InvalidConfiguration(format!(
+                "degraded seed has {} weights against {n_scores} quality score options; the two \
+                 populations share one option set",
+                seed_weights.len()
+            )));
+        }
+        self.degradation = Some(QualityDegradation {
+            read_fraction,
+            degraded_seed: DiscreteDistribution::new(&seed_weights, &self.quality_score_options)?,
+            degraded_distros: build_distros(&trans_weights, n_scores)?,
+        });
+        Ok(self)
+    }
+
     pub fn generate_quality_scores(
         &self,
         length: usize,
@@ -169,12 +300,32 @@ impl QualityScoreModel {
 
         // This will be the list of scores generated
         let mut score_list: Vec<usize> = Vec::with_capacity(length);
+
+        // ONE class draw per read, and only when the model carries a degraded population
+        // (#694). A read belongs to one population for its whole length: the measurement says
+        // reads that end badly are already noisy at the start, so there is no onset to model.
+        //
+        // The draw sits inside the `Some` arm deliberately. Drawing unconditionally would
+        // consume an RNG value for every model that has no degraded population, shifting the
+        // output of every model file that predates this field and every frozen baseline with
+        // it. `None` must be byte-identical, and that is asserted below.
+        let (seed_dist, distros) = match &self.degradation {
+            None => (&self.seed_dist, &self.distros_from_one),
+            Some(d) => {
+                if rng.random()? < d.read_fraction {
+                    (&d.degraded_seed, &d.degraded_distros)
+                } else {
+                    (&self.seed_dist, &self.distros_from_one)
+                }
+            }
+        };
+
         // sample the scores list with the seed weights applied to generate the first score.
         // Samples an index based on the weights, which then selects the quality score.
-        let mut seed_score = self.seed_dist.sample(rng.random()?)?;
-        // We don't want the first score to be 31. That throws off the parser, because it makes an @ symbol
-        if seed_score == 31 {
-            seed_score -= 1
+        let mut seed_score = seed_dist.sample(rng.random()?)?;
+        // Position 1 must not be Q31 ('@'). See AT_SYMBOL_SCORE.
+        if seed_score == AT_SYMBOL_SCORE {
+            seed_score = self.substitute_for_at_symbol()?;
         }
         // Adding the seed score to the list. This is safe so long as the qual score max is <= 255 (currently 40)
         score_list.push(seed_score);
@@ -193,21 +344,53 @@ impl QualityScoreModel {
 
             // First get the index of the previous score from the original scores list.
             // This will match the index in the score weights table that corresponds to that score.
+            let previous = score_list[current_index - 1];
             let score_position = self
                 .quality_score_options
                 .iter()
-                .position(|&x| x == score_list[current_index - 1])
-                .unwrap();
+                .position(|&x| x == previous)
+                .ok_or_else(|| {
+                    QualityModelError::InvalidConfiguration(format!(
+                        "quality score {previous} at position {current_index} is not in this \
+                         model's option set {:?}, so there is no transition row for it. The \
+                         model is internally inconsistent.",
+                        self.quality_score_options
+                    ))
+                })?;
             // Now we have an index (in the default case 0..<4) of a vector for the position, based
             // on the previous score. We have to subtract one from the index because the first matrix
             // (position 0) corresponds to the second quality score (position 1).
             // We need to figure out a better way if we're going to do discrete.
-            let index = self.distros_from_one[i - 1][score_position].sample(rng.random()?)?;
+            let index = distros[i - 1][score_position].sample(rng.random()?)?;
             let score = self.quality_score_options[index];
             score_list.push(score);
             current_index += 1;
         }
         Ok(score_list)
+    }
+
+    /// The score to emit at position 1 in place of a sampled Q31: the nearest OTHER member of
+    /// `quality_score_options`, with ties going to the lower score.
+    ///
+    /// Ties going low is not arbitrary. On the dense option set that every model fitted from
+    /// real data has, 30 and 32 are equidistant from 31, and the previous implementation
+    /// produced 30 (`seed_score -= 1`). Keeping that tie-break means this changes nothing for
+    /// such a model; it only stops emitting a score that is not in the option set at all, which
+    /// is what `.position(...).unwrap()` then panicked on (#705).
+    fn substitute_for_at_symbol(&self) -> Result<usize, QualityModelError> {
+        self.quality_score_options
+            .iter()
+            .copied()
+            .filter(|&q| q != AT_SYMBOL_SCORE)
+            .min_by_key(|&q| (q.abs_diff(AT_SYMBOL_SCORE), q))
+            .ok_or_else(|| {
+                QualityModelError::InvalidConfiguration(format!(
+                    "this model's only quality score option is {AT_SYMBOL_SCORE}, which encodes \
+                     to '@' under Phred+33 and cannot begin a quality line, so there is no score \
+                     available for the first position. Fit the model on data with more than one \
+                     distinct quality score."
+                ))
+            })
     }
 
     fn quality_index_remap(&self, length: usize) -> Vec<usize> {
@@ -269,30 +452,16 @@ impl QualityScoreModel {
         // value directly); distros_from_one values are indices into quality_score_options
         // (generate_quality_scores indexes quality_score_options[sampled_index]).
         let seed_dist = DiscreteDistribution::new(&seed_weights, &quality_score_options)?;
-        let n_scores = quality_score_options.len();
-        let score_indices: Vec<usize> = (0..n_scores).collect();
-        let uniform = vec![1.0f64; n_scores];
-        let mut distros_from_one: Vec<Vec<DiscreteDistribution<usize>>> = Vec::new();
-        for pos_weights in &trans_weights {
-            let mut row: Vec<DiscreteDistribution<usize>> = Vec::new();
-            for prev_weights in pos_weights {
-                // A prev_score that never appeared as a transition source has all-zero weights.
-                // Fall back to uniform so sample() doesn't always return the lowest score.
-                let weights = if prev_weights.iter().all(|&w| w == 0.0) {
-                    &uniform
-                } else {
-                    prev_weights
-                };
-                row.push(DiscreteDistribution::new(weights, &score_indices)?);
-            }
-            distros_from_one.push(row);
-        }
+        let distros_from_one = build_distros(&trans_weights, quality_score_options.len())?;
         Ok(QualityScoreModel {
             quality_score_options,
             binned_scores: is_binned,
             assumed_read_length: read_length,
             seed_dist,
             distros_from_one,
+            // from_counts fits one population; the degraded component comes from
+            // the two-population fitter, which is a separate entry point.
+            degradation: None,
         })
     }
 
@@ -318,16 +487,30 @@ mod tests {
         let mut temp_file = PathBuf::from(temp_dir.path());
         temp_file.push("test.json.gz");
         let model: QualityScoreModel = QualityScoreModel::default().unwrap();
-        assert_eq!(model.assumed_read_length, 101);
+        assert_eq!(model.assumed_read_length, 250);
         let result = model.write_to_file(&temp_file);
         assert_eq!(result.unwrap(), ());
         temp_dir.close().unwrap();
     }
 
     #[test]
+    /// The bare quality default must BE the R1 half of the shipped sequencing-error model,
+    /// not a second copy that can drift from it. That is the whole reason this function reads
+    /// the same file rather than its own.
     fn test_model_default() {
+        use crate::models::sequencing_error_model::SequencingErrorModel;
         let model = QualityScoreModel::default().unwrap();
-        assert_eq!(model.assumed_read_length, 101)
+        let from_seq_model = SequencingErrorModel::default().unwrap();
+        let r1 = from_seq_model.quality_score_model();
+        assert_eq!(model.assumed_read_length, 250);
+        assert_eq!(model.assumed_read_length, r1.assumed_read_length);
+        assert_eq!(model.quality_score_options, r1.quality_score_options);
+        assert_eq!(model.binned_scores, r1.binned_scores);
+        assert_eq!(
+            model.degradation.is_some(),
+            r1.degradation.is_some(),
+            "the degraded population must come through both paths"
+        );
     }
 
     #[test]
@@ -554,6 +737,251 @@ mod tests {
             result,
             Err(QualityModelError::InvalidConfiguration(_))
         ));
+    }
+
+    /// Build a model over `options` where every transition row is uniform, so generation is
+    /// driven only by the option set and the seed path.
+    fn uniform_model(options: Vec<usize>, read_length: usize) -> QualityScoreModel {
+        let n = options.len();
+        let uniform_row = vec![1.0; n];
+        let trans_weights = vec![vec![uniform_row.clone(); n]; read_length - 1];
+        QualityScoreModel::from_counts(options, read_length, vec![1.0; n], trans_weights, false)
+            .unwrap()
+    }
+
+    /// Build a two-population model whose answer is set by construction, not derived from the
+    /// code under test: healthy reads are every base Q40, degraded reads every base Q10, and
+    /// `read_fraction` of the reads are drawn from the degraded one.
+    fn two_population_model(read_fraction: f64, read_length: usize) -> QualityScoreModel {
+        let options = vec![10usize, 40usize];
+        let idx = vec![0usize, 1usize];
+        // Seeds take SCORE values; transition rows take INDICES into `quality_score_options`.
+        let healthy_seed = DiscreteDistribution::new(&vec![0.0, 1.0], &options).unwrap();
+        let degraded_seed = DiscreteDistribution::new(&vec![1.0, 0.0], &options).unwrap();
+        let to_high = DiscreteDistribution::new(&vec![0.0, 1.0], &idx).unwrap();
+        let to_low = DiscreteDistribution::new(&vec![1.0, 0.0], &idx).unwrap();
+        QualityScoreModel {
+            quality_score_options: options,
+            binned_scores: false,
+            assumed_read_length: read_length,
+            seed_dist: healthy_seed,
+            distros_from_one: vec![vec![to_high.clone(), to_high.clone()]; read_length - 1],
+            degradation: Some(QualityDegradation {
+                read_fraction,
+                degraded_seed,
+                degraded_distros: vec![vec![to_low.clone(), to_low.clone()]; read_length - 1],
+            }),
+        }
+    }
+
+    /// THE criterion for #694: a model carrying a degraded population must GENERATE it, at the
+    /// fraction the model declares.
+    ///
+    /// Known answer by construction. Every degraded read is all Q10 and every healthy read all
+    /// Q40, so classifying a generated read is exact, and the expected rate is the planted
+    /// `read_fraction` rather than anything the code computes. At n = 2000 and p = 0.30 the
+    /// binomial standard error is 1.0 point, so the band below is several sigma wide.
+    #[test]
+    fn a_model_with_a_degraded_population_generates_it() {
+        let model = two_population_model(0.30, 20);
+        let mut rng = NeatRng::new_from_seed(&vec!["694".to_string()]).unwrap();
+
+        let (mut n, mut degraded) = (0usize, 0usize);
+        for _ in 0..2000 {
+            let scores = model.generate_quality_scores(20, &mut rng).unwrap();
+            assert_eq!(scores.len(), 20);
+            // Every base must come from one population or the other; a mixed read would mean
+            // the class was drawn per position rather than per read.
+            let all_low = scores.iter().all(|&q| q == 10);
+            let all_high = scores.iter().all(|&q| q == 40);
+            assert!(
+                all_low || all_high,
+                "read mixes both populations, so the class is not per-read: {scores:?}"
+            );
+            n += 1;
+            if all_low {
+                degraded += 1;
+            }
+        }
+        assert_eq!(n, 2000, "every generated read must be counted");
+        let rate = degraded as f64 / n as f64;
+        assert!(
+            (0.26..0.34).contains(&rate),
+            "planted read_fraction 0.30, generated {rate:.3} ({degraded} of {n})"
+        );
+    }
+
+    /// MUST NOT FIRE, and this is the one that protects every frozen baseline: a model with no
+    /// degraded population must consume exactly as much randomness as it did before the
+    /// component existed, which is one draw per position and not one more.
+    ///
+    /// Asserted by advancing a second RNG from the same seed by hand and comparing what each
+    /// yields NEXT. An extra class draw would desynchronize them, and every model file written
+    /// before #694 would generate different reads at the same seed.
+    #[test]
+    fn a_model_without_degradation_consumes_no_extra_randomness() {
+        const LEN: usize = 20;
+        let mut model = two_population_model(0.30, LEN);
+        model.degradation = None;
+
+        let mut rng_model = NeatRng::new_from_seed(&vec!["parity".to_string()]).unwrap();
+        let scores = model.generate_quality_scores(LEN, &mut rng_model).unwrap();
+        let after_model = rng_model.random().unwrap();
+
+        // One draw for the seed position, one for each position after it.
+        let mut rng_hand = NeatRng::new_from_seed(&vec!["parity".to_string()]).unwrap();
+        for _ in 0..LEN {
+            rng_hand.random().unwrap();
+        }
+        let after_hand = rng_hand.random().unwrap();
+
+        assert_eq!(scores.len(), LEN);
+        assert_eq!(
+            after_model, after_hand,
+            "a model with no degraded population drew {LEN} values before this change and must \
+             still draw exactly {LEN}; an extra class draw shifts every frozen baseline"
+        );
+    }
+
+    /// MUST NOT FIRE: a declared population with zero weight never appears. Most defects in
+    /// this repo were things firing when they should not have.
+    #[test]
+    fn read_fraction_zero_never_produces_a_degraded_read() {
+        let model = two_population_model(0.0, 20);
+        let mut rng = NeatRng::new_from_seed(&vec!["zero".to_string()]).unwrap();
+        let mut n = 0usize;
+        for _ in 0..500 {
+            let scores = model.generate_quality_scores(20, &mut rng).unwrap();
+            n += 1;
+            assert!(
+                scores.iter().all(|&q| q == 40),
+                "read_fraction 0.0 must never draw the degraded population: {scores:?}"
+            );
+        }
+        assert_eq!(n, 500, "every read must be checked");
+    }
+
+    /// A model file written before this field exists must load, with no degraded population.
+    /// Every shipped model and every baseline is in that state.
+    #[test]
+    fn a_model_file_without_the_field_loads_as_none() {
+        let model = two_population_model(0.30, 4);
+        let mut value = serde_json::to_value(&model).unwrap();
+        value.as_object_mut().unwrap().remove("degradation");
+        assert!(
+            value.get("degradation").is_none(),
+            "fixture precondition: the field must be absent"
+        );
+
+        let loaded: QualityScoreModel = serde_json::from_value(value).unwrap();
+        assert!(loaded.degradation.is_none());
+        assert_eq!(loaded.quality_score_options, model.quality_score_options);
+        assert_eq!(loaded.assumed_read_length, model.assumed_read_length);
+    }
+
+    /// A model with no degraded population must write the same BYTES it wrote before the field
+    /// existed, not just generate the same reads. Every frozen baseline depends on this, and
+    /// `seq_error_model_matches_baseline` failed until it was true.
+    ///
+    /// Both directions, because "never emitted" would be just as wrong as "always emitted".
+    #[test]
+    fn the_degraded_population_is_serialized_only_when_present() {
+        let mut without = two_population_model(0.3, 4);
+        without.degradation = None;
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(
+            v.get("degradation").is_none(),
+            "a model with no degraded population must not write the key at all, or every \
+             frozen baseline shifts: {v}"
+        );
+
+        let with = two_population_model(0.3, 4);
+        let v = serde_json::to_value(&with).unwrap();
+        assert!(
+            v.get("degradation").is_some(),
+            "a model that HAS a degraded population must write it: {v}"
+        );
+    }
+
+    /// THE regression for #705. A model whose options contain 31 but NOT 30 used to panic:
+    /// the seed rewrite did `31 - 1`, producing a score absent from the option set, and the
+    /// next iteration's `.position(...).unwrap()` found nothing.
+    ///
+    /// Reproduced from a real fit — a FASTQ of `@IIIIIIIII` quality strings gives options
+    /// [31, 40] — while writing the parser test for #700.
+    #[test]
+    fn a_model_with_thirty_one_but_no_thirty_generates_without_panicking() {
+        let options = vec![31usize, 40usize];
+        let model = uniform_model(options.clone(), 10);
+        let mut rng = NeatRng::new_from_seed(&vec!["705".to_string()]).unwrap();
+        for _ in 0..200 {
+            let scores = model.generate_quality_scores(10, &mut rng).unwrap();
+            for &s in &scores {
+                assert!(
+                    options.contains(&s),
+                    "score {s} is not in the option set {options:?}"
+                );
+            }
+            assert_ne!(
+                scores[0], AT_SYMBOL_SCORE,
+                "position 1 must never be Q31, which encodes to '@'"
+            );
+        }
+    }
+
+    /// MUST NOT FIRE: on the dense option set every real model has, the substitute is 30 —
+    /// exactly what `seed_score -= 1` produced. This change must alter nothing for such models.
+    #[test]
+    fn a_dense_model_substitutes_thirty_exactly_as_before() {
+        let options: Vec<usize> = (0..=40).collect();
+        let model = uniform_model(options, 5);
+        assert_eq!(
+            model.substitute_for_at_symbol().unwrap(),
+            30,
+            "ties go to the lower score, which reproduces the previous behavior"
+        );
+    }
+
+    /// The tie-break is what makes the above true, so pin it directly: 30 and 32 are both one
+    /// away from 31, and the lower one wins.
+    #[test]
+    fn the_substitute_is_the_nearest_option_ties_going_low() {
+        // Both neighbors present: lower wins.
+        assert_eq!(
+            uniform_model(vec![30, 31, 32], 3)
+                .substitute_for_at_symbol()
+                .unwrap(),
+            30
+        );
+        // Only the higher neighbor present: it wins despite being higher.
+        assert_eq!(
+            uniform_model(vec![31, 32, 40], 3)
+                .substitute_for_at_symbol()
+                .unwrap(),
+            32
+        );
+        // Nearest wins over "one less", which is what the old arithmetic assumed.
+        assert_eq!(
+            uniform_model(vec![2, 31, 33], 3)
+                .substitute_for_at_symbol()
+                .unwrap(),
+            33
+        );
+    }
+
+    /// The degenerate case: nothing to substitute. Better a clear error than a score that
+    /// cannot legally begin a quality line.
+    #[test]
+    fn a_model_whose_only_option_is_thirty_one_is_a_clear_error() {
+        let model = uniform_model(vec![31usize], 4);
+        let mut rng = NeatRng::new_from_seed(&vec!["only31".to_string()]).unwrap();
+        let err = model.generate_quality_scores(4, &mut rng).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("31"), "must name the score: {msg}");
+        assert!(
+            msg.contains('@'),
+            "must say why 31 cannot start a quality line: {msg}"
+        );
     }
 
     #[test]

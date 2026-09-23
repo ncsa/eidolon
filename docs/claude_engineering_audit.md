@@ -233,10 +233,55 @@ decision, and every subsequent piece of work is built on it.
 | BND (§6) | PCAWG `TRA` count ⇒ our BND rate | `TRA` is *inter-chromosomal*; the generator emits only same-contig junctions |
 | truvari | "truvari cannot benchmark breakends" | true of v4, reversed in v5.0.0; deployed version was v5.4.0 with `--bnddist` |
 | `bnd_proximity.py` | same belief | an entire helper written to work around a limitation that no longer existed |
+| `cand_per_mb` (#672) | the panel's two arms are comparable | the real BAM came from a trimmed FASTQ, the simulated one did not |
 
 **Detection cost is the problem, not frequency.** The truvari belief produced
 `BND recall = 0.000` across every SV run for two months and was read as a caller
 limitation each time.
+
+#### `cand_per_mb`: a correct investigation of an artifact (2026-09-01)
+
+The longest instance to date, and the one that most resembles `bnd_proximity.py`. The
+realism panel reported `SIM cand_per_mb = 0` against a real 57.5/Mb. That gap drove three
+Delta campaigns and a sequence of hypotheses, each tested and each eliminated: sequencing
+error rate, indel-error length, variant indel placement, structural variants, mappability,
+quality degradation. The work was sound. The premise underneath it was never checked.
+
+The panel compared a real BAM against a simulated one. The real BAM was SEQC2's published
+HCC1395 deliverable, trimmed before alignment; `stage_hcc1395.sh` only region-subsets it.
+eidolon's reads reach the aligner untrimmed and uniform. Nothing in the panel asserted the
+two arms had to carry the same read lengths, and they did not: real reads averaged 89.7 bp
+at the measured loci against a simulated BAM that was 99.6% exactly 151 bp.
+
+Measured on SLURM job 21830618; GIAB v3.6 GRCh38 stratifications; fixed in #687.
+
+| soft clip >= 20 bp, at 61 loci in >= 21 bp homopolymers | real | simulated | |
+|---|---|---|---|
+| all reads | 6.00% | 0.26% | 22.9x |
+| reads 145-151 bp only | 0.61% (4 of 651) | 0.26% (10 of 3816) | 2.3x, P = 0.094 |
+
+96.8% of the real side's clips came from reads of 40-80 bp. Matched on read length the
+difference is four events.
+
+**What made it survive so long.** Every intermediate result was correct and pointed
+somewhere real. Candidates genuinely do concentrate in long homopolymers — 93.8x at runs of
+21 bp or more, against a shuffled background, with a monotone dose-response across the run
+ladder and mappability flat at 1.2x. That finding replicated across two independent data
+reductions. It was simply not a finding about read generation: what concentrates in
+homopolymers is where a quality trimmer cuts, and the trimming happened upstream of anything
+eidolon emits.
+
+**A second-order casualty.** An earlier measurement had reported no quality degradation in
+homopolymers (Q36.7 in-run vs Q36.8 elsewhere) and that was recorded as refuting the
+hypothesis. It was measured on a BAM built from quality-trimmed FASTQ, so the degraded bases
+had been removed before the measurement ran. The question is untested, not refuted — the
+same censored-denominator shape as rule 4, applied to a distribution rather than a count.
+
+**What would have caught it earlier.** One command: the read-length distribution of each
+arm — `samtools view <bam> | awk '{print length($10)}' | sort -n | uniq -c`. It was never asked because "both arms are BAMs of the same reference at the same depth"
+felt like enough. The panel now derives one read-length band and passes it to both arms,
+`test_realism_panel.sh` pins that they receive the same one, and `test_realism_band.sh`
+drives the binary over a real BAM to assert the band does what it claims.
 
 ### 5.2 Cross-component invariant
 
@@ -267,6 +312,55 @@ pinning the `'S'`; nothing checked the BAM honoured it. Fixed in
 largest single number in the ACCESS report's fix table (SNP recall 0.0004 → 0.944).
 
 The same shape produced #451 (truth VCF and reads disagreeing about geometry).
+
+#### R2's quality in the wrong coordinate system (2026-09-19)
+
+A variant of the same shape, where the two "components" are a per-base array and the
+coordinate system it is indexed in. `reverse_complement_record` flips a forward-generated
+read into its reverse mate by reversing `sequence`, `cigar_ops` and `quality_scores`
+together. The first two are reference-coordinate properties and the reversal is right. The
+third is not: a quality score belongs to a **sequencing cycle**, which is fixed by the read
+and not by which strand it aligns to.
+
+The result: every paired FASTQ eidolon produced carried R2's per-cycle quality profile
+backwards. Measured on the shipped default model, ecoli, 150 bp paired, n=30,935 per mate:
+
+| | cycle 1 | cycle 150 |
+|---|---|---|
+| R1 | 35.49 | 28.34 |
+| R2 | **28.50** | **35.47** |
+
+Because errors are injected from each base's own quality, R2's sequencing errors were
+mirrored with it — concentrated at the 5' end, where a real R2 is cleanest.
+
+**Why it survived: every local invariant held.** Each base kept its own quality. The CIGAR
+matched the sequence. The golden BAM correctly mirrored the FASTQ, per SAM §1.4. A test of
+R2 in isolation passes either way, because nothing about a single mate says which end
+should be worse. Only the *profile along the emitted read, compared against R1's*, is
+wrong, and no test compared them.
+
+**The fix is not where it looks, and a mutation proved it.** Removing the reversal from
+`reverse_complement_record` corrects the emitted quality string, keeps the BAM mirror
+intact, and **leaves the errors mirrored** — because the error is rolled from the quality at
+the same index during forward generation, before the flip. Applied as a mutation, that
+"fix" passes the quality assertion and the BAM assertion and is caught only by the
+per-cycle error-rate assertion. The real fix lays R2's array down backwards at the two
+sites that build it, so the existing flip lands it in cycle order and base and quality stay
+paired throughout.
+
+**The rule this earns:** when a value is copied between coordinate systems, the test has to
+compare the two systems against each other. Asserting the shape of R2 alone cannot fail.
+Asserting that R2 degrades *like R1 does* is the assertion that can.
+
+It also earns a footnote on mutation discipline. The first attempt at reverting the fix
+reported SURVIVOR: `cargo fmt` had rewrapped one of the two call sites, so the edit matched
+only the other — the haplotype writer, which the test does not exercise. The file genuinely
+changed, so a checksum guard passed, and the verdict was still wrong. **Mutate the single
+function the call sites share, not the call sites**, when the alternative is an edit that
+can partially apply.
+
+Tracked in [#734](https://github.com/ncsa/eidolon/issues/734), fixed in
+[#735](https://github.com/ncsa/eidolon/pull/735).
 
 ### 5.3 Verification theatre
 

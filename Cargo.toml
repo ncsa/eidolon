@@ -11,11 +11,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = '3.3.0'
+version = '3.4.0'
 edition = '2024'
 authors = ["Joshua Allen", "Mikolaj Kowalik", "See coauthors of Python Neat versions"]
 description = "Toolkit for generating simulated NGS read data in fastq and vcf formats. Feature set under development."
 repository = "https://github.com/ncsa/eidolon"
+# BSD 3-Clause, per LICENSE.md. `CITATION.cff` and `conda-recipe/meta.yaml` already declared
+# this; the Cargo manifests did not, and crate metadata is what Rust tooling reads.
+license = "BSD-3-Clause"
 
 # Clippy is a CI gate (eidolon-tests.yml). It runs with `-D warnings`, so anything not
 # explicitly allowed below fails the build.

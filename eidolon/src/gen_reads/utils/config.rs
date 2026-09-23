@@ -155,7 +155,12 @@ impl Default for RunConfiguration {
     fn default() -> Self {
         RunConfiguration {
             reference: PathBuf::new(),
-            read_len: 151,
+            // Matches the shipped default sequencing-error model, which is fitted at 250 bp
+            // (GIAB HG002 2x250). A run that takes both defaults therefore uses the model at
+            // the length it was measured at, with no rescaling. Ask for another read length
+            // and the model is rescaled to it -- which is what NEAT2 did too, and is an
+            // approximation; prefer fitting a model at your own read length (#730, #742).
+            read_len: 250,
             coverage: 10,
             mutation_rate: None,
             ploidy: 2,
@@ -1026,7 +1031,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = RunConfiguration::default();
-        assert_eq!(config.read_len, 151);
+        assert_eq!(config.read_len, 250);
         assert_eq!(config.coverage, 10);
         assert!(!config.paired_ended);
         assert!(config.produce_fastq);
@@ -1201,6 +1206,28 @@ mod tests {
         )
         .unwrap();
         yaml
+    }
+
+    /// The value a user actually gets from a config file that omits `read_len`.
+    ///
+    /// WHAT THIS DOES AND DOES NOT ADD over asserting on `RunConfiguration::default()`. The
+    /// parser starts from that default and overwrites only the keys the YAML carries, so the
+    /// two are not independent paths and this cannot catch a parser-side fallback — there
+    /// isn't one. What it does catch is a missing key being treated as an ERROR rather than a
+    /// default, and anything between parsing and use resetting the field.
+    ///
+    /// 250 because that is the length the shipped model is fitted at: taking both defaults
+    /// uses the model natively, with no rescaling (#742).
+    #[test]
+    fn a_config_omitting_read_len_parses_as_the_model_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = write_cfg(dir.path(), "");
+        let cfg = RunConfiguration::from_yaml_file(&yaml).unwrap();
+        assert_eq!(
+            cfg.read_len, 250,
+            "a config with no read_len must parse as 250, matching the shipped model"
+        );
+        assert_eq!(cfg.read_len, RunConfiguration::default().read_len);
     }
 
     #[test]

@@ -79,6 +79,8 @@ which is germline-derived. Supplying a cancer-trained tumor model is strongly
 recommended for any non-toy run — see issue #186):
   --normal-model     Path to a .json.gz mutation model for the normal pass
   --tumor-model      Path to a .json.gz mutation model for the tumor pass
+  --seq-error-model  Path to a .json.gz sequencing error model, used by BOTH passes.
+                     Defaults to the model compiled into the binary.
 
 Mutation-rate overrides:
   --normal-mutation-rate  Override the normal pass's per-base mutation rate.
@@ -158,6 +160,7 @@ while [[ $# -gt 0 ]]; do
         --purity)           PURITY="$2"; shift 2 ;;
         --normal-model)         NORMAL_MODEL="$2"; shift 2 ;;
         --tumor-model)          TUMOR_MODEL="$2"; shift 2 ;;
+        --seq-error-model)      SEQ_ERROR_MODEL="$2"; shift 2 ;;
         --normal-mutation-rate) NORMAL_MUTATION_RATE="$2"; shift 2 ;;
         --tumor-mutation-rate)  TUMOR_MUTATION_RATE="$2"; shift 2 ;;
         --germline-vcf)     GERMLINE_VCF="$2"; shift 2 ;;
@@ -255,6 +258,12 @@ EOF
     # intended behavior. Spell it out with `if`.
     if [[ -n "$model_path" ]]; then
         echo "mutation_model: $model_path" >> "$config_path"
+    fi
+    # Both passes get the same sequencing error model. It describes the instrument,
+    # not the sample, so a tumor/normal pair that differed here would be comparing
+    # two machines rather than two genomes.
+    if [[ -n "${SEQ_ERROR_MODEL:-}" ]]; then
+        echo "sequence_error_model: $SEQ_ERROR_MODEL" >> "$config_path"
     fi
     if [[ -n "$input_vcf" ]]; then
         echo "input_vcf: $input_vcf" >> "$config_path"

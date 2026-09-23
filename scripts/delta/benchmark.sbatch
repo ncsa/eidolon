@@ -59,12 +59,17 @@ CONDA_ENV_NAME="neat4"
 # sweep on a single-contig genome (e.g. chr22) is pure redundancy — every mode
 # returns the same number — and NEAT-at-every-thread-count is what blew the
 # 8h walltime. Missing files are skipped.
-GENOMES=(
-    "ecoli:$DATA_DIR/ecoli.fa"        # single-contig, tiny
-    "yeast:$DATA_DIR/yeast.fa"        # MULTI-contig (~16) — also the Phase B genome
-    "chr22:$DATA_DIR/chr22.fa"        # single-contig, ~50 Mb
-    "human:$DATA_DIR/GRCh38.fa"       # multi-contig, large — eidolon-only (NEAT arm auto-skipped: too big, see run_neat)
-)
+# Overridable as a space-separated "label:path" list, because a caller that needs only
+# some of these has no other way to say so. The regression gate reads FOUR numbers out of
+# this job — ecoli and chr22, eidolon, 1 thread — and discards the rest, so it was paying
+# ~3 h for the GRCh38 arm and ~45 min for the NEAT arm to obtain ~3 min of gated compute,
+# and timing out (job 21766280) doing it.
+GENOMES=(${GENOMES:-
+    "ecoli:$DATA_DIR/ecoli.fa"
+    "yeast:$DATA_DIR/yeast.fa"
+    "chr22:$DATA_DIR/chr22.fa"
+    "human:$DATA_DIR/GRCh38.fa"
+})
 HEADTOHEAD_THREADS="${HEADTOHEAD_THREADS:-1}"
 
 # PHASE B — eidolon thread-scaling curve. Only meaningful on a MULTI-CONTIG genome
@@ -80,7 +85,11 @@ COVERAGE=10
 READ_LEN=151
 FRAG_MEAN=350
 FRAG_SD=50
-REPS=3       # repetitions per config; median is reported
+REPS="${REPS:-3}"   # repetitions per config; median is reported.
+# Was a plain `REPS=3`, which silently ignored the environment while line 20 of
+# this header documented `REPS=2` as a supported override. A documented knob that
+# does nothing is worse than no knob: it sends a caller looking for the real cause
+# somewhere else.
 
 # ── Environment ─────────────────────────────────────────────────────────
 source "$HOME/.cargo/env"
@@ -124,11 +133,42 @@ median_of() {
              else{printf "%.2f",(v[NR/2]+v[NR/2+1])/2} }'
 }
 
+# Size in whole MB, or empty if it cannot be determined.
+#
+# The `-L` is load-bearing, and job 21766280 is why. `$SCRATCH/neat_data/GRCh38.fa` is a
+# relative SYMLINK to `GRCh38.chr.fa`, and `stat -c%s` without `-L` reports the size of the
+# LINK -- 13 bytes, the character length of that target path -- not the 3,144,230,986-byte
+# genome. 13/1048576 rounds to 0.0 MB, so the NEAT size cap compared `(( 0 > 200 ))`, found
+# it false, and ran the ~12 h/rep human arm the cap exists to prevent, burning the whole
+# 6 h wall clock for zero perf rows.
+#
+# The asymmetry is what hid it: `[[ -f ]]` DOES follow symlinks, so the file passed every
+# existence check and eidolon read it correctly for 77 minutes. Only the size was wrong.
+#
+# An unknown size is still returned as EMPTY rather than 0, so it can never reach a numeric
+# comparison and fail open a second way. Callers must handle the empty case explicitly.
+# Second arg is the printf format, defaulting to the whole-MB integer the size cap needs
+# for its `(( ))` comparison. run_one passes %.1f: the per_rep.tsv `size_mb` column has
+# always carried one decimal (4.5, 11.7, 49.4), and collapsing it to `4`/`49` would quietly
+# change a reported artifact to suit an internal caller.
+genome_size_mb() {
+    local bytes fmt="${2:-%.0f}"
+    bytes="$(stat -Lc%s "$1" 2>/dev/null)" || return 0
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+    awk -v b="$bytes" -v f="$fmt" 'BEGIN{printf f, b/1048576}'
+}
+
 run_one() {
     local label="$1" fasta="$2" nthreads="$3" tool="$4" cfg="$5" run_dir="$6"
     local size_mb walls=() rsss=() ok=0
 
-    size_mb=$(awk -v b="$(stat -c%s "$fasta")" 'BEGIN{printf "%.1f", b/1048576}')
+    size_mb="$(genome_size_mb "$fasta" '%.1f')"
+    if [[ -z "$size_mb" ]]; then
+        # Reported, not swallowed: a 0.0 in the TSV is indistinguishable from a tiny
+        # genome, and that ambiguity is what hid the cap failure for a whole 6 h job.
+        echo "  WARNING: cannot determine size of $fasta — recording size_mb=NA" >&2
+        size_mb="NA"
+    fi
 
     for rep in $(seq 1 "$REPS"); do
         local tf="$OUTDIR/${tool}_${label}_t${nthreads}_r${rep}.time"
@@ -198,7 +238,20 @@ run_neat() {
     # size; eidolon still runs on the large genome for its own numbers, and that eidolon-
     # only result (eidolon does human in ~1 h; NEAT can't) is itself the comparison.
     local neat_cap_mb="${NEAT_MAX_GENOME_MB:-200}"
-    local sz_mb; sz_mb=$(awk -v b="$(stat -c%s "$fasta")" 'BEGIN{printf "%.0f", b/1048576}')
+    local sz_mb; sz_mb="$(genome_size_mb "$fasta")"
+    # FAIL CLOSED. An unknown size skips the NEAT arm rather than risking it. Getting this
+    # backwards cost job 21766280 its entire 6 h wall clock and produced no perf rows.
+    if [[ -z "$sz_mb" ]]; then
+        echo "  [neat] SKIP $label: cannot determine genome size, so the ${neat_cap_mb} MB cap"
+        echo "         cannot be enforced. Skipping rather than risking an unbounded NEAT arm."
+        return
+    fi
+    # A cap of 0 disables the NEAT arm outright — how the regression suite asks for
+    # eidolon-only perf rows without editing this file.
+    if (( neat_cap_mb <= 0 )); then
+        echo "  [neat] SKIP $label (NEAT_MAX_GENOME_MB=${neat_cap_mb}): NEAT arm disabled"
+        return
+    fi
     if (( sz_mb > neat_cap_mb )); then
         echo "  [neat] SKIP $label (${sz_mb} MB > NEAT_MAX_GENOME_MB=${neat_cap_mb} MB): NEAT 4 is intractable at this size"
         return

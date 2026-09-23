@@ -1,3 +1,241 @@
+9/22/2026
+=========
+## eidolon v3.4.0 — a quality model measured from real, named data
+
+The shipped sequencing-error model no longer comes from a sample nobody recorded. It is
+fitted from a public GIAB library, it carries the two mates separately because they are
+measurably different, and it reproduces the collapsed-tail reads that real Illumina data has
+and eidolon previously could not produce at all. Separately, sequencing-error indels were
+being generated about 40x too often and uniformly across the genome; that is corrected and
+now depends on local homopolymer run length.
+
+### The default model is fitted from data you can download
+
+Until now the default was NEAT2's bundled `errorModel_toy.p`, converted. It was a real fit,
+but its originating sample was never recorded upstream, so nothing about it could be
+reproduced or checked.
+
+The default is now fitted from **GIAB HG002, `NIST_Illumina_2x250bps`** — public and
+downloadable. `eidolon-core/src/models/model_data/README.md` records the chunk, the sampling
+stride, the read count, the degraded-population cut and the job that produced it.
+
+| | |
+|---|---|
+| Read length | 250 bp (`gen-reads`' `read_len` now defaults to 250 to match) |
+| Quality scores | 31 observed levels, Q2–Q40, **continuous** |
+| Reads fitted | 3,391,610 per mate, taken 1-in-10 across the file |
+| `error_rate` | 0.003774, against the inherited 0.006638 |
+
+**What it is not.** HiSeq 2500 is 2020-era chemistry and its scores are continuous; current
+instruments commonly emit binned scores. GIAB's HG002 path has no NovaSeq library at all, so
+this is the best provenanced option from that source rather than the most modern one (#730).
+
+**And it is a starting point, not a description of your data.** Fit your own with
+`gen-seq-error-model` whenever you can — that is what it is for. Generating at a read length
+the model was not fitted at rescales the curve to fit, which is an approximation inherited
+from NEAT2 (#742).
+
+### Upgrading: check `fragment_mean` against `read_len`
+
+`gen-reads`' `read_len` default moves 151 → 250. **`gen-cancer-reads` is unchanged at 151**, so
+a cancer config that omits `read_len` rescales the 250 bp model rather than using it natively.
+
+If you have a paired-end `gen-reads` config that **omits `read_len`** and sets a small
+`fragment_mean`, set `read_len: 151` explicitly or raise `fragment_mean`. Paired-end fragment
+sampling rejects any fragment below `read_len + 10`, so a config written for 151 bp reads with
+`fragment_mean: 200` now discards most of its draws: the run still completes, with a single
+`WARN` about insert-size diversity and a realized insert distribution nothing like the one
+configured. Configs derived from `template_config/gen_reads_template.yml` set `read_len`
+explicitly and are unaffected.
+
+### Reads now degrade the way real reads do (#694, #720)
+
+Real Illumina data is bimodal: about one read in ten loses signal toward the 3' end and stays
+collapsed. eidolon's quality model is a first-order chain over (position, previous score),
+which has no per-read state, so a pooled fit landed on the average of the two populations and
+produced essentially none of them.
+
+Measured on HG002, against a single-population fit of the same reads by the same build:
+
+| | real | v3.4.0 | single population |
+|---|---|---|---|
+| R1, last 50 bases below Q25 | 11.12% | 11.95% | 0.54% |
+| R1, below Q20 | 4.92% | 5.91% | **0.00%** |
+| R2, below Q25 | 26.22% | 26.36% | 11.74% |
+| R2, below Q20 | 12.48% | 14.00% | 0.32% |
+
+`gen-seq-error-model` fits this with `fit_quality_degradation: true`; the shipped default
+already carries it.
+
+### R1 and R2 are modeled separately (#723)
+
+HG002's two mates are different distributions, not a perturbation of one: **2.07x** on fitted
+error rate and **2.36x** on collapsed-tail rate. Drawing both from one model always
+misrepresented one of them.
+
+`gen-seq-error-model` takes `fastq_file_r2:` and writes both mates into one model file;
+`gen-reads` draws R2 from the second. Single-ended runs are unaffected — that path never asks
+for R2. Fitting one FASTQ still writes the same bytes it did before.
+
+**Not yet on every path.** The four structural-variant junction writers (BND, INV, DEL, DUP in
+`gen_reads/utils/runner.rs`) still draw both mates from the R1 model, so on a run with
+`sv_rate_scale > 0` the junction reads — precisely the ones an SV caller uses — carry R1's
+error rate and degraded fraction rather than R2's. Tracked separately.
+
+### Fixed: R2's quality scores were emitted backwards (#734)
+
+**This affected every paired FASTQ eidolon has ever produced.** R2's per-cycle quality
+profile ran in reverse — reads got *better* toward the 3' end where real reads get worse — and
+because errors are injected from each base's own quality, R2's sequencing errors were mirrored
+with it, concentrated at the 5' end instead of the 3'.
+
+Measured on the shipped model at 150 bp, before and after:
+
+| | cycle 1 | cycle 150 |
+|---|---|---|
+| R1 | 35.49 | 28.34 |
+| R2, before | **28.50** | **35.47** |
+| R2, after | 35.54 | 28.48 |
+
+A quality score belongs to a sequencing cycle, and the flip that turns a forward-generated
+read into its reverse mate was reversing it along with the sequence and the CIGAR, where that
+is correct.
+
+**Output for a given seed changes, including R1's.** Fragment placement is untouched, but a
+sequencing error consumes extra random draws, so changing which R2 bases error shifts the
+stream for every read after it. Per-seed content has never been part of the public API.
+
+### Sequencing-error indels
+
+**Two corrected constants (#660).** `indel_probability` (the odds a sequencing error is an
+indel) and `insertion_fraction` (the odds such an indel is an insertion) had been
+transposed: 0.4 was applied as the indel rate and the insertion split was fixed at 0.5. At
+Q35 that produced 1.26e-4 indel errors per base against an intended 3.16e-6. Both now carry
+their correct values, 0.01 and 0.4, and the insertion split is a serialized
+`insertion_fraction` field rather than a literal.
+
+**`indel_probability` is not yet measured.** 0.01 matches its source but sits about 3x below
+a real Illumina indel-error rate near 1e-5/base. It is left at its source value pending a
+measurement rather than tuned to an unverified number. `insertion_fraction` **has** been
+measured — 0.387 on HCC1395 normal — and holds at 0.4.
+
+**Indel errors now follow local homopolymer run length (#661).** Real slippage is
+concentrated in homopolymers, where gap placement is ambiguous and aligners clip at the
+repeat boundary consistently across reads. Measured on HCC1395 normal (chr20/21/22 at 46x,
+1,726 slippage events over an exact 3,999,990-base background), the propensity is monotone
+from **0.64x** at run 1 to **39.20x** at runs of 10 or more, crossing 1.0 at run 4.
+
+This **redistributes** the indel rate rather than raising it. Each entry is a normalized
+enrichment, so the curve is 1.0-centered by construction over its human background and the
+genome-wide total is unchanged there. On a reference with different homopolymer composition
+the total moves with that composition — measured at 0.745x on E. coli — because a genome
+with fewer homopolymers genuinely slips less.
+
+The curve is a **default, not a measurement of your data**, the same status the
+fragment-length model carries. Full provenance is in
+`eidolon-core/src/models/model_data/README.md`. #662 makes it fittable from a BAM.
+
+This implements sequence-context dependence that the upstream design anticipated but did
+not ship; the parameters were static defaults there.
+
+### Validation harness
+
+**The realism panel now matches read lengths between its two arms (#672).** It had been
+comparing a real BAM built from a trimmed FASTQ against simulated reads that reach the
+aligner untrimmed and uniform, and nothing asserted the two had to match. Clip-derived
+metrics are sensitive to that, because a short read carries less unique anchor and clips
+more readily.
+
+Measured on job 21830618 (HCC1395 normal, GRCh38 chr20/21/22), over the 61 measured loci
+that sit in homopolymer runs of 21 bp or more:
+
+| | real | simulated |
+|---|---|---|
+| soft clip >= 20 bp, all reads | 6.00% | 0.26% |
+| soft clip >= 20 bp, reads 145-151 bp | 0.61% (4 of 651) | 0.26% (10 of 3816) |
+
+96.8% of the real side's clips at those loci came from reads of 40-80 bp. Matched on read
+length the difference is four events, P = 0.094. `cand_per_mb` had been reporting the
+unmatched comparison.
+
+`realism-panel` takes `--min-read-len` / `--max-read-len`, the wrapper builds one band from
+`READ_LEN` and passes it to both arms, and each locus reports `len_filtered` so the band's
+cost is visible beside the metric it made comparable. `MATCH_READ_LEN=0` reproduces a
+pre-#672 run and says so in the banner.
+
+### Compatibility
+
+**Model files built before this release keep working.** `insertion_fraction` and
+`indel_context_curve` both deserialize to their shipped defaults when absent, so an older
+`.json.gz` loads and picks up the corrected behavior rather than failing.
+
+**Output will differ at the same seed.** Both changes alter which errors are drawn, so runs
+are not byte-comparable across this version. Anything measured against a pre-3.4.0 baseline
+needs re-baselining.
+
+**The reverse does not hold: do not read a 3.4.0 model with an older eidolon.** Model files
+carry no version stamp and unknown fields are ignored silently, so an older binary will load a
+3.4.0 model, discard `indel_context_curve`, and simulate with its own flat default without
+warning that it did. The README's *Versioning and the public API* section now states which
+direction is supported; #708 tracks making the mismatch detectable rather than documented.
+
+### Model files now say what wrote them (#708, #711)
+
+Every model eidolon writes carries a provenance stamp: the format version and the eidolon
+that produced it. A file from a *newer* eidolon is now refused instead of being loaded with
+its unrecognized fields silently discarded. Files written before this release have no stamp;
+they load, and the absence is logged rather than treated as an error.
+
+### Other changes
+
+- **`gen-seq-error-model` takes its read length from the reads** rather than from the first
+  record (#698). A short first record used to truncate the whole model to its length, dropping
+  the 3' end where quality degrades. `max_model_read_length` bounds memory and rejects a
+  longer read instead of silently truncating it (#701).
+- **FASTQ input is validated structurally as it is read** (#706): a malformed header, a bad
+  separator, a length mismatch or a truncated final record is an error naming its line, not a
+  model built from nonsense.
+- **A seed quality of Q31 is replaced with a valid neighbouring score** rather than
+  decremented (#712). Phred+33 encodes 31 as `@`, which must not begin a quality line.
+- **`error_rate` is documented as what it is** (#729): a fitted summary of the quality
+  histogram, not a knob. Generation injects errors from each base's own quality score and
+  never reads it.
+- **`gen-reads` no longer panics when a fragment is materialized short** (#690).
+- **Documentation is now a site.** The 1,275-line README is split into a navigable mdBook
+  under `docs-site/` with a sidebar and search, published to GitHub Pages (#703). The README
+  keeps the pitch, install and a minimal example.
+
+### Evidence
+
+Verified locally: unit tests pin both NEAT2 constants and the curve against their sources;
+an end-to-end test measures indel enrichment out of produced BAMs at **60.25x** against a
+predicted 61.25x (poly-A vs. alternating-AT references, both 0% GC so GC bias cannot
+confound), and **1.89x** against a predicted 1.92x for positional enrichment on a
+mixed-composition reference. Nine mutation experiments were run against these tests; all
+were killed, one only after a positional test was added — the overall rate was correct
+while placement was not.
+
+The panel change is covered by 22 end-to-end assertions driving the real binary over a
+committed BAM, with a known answer built by truncating exactly half its records; five
+mutations of the band logic were run and all were killed. `test_realism_panel.sh` pins that
+both arms receive the same band, verified by four mutations of the wrapper — one of which
+exposed an assertion of its own that was matching the wrong line.
+
+The quality-model work is evidenced differently. The degraded population and the per-mate
+split are measured on **real HG002 data**, each against a control differing in one variable,
+and the numbers are in the tables above. Locally, known-answer fixtures pin that each mate is
+drawn from its own fit, that swapping the two inputs swaps the two outputs, and that a
+four-population model keeps the mates and the populations apart; every one was checked by
+mutation.
+
+**Not yet verified.** The panel change has not been run on Delta, so the corrected
+`cand_per_mb` figure is not in hand; `cand_per_mb` should not be read as a property of the
+simulator on any run before this one. The new default has been shown to reproduce the library
+it was fitted from — that is self-consistency, and it is not the same as generalizing to a
+library it has not seen, which is unmeasured (#745). Whether a more faithful quality model
+changes what a variant caller does is also unmeasured: the realism panel does not move on
+quality changes, because its metrics are clip- and pair-derived.
+
 8/31/2026
 =========
 ## eidolon v3.3.0 — fragment length realism
@@ -21,7 +259,7 @@ on skew and 0.00% at p99**. The old normal fit matched the mean and standard dev
 missed the skew entirely — under-predicting long fragments by 4.81% at p99.
 
 **The shipped default was replaced.** The previous one was left-skewed (−0.434) where every
-real library is right-skewed, centred 130 bp high, truncated at 799 bp, carried 33 integer
+real library is right-skewed, centered 130 bp high, truncated at 799 bp, carried 33 integer
 lengths inside its own range with no bin at all, and held an isolated spike at fragment
 length **1**. Its provenance was unknown; it predates the Rust port.
 
@@ -68,7 +306,7 @@ standard deviation, skew and p99 all at **1.0x** of real — closed from 1.3x, 1
 
 **The binary is unchanged from v3.2.0.** `eidolon/src`, `eidolon-core/src` and their
 manifests are byte-for-byte identical between the two tags. This release exists solely to
-publish a complete set of platform binaries; nothing in it alters simulator behaviour.
+publish a complete set of platform binaries; nothing in it alters simulator behavior.
 
 ### What was wrong
 
@@ -103,7 +341,7 @@ purity 0.6, `SV_RATE_SCALE=30`, exit 0). Every claim below states the evidence b
 ### Insertions now reach the reads, the CIGAR, and the truth
 
 - **Symbolic `<INS>` is realized** (#500). `SVTYPE=INS;SVLEN=60` from `input_vcf` used to be
-  preserved verbatim while the reads came out behaviourally identical to a no-variant
+  preserved verbatim while the reads came out behaviorally identical to a no-variant
   control — same `I` count, same `D` count, same depth. A benchmark built on that truth
   scored a caller as missing an insertion that was never in the data. `SVLEN` novel bases are
   now drawn and the record becomes a literal ALT, which is what routes them through the
@@ -373,7 +611,7 @@ Three defects:
   (one record per junction, `POS`=min, `END`=max) for callers that re-represent a
   junction as `<DUP:TANDEM>`/`<DEL>`/`<INV>` — a span and a point record are not
   interval-comparable, which no similarity threshold can bridge. Both are reported and
-  labelled. Spans are a comparison artifact only; `END` on an emitted BND still equals
+  labeled. Spans are a comparison artifact only; `END` on an emitted BND still equals
   `POS` per VCF 4.2 §5.4.
 - **The aggregate was dominated by unmatchable types.** BND + CNV were 23 of 47 truth
   records in one run, all guaranteed misses, capping the aggregate near 0.5 regardless of

@@ -20,6 +20,36 @@ pub struct RunConfiguration {
     /// Optional aligned BAM file to infer the SNP transition matrix from read-vs-reference
     /// mismatches. Requires MD tags. Ignored if transition_matrix_file is also set.
     pub bam_file: Option<PathBuf>,
+    /// Largest read length the model will fit, in bp; 0 disables the limit.
+    ///
+    /// The transition tensor holds one MAX_SCORE x MAX_SCORE count matrix per position, about
+    /// 69 KiB each, so the read length bounds the allocation directly (1000 bp is ~67 MiB).
+    /// A read above this is a hard error rather than a silent truncation, because a silent
+    /// truncation is #697.
+    pub max_model_read_length: usize,
+    /// The R2 mate's FASTQ, fitted into the SAME model file as a second quality population
+    /// (#723).
+    ///
+    /// Optional, and absent means today's behavior: one quality model serving both mates.
+    /// NEAT2 carried the same option as `genSeqErrorModel.py -i2`, writing one pickle holding
+    /// `initQ/probQ` for R1 and `initQ2/probQ2` for R2 with the score set shared between them.
+    /// The shape here is the same, for the same reason: generation indexes one option list.
+    pub fastq_file_r2: Option<PathBuf>,
+    /// Fit a second, degraded quality population alongside the main one (#694).
+    ///
+    /// OPT-IN, and default false, because it is not yet validated against real data. A model
+    /// fitted with this on generates a bimodal quality profile; one fitted without it behaves
+    /// exactly as every model before it. Flip the default once a fitted model has been measured
+    /// against the library it came from.
+    pub fit_quality_degradation: bool,
+    /// Window at the 3' end used to classify a read as degraded, in bases.
+    pub degradation_tail_window: usize,
+    /// A read whose last `degradation_tail_window` bases average below this is degraded.
+    ///
+    /// A tuning knob, and treated as one: the fit reports the resulting fraction at this cut and
+    /// at two Q either side, so a reader can see whether the two populations are actually
+    /// separable or whether the cut is just slicing one distribution in half.
+    pub degradation_tail_cut: usize,
     /// Optional path to a 4×4 TSV specifying a custom SNP transition matrix.
     /// Rows/columns are A/C/G/T. A single header line is ignored.
     /// Takes precedence over bam_file.
@@ -65,6 +95,21 @@ impl RunConfiguration {
                 })?,
         );
 
+        // Read by key like every other option, so an older binary IGNORES this rather than
+        // rejecting it -- which is why a Delta job needs a rebuilt binary, not just a pull.
+        let fastq_file_r2 = match scrape_config.get("fastq_file_r2").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => {
+                let path = PathBuf::from(s);
+                if !path.is_file() {
+                    return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                        "fastq_file_r2 not found: {path:?}"
+                    )));
+                }
+                Some(path)
+            }
+        };
+
         let overwrite_output = scrape_config
             .get("overwrite_output")
             .and_then(|v| v.as_bool())
@@ -82,6 +127,50 @@ impl RunConfiguration {
             .get("qual_offset")
             .and_then(|v| v.as_u64())
             .unwrap_or(33) as usize;
+
+        // 1000 bp is generous headroom over any short-read platform (2x300 merged is 600) and
+        // costs ~67 MiB. gen-seq-error-model is short-read only today; long-read error models
+        // are #319, and this key is how someone lifts the limit before then.
+        let max_model_read_length = scrape_config
+            .get("max_model_read_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1000) as usize;
+
+        let fit_quality_degradation = scrape_config
+            .get("fit_quality_degradation")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let degradation_tail_window = scrape_config
+            .get("degradation_tail_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+
+        let degradation_tail_cut = scrape_config
+            .get("degradation_tail_cut")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(25) as usize;
+
+        // Floors, checked only when the feature is on so an inert stale key cannot make an
+        // existing config unloadable. A zero window makes the tail mean 0.0/0.0 = NaN and every
+        // comparison against it false, which surfaces as "this library has no degraded
+        // population" -- a true statement about the wrong thing. A cut below 2 underflows
+        // `cut - 2` in the separability report.
+        if fit_quality_degradation {
+            if degradation_tail_window == 0 {
+                return Err(GenSeqErrorModelError::ConfigurationError(
+                    "degradation_tail_window must be at least 1: a zero-length tail has no mean \
+                     to compare against the cut"
+                        .to_string(),
+                ));
+            }
+            if degradation_tail_cut < 2 {
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "degradation_tail_cut must be at least 2, got {degradation_tail_cut}: the \
+                     separability report quotes the fraction two Q below the cut"
+                )));
+            }
+        }
 
         let binned_quality_bins = match scrape_config.get("binned_quality_bins") {
             None => None,
@@ -157,10 +246,15 @@ impl RunConfiguration {
 
         Ok(RunConfiguration {
             fastq_file,
+            fastq_file_r2,
             output_file,
             overwrite_output,
             max_reads,
             qual_offset,
+            max_model_read_length,
+            fit_quality_degradation,
+            degradation_tail_window,
+            degradation_tail_cut,
             binned_quality_bins,
             bam_file,
             transition_matrix_file,
@@ -244,7 +338,108 @@ mod tests {
         let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
         assert_eq!(config.max_reads, 0);
         assert_eq!(config.qual_offset, 33);
+        assert_eq!(config.max_model_read_length, 1000);
+        assert!(
+            !config.fit_quality_degradation,
+            "degradation fitting is opt-in"
+        );
+        assert_eq!(config.degradation_tail_window, 50);
+        assert_eq!(config.degradation_tail_cut, 25);
         assert!(!config.overwrite_output);
+    }
+
+    /// A zero window makes the tail mean 0.0/0.0 = NaN, and every comparison against NaN is
+    /// false, so no read is ever classified degraded and the fit dies complaining that the
+    /// library has no degraded population. The config is what is wrong, so say that instead.
+    #[test]
+    fn a_zero_tail_window_is_refused_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nfit_quality_degradation: true\n\
+             degradation_tail_window: 0\n",
+            fastq.display(),
+            output.display()
+        ));
+        let err = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap_err();
+        assert!(
+            err.to_string().contains("degradation_tail_window"),
+            "the message must name the option that is wrong: {err}"
+        );
+    }
+
+    /// The separability report prints the fraction at the cut and two Q either side, so a cut
+    /// below 2 underflows `cut - 2` on a usize. Reachable only with near-zero-quality reads,
+    /// which is exactly the kind of input a fixture supplies.
+    #[test]
+    fn a_tail_cut_below_two_is_refused_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nfit_quality_degradation: true\n\
+             degradation_tail_cut: 1\n",
+            fastq.display(),
+            output.display()
+        ));
+        let err = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap_err();
+        assert!(
+            err.to_string().contains("degradation_tail_cut"),
+            "the message must name the option that is wrong: {err}"
+        );
+    }
+
+    /// Must NOT fire: the validation is a floor, not a straitjacket. A window of 1 and a cut of
+    /// 2 are the smallest legal values and have to survive, or the check is just a narrower bug.
+    #[test]
+    fn the_smallest_legal_degradation_settings_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nfit_quality_degradation: true\n\
+             degradation_tail_window: 1\ndegradation_tail_cut: 2\n",
+            fastq.display(),
+            output.display()
+        ));
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert_eq!(config.degradation_tail_window, 1);
+        assert_eq!(config.degradation_tail_cut, 2);
+    }
+
+    /// And the floors must not apply when the feature is off, or every existing config that
+    /// happens to carry a stale key becomes unloadable.
+    #[test]
+    fn the_degradation_floors_do_not_apply_when_the_feature_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\ndegradation_tail_window: 0\n\
+             degradation_tail_cut: 0\n",
+            fastq.display(),
+            output.display()
+        ));
+        assert!(RunConfiguration::from(&tmp.path().to_path_buf()).is_ok());
+    }
+
+    #[test]
+    fn max_model_read_length_is_configurable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let tmp = write_config(&format!(
+            "fastq_file: {}\noutput_file: {}\nmax_model_read_length: 25000\n",
+            fastq.display(),
+            output.display()
+        ));
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert_eq!(config.max_model_read_length, 25000);
     }
 
     #[test]

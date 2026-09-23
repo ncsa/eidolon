@@ -109,6 +109,38 @@ contig lengths).
   moment a token is renamed. Anchor on the token (`sub(/^EIDOLON_VAF=/,"",v)`) or use
   `PREFIX.len()`.
 
+## Writing about models and inherited code
+
+The vetting standard above is deliberately blunt about defects. That applies to **eidolon's
+own behavior**. It does not extend to attribution.
+
+For any model parameter, docs and comments state three things and stop: **the value, where
+it came from, and whether it has been measured.** Provenance belongs in
+`model_data/README.md`, mentioned once per document rather than restated per paragraph.
+
+- Write "inherited static default, not yet measured", not "placeholder that was never
+  fitted".
+- Name an upstream file when it helps someone reproduce a number. Don't catalog what
+  upstream left unfinished.
+- State a correction as what is true now — "X and Y were transposed; both now carry their
+  correct values" — rather than narrating how wrong the previous value was.
+- eidolon's context-dependent modeling implements designs anticipated upstream but not
+  shipped. Describe it that way.
+
+This is a standard for CHANGELOGs, issues and PR bodies as much as for code comments.
+
+**American spelling, going forward** — code, comments, docs, commit messages, issues and
+PR bodies. `behavior` not `behaviour`, `centered` not `centred`, `normalize` not
+`normalise`, `modeling` not `modelling`, `analyze` not `analyse`, `labeled` not `labelled`,
+`judgment` not `judgement`, `defense` not `defence`.
+
+Existing prose gets corrected when a file is already being edited for another reason. No
+sweeping rename commits.
+
+**Identifiers and filenames are exempt.** `indel_context_summarise.awk`, its `SUMMARISE`
+override and the `summarise()` helpers in its tests keep their spelling: they are harness
+code, and renaming them would ripple through the sbatch and its test suite for no gain.
+
 ## Languages: Rust, bash, and (reluctantly) Python
 - **The shipped artifact is pure Rust** and must stay that way: the binary invokes no
   interpreter, `Cargo.lock` has no `pyo3`/`cpython`, and `conda-recipe/meta.yaml`
@@ -158,7 +190,7 @@ contig lengths).
   It removes the package while leaving `craype-accel-nvidia80`, the module that demands it.
   Unloading `craype-accel-nvidia80` instead is untested; it should work by the same reasoning,
   but it would not persist anyway since `default` reloads at every login.
-  **Symptom to recognise:** every dependency *build script* fails to link on a fresh
+  **Symptom to recognize:** every dependency *build script* fails to link on a fresh
   `CARGO_TARGET_DIR`, while a cached target dir gets all the way to the final binary and fails
   there. Same cause; the cache only changes where it surfaces.
   **`CARGO_TARGET_DIR` must be `$SCRATCH/cargo-target/eidolon`** — the pipeline reads
@@ -185,13 +217,29 @@ contig lengths).
   Measured footprint for `sv_pipeline.sbatch` on GRCh38 at 30x: **~214 GB peak per
   replicate** — the pipeline's disk gate scales this by genome size and coverage, so chr22 at
   30x asks for the 5 GB floor rather than 214 (a constant would have refused every smoke run
-  once `/scratch` passed 336 GB used). Itemised from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
+  once `/scratch` passed 336 GB used). Itemized from job 20884022 — FASTQ 116 GB (merged 29+29, tumor 17+17,
   normal 12+12) **plus** BAMs 98 GB (the figure `prune_bams` itself reported across
   campaign 20925151), which coexist because pruning only runs at the end. An earlier
   "~113 GB" figure here counted the FASTQ only and was wrong; every capacity estimate built on it was ~half of reality. With a ~171 GB fixed
   baseline (`neat_data` + bwa-mem2 index) **one replicate at a time is all that fits** in a
   500 GB quota (171 + 214 = 385 GB), so serialize with `%1` — `%2` cannot work at any array
   size.
+
+- **The filesystem map, measured 2026-09-06** (`df --output=source,target`, plus `stat -c %i`
+  to settle the aliases). The `/scratch` disagreement noted above is explained by the last row:
+
+  | path | backing | `bhrd` quota | used |
+  |---|---|---|---|
+  | `/projects` | `taiga/nsf/delta` — a **different filesystem** | 500 G | 1.6 G |
+  | `/work/nvme` | `dltawork/nvme`, separate OST pool and quota | 500 G | 494.9 M |
+  | `/work/hdd`, `/scratch` | `dltawork` | **1000 G** | 525.1 G |
+
+  **`$SCRATCH` and `/work/hdd/<proj>` are the same directory** — identical inode, two paths.
+  So scratch's quota is the 1000 G `/work/hdd` row, and `quota` printing no `/scratch` line is
+  not an omission. `/projects` is genuinely separate capacity on Taiga rather than a second
+  view of the same space; `/work/nvme` shares the Lustre instance with scratch but carries its
+  own quota. The one-replicate-at-a-time conclusion above still holds, but from **current
+  usage** (525 of 1000 G) rather than from a 500 G ceiling.
   **A replicate that FAILS keeps all ~214 GB**: its FASTQ prune never runs. Job 20884022 died
   incomplete, held 203 GB indefinitely, and starved array 20904141 — all five tasks failed,
   task 4 spending 8 h 45 m producing 8 KB against a full filesystem. Clear a failed
@@ -258,6 +306,45 @@ contig lengths).
   the same treatment: **a caller recall of 0 is uninterpretable until you know the evidence was
   there to find.** `PRUNE_BAM=0` keeps the BAMs when a run is specifically diagnostic.
 
+- **Say "rebuild first" every time a Delta job exercises code that is not yet on `develop`.**
+  The binary at `$SCRATCH/cargo-target/eidolon/release/eidolon` is a build artifact, not the
+  checkout: `git pull` on Delta updates the scripts and leaves the binary alone. Config is read
+  by key lookup rather than a strict struct, so a binary predating a new option **ignores it
+  instead of rejecting it** — the job runs to completion and quietly measures the old behavior.
+  Submitting instructions without the rebuild line has cost a round trip; it is not the user's
+  job to remember which commits are compiled in.
+
+- **The submit rule. If it might take more than five minutes, submit it.**
+  - **A script gets `#SBATCH` directives. Always.** Not "if it looks long" — always. They are
+    comments to bash, so the same file still runs inline for a smoke pass, and a script that
+    lacks them gets worked around with `--wrap` one-liners forever.
+  - **A one-liner that might run long gets wrapped**, including an innocent-looking
+    `samtools`/`zcat`/`gzip` over a real library. Suspicion is enough; the cost of submitting
+    something that would have taken two minutes is nil, and the cost of not submitting is a
+    silent kill at the 30-minute cap.
+  - **`-o` captures both streams.** SLURM merges stderr into `--output` unless `--error` is
+    given separately, so one flag suffices — no redirect inside the `--wrap`.
+  - **`scripts/delta/submit.sh` does the wrapping**, so following this costs one command:
+    `scripts/delta/submit.sh 'samtools fastq -F 0x900 in.bam | gzip -c > out.fq.gz'`.
+    `NAME`/`TIME`/`MEM`/`CPUS` override the defaults; it prints the job id and the `sacct` line
+    to check it with. For a SCRIPT do not use it — give the script its own `#SBATCH` and submit
+    it directly.
+  - **Then check the exit state, not just the log.** A killed job leaves partial output that
+    reads like a short successful run. `sacct -j <id> --format=JobID,State,ExitCode,Elapsed`
+    says `CANCELLED` and a non-zero `ExitCode`; the log does not.
+
+- **A script in `scripts/delta/` carries its own `#SBATCH` directives and is submitted, not run
+  interactively.** Every established script here does; a new one that does not is the odd one
+  out and will be worked around with `sbatch --wrap` one-liners forever. `#SBATCH` lines are
+  comments to bash, so the same file still runs inline for a smoke pass — there is no reason to
+  omit them.
+  **Login nodes cap at 30 minutes.** A full pass over a real library does not fit:
+  `measure_quality_degradation.sh` over HG002 is ~65 billion base iterations, and two runs were
+  killed learning that. The second printed its "done" banner over an empty file, because its
+  only guard lived in an `END` block that a killed process never reaches — a measurement tool
+  reporting success having measured nothing. **A harness must check that its own pass finished**,
+  outside whatever the pass itself prints.
+
 - Staging: `fetch_validation_data.sh` (references), `stage_soy.sh` (align + call a
   self-consistent ref/BAM/VCF; `FULL_GENOME=1` for the whole-genome stress vs the
   fast single-chromosome default). `model_builders.sbatch` exercises the builders.
@@ -277,6 +364,13 @@ contig lengths).
 - **Model fidelity** (built model file actually shapes gen-reads output) is covered by
   `model_fragment_fidelity.rs` and `model_output_fidelity.rs`; `docs/model_builder_baseline.md`
   records the Delta resource envelope and the fidelity status.
+- **`#[ignore]` means "runs in release-gates", NOT "skipped".** `release-gates.yml` runs
+  `cargo test --workspace -- --ignored` precisely because an ignored test nothing ever runs is
+  not a gate — `gate2_realigned_dup` sat red on both `develop` and `main` through an entire
+  release before anyone ran it by hand (#582). So an ignored test must PASS. A known-failing
+  target, parked until a fix lands, does not belong there; it breaks the job built to catch
+  exactly that. Record the target in the file header and let a characterization test — one that
+  pins the current numbers and fails when they move — be the tripwire.
 - **The toolchain is pinned** in `rust-toolchain.toml`, so `cargo clippy -D warnings` here
   gives the same verdict CI does. It was not always so: three PRs passed clippy locally and
   failed on the runner (#618 `useless_borrows_in_formatting`, 23 sites; #621; #626
@@ -308,11 +402,26 @@ contig lengths).
 - **`gh pr view --json commits` has served a STALE commit list** — it showed only the first
   commit of a branch while `gh api repos/ncsa/eidolon/pulls/<N>/commits` was correct.
   Retested on gh 2.98.0 (2026-08-30): the two agreed on PR #640. That is ONE PR, not proof
-  the bug is gone — it was never characterised well enough to know if it was timing-dependent
+  the bug is gone — it was never characterized well enough to know if it was timing-dependent
   — but it is consistent with the same stale-client cause as the `gh pr edit` failure above.
   Keep using the API when it matters. When
   checking whether a push made it into a PR, trust the API, not `gh pr view`. (This compounds
   the missed-merge hazard above: both the "did it land" checks can lie in the same direction.)
+- **A merged branch can still look unmerged — use `git cherry`, not ancestry, to decide.**
+  `git merge-base --is-ancestor` and a three-dot `git diff origin/develop...<branch>` both
+  answer "not merged" for a branch whose patch landed under a different SHA, which is every
+  rebase, cherry-pick and squash merge. `git cherry -v origin/develop <branch>` answers
+  correctly: `-` means an equivalent patch is already upstream, `+` means it is genuinely
+  absent. On 2026-09-12 a local `feature/fit_indel_context` read as unpushed work — the
+  three-dot diff showed 2 files, 142 insertions — while its commit `89faa67` was
+  byte-identical to `27f7c3c`, already on `develop` with three commits built on top of it.
+  Ancestry is the right test in the other direction (did MY commit land, above). Here it is
+  the wrong one, and it fails toward opening a duplicate PR.
+- **A broad `git add -A` picks up shell accidents.** An empty file named `=10` reached
+  `main` from an unquoted `>=10` in an interactive shell. Before a `develop` -> `main`
+  merge, check for empty tracked files and paths with characters outside
+  `[A-Za-z0-9_./-]`; the release skill has the two commands. `.gitignore` does not help
+  once a file is tracked — it needs `git rm`.
 - End commit messages with `Co-Authored-By: Claude <noreply@anthropic.com>`.
 
 ## GitNexus block (below)

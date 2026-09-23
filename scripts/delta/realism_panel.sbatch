@@ -57,6 +57,15 @@
 #   REAL_BAM=... GC_BIAS_MODEL=$D/gc.json.gz FRAGMENT_MODEL=$D/frag.json.gz \
 #     ALIGN_TLEN=1 sbatch scripts/delta/realism_panel.sbatch
 #
+#   # HISTORICAL MODE. Read lengths are matched between the arms by default (#672). Turn it
+#   # off only to reproduce a pre-#672 run; clip-derived metrics then compare a trimmed real
+#   # BAM against untrimmed simulated reads and are not a property of the simulator.
+#   REAL_BAM=... MATCH_READ_LEN=0 sbatch scripts/delta/realism_panel.sbatch
+#
+#   # A real BAM whose reads are not 151 bp needs READ_LEN set, since the band is derived
+#   # from it and drives the simulation as well.
+#   REAL_BAM=... READ_LEN=100 sbatch scripts/delta/realism_panel.sbatch
+#
 #   # ADAPTERS=truseq turns on 3' read-through, which is a direct source of soft clips and
 #   # also stops short fragments being rejected. clip_pct was 19x below real data without
 #   # it, and cand_per_mb was exactly 0 as a consequence.
@@ -143,6 +152,28 @@ SEED="${SEED:-realism panel}"
 # chromosome is hours. See the caveat printed below when the cap actually bites.
 MAX_SIM_DEPTH="${MAX_SIM_DEPTH:-0}"
 
+# ── Read-length matching (#672) ─────────────────────────────────────────────
+#
+# WHY THIS IS ON BY DEFAULT. The two arms had different read-length distributions and
+# nothing asserted they must match. A published real BAM is usually built from a trimmed
+# FASTQ; eidolon's reads reach the aligner untrimmed at exactly $READ_LEN. Every
+# clip-derived metric is sensitive to that, because a short read carries less unique anchor
+# and clips far more readily.
+#
+# Measured on job 21830618 (HCC1395 normal, GRCh38 chr20/21/22), over the 61 loci sitting in
+# >= 21 bp homopolymers:
+#
+#   real reads there averaged 89.7 bp; the simulated BAM was 99.6% exactly 151 bp
+#   96.8% of the real side's soft clips came from reads of 40-80 bp
+#   matched on read length: real 0.61% (4/651) vs simulated 0.26% (10/3816), P = 0.094
+#   unmatched:              real 6.00%          vs simulated 0.26%          -- 22.9x
+#
+# The unmatched figure is what `cand_per_mb` had been reporting. Set MATCH_READ_LEN=0 to
+# reproduce a historical run; the job says which mode it is in, and `len_filtered` in the
+# TSV records how many reads the band dropped per locus on each side.
+MATCH_READ_LEN="${MATCH_READ_LEN:-1}"
+READ_LEN_TOL="${READ_LEN_TOL:-6}"    # band is [READ_LEN-TOL, READ_LEN]; 6 covers 145-151
+
 # ── Trained models. Unset = eidolon's built-in defaults ─────────────────────
 #
 # WHY THIS EXISTS. Job 21623108 measured a 16.2x depth_excess gap and a 10.7x insert-skew
@@ -218,12 +249,56 @@ done
 
 [[ -x "$PANEL_BIN" ]]   || { echo "ERROR: realism-panel not built at $PANEL_BIN — cargo build --release builds the whole workspace, including it." >&2; exit 1; }
 
+# ── The binary must accept the flags this script passes ─────────────────────
+#
+# The sbatch and the binary are two components sharing one contract: the flag set below.
+# Nothing asserted they agreed. Job 21840744 ran with a current checkout and a $PANEL_BIN
+# built before #687, so it generated its reads, aligned BOTH arms, and only then died with
+# `unknown argument --min-read-len` — every expensive step paid for, nothing measured.
+#
+# Checked at job START, where the cost is a resubmit rather than a wasted allocation.
+# `--help` exits non-zero by design (it prints usage), so the status is ignored and the
+# output is what gets read. PANEL_FLAGS is the list `test_realism_panel.sh` cross-checks
+# against the flags actually passed below, so a new flag cannot be added without landing
+# here too.
+PANEL_FLAGS="--min-clip --min-support --max-tlen --depth-lag --min-read-len --max-read-len --dump-candidates"
+panel_help="$("$PANEL_BIN" --help 2>&1 || true)"
+for flag in $PANEL_FLAGS; do
+    case "$panel_help" in
+        *"$flag"*) ;;
+        *) echo "ERROR: $PANEL_BIN does not accept $flag — the binary is older than this script." >&2
+           echo "       This is the stale-binary trap: the checkout updated, the build did not." >&2
+           echo "       Rebuild before resubmitting:" >&2
+           echo "         CARGO_TARGET_DIR=\$SCRATCH/cargo-target/eidolon \\" >&2
+           echo "         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc cargo build --release" >&2
+           exit 1;;
+    esac
+done
+
 mkdir -p "$OUTDIR"
 echo "=== eidolon realism panel: $SLURM_JOB_ID ==="
 echo "Real BAM:   $REAL_BAM"
 echo "Reference:  $REFERENCE"
 echo "Outdir:     $OUTDIR"
 echo "Thresholds: min_clip=$MIN_CLIP min_support=$MIN_SUPPORT max_tlen=$MAX_TLEN depth_lag=$DEPTH_LAG"
+
+# ── The read-length band, built ONCE and passed to both arms ────────────────
+#
+# ONE variable, expanded twice. Two literal flag lists would be two places to edit and the
+# panel would go on reporting a ratio between differently-filtered read sets -- the same
+# shape of defect as the collector/harness label drift that `test_regression_collector.sh`
+# exists to pin. `test_realism_panel.sh` asserts both invocations expand this same name.
+BAND_ARGS=()
+if [[ "$MATCH_READ_LEN" -eq 1 ]]; then
+    BAND_LO=$(( READ_LEN - READ_LEN_TOL ))
+    [[ "$BAND_LO" -ge 1 ]] || { echo "ERROR: READ_LEN=$READ_LEN with READ_LEN_TOL=$READ_LEN_TOL gives a lower bound of $BAND_LO; no read can be shorter than 1 base." >&2; exit 1; }
+    BAND_ARGS=(--min-read-len "$BAND_LO" --max-read-len "$READ_LEN")
+    echo "Read len:   matched, band ${BAND_LO}-${READ_LEN} bp on BOTH arms (#672)"
+else
+    echo "Read len:   NOT MATCHED (MATCH_READ_LEN=0). Clip-derived metrics -- cand_per_mb,"
+    echo "            clip_pct -- compare differently-trimmed read sets and are not a"
+    echo "            property of the simulator. See #672."
+fi
 
 # ── Provenance: the table below is about a CONFIGURATION, so name it ────────
 #
@@ -492,11 +567,11 @@ echo "[3/3] measuring..."
 # distinction measured. Classify the real sites before trying to reproduce them.
 "$PANEL_BIN" --bam "$REAL_BAM" --regions "$REGIONS" --label REAL \
     --min-clip "$MIN_CLIP" --min-support "$MIN_SUPPORT" \
-    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" \
+    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" "${BAND_ARGS[@]}" \
     --dump-candidates "$OUTDIR/real_candidates.tsv" > "$OUTDIR/real.tsv"
 "$PANEL_BIN" --bam "$SIMDIR/sim.bam" --regions "$REGIONS" --label SIMULATED \
     --min-clip "$MIN_CLIP" --min-support "$MIN_SUPPORT" \
-    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" \
+    --max-tlen "$MAX_TLEN" --depth-lag "$DEPTH_LAG" "${BAND_ARGS[@]}" \
     --dump-candidates "$OUTDIR/sim_candidates.tsv" > "$OUTDIR/sim.tsv"
 
 cat "$OUTDIR/real.tsv" > "$OUTDIR/panel.tsv"

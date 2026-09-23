@@ -90,12 +90,78 @@ fn reference_span(cigar_ops: &[char]) -> usize {
         .count()
 }
 
+/// Length of the maximal homopolymer run containing `index`, saturating at `cap`.
+///
+/// This is the FULL run, scanning both directions — not the trailing count a
+/// reset-on-change counter would give. The distinction is the whole point: under a
+/// trailing counter the first base of a 10-mer scores 1, so the enrichment that belongs at
+/// the repeat lands on its wrong end, and the acceptance test for #661 is precisely that
+/// simulated clip boundaries sit in homopolymers at the rate real ones do.
+///
+/// `cap` bounds the work: the curve saturates at 10, so there is never a reason to walk a
+/// 300 bp poly-A tract to its end. Both scans stop as soon as `cap` is reached, making this
+/// O(cap) worst case and ~2 comparisons on the random sequence that dominates a genome.
+/// No allocation — this runs once per base of every read, in the loop that
+/// [`generate_read`] deliberately keeps off the heap.
+///
+/// `N` is unsequenced reference, not a homopolymer, so it never forms or extends a run.
+fn homopolymer_run_at(sequence: &[Nucleotide], index: usize, cap: usize) -> usize {
+    let base = sequence[index].get_unmasked_base();
+    if base == N {
+        return 0;
+    }
+    let mut run = 1;
+    // Backwards from index, then forwards, stopping at the first differing base.
+    for i in (0..index).rev() {
+        if run >= cap || sequence[i].get_unmasked_base() != base {
+            break;
+        }
+        run += 1;
+    }
+    for base_at in sequence.iter().skip(index + 1) {
+        if run >= cap || base_at.get_unmasked_base() != base {
+            break;
+        }
+        run += 1;
+    }
+    run
+}
+
 /// Set SAM TLEN from the realized pair geometry rather than the sampled
 /// fragment length. Insertions and soft clips consume no reference; deletions
 /// do, so the sampled length can disagree with what the two CIGARs cover.
 ///
 /// Positions are 0-based and ends are exclusive. For equal starts, retain R1
 /// as the positive mate, which makes the otherwise ambiguous sign stable.
+/// Offset of the R2 window inside a materialized fragment, or `None` when the fragment
+/// cannot carry one.
+///
+/// R2 covers the right end of the fragment, so its window begins `read_len` bases before the
+/// end. `ref_span` (`end - start`) is the width the fragment was PLANNED at; `fragment_len` is
+/// what could actually be materialized. Those differ whenever the interval was clamped —
+/// `padded_end` is capped at `materializable_len`, so a fragment whose `end` runs past the end
+/// of a haplotype comes back short.
+///
+/// Indexing the fragment with an offset derived from `ref_span` therefore panicked:
+///
+/// ```text
+/// range start index 263 out of range for slice of length 189
+/// ```
+///
+/// Seen on `gen-reads` with an `input_vcf` of Delly SV calls against a draft assembly, in a
+/// worker thread — so the panic killed the thread and silently dropped every remaining read in
+/// its chunk while the run went on to report success.
+///
+/// Returning `None` skips the pair, which is what the sibling "fragment shorter than a read"
+/// case already does; an orphaned R1 desynchronizes the two FASTQ streams and makes BWA-MEM
+/// abort on mismatched read names.
+fn r2_window_offset(ref_span: usize, read_len: usize, fragment_len: usize) -> Option<usize> {
+    let off = ref_span.checked_sub(read_len)?;
+    // Strictly less: an offset equal to the length yields an empty window, which cannot hold
+    // a read and would surface later as a TruncatedRead instead of here.
+    (off < fragment_len).then_some(off)
+}
+
 fn set_observed_template_lengths(r1: &mut ReadRecord, r2: &mut ReadRecord) {
     let left_start = r1.position.min(r2.position);
     let right_end = (r1.position + reference_span(&r1.cigar_ops))
@@ -173,6 +239,11 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     keep_short: bool,
     read_name_prefix: &str,
     quality_score_model: &QualityScoreModel,
+    // The R2 mate's quality model (#723). `None` means one model serves both mates, which is
+    // every model written before that field existed and also what an explicit
+    // `quality_score_model:` override means -- a model the user named by hand applies to the
+    // whole run, not to R1 only.
+    quality_score_model_r2: Option<&QualityScoreModel>,
     sequencing_error_model: &SequencingErrorModel,
     rng: &mut NeatRng,
     mut bam_writer: Option<&mut dyn BamRecordStager>,
@@ -521,8 +592,10 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         // seq_index past the deleted bases and exhausts the buffer for
         // long deletions near a fragment edge.
         let mut r2_record = if paired_ended {
+            // R2 draws from the R2 fit when the model carries one (#723).
+            let qsm_r2 = r2_quality_model(quality_score_model, quality_score_model_r2);
             let quality_scores_2 =
-                quality_score_model.generate_quality_scores(effective_read_len, rng)?;
+                laid_down_for_the_flip(qsm_r2.generate_quality_scores(effective_read_len, rng)?);
             let r2_pos = r2_ref_pos
                 .or(r1_ref_pos)
                 .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
@@ -536,12 +609,22 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             // R2 window starts at (end - effective_read_len); since `fragment`
             // is padded beyond `end`, &fragment[off..] is the window plus the
             // deletion buffer (so R2 deletions don't truncate and drop the pair).
-            let r2_sub: &[Nucleotide] = match (end - start).checked_sub(effective_read_len) {
-                Some(off) => &fragment[off..],
-                // Fragment shorter than a read: skip the pair to avoid an
-                // orphaned R1 (matches the TruncatedRead handling below).
-                None => continue,
+            // Bounds-checked against what was MATERIALIZED, not what was planned: a
+            // clamped `padded_end` makes `fragment` shorter than `end - start`. See
+            // `r2_window_offset`.
+            let Some(r2_off) = r2_window_offset(end - start, effective_read_len, fragment.len())
+            else {
+                // Fragment shorter than a read, or truncated below the R2 window: skip the
+                // pair to avoid an orphaned R1 (matches the TruncatedRead handling below).
+                debug!(
+                    "no R2 window in fragment {frag_idx}: span {} materialized {} read {} — skipping pair",
+                    end - start,
+                    fragment.len(),
+                    effective_read_len
+                );
+                continue;
             };
+            let r2_sub: &[Nucleotide] = &fragment[r2_off..];
             // The mask is sliced by the SAME offset as r2_sub, so index i of one lines up
             // with index i of the other. R2 is generated forward over this window and the
             // record (CIGAR included) is reverse-complemented afterwards, so no reversal
@@ -602,7 +685,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                             rec,
                             r2_adapter,
                             read_length,
-                            quality_score_model,
+                            r2_quality_model(quality_score_model, quality_score_model_r2),
                             sequencing_error_model,
                             rng,
                         )?;
@@ -741,6 +824,19 @@ pub struct HaplotypePairedFragment {
     pub template_length: i32,
 }
 
+/// The quality model R2 draws from: its own when the fit produced one, R1's otherwise (#723).
+///
+/// One helper for all three R2 sites — the paired writer, the haplotype paired writer, and the
+/// R2 adapter readthrough — so they cannot drift. Three copies of `unwrap_or` is three chances
+/// for one of them to keep using R1 after the others stopped, and every aggregate measure over
+/// the pair would still look right.
+fn r2_quality_model<'a>(
+    r1: &'a QualityScoreModel,
+    r2: Option<&'a QualityScoreModel>,
+) -> &'a QualityScoreModel {
+    r2.unwrap_or(r1)
+}
+
 /// Write paired-end reads from expanded-coordinate haplotype windows. R2 is
 /// generated in forward orientation, annotated with its baseline operations,
 /// then reverse-complemented so the two records share the same construction
@@ -753,6 +849,11 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
     read_name_prefix: &str,
     contig_name: &str,
     quality_score_model: &QualityScoreModel,
+    // The R2 mate's quality model (#723). `None` means one model serves both mates, which is
+    // every model written before that field existed and also what an explicit
+    // `quality_score_model:` override means -- a model the user named by hand applies to the
+    // whole run, not to R1 only.
+    quality_score_model_r2: Option<&QualityScoreModel>,
     sequencing_error_model: &SequencingErrorModel,
     rng: &mut NeatRng,
     mut bam_writer: Option<&mut dyn BamRecordStager>,
@@ -797,7 +898,10 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         };
         apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
 
-        let r2_quality = quality_score_model.generate_quality_scores(read_length, rng)?;
+        let r2_quality = laid_down_for_the_flip(
+            r2_quality_model(quality_score_model, quality_score_model_r2)
+                .generate_quality_scores(read_length, rng)?,
+        );
         let mut r2 = match generate_read(
             &fragment.r2_sequence,
             // Chimeric reads are stitched from reference pieces: every base is 'M', and
@@ -938,6 +1042,10 @@ pub fn generate_read(
     let mut ins_buf: Vec<Nucleotide> = Vec::new();
     let mut quality_index = 0;
     let mut seq_index = 0;
+    // Read off the model, not a constant: a fitted curve (#662) may carry more
+    // buckets than the shipped default, and a scan capped at the default's length
+    // could never reach them. Hoisted out of the per-base loop below.
+    let run_cap = sequencing_error_model.context_run_cap();
 
     'outer: while (seq_index < fragment_length) && (bases_written < read_length) {
         // Index variants by seq_index for BOTH strands. The caller already
@@ -1030,8 +1138,17 @@ pub fn generate_read(
             let score = quality_scores[quality_index];
             let prob = sequencing_error_model.convert_score(score)?;
             if rng.random()? < prob {
-                let error =
-                    sequencing_error_model.generate_sequencing_error(reference_base, rng)?;
+                // Homopolymer context for the indel/substitution split (#661). Computed
+                // from `sequence`, which is the fragment as drawn from the reference —
+                // slippage is a property of the template being copied, not of whatever
+                // variant this read ends up carrying. `seq_index` jumps on deletions, so
+                // this is read from the current index rather than carried in a counter.
+                let run = homopolymer_run_at(sequence, seq_index, run_cap);
+                let error = sequencing_error_model.generate_sequencing_error(
+                    reference_base,
+                    Some(run),
+                    rng,
+                )?;
                 match error {
                     SequencingErrorType::SnpError(base) => {
                         single[0] = base;
@@ -1144,8 +1261,31 @@ pub fn apply_haplotype_baseline_cigar(
     Ok(())
 }
 
+/// Lay R2's cycle-ordered quality down backwards, so the flip lands it forwards (#734).
+///
+/// `generate_quality_scores` returns CYCLE order: index 0 is cycle 1, and quality falls from
+/// there. R2 is generated forward over the fragment's right-end window and then flipped by
+/// `reverse_complement_record`, and for R2 that window's LAST base is the first one sequenced.
+/// So cycle order has to be written in reverse here for the flip to leave it in cycle order on
+/// the emitted read.
+///
+/// WHY HERE AND NOT AFTER THE FLIP. The per-base sequencing error is rolled from the quality at
+/// the same index during forward generation (`convert_score`, below), so base and quality are
+/// paired the moment the read is built. Un-reversing the emitted string afterwards would fix
+/// the profile and leave every base carrying a quality its error did not come from -- the reads
+/// would look right and their errors would still sit at the wrong end.
+fn laid_down_for_the_flip(mut quality: Vec<usize>) -> Vec<usize> {
+    quality.reverse();
+    quality
+}
+
 /// Turn a forward-generated read into its reverse-strand mate: reverse-complement
-/// the sequence and reverse the per-base CIGAR ops and qualities. R2 is generated
+/// the sequence and reverse the per-base CIGAR ops and qualities.
+///
+/// Reversing the qualities is correct ONLY because R2's array was laid down backwards to
+/// begin with — see `laid_down_for_the_flip`. Removing the reversal here looks like a fix for
+/// #734 and is not: it corrects the emitted profile while leaving each base carrying a quality
+/// its sequencing error did not come from. R2 is generated
 /// forward over the fragment's right-end window (so SNP/insertion/deletion handling
 /// is identical to R1 and correct) and flipped here — this avoids the
 /// reverse-walk indel hazards (insertion base order, deletion anchor) that
@@ -1206,8 +1346,11 @@ fn append_adapter_readthrough(
         let prob = sequencing_error_model.convert_score(score)?;
         if rng.random()? < prob {
             // Substitution noise only — preserves exact read_length.
+            // `None` for homopolymer context: this is synthetic adapter sequence, not
+            // genome, so a run length measured in it would not mean what the #661 curve
+            // measured. Passing no context keeps this path's behaviour unchanged.
             if let SequencingErrorType::SnpError(b) =
-                sequencing_error_model.generate_sequencing_error(base, rng)?
+                sequencing_error_model.generate_sequencing_error(base, None, rng)?
             {
                 base = b;
             }
@@ -1241,6 +1384,57 @@ pub fn quality_scores_to_char_vec(array: &[usize]) -> Result<Vec<u8>, FastqTools
 
 #[cfg(test)]
 mod tests {
+    use super::r2_window_offset;
+
+    // ── R2 window bounds ──────────────────────────────────────────────────
+    //
+    // Known answers from arithmetic, sharing nothing with the implementation. The cases
+    // that matter are the ones that must NOT produce an offset: an offset past the end of
+    // what was materialized is the panic this function exists to prevent.
+
+    #[test]
+    fn r2_window_starts_a_read_length_before_the_fragment_end() {
+        // 400 bp planned, 400 bp materialized, 151 bp reads -> window opens at 249.
+        assert_eq!(r2_window_offset(400, 151, 400), Some(249));
+        // A fragment padded beyond its span still opens the window at the same place: the
+        // pad exists so R2 deletions have bases to consume, and must not move R2.
+        assert_eq!(r2_window_offset(400, 151, 551), Some(249));
+    }
+
+    #[test]
+    fn a_fragment_shorter_than_a_read_has_no_window() {
+        assert_eq!(r2_window_offset(100, 151, 100), None);
+        // Exactly one read long: offset 0, the whole fragment.
+        assert_eq!(r2_window_offset(151, 151, 151), Some(0));
+        assert_eq!(r2_window_offset(150, 151, 150), None);
+    }
+
+    #[test]
+    fn a_truncated_fragment_has_no_window_rather_than_a_bad_offset() {
+        // THE regression. Planned 414, materialized 189 because `padded_end` was clamped at
+        // the end of a haplotype. The old code indexed &fragment[263..] into 189 bases and
+        // panicked: "range start index 263 out of range for slice of length 189".
+        assert_eq!(r2_window_offset(414, 151, 189), None);
+        // The second panic from the same run, same shape.
+        assert_eq!(r2_window_offset(404, 151, 218), None);
+    }
+
+    #[test]
+    fn the_boundary_between_a_usable_and_an_unusable_window() {
+        // Offset one short of the length leaves a single base — degenerate but in range, so
+        // it is handled downstream as a truncated read rather than as an index panic.
+        assert_eq!(r2_window_offset(400, 151, 250), Some(249));
+        // Offset EQUAL to the length is an empty window and must be refused here.
+        assert_eq!(r2_window_offset(400, 151, 249), None);
+        assert_eq!(r2_window_offset(400, 151, 248), None);
+    }
+
+    #[test]
+    fn a_zero_length_fragment_never_yields_an_offset() {
+        assert_eq!(r2_window_offset(0, 151, 0), None);
+        assert_eq!(r2_window_offset(400, 151, 0), None);
+    }
+
     use super::*;
     use crate::file_tools::bam_writer::{BamRecordStager, BamWriter, BamWriterError};
     use crate::file_tools::file_io::{VectorBuffer, create_output_file, read_gzip_lines};
@@ -1435,6 +1629,7 @@ mod tests {
             "hap",
             "chr1",
             &quality_model,
+            None,
             &error_model,
             &mut rng,
             None,
@@ -1484,6 +1679,7 @@ mod tests {
                 "hap",
                 "chr1",
                 &quality_model,
+                None,
                 &error_model,
                 &mut rng,
                 Some(&mut captured),
@@ -1763,6 +1959,7 @@ mod tests {
             false, // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -1859,6 +2056,7 @@ mod tests {
             false, // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -1953,6 +2151,7 @@ mod tests {
             true,  // keep_short (adapters on → short fragments kept)
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -2050,6 +2249,7 @@ mod tests {
             true,  // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             None,
@@ -2788,6 +2988,7 @@ mod tests {
             false, // keep_short
             "chr1",
             &quality_model,
+            None,
             &seq_err_model,
             &mut rng,
             stager,
@@ -2875,5 +3076,98 @@ mod tests {
             "BAM must be coordinate-sorted; got: {:?}",
             positions
         );
+    }
+}
+
+/// Tests for the homopolymer-run context that drives the #661 indel-error curve.
+///
+/// These cover the geometry only — that `homopolymer_run_at` reports the run a base sits
+/// in. Whether that run then changes the error mix is asserted in
+/// `sequencing_error_model`, and whether it reaches the reads in
+/// `eidolon/tests/indel_context_fidelity.rs`.
+#[cfg(test)]
+mod homopolymer_context_tests {
+    use super::*;
+    use crate::models::sequencing_error_model::INDEL_CONTEXT_RUN_CAP;
+    use crate::structs::nucleotides::Nucleotide::{A, C, G, T};
+
+    fn run_at(seq: &[Nucleotide], index: usize) -> usize {
+        homopolymer_run_at(seq, index, INDEL_CONTEXT_RUN_CAP)
+    }
+
+    #[test]
+    fn a_run_is_measured_from_both_ends_not_just_backwards() {
+        // The distinction that matters. `AAAAAC`: every A is in the SAME run of 5, so all
+        // five positions must report 5. A reset-on-change counter reports 1,2,3,4,5 —
+        // right only at the last base, and wrong at the boundary where an aligner
+        // actually clips. This test fails against that implementation.
+        let seq = [A, A, A, A, A, C];
+        for index in 0..5 {
+            assert_eq!(
+                run_at(&seq, index),
+                5,
+                "position {index} of a 5-mer must report the whole run"
+            );
+        }
+        assert_eq!(run_at(&seq, 5), 1, "the lone C is a run of 1");
+    }
+
+    #[test]
+    fn an_isolated_base_between_two_runs_is_a_run_of_one() {
+        // Must-not-fire: a single base flanked by different bases gets no enrichment.
+        let seq = [G, G, G, A, T, T, T];
+        assert_eq!(run_at(&seq, 3), 1, "the single A is its own run");
+        assert_eq!(run_at(&seq, 0), 3);
+        assert_eq!(run_at(&seq, 6), 3);
+    }
+
+    #[test]
+    fn runs_at_the_sequence_edges_are_not_truncated_or_overrun() {
+        // Off-by-one guard at both boundaries: the backward scan starts at index 0 and the
+        // forward scan must stop at len(), neither panicking nor under-counting.
+        let seq = [T, T, T, C, A, A];
+        assert_eq!(run_at(&seq, 0), 3, "run touching the left edge");
+        assert_eq!(run_at(&seq, 2), 3);
+        assert_eq!(run_at(&seq, 5), 2, "run touching the right edge");
+        assert_eq!(run_at(&[A], 0), 1, "single-base sequence");
+    }
+
+    #[test]
+    fn n_forms_no_run_and_breaks_the_runs_around_it() {
+        // N is unsequenced reference, not a homopolymer. `indel_context.sbatch` excludes
+        // N runs from both the observed and background sides, so the simulator must not
+        // treat them as context either.
+        let seq = [A, A, N, A, A];
+        assert_eq!(run_at(&seq, 2), 0, "N itself has no run length");
+        assert_eq!(run_at(&seq, 0), 2, "the N must not join the two A pairs");
+        assert_eq!(run_at(&seq, 4), 2);
+    }
+
+    #[test]
+    fn a_long_run_saturates_at_the_cap_without_walking_to_its_end() {
+        // A 300 bp poly-A tract must cost the same as a 10 bp one. The curve pools
+        // everything at or above the cap into one bucket, so scanning further could not
+        // change the answer.
+        let seq = vec![A; 300];
+        assert_eq!(run_at(&seq, 0), INDEL_CONTEXT_RUN_CAP);
+        assert_eq!(run_at(&seq, 150), INDEL_CONTEXT_RUN_CAP);
+        assert_eq!(run_at(&seq, 299), INDEL_CONTEXT_RUN_CAP);
+    }
+
+    #[test]
+    fn run_length_is_strand_symmetric() {
+        // Reverse (R2) reads are reverse-complemented before this walk, so a run of A on
+        // one strand is the same-length run of T on the other. If these disagreed, R2
+        // reads would carry different slippage from R1 at the same locus — the shape of
+        // the strand-bias defect the `generate_read` comment above already records.
+        let forward = [C, A, A, A, A, G];
+        let reverse: Vec<Nucleotide> = reverse_complement(forward.to_vec());
+        for index in 0..forward.len() {
+            assert_eq!(
+                run_at(&forward, index),
+                run_at(&reverse, forward.len() - 1 - index),
+                "strand disagreement at forward index {index}"
+            );
+        }
     }
 }

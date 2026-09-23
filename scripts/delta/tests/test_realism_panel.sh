@@ -193,6 +193,8 @@ echo "=== adapters: off by default, and a nested map when set ==="
 )
 hasnt "no adapters key when unset" "$(cat "$WORK/c_noad.yml")" "adapters"
 (
+
+
   unset GC_BIAS_MODEL FRAGMENT_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
   ADAPTERS=truseq write_sim_config "$WORK/c_ad.yml" /ref.fa /out seed 8 30 151 400 90
 )
@@ -304,6 +306,172 @@ echo "=== the frag ceiling vs MAX_TLEN mismatch is reported ==="
 ceil="$(sed -n '/Frag ceiling:/,+14p' "$PIPELINE")"
 has "it warns the gap may be the ceiling" "$ceil" "rather than the simulator"
 has "it offers the alignment knob"        "$ceil" "ALIGN_TLEN=1"
+
+echo "=== INPUT_VCF reaches the config, and is absent when unset ==="
+# Drawn germline SVs arrive this way rather than through a model (#685). Supplied variants
+# are added to the de novo mutations, so the run keeps its SNPs and small indels.
+write_sim_config "$WORK/c_novcf.yml" /ref.fa /out seed 8 30 151 400 90
+hasnt "no input_vcf key when unset" "$(cat "$WORK/c_novcf.yml")" "input_vcf"
+INPUT_VCF=/v/drawn.vcf write_sim_config "$WORK/c_vcf.yml" /ref.fa /out seed 8 30 151 400 90
+has "INPUT_VCF reaches the config" "$(cat "$WORK/c_vcf.yml")" "input_vcf: /v/drawn.vcf"
+# Must-not-fire: supplying a VCF must not silently disable SV generation or anything else.
+has "setting INPUT_VCF leaves sv_rate_scale alone" \
+    "$(cat "$WORK/c_vcf.yml")" "sv_rate_scale: 0.0"
+
+echo "=== SV_RATE_SCALE is overridable, and defaults to off ==="
+# cand_per_mb compares a real genome carrying structural variants against a simulation
+# that plants none. The knob has to exist before that can be tested (#684); it must also
+# stay off by default so every existing panel run is unchanged.
+write_sim_config "$WORK/c_sv_default.yml" /ref.fa /out seed 8 30 151 400 90
+has "sv_rate_scale defaults to 0.0" \
+    "$(cat "$WORK/c_sv_default.yml")" "sv_rate_scale: 0.0"
+SV_RATE_SCALE=0.005 write_sim_config "$WORK/c_sv_on.yml" /ref.fa /out seed 8 30 151 400 90
+has "SV_RATE_SCALE reaches the config" \
+    "$(cat "$WORK/c_sv_on.yml")" "sv_rate_scale: 0.005"
+# Exactly one such key. `hasnt "sv_rate_scale: 0.0"` cannot express this -- that string
+# is a prefix of "sv_rate_scale: 0.005" and matches its own replacement.
+has "the override replaces the default rather than adding a second key" \
+    "$(grep -c '^sv_rate_scale:' "$WORK/c_sv_on.yml")" "1"
+# Must-not-fire: setting it must not disturb anything else in the config.
+if diff -q <(grep -v '^sv_rate_scale:' "$WORK/c_sv_default.yml") \
+           <(grep -v '^sv_rate_scale:' "$WORK/c_sv_on.yml") >/dev/null; then
+    ok "no other key changes when SV_RATE_SCALE is set"
+else
+    bad "no other key changes when SV_RATE_SCALE is set" "identical apart from sv_rate_scale" \
+        "$(diff <(grep -v '^sv_rate_scale:' "$WORK/c_sv_default.yml") \
+                <(grep -v '^sv_rate_scale:' "$WORK/c_sv_on.yml"))"
+fi
+# The calibration warning has to survive, or someone reads 1.0 as realistic.
+if grep -q "UNION across the cohort" "$HERE/../lib_realism_config.sh"; then
+    ok "the sites-VCF calibration warning is recorded"
+else
+    bad "the sites-VCF calibration warning is recorded" "a warning about cohort union" "absent"
+fi
+
+echo "=== both arms get the SAME read-length band (#672) ==="
+# THE two-component invariant. The panel reports a ratio between two BAMs; if the arms are
+# filtered differently the ratio measures the filter. Nothing asserted they had to match
+# before, and the arms ran with different read-length distributions for every run to date.
+#
+# Assert on the shared variable NAME, not on a value: two literal flag lists that happen to
+# agree today are exactly the drift this is meant to prevent.
+inv_real="$(grep -c -- '--dump-candidates "$OUTDIR/real_candidates.tsv"' "$PIPELINE")"
+inv_sim="$(grep -c -- '--dump-candidates "$OUTDIR/sim_candidates.tsv"' "$PIPELINE")"
+[[ "$inv_real" == "1" ]] && ok "there is exactly one REAL panel invocation" \
+  || bad "there is exactly one REAL panel invocation" "1" "$inv_real"
+[[ "$inv_sim" == "1" ]] && ok "there is exactly one SIMULATED panel invocation" \
+  || bad "there is exactly one SIMULATED panel invocation" "1" "$inv_sim"
+
+# Each invocation is a backslash-continued command; join continuations before matching so a
+# flag on a different physical line still counts as part of its own invocation.
+joined="$WORK/pipeline_joined.sh"
+sed -e :a -e '/\\$/N; s/\\\n//; ta' "$PIPELINE" > "$joined"
+band_uses="$(grep -c 'BAND_ARGS\[@\]' "$joined")"
+[[ "$band_uses" == "2" ]] && ok "both panel invocations expand BAND_ARGS" \
+  || bad "both panel invocations expand BAND_ARGS" "2" "$band_uses"
+# And they must be the two panel invocations, not one of them twice.
+real_line="$(grep -n 'dump-candidates "\$OUTDIR/real_candidates.tsv"' "$joined" | cut -d: -f1)"
+sim_line="$(grep -n 'dump-candidates "\$OUTDIR/sim_candidates.tsv"' "$joined" | cut -d: -f1)"
+if [[ -n "$real_line" ]] && sed -n "${real_line}p" "$joined" | grep -q 'BAND_ARGS\[@\]'; then
+    ok "the REAL arm is filtered by the band"
+else
+    bad "the REAL arm is filtered by the band" "BAND_ARGS on the REAL invocation" "absent"
+fi
+if [[ -n "$sim_line" ]] && sed -n "${sim_line}p" "$joined" | grep -q 'BAND_ARGS\[@\]'; then
+    ok "the SIMULATED arm is filtered by the band"
+else
+    bad "the SIMULATED arm is filtered by the band" "BAND_ARGS on the SIMULATED invocation" "absent"
+fi
+# Non-vacuity: the matcher must be able to see an arm that LACKS the band, or the two checks
+# above prove nothing about where BAND_ARGS is.
+stripped="$WORK/pipeline_nobands.sh"
+sed 's/"${BAND_ARGS\[@\]}" //g' "$joined" > "$stripped"
+if sed -n "${real_line}p" "$stripped" | grep -q 'BAND_ARGS\[@\]'; then
+    bad "the band check can detect a missing band" "no match after stripping" "still matched"
+else
+    ok "the band check can detect a missing band"
+fi
+
+echo "=== the band is built once, and reports what it dropped ==="
+# Built from READ_LEN so the two cannot be set independently; a hardcoded 145 would drift the
+# moment someone runs at a different read length.
+grep -q 'BAND_LO=$(( READ_LEN - READ_LEN_TOL ))' "$PIPELINE" \
+  && ok "the band is derived from READ_LEN, not hardcoded" \
+  || bad "the band is derived from READ_LEN, not hardcoded" "BAND_LO from READ_LEN" "absent"
+# Rule 4: a filter that drops data has to say how much.
+grep -q 'len_filtered' "$HERE/../realism/src/main.rs" \
+  && ok "the TSV carries a len_filtered column" \
+  || bad "the TSV carries a len_filtered column" "len_filtered emitted" "absent"
+# MATCH_READ_LEN=0 must be loud, or a historical-mode run reads like a matched one.
+# Anchored on the "Read len:" label: a bare 'NOT MATCHED' also matches the depth-cap banner
+# further down, and a mutation sweep showed the unanchored version passing with this notice
+# deleted.
+grep -q 'Read len:.*NOT MATCHED' "$PIPELINE" \
+  && ok "an unmatched run says so in its banner" \
+  || bad "an unmatched run says so in its banner" "a NOT MATCHED notice" "absent"
+# A lower bound below 1 is a configuration error, not a wide-open band.
+grep -q 'BAND_LO" -ge 1' "$PIPELINE" \
+  && ok "an impossible lower bound is refused" \
+  || bad "an impossible lower bound is refused" "a guard on BAND_LO" "absent"
+
+echo "=== the binary is checked for the flags this script passes (#672) ==="
+# Job 21840744 generated its reads, aligned BOTH arms, and died at the measurement step on
+# `unknown argument --min-read-len`: a current checkout against a $PANEL_BIN built before
+# #687. The sbatch checked that the binary EXISTED and never that it understood the flags.
+# That is the same two-component drift test_regression_collector.sh pins for the collector.
+#
+# Derived, not restated. The flag list is extracted from the invocations themselves, so a
+# flag added below without being added to PANEL_FLAGS fails here rather than on Delta.
+grep -q '^PANEL_FLAGS=' "$PIPELINE" \
+  && ok "the script declares the flag set it depends on" \
+  || bad "the script declares the flag set it depends on" "a PANEL_FLAGS list" "absent"
+declared="$(grep -m1 '^PANEL_FLAGS=' "$PIPELINE" | cut -d'"' -f2)"
+# Flags actually handed to the binary: the two panel invocations plus the BAND_ARGS array
+# they expand. --bam/--regions/--label are the required arguments and predate any of this.
+passed="$(grep -E 'dump-candidates "\$OUTDIR/(real|sim)_candidates.tsv"|^ *BAND_ARGS=\(--' "$joined" \
+          | grep -oE '\-\-[a-z][a-z-]+' | sort -u | grep -vE '^--(bam|regions|label)$')"
+[[ -n "$passed" ]] && ok "flags were extracted from the invocations" \
+  || bad "flags were extracted from the invocations" "a flag list" "nothing matched"
+unprobed=""
+for f in $passed; do
+    case " $declared " in *" $f "*) ;; *) unprobed="$unprobed $f";; esac
+done
+if [[ -z "$unprobed" ]]; then
+    ok "every flag passed to the binary is one the preflight probes"
+else
+    bad "every flag passed to the binary is one the preflight probes" "no unprobed flags" "unprobed:$unprobed"
+fi
+# Non-vacuity: the comparison must be able to see an unprobed flag at all.
+case " $declared " in
+    *" --a-flag-that-is-not-declared "*) bad "the unprobed check can detect one" "no match" "matched";;
+    *) ok "the unprobed check can detect one";;
+esac
+
+echo "=== and it is checked BEFORE the expensive steps ==="
+# Failing after gen-reads and two alignments costs an allocation; failing at job start costs
+# a resubmit. The guard's position in the file is the whole value of it.
+guard_ln="$(grep -n 'does not accept' "$PIPELINE" | head -1 | cut -d: -f1)"
+work_ln="$(grep -n 'gen-reads -c' "$PIPELINE" | head -1 | cut -d: -f1)"
+if [[ -n "$guard_ln" && -n "$work_ln" && "$guard_ln" -lt "$work_ln" ]]; then
+    ok "the flag preflight runs before gen-reads (line $guard_ln < $work_ln)"
+else
+    bad "the flag preflight runs before gen-reads" "guard before gen-reads" "guard=$guard_ln work=$work_ln"
+fi
+has "the failure names the stale-binary cause" "$(cat "$PIPELINE")" "the binary is older than this script"
+# Anchored on the linker export, which appears only in this hint. A bare
+# "cargo build --release" also occurs in the older "not built" message, and a mutation
+# sweep showed the unanchored version passing with the whole hint deleted.
+has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc cargo build"
+
+# Floor on how many assertions must execute. This file had none, which is how four
+# assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
+# discarded -- ran without changing the count. Raise it when adding tests.
+MIN_ASSERTIONS=88
+TOTAL=$((PASS + FAIL))
+if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
+    printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
+    FAIL=$((FAIL+1))
+fi
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

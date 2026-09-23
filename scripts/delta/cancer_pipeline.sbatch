@@ -71,6 +71,16 @@ PRUNE="${PRUNE:-0}"
 
 # Tumor mutation model (COSMIC pan-cancer). Bundled in the repo.
 TUMOR_MODEL="$REPO_ROOT/tools/cosmic_v104_pancancer_model.json.gz"
+# Optional. Set to compare error models against an otherwise identical run -- the
+# somatic_snv_recall question in #680 needs exactly that A/B.
+SEQ_ERROR_MODEL="${SEQ_ERROR_MODEL:-}"
+SEQ_ERR_FLAG=""
+# `if`, not `[[ ]] && x=y`. The && form survives at top level but returns 1 when the test
+# is false, so it aborts under `set -e` the moment anyone moves it inside a function --
+# the footgun cancer_simulate.sh already documents at its own config writer.
+if [[ -n "$SEQ_ERROR_MODEL" ]]; then
+    SEQ_ERR_FLAG="--seq-error-model $SEQ_ERROR_MODEL"
+fi
 
 # Path to the hap.py Apptainer SIF (built by setup.sh).
 HAPPY_SIF="${HAPPY_SIF:-$SCRATCH/sif/happy_v0.3.12.sif}"
@@ -141,6 +151,7 @@ else
         --purity "$PURITY" \
         --read-len "$READ_LEN" \
         --tumor-model "$TUMOR_MODEL" \
+        $SEQ_ERR_FLAG \
         --sv-rate-scale "$SV_RATE_SCALE" \
         --rng-seed "$RNG_SEED_ROOT" \
         --eidolon-bin "$EIDOLON_BIN" \

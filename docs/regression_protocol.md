@@ -13,7 +13,7 @@ build against a frozen baseline with **statistically-grounded tolerances**.
 ## Why this is now possible: the replication study gives the noise floor
 
 The Phase-2 replication runs measured the *run-to-run* standard deviation of every
-metric (see [`replication_audit.md`](archive/replication_audit.md)). That sd is exactly
+metric (see [`replication_audit.md`](https://github.com/ncsa/eidolon/blob/develop/docs/archive/replication_audit.md)). That sd is exactly
 what separates a **real regression** from normal scatter:
 
 | metric | measured run-to-run sd | gate uses |

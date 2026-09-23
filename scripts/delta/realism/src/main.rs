@@ -37,7 +37,7 @@
 mod metrics;
 mod reader;
 
-use reader::{Region, measure};
+use reader::{LenBand, Region, measure};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -49,6 +49,9 @@ struct Args {
     min_support: usize,
     max_tlen: i64,
     depth_lag: usize,
+    /// Reads outside this length band are excluded from every metric. Defaults to open, so
+    /// the caller has to ask; `realism_panel.sbatch` asks with one value for both arms.
+    band: LenBand,
     /// Where to write the candidate sites themselves. The headline metric is a COUNT, and
     /// a count cannot say whether the boundaries came from repeats, from structural
     /// variation, or from scattered read-level artifacts -- which is the difference between
@@ -59,7 +62,7 @@ struct Args {
 fn usage() -> &'static str {
     "usage: realism-panel --bam <file> --regions <bed> [--label NAME] \
      [--min-clip N] [--min-support N] [--max-tlen N] [--depth-lag N] \
-     [--dump-candidates <tsv>]"
+     [--min-read-len N] [--max-read-len N] [--dump-candidates <tsv>]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -70,6 +73,8 @@ fn parse_args() -> Result<Args, String> {
     let mut min_support = 3usize;
     let mut max_tlen = 2000i64;
     let mut depth_lag = 500usize;
+    let mut min_read_len = LenBand::ANY.min;
+    let mut max_read_len = LenBand::ANY.max;
     let mut dump_candidates: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
@@ -85,6 +90,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--max-tlen" => max_tlen = val()?.parse().map_err(|e| format!("--max-tlen: {e}"))?,
             "--depth-lag" => depth_lag = val()?.parse().map_err(|e| format!("--depth-lag: {e}"))?,
+            "--min-read-len" => {
+                min_read_len = val()?.parse().map_err(|e| format!("--min-read-len: {e}"))?
+            }
+            "--max-read-len" => {
+                max_read_len = val()?.parse().map_err(|e| format!("--max-read-len: {e}"))?
+            }
             "--dump-candidates" => dump_candidates = Some(PathBuf::from(val()?)),
             "-h" | "--help" => return Err(usage().to_string()),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
@@ -98,6 +109,7 @@ fn parse_args() -> Result<Args, String> {
         min_support,
         max_tlen,
         depth_lag,
+        band: LenBand::new(min_read_len, max_read_len)?,
         dump_candidates,
     })
 }
@@ -168,6 +180,7 @@ fn main() -> ExitCode {
         args.min_support,
         args.max_tlen,
         args.depth_lag,
+        args.band,
         args.dump_candidates.as_deref(),
     ) {
         Ok(m) => m,
@@ -180,8 +193,40 @@ fn main() -> ExitCode {
         }
     };
 
+    // The band's cost goes to stderr as one line per run, so it lands in the job log even
+    // when stdout is redirected into the TSV. `len_filtered` carries the same number per
+    // region; this is the total, which is what says whether a band was too tight to trust.
+    if !args.band.is_open() {
+        let kept: usize = measured.iter().map(|m| m.reads).sum();
+        let dropped: usize = measured.iter().map(|m| m.len_filtered).sum();
+        let total = kept + dropped;
+        let pct = if total > 0 {
+            dropped as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "realism-panel [{}]: read-length band {}-{} kept {kept} of {total} reads \
+             ({pct:.1}% excluded)",
+            args.label, args.band.min, args.band.max
+        );
+        // Reporting that percentage is not the same as acting on it. Job 22237471 printed
+        // "100.0% excluded" and went on to emit a full table over 161 reads.
+        let longest_excluded = measured
+            .iter()
+            .map(|m| m.max_excluded_query_len)
+            .max()
+            .unwrap_or(0);
+        if let Err(e) =
+            reader::check_band_coverage(&args.label, kept, dropped, longest_excluded, &args.band)
+        {
+            eprintln!("realism-panel: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     println!(
-        "label\tcontig\tstart\tend\treads\tspan_bp\tcand_bp\tcand_per_mb\timproper_pct\
+        "label\tcontig\tstart\tend\treads\tlen_filtered\tspan_bp\tcand_bp\tcand_per_mb\timproper_pct\
          \tclip_pct\tmapq0_pct\tdepth_mean\tdepth_vmr\tdepth_excess\tdepth_acf\tins_n\tins_mean\tins_sd\
          \tins_skew\tins_p99"
     );
@@ -197,13 +242,14 @@ fn main() -> ExitCode {
             None => (0.0, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
         };
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{:.3}\t{:.5}\
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.4}\t{:.4}\t{:.4}\t{:.2}\t{:.3}\t{:.5}\
              \t{:.3}\t{:.0}\t{:.1}\t{:.1}\t{:+.3}\t{:.0}",
             args.label,
             r.contig,
             r.start,
             r.end,
             m.reads,
+            m.len_filtered,
             m.span_bp,
             m.candidate_breakpoints,
             m.candidates_per_mb(),
