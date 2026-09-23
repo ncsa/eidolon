@@ -3,7 +3,32 @@
 #   regression_suite.sh MODE=submit TIER=2 ; ... ; regression_suite.sh MODE=collect ... > baseline_metrics.tsv
 # columns: metric <tab> value <tab> sd <tab> gate <tab> tier
 #   gate: exact | ge2sd (>= value-2*sd) | band:LO:HI | lepct:P (<= value*(1+P/100))
-# PERF rows (*_wall_s / *_rss_mb) re-frozen on the v1.19.1 fixed build (#340): the
+# PERF rows re-frozen on job 22302963 for v3.4.0. They had been failing on EVERY build for
+# months (#670) because the recorded values predated a ~40 MB fixed overhead, so the gate was
+# reporting a stale baseline rather than a regression. This release adds a further +22 MB,
+# which is real and accounted for: the shipped default now carries four 249x31 quality tensors
+# (R1/R2 x healthy/degraded) where it carried one 100x42, plus the clone at
+# gen_reads/utils/runner.rs:143. Measured by building both sides of b3276aa and running an
+# identical config: 55.7 -> 77.7 MB, flat across 1/4/8/16 threads, with no wall-time cost.
+#
+#   ecoli_wall_s    8.17 -> 10.93     ecoli_rss_mb    41.3 -> 101.1
+#   chr22_wall_s   57.17 -> 64.04     chr22_rss_mb   226.5 -> 295.5
+#
+# chr22_wall_s was PASSING at 64.04 against a 68.60 limit and is re-frozen anyway, for
+# consistency with the other three from the same job and because "re-freeze on each release"
+# is this file's stated practice. Note what that costs: its limit moves 68.60 -> 76.85, so the
+# gate is looser than it was. If that is not wanted, revert this one row to 57.17.
+#
+# somatic_snv_recall is deliberately NOT re-frozen. It is failing (#680), it has read 0.8397
+# on four builds now, and freezing it at the observed value would convert an open question
+# into a silent pass.
+#
+# CAUTION, and #671 is NOT closed by this. These come from ONE job, and the sd column is 0, so
+# they carry no measured job-to-job spread -- which is the very thing #671 is about. The
+# re-freeze moves each limit above the spread #671 recorded, so the rows should stop flipping,
+# but a tolerance set from a single job is a guess about variance, not a measurement of it.
+#
+# PERF rows (*_wall_s / *_rss_mb) previously re-frozen on the v1.19.1 fixed build (#340): the
 # original perf baseline was captured under the old default log-level `trace`
 # (per-base debug I/O), so it was 3-4x too slow. Fidelity/determinism rows unchanged
 # (the logging fix is output-preserving; Tier-1 gate re-confirmed all fidelity PASS).
@@ -21,15 +46,15 @@ ecoli_snp_recall	0.9859	0.0010	ge2sd	0
 ecoli_snp_precision	0.9998	0.0002	ge2sd	0
 ecoli_indel_recall	0.9836	0.0031	ge2sd	0
 ecoli_tstv	2.344	0.144	band:2.0:2.6	0
-ecoli_wall_s	8.17	0	lepct:20	0
-ecoli_rss_mb	41.3	0	lepct:15	0
+ecoli_wall_s	10.93	0	lepct:20	0
+ecoli_rss_mb	101.1	0	lepct:15	0
 chr22_snp_recall	0.989	0.010	ge2sd	1
 chr22_snp_precision	0.9996	0.0010	ge2sd	1
 chr22_indel_recall	0.982	0.050	ge2sd	1
 chr22_indel_precision	0.989	0.020	ge2sd	1
 chr22_tstv	2.35	0.14	band:2.0:2.6	1
-chr22_wall_s	57.17	0	lepct:20	1
-chr22_rss_mb	226.5	0	lepct:15	1
+chr22_wall_s	64.04	0	lepct:20	1
+chr22_rss_mb	295.5	0	lepct:15	1
 # Somatic recall re-frozen for v1.20.0 (#372) from a develop-vs-#372 A/B on THIS
 # suite config (COSMIC pan-cancer model, chr22, 30x, purity 0.6): 3 seed reps per
 # arm + the v1200b gate run = 7 clean runs. The A/B showed #372 has NO effect on
