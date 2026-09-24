@@ -18,9 +18,9 @@ repeatability.
 | indel-error lengths | HCC1395 normal | yes |
 | homopolymer context curve | HCC1395 normal | yes |
 | `default_sequencing_error_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
-| `default_mutation_model.json.gz` (+ `_bkup`) | unrecorded | no |
-| `default_indel_model.json.gz` | unrecorded | no |
-| `default_trinuc_model.json.gz` | unrecorded | no |
+| `default_mutation_model.json.gz` (+ `_bkup`) | NEAT2 `MutModel_NA12878.p.gz` | no — source verified, values unmeasured |
+| `default_indel_model.json.gz` | NEAT2 `MutModel_NA12878.p.gz` (`INDEL_FREQ`) | no — source verified, values unmeasured |
+| `default_trinuc_model.json.gz` | NEAT2 `MutModel_NA12878.p.gz` (`TRINUC_MUT_PROB`) | no — source verified, values unmeasured |
 
 ## `default_fragment_length_model.json.gz`
 
@@ -214,18 +214,49 @@ average below Q20 fall from 5.70% to 1.28%. The direction is conservative: a res
 cleaner than a native one, never dirtier. For comparison, the pre-v3.4.0 default produced
 0.00% of those reads at any length. A 151 bp model is #744.
 
-## Models with unrecorded provenance
+## The variant models: NEAT2's NA12878
 
-These predate the Rust port. Round-trip serialization is the only property currently
-asserted for them.
+`default_mutation_model.json.gz` (+ `_bkup`), `default_indel_model.json.gz` and
+`default_trinuc_model.json.gz` all derive from **one** upstream file:
+`~/code/neat2/models/MutModel_NA12878.p.gz`.
 
-- `default_mutation_model.json.gz` (+ `_bkup`)
-- `default_indel_model.json.gz` — variant indel lengths, `ins_dist` (70 values) and
-  `del_dist` (72)
-- `default_trinuc_model.json.gz`
+That was recorded as "unrecorded provenance" until it was checked. It is not a cancer model
+and not a toy: NA12878 is the CEPH/GIAB germline reference sample, which makes it a defensible
+source for germline defaults. What is genuinely unrecorded is how NEAT2 built it — reference
+build, aligner and caller are not stated upstream, and given NEAT2's age it is likely GRCh37
+era.
 
-Each needs the same treatment as the models above: a recorded source, a measurement against
-real data, and a test asserting the default is usable.
+Verified by value, not by reading:
+
+| eidolon | upstream field | agreement |
+|---|---|---|
+| `mutation_rate` 0.0010987132390211135 | `AVG_MUT_RATE` | exact, 16 digits |
+| `_bkup`'s `variant_dist` first weight 0.886404192662459 | `SNP_FREQ` | exact, 16 digits |
+| `default_indel_model` `ins_dist` (70 lengths) | positive `INDEL_FREQ` keys, renormalized | max diff 5.4e-17 |
+| `default_indel_model` `del_dist` (72 lengths) | negative `INDEL_FREQ` keys, renormalized | max diff 1.1e-16 |
+| `default_trinuc_model` `snp_distro` (64) | `TRINUC_MUT_PROB`, normalized, alphabetical (AAA, AAC, AAG, …) indexed 0–63 | max diff 5.7e-17 |
+
+### Two deliberate departures, and one unexplained number
+
+**`homozygous_frequency` 0.01 → 0.3333.** `_bkup` carries NEAT2's 0.01, which implies a
+het/hom ratio near 99. The live model uses 1/3, a ratio near 2.0, which is what human data
+shows. This is the difference the NEAT comparison table in the README refers to, and it is
+locked by a test.
+
+**`variant_dist` is keyed by name** (`SNP`/`Insertion`/`Deletion`) where `_bkup` keys by
+integer. Presentation only; the weights are unchanged.
+
+**`insertion_probability` 0.4538979885714955 does not derive from the pickle by any obvious
+route.** The upstream insertion share of total indel mass is 0.4768593189964158 and the ratio
+of distinct insertion to deletion lengths is 0.4929577464788732. Neither is the shipped value,
+while the two length distributions beside it match to floating-point epsilon. Recorded as
+unexplained rather than reverse-engineered into a plausible story.
+
+### What is still missing
+
+A measurement. Knowing the source is not knowing whether the values describe the data eidolon
+is asked to simulate, and none of the three has been checked against a modern human callset.
+That is the germline-defaults review (#752).
 
 ## Building a custom model
 
