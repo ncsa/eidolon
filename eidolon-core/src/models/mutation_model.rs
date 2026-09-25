@@ -117,11 +117,8 @@ impl MutationModel {
         let transition_matrix = if let Some(tm) = transition_matrix_override {
             tm
         } else {
-            // Index with `usize::from`, never `as usize`. The enum's discriminants
-            // are A=0, C=1, T=2, G=3, while `TransitionMatrix::from` labels the four
-            // slots in ALLOWED_NUCS order (A, C, G, T). Using the discriminant swaps
-            // the G and T alt columns, which inverts Ti/Tv from ~2.1 to ~0.8 and
-            // leaves a non-zero self-transition on the G and T rows.
+            // `TransitionMatrix::from` labels the four slots in ALLOWED_NUCS order
+            // (A, C, G, T). Rows and columns must be indexed in that same order.
             let mut temp_trans_matrix: [[f64; 4]; 4] = [[0.0; 4]; 4];
             for (key, value) in snp_transition_frequency {
                 temp_trans_matrix[usize::from(key.0)][usize::from(key.1)] = value;
