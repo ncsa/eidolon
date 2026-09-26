@@ -34,8 +34,8 @@ pub fn run_from_coverage(
     config: &GcBiasModelParams,
     mut cov_by_contig: HashMap<String, Vec<u32>>,
 ) -> Result<(), GenGcBiasModelError> {
-    let mut gc_weight_sum = [0.0f64; 101];
-    let mut gc_window_count = [0usize; 101];
+    // Every window's mean coverage, by GC percent.
+    let mut bins: Vec<Vec<f32>> = vec![Vec::new(); 101];
 
     info!("Processing reference {:?}", config.reference);
     let fasta = FastaStream::open(&config.reference)?;
@@ -84,15 +84,14 @@ pub fn run_from_coverage(
                 region_end,
                 config.window_size,
                 config.window_stride,
-                &mut gc_weight_sum,
-                &mut gc_window_count,
+                &mut bins,
             );
         }
 
         debug!("Processed {}", contig_name);
     }
 
-    let total_windows: usize = gc_window_count.iter().sum();
+    let total_windows: usize = bins.iter().map(Vec::len).sum();
     if total_windows == 0 {
         return Err(GenGcBiasModelError::ConfigError(
             "No windows were processed — verify that the BAM and reference share contig names"
@@ -100,42 +99,154 @@ pub fn run_from_coverage(
         ));
     }
 
-    // Only well-populated bins contribute to the reference mean. Including sparse bins
-    // risks a single anomalous window (e.g. a repetitive region) inflating the mean and
-    // pushing all other weights below 1.0.
-    let overall_mean = {
-        let (weight_sum, count_sum) = (0..=100usize)
-            .filter(|&i| gc_window_count[i] >= config.min_windows_per_bin)
-            .fold((0.0f64, 0usize), |(ws, cs), i| {
-                (ws + gc_weight_sum[i], cs + gc_window_count[i])
-            });
-        if count_sum == 0 {
-            warn!(
-                "No GC bins met min_windows_per_bin ({}); all weights will be neutral (1.0). \
-                 Try lowering min_windows_per_bin or using a larger genome/region.",
-                config.min_windows_per_bin
-            );
-            1.0
-        } else {
-            weight_sum / count_sum as f64
-        }
-    };
-
-    let weights: Vec<f64> = (0..=100usize)
-        .map(|i| {
-            if gc_window_count[i] >= config.min_windows_per_bin && overall_mean > 0.0 {
-                (gc_weight_sum[i] / gc_window_count[i] as f64) / overall_mean
-            } else {
-                1.0
-            }
-        })
-        .collect();
+    let any_supported = bins
+        .iter()
+        .any(|v| !v.is_empty() && v.len() >= config.min_windows_per_bin);
+    let fitted = fit_weights(&mut bins, config.min_windows_per_bin);
+    // Supported bins but nothing fitted means the overall median is zero: most windows have
+    // no coverage, so no weight is defined. Refuse rather than write a neutral model.
+    if any_supported && fitted.iter().all(|b| !b.fitted) {
+        return Err(GenGcBiasModelError::ConfigError(format!(
+            "the median window across the reference has zero coverage ({total_windows} windows), \
+             so GC weights cannot be measured. The BAM covers only part of the reference, as a \
+             targeted or exome library does. Set bed_file to the regions it covers."
+        )));
+    }
+    if fitted.iter().all(|b| !b.fitted) {
+        warn!(
+            "No GC bins met min_windows_per_bin ({}); all weights will be neutral (1.0). \
+             Try lowering min_windows_per_bin or using a larger genome/region.",
+            config.min_windows_per_bin
+        );
+    }
+    let weights: Vec<f64> = fitted.iter().map(|b| b.weight).collect();
+    let mut report = config.output_file.clone().into_os_string();
+    report.push(".bins.tsv");
+    let report = PathBuf::from(report);
+    write_bin_report(&report, &fitted)?;
+    info!(
+        "{} of 101 GC bins fitted from at least {} windows; the rest interpolated. \
+         Per-bin support: {:?}",
+        fitted.iter().filter(|b| b.fitted).count(),
+        config.min_windows_per_bin,
+        report
+    );
 
     let model = GcBiasModel::from_weights(weights, config.window_size)?;
     model.write_to_file(&config.output_file)?;
     info!("GC bias model written to {:?}", config.output_file);
 
     Ok(())
+}
+
+/// One GC bin's support and fitted weight.
+#[derive(Debug, Clone, PartialEq)]
+struct GcBin {
+    windows: usize,
+    mean: f64,
+    median: f64,
+    weight: f64,
+    /// True when the bin had at least `min_windows_per_bin` windows and its weight comes from
+    /// its own data; false when it was filled in.
+    fitted: bool,
+}
+
+/// Median of an ascending slice; the middle two averaged for an even count.
+fn median_sorted(v: &[f32]) -> f64 {
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2] as f64
+    } else {
+        (v[n / 2 - 1] as f64 + v[n / 2] as f64) / 2.0
+    }
+}
+
+/// Weights for the 101 GC bins, from each bin's window coverages. Sorts each bin in place.
+///
+/// A bin with at least `min_windows` windows is fitted: its median coverage over the median of
+/// every window in a fitted bin. Medians, because a few pileup windows (collapsed repeats) move
+/// a mean arbitrarily far, and the simulator cannot reproduce them from a single-copy reference.
+/// Every other bin is interpolated linearly between the nearest fitted bins on each side, or
+/// takes the nearest fitted bin's weight past the ends, so a thinly supported bin neither jumps
+/// to 1.0 nor rests on its own few windows. With no fitted bin, every weight is 1.0.
+fn fit_weights(bins: &mut [Vec<f32>], min_windows: usize) -> Vec<GcBin> {
+    for v in bins.iter_mut() {
+        v.sort_by(f32::total_cmp);
+    }
+    let supported: Vec<bool> = bins
+        .iter()
+        .map(|v| !v.is_empty() && v.len() >= min_windows)
+        .collect();
+    let mut pooled: Vec<f32> = bins
+        .iter()
+        .zip(&supported)
+        .filter(|(_, s)| **s)
+        .flat_map(|(v, _)| v.iter().copied())
+        .collect();
+    pooled.sort_by(f32::total_cmp);
+    let overall = if pooled.is_empty() {
+        0.0
+    } else {
+        median_sorted(&pooled)
+    };
+
+    let mut out: Vec<GcBin> = bins
+        .iter()
+        .zip(&supported)
+        .map(|(v, &s)| {
+            let n = v.len();
+            let median = if n > 0 { median_sorted(v) } else { 0.0 };
+            let fitted = s && overall > 0.0;
+            GcBin {
+                windows: n,
+                mean: if n > 0 {
+                    v.iter().map(|&x| x as f64).sum::<f64>() / n as f64
+                } else {
+                    0.0
+                },
+                median,
+                weight: if fitted { median / overall } else { 1.0 },
+                fitted,
+            }
+        })
+        .collect();
+
+    let anchors: Vec<usize> = (0..out.len()).filter(|&i| out[i].fitted).collect();
+    if let (Some(&first), Some(&last)) = (anchors.first(), anchors.last()) {
+        for i in 0..out.len() {
+            if out[i].fitted {
+                continue;
+            }
+            out[i].weight = if i < first {
+                out[first].weight
+            } else if i > last {
+                out[last].weight
+            } else {
+                let hi = *anchors.iter().find(|&&a| a > i).unwrap();
+                let lo = *anchors.iter().rev().find(|&&a| a < i).unwrap();
+                let t = (i - lo) as f64 / (hi - lo) as f64;
+                out[lo].weight + (out[hi].weight - out[lo].weight) * t
+            };
+        }
+    }
+    out
+}
+
+/// Writes one row per GC percent: the windows behind each weight, and whether it was fitted
+/// from them or interpolated.
+fn write_bin_report(path: &PathBuf, bins: &[GcBin]) -> std::io::Result<()> {
+    let mut body = String::from("gc_percent\twindows\tmedian\tmean\tweight\tsource\n");
+    for (gc, b) in bins.iter().enumerate() {
+        body.push_str(&format!(
+            "{gc}\t{}\t{:.3}\t{:.3}\t{:.6}\t{}\n",
+            b.windows,
+            b.median,
+            b.mean,
+            b.weight,
+            if b.fitted { "fitted" } else { "interpolated" }
+        ));
+    }
+    std::fs::write(path, body)
 }
 
 /// Accumulate GC% vs mean-coverage data for all windows in `[region_start, region_end)`.
@@ -149,17 +260,16 @@ fn accumulate_region(
     region_end: usize,
     window_size: usize,
     window_stride: usize,
-    gc_weight_sum: &mut [f64; 101],
-    gc_window_count: &mut [usize; 101],
+    bins: &mut [Vec<f32>],
 ) {
     let first = &sequence[region_start..region_start + window_size];
     let mut gc_count: usize = first
         .iter()
-        .filter(|&&n| n == Nucleotide::G || n == Nucleotide::C)
+        .filter(|n| matches!(n.get_unmasked_base(), Nucleotide::G | Nucleotide::C))
         .count();
     let mut n_count: usize = first
         .iter()
-        .filter(|&&n| n == Nucleotide::N || n == Nucleotide::X)
+        .filter(|n| n.get_unmasked_base() == Nucleotide::N)
         .count();
 
     let mut cov_sum: u64 = (0..window_size)
@@ -172,8 +282,7 @@ fn accumulate_region(
         if called > 0 {
             let gc_pct = ((gc_count as f64 / called as f64) * 100.0).round() as usize;
             let gc_pct = gc_pct.min(100);
-            gc_weight_sum[gc_pct] += cov_sum as f64 / window_size as f64;
-            gc_window_count[gc_pct] += 1;
+            bins[gc_pct].push((cov_sum as f64 / window_size as f64) as f32);
         }
 
         let next_w = w + window_stride;
@@ -183,14 +292,15 @@ fn accumulate_region(
 
         // Advance both sliding windows by stride steps.
         for j in 0..window_stride {
-            match sequence[w + j] {
+            // Soft-masked (lowercase) bases count as the base they are (#771).
+            match sequence[w + j].get_unmasked_base() {
                 Nucleotide::G | Nucleotide::C => gc_count -= 1,
-                Nucleotide::N | Nucleotide::X => n_count -= 1,
+                Nucleotide::N => n_count -= 1,
                 _ => {}
             }
-            match sequence[w + window_size + j] {
+            match sequence[w + window_size + j].get_unmasked_base() {
                 Nucleotide::G | Nucleotide::C => gc_count += 1,
-                Nucleotide::N | Nucleotide::X => n_count += 1,
+                Nucleotide::N => n_count += 1,
                 _ => {}
             }
             cov_sum -= cov.get(w + j).copied().unwrap_or(0) as u64;
@@ -289,6 +399,175 @@ mod tests {
                 *record.mapping_quality_mut() = Some(MappingQuality::try_from(30u8).unwrap());
                 writer.write_alignment_record(&header, &record).unwrap();
             }
+        }
+    }
+
+    /// `bins[gc]` = the given window coverages; every other bin empty.
+    fn bins_with(entries: &[(usize, &[f32])]) -> Vec<Vec<f32>> {
+        let mut bins = vec![Vec::new(); 101];
+        for (gc, v) in entries {
+            bins[*gc] = v.to_vec();
+        }
+        bins
+    }
+
+    // CORRECTNESS CRITERION, #752. A bin's weight is its typical window, not its average: a few
+    // pileup windows (collapsed repeats) swung real bins either side of 1.0 on NA12878 chr22,
+    // one reading 18,138x against a median of 298. Known answer by hand: bin 40 is
+    // [10,10,10,10,1000] and bin 60 is [20]*5. The overall median of those ten windows is 20,
+    // so bin 40 weighs 10/20 = 0.5 and bin 60 20/20 = 1.0. The mean would put bin 40 at ~10.4.
+    #[test]
+    fn a_bins_weight_is_its_median_over_the_overall_median() {
+        let mut bins = bins_with(&[(40, &[10.0, 10.0, 10.0, 10.0, 1000.0]), (60, &[20.0; 5])]);
+        let fit = fit_weights(&mut bins, 5);
+        assert_eq!(fit[40].weight, 0.5, "bin 40: {:?}", fit[40]);
+        assert_eq!(fit[60].weight, 1.0, "bin 60: {:?}", fit[60]);
+        assert!(fit[40].fitted && fit[60].fitted);
+        assert_eq!((fit[40].windows, fit[40].median), (5, 10.0));
+    }
+
+    // A bin below min_windows_per_bin used to snap to exactly 1.0, a cliff between its
+    // neighbors (0.86 then 1.00 at 90/91% GC on chr22). It now takes the value interpolated
+    // between the nearest supported bins, and holds the edge value past the last one. Its own
+    // windows, however extreme, do not set its weight.
+    #[test]
+    fn a_sparse_bin_is_interpolated_between_its_supported_neighbors() {
+        // Unequal support on purpose: with equal counts the two weights average to exactly
+        // 1.0, which is also what the old cliff gave, so a midpoint check could not tell them
+        // apart. Twelve supported windows [10]*5 + [20]*7: overall median 20, so bin 40 weighs
+        // 0.5 and bin 60 1.0. Bin 45 sits a quarter of the way across: 0.625.
+        let mut bins = bins_with(&[
+            (40, &[10.0; 5]),
+            (45, &[5000.0]),
+            (60, &[20.0; 7]),
+            (95, &[1.0]),
+        ]);
+        let fit = fit_weights(&mut bins, 5);
+        assert_eq!((fit[40].weight, fit[60].weight), (0.5, 1.0));
+        assert!(
+            (fit[45].weight - 0.625).abs() < 1e-12,
+            "bin 45: {:?}",
+            fit[45]
+        );
+        assert!(!fit[45].fitted);
+        assert!(
+            (fit[50].weight - 0.75).abs() < 1e-12,
+            "empty bin 50: {:?}",
+            fit[50]
+        );
+        // Past the supported range: the edge value, on both sides, empty bins included.
+        assert_eq!(fit[0].weight, 0.5, "bin 0: {:?}", fit[0]);
+        assert_eq!(fit[95].weight, 1.0, "bin 95: {:?}", fit[95]);
+        assert_eq!(fit[100].weight, 1.0, "bin 100: {:?}", fit[100]);
+    }
+
+    /// With no supported bin there is nothing to measure, so every weight stays neutral.
+    #[test]
+    fn with_no_supported_bin_every_weight_is_neutral() {
+        let mut bins = bins_with(&[(50, &[7.0, 9.0])]);
+        let fit = fit_weights(&mut bins, 5);
+        assert!(fit.iter().all(|b| b.weight == 1.0 && !b.fitted));
+    }
+
+    fn params(reference: &std::path::Path, out: &std::path::Path) -> GcBiasModelParams {
+        GcBiasModelParams {
+            reference: reference.to_path_buf(),
+            bed_table: HashMap::new(),
+            output_file: out.to_path_buf(),
+            overwrite_output: true,
+            window_size: 100,
+            window_stride: 100,
+            min_windows_per_bin: 1,
+        }
+    }
+
+    // Every fit writes a per-bin report next to the model, so a surprising weight can be traced
+    // to the windows behind it: HG002's 94% bin read 34x and nothing said how many windows made
+    // it. One 0%-GC window at depth 10 and one 100%-GC window at depth 30.
+    #[test]
+    fn the_fit_writes_a_per_bin_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let fasta = dir.path().join("ref.fa");
+        std::fs::write(
+            &fasta,
+            format!(">chr1\n{}{}\n", "A".repeat(100), "G".repeat(100)),
+        )
+        .unwrap();
+        let out = dir.path().join("gc.json.gz");
+        let mut cov = vec![10u32; 100];
+        cov.extend(vec![30u32; 100]);
+        run_from_coverage(
+            &params(&fasta, &out),
+            HashMap::from([("chr1".to_string(), cov)]),
+        )
+        .unwrap();
+
+        let report = std::fs::read_to_string(dir.path().join("gc.json.gz.bins.tsv")).unwrap();
+        let rows: Vec<&str> = report.lines().collect();
+        assert_eq!(rows[0], "gc_percent\twindows\tmedian\tmean\tweight\tsource");
+        assert_eq!(rows.len(), 102, "a header and one row per GC percent");
+        assert_eq!(rows[1], "0\t1\t10.000\t10.000\t0.500000\tfitted");
+        assert_eq!(rows[101], "100\t1\t30.000\t30.000\t1.500000\tfitted");
+        assert!(rows[51].ends_with("\tinterpolated"), "{}", rows[51]);
+    }
+
+    // A BAM that covers a small part of the reference (an exome or panel fitted against a
+    // whole genome) has a median window at zero coverage. Every median-based weight is then
+    // undefined, and the model would silently come out neutral. That is a zero denominator,
+    // so it is refused and the message says how to fix it.
+    #[test]
+    fn a_fit_whose_median_window_is_uncovered_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fasta = dir.path().join("ref.fa");
+        std::fs::write(&fasta, format!(">chr1\n{}\n", "ACGT".repeat(250))).unwrap();
+        let out = dir.path().join("gc.json.gz");
+        let mut cov = vec![30u32; 100];
+        cov.extend(vec![0u32; 900]);
+        let err = run_from_coverage(
+            &params(&fasta, &out),
+            HashMap::from([("chr1".to_string(), cov)]),
+        )
+        .expect_err("a mostly uncovered fit must be refused");
+        assert!(
+            format!("{err}").contains("bed_file"),
+            "the error must say how to fix it: {err}"
+        );
+        assert!(!out.exists(), "no model may be written");
+    }
+
+    // #771: a soft-masked (lowercase) base is the same base. Counting only uppercase G/C made
+    // repeat windows read as lower GC than they are, so the same reference lowercased must give
+    // the same model. Must-not-fire: the uppercase fit is the reference result.
+    #[test]
+    fn a_soft_masked_reference_gives_the_same_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let seq = format!(
+            "{}{}{}",
+            "ACGT".repeat(25),
+            "GGCA".repeat(25),
+            "ATTA".repeat(25)
+        );
+        let cov: Vec<u32> = (0..300).map(|i| 10 + (i / 100) as u32 * 7).collect();
+        let fit = |name: &str, s: &str| {
+            let fasta = dir.path().join(format!("{name}.fa"));
+            std::fs::write(&fasta, format!(">chr1\n{s}\n")).unwrap();
+            let out = dir.path().join(format!("{name}.json.gz"));
+            run_from_coverage(
+                &params(&fasta, &out),
+                HashMap::from([("chr1".to_string(), cov.clone())]),
+            )
+            .unwrap();
+            GcBiasModel::from_file(&out).unwrap()
+        };
+        let upper = fit("upper", &seq);
+        let lower = fit("lower", &seq.to_lowercase());
+        for gc in 0..=100 {
+            let f = gc as f64 / 100.0;
+            assert_eq!(
+                upper.weight_for_gc_fraction(f),
+                lower.weight_for_gc_fraction(f),
+                "GC {gc}%"
+            );
         }
     }
 

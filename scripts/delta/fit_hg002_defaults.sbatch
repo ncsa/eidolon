@@ -137,6 +137,6 @@ sed 's/\x1b\[[0-9;]*m//g' "$WORK/seqerr.log" | grep -E "error_rate|[Dd]egraded p
 echo
 
 archive_run hg002_defaults "$WORK" \
-    mut_hg002.json.gz frag_hg002.json.gz gc_hg002.json.gz seqerr_hg002.json.gz \
+    mut_hg002.json.gz frag_hg002.json.gz gc_hg002.json.gz gc_hg002.json.gz.bins.tsv seqerr_hg002.json.gz \
     mut.yml frag.yml gc.yml seqerr.yml mut.log frag.log frag_validate.log gc.log seqerr.log
 echo "DONE."
