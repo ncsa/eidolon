@@ -49,6 +49,11 @@ fit_quality_degradation: false
 # Ignored if transition_matrix_file is also set. If the BAM yields no mismatches, this is an
 # error, not a silent fallback to the default matrix -- omit this key to use the default.
 bam_file:
+# VCF of the sample's own variants [optional; requires bam_file]. Mismatches at the positions
+# its records cover (every REF base, multi-allelic records included) are left out of the
+# matrix: a variant mismatches the reference in every read that carries it, and it is not a
+# sequencing error. The log reports how many mismatches were masked.
+known_variants_vcf:
 # path to a custom 4x4 SNP transition matrix TSV [optional] - rows and columns are A/C/G/T.
 # A single header line is allowed and will be skipped. Diagonal values are ignored (set to 0).
 # Each row needs four finite, non-negative values with some weight off the diagonal; a

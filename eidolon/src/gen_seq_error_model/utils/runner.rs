@@ -2,8 +2,9 @@ use crate::gen_seq_error_model::{errors::GenSeqErrorModelError, utils::config::R
 use eidolon_core::file_tools::file_io::is_gzipped_file;
 use eidolon_core::{
     file_tools::{
-        bam_reader::read_bam_transitions,
+        bam_reader::{read_bam_transitions, read_bam_transitions_masked},
         file_io::{read_gzip_lines, read_lines},
+        vcf_tools::read_known_sites,
     },
     models::{quality_scores::QualityScoreModel, sequencing_error_model::SequencingErrorModel},
     structs::transition_matrix::TransitionMatrix,
@@ -714,7 +715,26 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             Some(TransitionMatrix::from_tsv(path)?)
         } else if let Some(path) = &config.bam_file {
             info!("Inferring SNP transition matrix from BAM: {:?}", path);
-            let counts = read_bam_transitions(path)?;
+            let counts = match &config.known_variants_vcf {
+                None => read_bam_transitions(path)?,
+                Some(vcf) => {
+                    let sites = read_known_sites(vcf)?;
+                    let n_sites: usize = sites.values().map(|s| s.len()).sum();
+                    info!("Masking {n_sites} reference positions from {vcf:?}");
+                    let (counts, masked) = read_bam_transitions_masked(path, sites)?;
+                    let kept: usize = counts.iter().flatten().sum();
+                    let seen = kept + masked;
+                    info!(
+                        "Masked {masked} of {seen} mismatches ({:.2}%) at known variant sites",
+                        if seen > 0 {
+                            100.0 * masked as f64 / seen as f64
+                        } else {
+                            0.0
+                        }
+                    );
+                    counts
+                }
+            };
             let total_mismatches: usize = counts.iter().flatten().sum();
             if total_mismatches == 0 {
                 // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
@@ -820,8 +840,15 @@ fn write_test_bam(
         },
     };
 
+    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
     let n = read_bases.len();
-    let header = sam::Header::default();
+    // One contig, every record at position 1, so a known-variants mask can address bases.
+    let header = sam::Header::builder()
+        .add_reference_sequence(
+            b"chr1".to_vec(),
+            Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(1_000).unwrap()),
+        )
+        .build();
 
     // Build MD string: match counts interspersed with ref bases at mismatches
     let md_str: Option<String> = if with_md {
@@ -852,6 +879,8 @@ fn write_test_bam(
         *record.flags_mut() = Flags::empty();
         *record.cigar_mut() = cigar;
         *record.sequence_mut() = Sequence::from(read_bases);
+        *record.reference_sequence_id_mut() = Some(0);
+        *record.alignment_start_mut() = noodles::core::Position::new(1);
 
         if let Some(ref md) = md_str {
             record
@@ -896,6 +925,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: None,
+            known_variants_vcf: None,
         }
     }
 
@@ -2180,6 +2210,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: Some(tsv_path),
+            known_variants_vcf: None,
         };
         runner(&config).unwrap();
         assert!(output_path.exists());
@@ -2264,6 +2295,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
         };
         runner(&config).unwrap();
 
@@ -2329,6 +2361,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
         };
         runner(&config).unwrap();
 
@@ -2355,6 +2388,58 @@ mod tests {
         );
     }
 
+    /// #752: a sample's own variants mismatch the reference in every read carrying them, so
+    /// they must not be fitted as sequencing errors. Same fixture as above (ref AAAACCCC, read
+    /// CCGTAAAG at chr1:1). Masking positions 1-2 removes both A->C, leaving the A row at
+    /// G 0.5 / T 0.5; the C row is untouched.
+    #[test]
+    fn known_variant_positions_are_not_fitted_as_errors() {
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let bam_path = temp.path().join("mixed.bam");
+        write_test_bam(&bam_path, 8, b"AAAACCCC", b"CCGTAAAG", true);
+        let vcf = temp.path().join("known.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\n\
+             chr1\t1\t.\tA\tC\nchr1\t2\t.\tA\tC\n",
+        )
+        .unwrap();
+        let output_path = temp.path().join("model.json.gz");
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            fastq_file_r2: None,
+            output_file: output_path.clone(),
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+            known_variants_vcf: Some(vcf),
+        };
+        runner(&config).unwrap();
+        let tm = SequencingErrorModel::from_file(&output_path)
+            .unwrap()
+            .transition_distros()
+            .clone();
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::A),
+            &[0.0, 0.0, 0.5, 1.0],
+            "A row with both A->C masked (1 G, 1 T)",
+        );
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::C),
+            &[0.75, 0.75, 1.0, 1.0],
+            "C row, which the mask does not touch",
+        );
+    }
     #[test]
     fn test_build_transition_matrix_from_counts_is_not_transposed() {
         // Guards the ref/read axis directly on the pure function, where the fixture can be
@@ -2444,6 +2529,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
         };
         let err = runner(&config).expect_err("an MD-less bam_file must not silently default");
         let msg = err.to_string();
@@ -2496,6 +2582,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
         };
         let err = runner(&config).expect_err("zero mismatches is no evidence, MD tags or not");
         assert!(
@@ -2549,6 +2636,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
         };
         runner(&config).unwrap();
 
@@ -2613,6 +2701,7 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: Some(tsv_path),
+            known_variants_vcf: None,
         };
         runner(&config).unwrap();
 

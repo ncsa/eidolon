@@ -45,6 +45,10 @@ max_model_read_length: 1000
 # default matrix. To use the default deliberately, omit this key.
 bam_file: /path/to/aligned.bam
 
+# optional, requires bam_file: the sample's own variants. Mismatches at the positions its
+# records cover are left out of the matrix, since they are variants, not sequencing errors.
+known_variants_vcf: /path/to/sample_variants.vcf.gz
+
 # optional: custom 4x4 SNP transition matrix TSV (rows/columns: A C G T).
 # A single header line is allowed. Diagonal values are ignored. Each row needs four
 # finite, non-negative values with some weight off the diagonal; a malformed row stops

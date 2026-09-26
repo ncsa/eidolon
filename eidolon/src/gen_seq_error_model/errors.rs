@@ -1,5 +1,5 @@
 use eidolon_core::{
-    file_tools::bam_reader::BamReaderError,
+    file_tools::{bam_reader::BamReaderError, vcf_tools::VcfToolsError},
     models::{quality_scores::QualityModelError, sequencing_error_model::SeqModelError},
     structs::transition_matrix::TransitionMatrixError,
 };
@@ -23,4 +23,6 @@ pub enum GenSeqErrorModelError {
     BamError(#[from] BamReaderError),
     #[error("Transition matrix error: {0}")]
     TransitionMatrixError(#[from] TransitionMatrixError),
+    #[error("Error reading known_variants_vcf: {0}")]
+    KnownVariantsError(#[from] VcfToolsError),
 }

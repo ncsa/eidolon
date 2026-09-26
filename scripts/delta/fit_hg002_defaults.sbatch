@@ -126,12 +126,14 @@ printf 'reference: %s\nbam_file: %s\nmin_mapq: 0\nbed_file: .\noutput_file: %s\n
 fit gc gen-gc-bias-model "$WORK/gc.yml" "$WORK/gc_hg002.json.gz"
 
 # ── 4. the shipped quality model plus a BAM-fitted substitution matrix ──────────
-# Settings are job 22233888's fit_pair.yml, with bam_file added.
-printf 'fastq_file: %s\nfastq_file_r2: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: true\ndegradation_tail_cut: 25\ndegradation_tail_window: 50\nbam_file: %s\n' \
-    "$PAIR_WORK/sub_r1.fastq.gz" "$PAIR_WORK/sub_r2.fastq.gz" "$WORK/seqerr_hg002.json.gz" "$BAM" > "$WORK/seqerr.yml"
+# Settings are job 22233888's fit_pair.yml, with bam_file added. The truth VCF masks HG002's
+# own variants, which mismatch the reference in every read carrying them and are not errors;
+# the log reports how many mismatches that removed.
+printf 'fastq_file: %s\nfastq_file_r2: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: true\ndegradation_tail_cut: 25\ndegradation_tail_window: 50\nbam_file: %s\nknown_variants_vcf: %s\n' \
+    "$PAIR_WORK/sub_r1.fastq.gz" "$PAIR_WORK/sub_r2.fastq.gz" "$WORK/seqerr_hg002.json.gz" "$BAM" "$VCF" > "$WORK/seqerr.yml"
 fit seqerr gen-seq-error-model "$WORK/seqerr.yml" "$WORK/seqerr_hg002.json.gz"
 echo "[seqerr] must match the shipped model: error_rate 0.003774, degraded R1 11.02%, R2 25.98%"
-sed 's/\x1b\[[0-9;]*m//g' "$WORK/seqerr.log" | grep -E "error_rate|[Dd]egraded population|mismatches" || true
+sed 's/\x1b\[[0-9;]*m//g' "$WORK/seqerr.log" | grep -E "error_rate|[Dd]egraded population|mismatches|Masking" || true
 echo
 
 archive_run hg002_defaults "$WORK" \

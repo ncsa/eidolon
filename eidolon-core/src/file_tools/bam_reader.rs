@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    path::PathBuf,
+};
 
 use noodles::bam;
 use noodles::sam::{
@@ -315,15 +319,42 @@ impl RecordObserver for FragLengthObserver {
     }
 }
 
+/// Reference positions to leave out of the transition count, as contig -> 1-based positions.
+/// A sample's own variants mismatch the reference in every read that carries them, and they
+/// are not sequencing errors.
+pub type KnownSites = HashMap<String, HashSet<usize>>;
+
 /// Accumulates a 4×4 read-vs-reference mismatch count matrix from MD tags.
 /// `counts[ref_base][read_base]` follows ALLOWED_NUCS order (A=0, C=1, G=2, T=3).
+/// Mismatches at a `KnownSites` position are counted in `masked` instead.
 /// Pair with `BamWalkFilter::for_transitions()`.
 #[derive(Debug, Default)]
 pub struct TransitionObserver {
     pub counts: [[usize; 4]; 4],
+    pub masked: usize,
+    mask: Option<KnownSites>,
+    contigs: Vec<String>,
+}
+
+impl TransitionObserver {
+    pub fn with_mask(mask: KnownSites) -> Self {
+        Self {
+            mask: Some(mask),
+            ..Self::default()
+        }
+    }
 }
 
 impl RecordObserver for TransitionObserver {
+    fn on_start(&mut self, header: &sam::Header) -> Result<(), BamReaderError> {
+        self.contigs = header
+            .reference_sequences()
+            .keys()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        Ok(())
+    }
+
     fn observe(&mut self, record: &bam::Record) -> Result<(), BamReaderError> {
         let md_bytes: Vec<u8> = match record.data().get(&Tag::MISMATCHED_POSITIONS) {
             Some(Ok(Value::String(s))) => s.iter().copied().collect(),
@@ -334,6 +365,16 @@ impl RecordObserver for TransitionObserver {
         let sequence = record.sequence();
         let mut walker = MdWalker::new(tokens);
         let mut read_pos = 0usize;
+        // The mask's positions for this record's contig, if any. `ref_pos` is 1-based, like
+        // the VCF the mask comes from, and advances on M/=/X and D/N only.
+        let sites = match (&self.mask, record.reference_sequence_id()) {
+            (Some(mask), Some(Ok(id))) => self.contigs.get(id).and_then(|c| mask.get(c)),
+            _ => None,
+        };
+        let mut ref_pos = match record.alignment_start() {
+            Some(Ok(p)) => usize::from(p),
+            _ => 0,
+        };
 
         for op_result in record.cigar().iter() {
             let op = op_result?;
@@ -348,10 +389,15 @@ impl RecordObserver for TransitionObserver {
                             let ri: usize = Nucleotide::from(ref_b as char).into();
                             let wi: usize = Nucleotide::from(read_b as char).into();
                             if ri < 4 && wi < 4 {
-                                self.counts[ri][wi] += 1;
+                                if sites.is_some_and(|s| s.contains(&ref_pos)) {
+                                    self.masked += 1;
+                                } else {
+                                    self.counts[ri][wi] += 1;
+                                }
                             }
                         }
                         read_pos += 1;
+                        ref_pos += 1;
                     }
                 }
                 CigarKind::Insertion | CigarKind::SoftClip => {
@@ -359,6 +405,7 @@ impl RecordObserver for TransitionObserver {
                 }
                 CigarKind::Deletion | CigarKind::Skip => {
                     walker.skip_deletion();
+                    ref_pos += len;
                 }
                 CigarKind::HardClip | CigarKind::Pad => {}
             }
@@ -534,6 +581,17 @@ pub fn read_bam_transitions(path: &PathBuf) -> Result<[[usize; 4]; 4], BamReader
     let mut obs = TransitionObserver::default();
     walk_bam(path, &BamWalkFilter::for_transitions(), &mut [&mut obs])?;
     Ok(obs.counts)
+}
+
+/// As `read_bam_transitions`, leaving out mismatches at `mask`'s positions. Returns the counts
+/// and how many mismatches were masked.
+pub fn read_bam_transitions_masked(
+    path: &PathBuf,
+    mask: KnownSites,
+) -> Result<([[usize; 4]; 4], usize), BamReaderError> {
+    let mut obs = TransitionObserver::with_mask(mask);
+    walk_bam(path, &BamWalkFilter::for_transitions(), &mut [&mut obs])?;
+    Ok((obs.counts, obs.masked))
 }
 
 #[cfg(test)]
@@ -721,6 +779,35 @@ mod tests {
     /// Records are `(cigar_ops, sequence, md)`. Unlike the `write_test_bam` above — which is
     /// fixed at `4M` with no MD — this exists to exercise `TransitionObserver`'s CIGAR
     /// handling, which the transition tests otherwise never reach.
+    /// The three samtools-generated reads documented on
+    /// `transition_observer_matches_samtools_generated_md_including_indels`.
+    fn write_samtools_md_fixture(path: &std::path::PathBuf) {
+        write_md_cigar_bam(
+            path,
+            &[
+                (&[(CigarOpKind::Match, 12)], "GCGAGTTCAAAA", "2T4A4"),
+                (
+                    &[
+                        (CigarOpKind::Match, 5),
+                        (CigarOpKind::Deletion, 2),
+                        (CigarOpKind::Match, 5),
+                    ],
+                    "GCTAGAACAA",
+                    "5^TT2A2",
+                ),
+                (
+                    &[
+                        (CigarOpKind::Match, 5),
+                        (CigarOpKind::Insertion, 2),
+                        (CigarOpKind::Match, 5),
+                    ],
+                    "GCTAGTTTGAAA",
+                    "6T3",
+                ),
+            ],
+        );
+    }
+
     fn write_md_cigar_bam(
         path: &std::path::PathBuf,
         records: &[(&[(CigarOpKind, usize)], &str, &str)],
@@ -809,30 +896,7 @@ mod tests {
     fn transition_observer_matches_samtools_generated_md_including_indels() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("samtools_md.bam");
-        write_md_cigar_bam(
-            &path,
-            &[
-                (&[(CigarOpKind::Match, 12)], "GCGAGTTCAAAA", "2T4A4"),
-                (
-                    &[
-                        (CigarOpKind::Match, 5),
-                        (CigarOpKind::Deletion, 2),
-                        (CigarOpKind::Match, 5),
-                    ],
-                    "GCTAGAACAA",
-                    "5^TT2A2",
-                ),
-                (
-                    &[
-                        (CigarOpKind::Match, 5),
-                        (CigarOpKind::Insertion, 2),
-                        (CigarOpKind::Match, 5),
-                    ],
-                    "GCTAGTTTGAAA",
-                    "6T3",
-                ),
-            ],
-        );
+        write_samtools_md_fixture(&path);
 
         let counts = read_bam_transitions(&path).unwrap();
 
@@ -857,6 +921,54 @@ mod tests {
         );
     }
 
+    /// The samtools-MD fixture above, masked. Its four mismatches sit at known reference
+    /// positions (hand-derived from the MD strings and CIGARs, 1-based):
+    ///
+    ///   r1  12M      T->G at 503, A->C at 508
+    ///   r2  5M2D5M   A->C at 510, after the deletion of 506-507
+    ///   r3  5M2I5M   T->G at 507, after two inserted bases that consume no reference
+    ///
+    /// Masking 503 and 510 must leave one T->G (507) and one A->C (508), and report 2 masked.
+    /// That needs the reference position right across both indels: advancing it on the
+    /// insertion, or not on the deletion, masks the wrong sites.
+    #[test]
+    fn masked_sites_are_left_out_of_the_transition_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samtools_md.bam");
+        write_samtools_md_fixture(&path);
+        let mask = |sites: &[(&str, usize)]| -> KnownSites {
+            let mut m = KnownSites::new();
+            for (c, p) in sites {
+                m.entry(c.to_string()).or_default().insert(*p);
+            }
+            m
+        };
+
+        let (counts, masked) =
+            read_bam_transitions_masked(&path, mask(&[("H1N1_HA", 503), ("H1N1_HA", 510)]))
+                .unwrap();
+        let mut expected = [[0usize; 4]; 4];
+        expected[0][1] = 1; // A -> C at 508
+        expected[3][2] = 1; // T -> G at 507
+        assert_eq!(counts, expected, "masking 503 and 510 left {counts:?}");
+        assert_eq!(masked, 2);
+
+        // r3's mismatch is the one after the insertion; masking it alone tests that path.
+        let (counts, masked) =
+            read_bam_transitions_masked(&path, mask(&[("H1N1_HA", 507)])).unwrap();
+        assert_eq!(
+            (counts[3][2], counts[0][1], masked),
+            (1, 2, 1),
+            "masking 507 left {counts:?}"
+        );
+
+        // MUST NOT FIRE: a site with no mismatch, and the right position on the wrong contig.
+        let (counts, masked) =
+            read_bam_transitions_masked(&path, mask(&[("H1N1_HA", 501), ("H1N1_NA", 503)]))
+                .unwrap();
+        assert_eq!(counts, read_bam_transitions(&path).unwrap());
+        assert_eq!(masked, 0);
+    }
     #[test]
     fn test_walk_bam_dispatches_to_multiple_observers() {
         // One kept record reaches every observer in the slice.
