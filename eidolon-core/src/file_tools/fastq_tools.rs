@@ -826,11 +826,12 @@ pub struct HaplotypePairedFragment {
 
 /// The quality model R2 draws from: its own when the fit produced one, R1's otherwise (#723).
 ///
-/// One helper for all three R2 sites — the paired writer, the haplotype paired writer, and the
-/// R2 adapter readthrough — so they cannot drift. Three copies of `unwrap_or` is three chances
-/// for one of them to keep using R1 after the others stopped, and every aggregate measure over
-/// the pair would still look right.
-fn r2_quality_model<'a>(
+/// One helper for every R2 site — the paired writer, the haplotype paired writer, the R2
+/// adapter readthrough, and gen-reads' four SV junction writers (BND, INV, DEL, DUP) — so they
+/// cannot drift. Each copy of `unwrap_or` is a chance for one of them to keep using R1 after
+/// the others stopped, and every aggregate measure over the pair would still look right. The
+/// junction writers did exactly that (#753).
+pub fn r2_quality_model<'a>(
     r1: &'a QualityScoreModel,
     r2: Option<&'a QualityScoreModel>,
 ) -> &'a QualityScoreModel {

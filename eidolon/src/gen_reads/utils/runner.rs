@@ -19,7 +19,7 @@ use crate::{
             fasta_stream::{FastaStream, map_buffer, resolve_iupac_bases},
             fastq_tools::{
                 HaplotypeContext, PlacedFragment, Strand, combine_temp_fastqs, generate_read,
-                reverse_complement, write_block_fastq, write_read_to_fastq,
+                r2_quality_model, reverse_complement, write_block_fastq, write_read_to_fastq,
             },
             file_io::{VectorBuffer, append_to_file},
             vcf_tools::{read_vcf, write_vcf},
@@ -2388,10 +2388,10 @@ fn generate_chimeric_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
+        let quality_scores_2 =
+            r2_quality_model(ctx.quality_score_model, ctx.quality_score_model_r2)
+                .generate_quality_scores(read_len, rng)
+                .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
             // Reference-derived bases only: no haplotype mask, no haplotype deletion.
@@ -2495,10 +2495,10 @@ fn generate_inv_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
+        let quality_scores_2 =
+            r2_quality_model(ctx.quality_score_model, ctx.quality_score_model_r2)
+                .generate_quality_scores(read_len, rng)
+                .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
             // Reference-derived bases only: no haplotype mask, no haplotype deletion.
@@ -2601,10 +2601,10 @@ fn generate_del_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
+        let quality_scores_2 =
+            r2_quality_model(ctx.quality_score_model, ctx.quality_score_model_r2)
+                .generate_quality_scores(read_len, rng)
+                .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
             // Reference-derived bases only: no haplotype mask, no haplotype deletion.
@@ -2729,10 +2729,10 @@ fn generate_dup_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
+        let quality_scores_2 =
+            r2_quality_model(ctx.quality_score_model, ctx.quality_score_model_r2)
+                .generate_quality_scores(read_len, rng)
+                .map_err(GenerateReadsError::from)?;
         let r2_record = generate_read(
             &reverse_complement(seq1),
             // Reference-derived bases only: no haplotype mask, no haplotype deletion.
