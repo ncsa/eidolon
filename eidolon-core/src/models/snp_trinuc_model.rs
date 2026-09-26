@@ -120,10 +120,10 @@ lazy_static! {
 
     static ref ALIAS_MAP: HashMap<TrinucFrame, TrinucFrame> = {
         // This builds an alias map. For each frame in all frames,
-        // We assign a value of the context featureing N in the middle position.
-        //      AAA => ANA ([0, 0, 0]: [0, 5, 0])
-        //      ATA => ANA ([0, 3, 0]: [0, 5, 0])
-        //      GTC => GNC ([2, 3, 1]: [2, 5, 1])
+        // We assign a value of the context featuring N in the middle position.
+        //      AAA => ANA ([0, 0, 0]: [0, 4, 0])
+        //      ATA => ANA ([0, 3, 0]: [0, 4, 0])
+        //      GTC => GNC ([2, 3, 1]: [2, 4, 1])
         // and so on. Building this to save time
         let all_frames = ALL_FRAMES.clone();
         let mut alias_map = HashMap::new();
@@ -147,8 +147,8 @@ lazy_static! {
     };
 
     static ref CONTEXT_FRAME_MAP: HashMap<TrinucFrame, Vec<TrinucFrame>> = {
-        // This builds the contexts for the trinucleotides. The 5 in the middle
-        // represents any one of 4 trinculeotides (unknown).
+        // This builds the contexts for the trinucleotides. The N in the middle
+        // represents any one of 4 trinucleotides (unknown).
         //    ANA => [AAA, ACA, AGA, ATA]
         //    ANT => [AAT, ACT, AGT, ATT]
         // and so on;
@@ -231,7 +231,7 @@ impl Index<usize> for TrinucFrame {
 pub struct SnpTrinucModel {
     // Relative weights given to each SNP frame. Ultimately this will be imputed from data.
     snp_distro: DiscreteDistribution<usize>,
-    // The transition matrix is the chance of mutating the middle base from A, C, T, or G to a
+    // The transition matrix is the chance of mutating the middle base from A, C, G, or T to a
     // different base (4x4 matrix with 0s on the diagonal).
     #[serde(with = "vectorize")]
     trinuc_distros: HashMap<TrinucFrame, TransitionMatrix>,
