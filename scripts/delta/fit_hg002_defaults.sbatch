@@ -24,8 +24,9 @@
 #   cd $REPO && git pull && CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
 #     CARGO_TARGET_DIR=$SCRATCH/cargo-target/eidolon cargo build --release
 #
-# INPUTS, all staged already: the BAM and pair subsample by stage_hg002.sh and
-# fit_hg002_pair.sbatch (job 22233888), the truth VCF and its BED by fetch_validation_data.sh.
+# INPUTS, all staged already: the BAM on /work/nvme (the 21x alignment of the same
+# NIST_Illumina_2x250bps library), the pair subsample by fit_hg002_pair.sbatch (job 22233888),
+# and the truth VCF and its BED by fetch_validation_data.sh.
 #
 # USAGE
 #   sbatch scripts/delta/fit_hg002_defaults.sbatch
@@ -50,7 +51,8 @@ REPO="${REPO:-/projects/bhrd/jallen17/eidolon}"
 source "$REPO/scripts/delta/lib_report.sh"
 
 DATA_DIR="${DATA_DIR:-$SCRATCH/neat_data/hg002}"
-BAM="${BAM:-$DATA_DIR/hg002.bam}"
+# The aligned library lives on nvme, not beside the VCF (#752).
+BAM="${BAM:-/work/nvme/bhrd/jallen17/hg002/hg002.bam}"
 VCF="${VCF:-$DATA_DIR/HG002_GRCh38_v4.2.1_benchmark.vcf.gz}"
 BED="${BED:-$DATA_DIR/HG002_GRCh38_v4.2.1_highconf.bed}"
 REFERENCE="${REFERENCE:-$SCRATCH/neat_data/GRCh38.fa}"
@@ -59,6 +61,11 @@ WORK="${WORK:-$SCRATCH/hg002_defaults}"
 EIDOLON="${EIDOLON:-$SCRATCH/cargo-target/eidolon/release/eidolon}"
 # The first #765 commit. The fit needs the binary to contain it.
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-bcfc623}"
+
+# samtools is for the fragment validator, which runs AFTER the fragment fit, so check it here
+# rather than find out hours in. Same module the other Delta scripts load.
+module load samtools/1.22-cce19.0.0 2>/dev/null || true
+command -v samtools >/dev/null || { echo "FATAL: samtools not on PATH after module load" >&2; exit 1; }
 
 for f in "$BAM" "$VCF" "$BED" "$REFERENCE" "$PAIR_WORK/sub_r1.fastq.gz" "$PAIR_WORK/sub_r2.fastq.gz"; do
     [[ -s "$f" ]] || { echo "FATAL: missing input: $f" >&2; exit 1; }
