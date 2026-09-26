@@ -11,42 +11,42 @@ repeatability.
 
 | model / parameter | source | measured |
 |---|---|---|
-| `default_fragment_length_model.json.gz` | HCC1395 normal | yes |
+| `default_fragment_length_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
 | `error_rate` | GIAB HG002 2x250, fitted | yes — 0.003774, measured |
 | `indel_probability` | NEAT2 static default | no |
 | `insertion_fraction` | NEAT2 static default | yes — confirmed at 0.387 |
 | indel-error lengths | HCC1395 normal | yes |
 | homopolymer context curve | HCC1395 normal | yes |
 | `default_sequencing_error_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
-| `default_mutation_model.json.gz` (+ `_bkup`) | NEAT2 `MutModel_NA12878.p.gz` | no — source verified, values unmeasured |
-| `default_indel_model.json.gz` | NEAT2 `MutModel_NA12878.p.gz` (`INDEL_FREQ`) | no — source verified, values unmeasured |
-| `default_trinuc_model.json.gz` | NEAT2 `MutModel_NA12878.p.gz` (`TRINUC_MUT_PROB`) | no — source verified, values unmeasured |
+| `default_mutation_model.json.gz` | GIAB HG002 v4.2.1 truth VCF, fitted | yes — see below |
+| `default_indel_model.json.gz` | the mutation default's own indel model | yes, with it |
+| `default_trinuc_model.json.gz` | the mutation default's own trinucleotide model | yes, with it |
+| `default_mutation_model_bkup.json.gz` | NEAT2 `MutModel_NA12878.p.gz`, first conversion | not loaded; provenance only |
 
 ## `default_fragment_length_model.json.gz`
 
 | | |
 |---|---|
-| **Source** | HCC1395 matched **normal**, SEQC2 Somatic Mutation WG reference sample |
-| **Read group** | `WGS_NS_N_1` (NovaSeq replicate 1, `WGS_NS_N_1.bwa.dedup.bam`) |
-| **Origin** | `ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS` |
-| **Reference** | GRCh38, chr-prefixed |
-| **Region** | chr20 + chr21 + chr22 |
-| **Pairs used** | 32,627,236 of 32,669,084 collected (0.13% trimmed as outliers) |
-| **Built with** | `eidolon gen-frag-length-model`, `min_reads: 100`, default `distribution: discrete` |
-| **Built at** | eidolon `3.2.1+2f98bb6`, 2026-08-30 |
+| **Source** | GIAB HG002, `NIST_Illumina_2x250bps`, aligned to GRCh38 (21x) — the library the quality model comes from |
+| **Pairs used** | 61,588,264; 0.19% trimmed as outliers (discordant and chimeric pairs) |
+| **Built with** | `eidolon gen-frag-length-model`, `min_reads: 100`, `distribution: discrete` |
+| **Fitted by** | `scripts/delta/fit_hg002_defaults.sbatch`, jobs 22443316 / 22444161 (#752) |
 
-Shape: 1087 bins over 8–1094 bp, no gaps. Mean 431.8, sd 112.3, **skew +0.528**,
-p05/p50/p95/p99 = 258/424/623/746.
+Shape: 982 bins over 3–984 bp, no gaps. Mean 408.5, sd 93.2, skew +0.207,
+p05/p50/p95/p99 = 262/404/567/649.
 
-**Cross-validated against a different chromosome.** A model built from chr20/21/22 was
-checked against chr1's fragments from the same library (27.6M independent pairs) with
-`scripts/delta/validate_frag_model.sh`: mean within **0.34%**, sd **0.12%**, skew **0.011**,
-p99 **0.13%** — against tolerances of 2% / 5% / 0.15 / 5%. A model built from chr1 itself
-did only marginally better (0.01% / 0.03% / 0.001 / 0.00%).
+**Checked against the BAM with samtools**, not eidolon (`scripts/delta/validate_frag_model.sh`,
+same filter as the builder): over the model's support the BAM reads mean 408.55, sd 93.19,
+skew +0.207, and the model agrees to 0.00% on mean, sd and p99. That checks the builder. It is
+not a held-out check: the model is fitted from the whole genome, so there is no unseen
+chromosome to test it on.
 
-Updating this model was motivated by careful analysis of public data. The previous default
-produced left-skewed (−0.434) fragments where the real data we analyzed was consistently
-right-skewed.
+At 250 bp reads, 4.71% of the mass falls below the sampler's `read_len + 10` floor.
+
+**Chemistry is older than the model it replaced.** The previous default came from HCC1395's
+NovaSeq normal (mean 431.8, sd 112.3, skew +0.528). This one is HiSeq 2500. It was chosen so
+the shipped defaults describe one library rather than the individually newest source per
+component (#752).
 
 ## Sequencing error model
 
@@ -214,49 +214,39 @@ average below Q20 fall from 5.70% to 1.28%. The direction is conservative: a res
 cleaner than a native one, never dirtier. For comparison, the pre-v3.4.0 default produced
 0.00% of those reads at any length. A 151 bp model is #744.
 
-## The variant models: NEAT2's NA12878
+## The variant models: GIAB HG002
 
-`default_mutation_model.json.gz` (+ `_bkup`), `default_indel_model.json.gz` and
-`default_trinuc_model.json.gz` all derive from **one** upstream file:
-`~/code/neat2/models/MutModel_NA12878.p.gz`.
+`default_mutation_model.json.gz` is fitted by `gen-mut-model` from the GIAB HG002 v4.2.1
+GRCh38 truth VCF, restricted to its `noinconsistent` high-confidence BED, against an unmasked
+GRCh38 (`scripts/delta/fit_hg002_defaults.sbatch`, job 22443316, #752).
+`default_indel_model.json.gz` and `default_trinuc_model.json.gz` are its own indel and
+trinucleotide components, extracted unchanged, so every mutation default describes the same
+sample. A test enforces that.
 
-That was recorded as "unrecorded provenance" until it was checked. It is not a cancer model
-and not a toy: NA12878 is the CEPH/GIAB germline reference sample, which makes it a defensible
-source for germline defaults. What is genuinely unrecorded is how NEAT2 built it — reference
-build, aligner and caller are not stated upstream, and given NEAT2's age it is likely GRCh37
-era.
+| | |
+|---|---|
+| `mutation_rate` | 0.0015161 |
+| `homozygous_frequency` | 0.3884 |
+| SNP / insertion / deletion | 0.8727 / 0.0617 / 0.0655 |
+| CpG context weight | 4.48x the mean context |
 
-Verified by value, not by reading:
+**Checked against the VCF without eidolon.** `bedtools intersect` of the biallelic records
+(by POS) with the BED gives 3,364,039 SNPs, 237,674 insertions and 252,894 deletions over
+2,542,242,843 bp. The model counts 353 fewer, all at BED edges (#770). Each of the 64
+per-context SNP rows, rebuilt from those SNPs and the reference, agrees with the model to
+3.4e-4. The insertion and deletion length distributions agree to 3e-5. Ti/Tv of the source
+SNPs is 2.102.
 
-| eidolon | upstream field | agreement |
-|---|---|---|
-| `mutation_rate` 0.0010987132390211135 | `AVG_MUT_RATE` | exact, 16 digits |
-| `_bkup`'s `variant_dist` first weight 0.886404192662459 | `SNP_FREQ` | exact, 16 digits |
-| `default_indel_model` `ins_dist` (70 lengths) | positive `INDEL_FREQ` keys, renormalized | max diff 5.4e-17 |
-| `default_indel_model` `del_dist` (72 lengths) | negative `INDEL_FREQ` keys, renormalized | max diff 1.1e-16 |
-| `default_trinuc_model` `snp_distro` (64) | `TRINUC_MUT_PROB`, normalized, alphabetical (AAA, AAC, AAG, …) indexed 0–63 | max diff 5.7e-17 |
+**What it is not:** a callset. Rates are per base of GIAB's high-confidence regions, which
+exclude the hardest parts of the genome. Multi-allelic sites (47,781) are not used.
 
-### Two deliberate departures, and one unexplained number
+### Previous default
 
-**`homozygous_frequency` 0.01 → 0.3333.** `_bkup` carries NEAT2's 0.01, which implies a
-het/hom ratio near 99. The live model uses 1/3, a ratio near 2.0, which is what human data
-shows. This is the difference the NEAT comparison table in the README refers to, and it is
-locked by a test.
-
-**`variant_dist` is keyed by name** (`SNP`/`Insertion`/`Deletion`) where `_bkup` keys by
-integer. Presentation only; the weights are unchanged.
-
-**`insertion_probability` 0.4538979885714955 does not derive from the pickle by any obvious
-route.** The upstream insertion share of total indel mass is 0.4768593189964158 and the ratio
-of distinct insertion to deletion lengths is 0.4929577464788732. Neither is the shipped value,
-while the two length distributions beside it match to floating-point epsilon. Recorded as
-unexplained rather than reverse-engineered into a plausible story.
-
-### What is still missing
-
-A measurement. Knowing the source is not knowing whether the values describe the data eidolon
-is asked to simulate, and none of the three has been checked against a modern human callset.
-That is the germline-defaults review (#752).
+NEAT2's `MutModel_NA12878.p.gz`, converted: `mutation_rate` 0.0010987, `homozygous_frequency`
+1/3 (NEAT2 used 0.01), SNP / insertion / deletion 0.95 / 0.03 / 0.02. That file is kept as
+`eidolon-core/src/models/test_fixtures/neat2_mutation_model.json.gz`, the fixture for loading
+pre-stamp and pre-#763 models. `default_mutation_model_bkup.json.gz` is NEAT2's first
+conversion and is kept for provenance only.
 
 ## Building a custom model
 

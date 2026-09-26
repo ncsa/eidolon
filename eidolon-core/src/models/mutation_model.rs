@@ -369,7 +369,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let output_file = temp_dir.path().join("test.json.gz");
         let model: MutationModel = MutationModel::default().unwrap();
-        assert_eq!(model.mutation_rate, 0.0010987132390211135);
+        assert_eq!(model.mutation_rate, 0.0015160841216223734);
         model.write_to_file(&output_file).unwrap();
         let loaded = MutationModel::from_file(&output_file).unwrap();
         assert_eq!(loaded.mutation_rate, model.mutation_rate);
@@ -378,38 +378,15 @@ mod tests {
     /// The embedded default model must carry real trinucleotide biology, not a
     /// context-neutral or corrupted weight vector.
     ///
-    /// #372 wired `context_weights()` into placement, but that only helps if the
-    /// model FILE carries meaningful weights. `default_mutation_model_bkup.json.gz`
-    /// holds the older context-neutral default (CpG share exactly 6.25% = uniform);
-    /// the replacement must actually elevate CpG, which is where SBS1 lives and the
-    /// single most mutable context in any real genome.
+    /// #372 wired `context_weights()` into placement, but that only helps if the model FILE
+    /// carries meaningful weights. CpG is where SBS1 lives and the single most mutable context
+    /// in any real genome, so a correctly built default elevates it. The HG002 default (#752)
+    /// averages 4.48x across the four CpG contexts.
     ///
     /// This is a data assertion, not a code one: it fails if the shipped default is
-    /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level
-    /// metric.
-    ///
-    /// ## Provenance of the repaired file, so it can be audited rather than trusted
-    ///
-    /// `default_mutation_model.json.gz` was repaired by hand, which a diff of a
-    /// gzipped blob cannot show. Both halves are reconstructible from files already
-    /// in this directory, and a reviewer can check them without trusting the commit:
-    ///
-    /// - **`snp_distro`** de-cumulated equals `default_trinuc_model.json.gz`'s
-    ///   `snp_distro` to 2.9e-15.
-    /// - **`transition_matrix`** equals `default_mutation_model_bkup.json.gz`'s to
-    ///   within one ULP — rows `a` and `t` are exactly equal, `c` and `g` differ by
-    ///   5.6e-17 and 1.1e-16, i.e. double round-trip noise, not a different fit.
-    ///
-    /// The two files are otherwise NOT interchangeable, which is the whole point of
-    /// the assertion below: `_bkup` predates the trinucleotide work (it stores
-    /// `snp_model`, not `snp_trinuc_model`) and its `snp_distro` is exactly uniform —
-    /// CpG share 6.2500%, i.e. 4/64 — so it is context-neutral by construction. The
-    /// corrupt file was a botched upgrade *from* that state: it took a real
-    /// context-weighted `snp_distro` and cumulated it twice, which flattened CpG back
-    /// to ~1.0x while looking nothing like the uniform original.
-    ///
-    /// Both files also still carry the dead `insertion_probability` key; see
-    /// `IndelModel`'s legacy-load test for why that is left alone.
+    /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level metric. An
+    /// earlier shipped file failed it by cumulating `snp_distro` twice, which flattens CpG to
+    /// ~1.0x.
     #[test]
     fn default_model_context_weights_elevate_cpg() {
         let model = MutationModel::default().unwrap();
@@ -442,6 +419,82 @@ mod tests {
              A monotonically-increasing-with-index weight vector here is the \
              signature of a snp_distro that was cumulated twice — de-cumulating it \
              a second time recovers default_trinuc_model.json.gz exactly."
+        );
+    }
+
+    /// The shipped default is the GIAB HG002 fit (#752), checked against numbers measured
+    /// WITHOUT eidolon: `bedtools intersect` of the v4.2.1 truth VCF's biallelic records (by
+    /// POS) with its `noinconsistent` high-confidence BED gives 3,364,039 SNPs, 237,674
+    /// insertions and 252,894 deletions over 2,542,242,843 bp, 38.845% homozygous. The model
+    /// counts 353 fewer at BED edges (#770), hence the tolerances. Provenance is in
+    /// model_data/README.md.
+    #[test]
+    fn the_shipped_default_is_the_hg002_fit() {
+        let model = MutationModel::default().unwrap();
+        let cum = model.variant_dist.weights().unwrap();
+        let shares = [cum[0], cum[1] - cum[0], cum[2] - cum[1]];
+        let total = (3_364_039 + 237_674 + 252_894) as f64;
+        let expected = [3_364_039.0 / total, 237_674.0 / total, 252_894.0 / total];
+        for (name, (got, want)) in ["SNP", "insertion", "deletion"]
+            .iter()
+            .zip(shares.iter().zip(expected))
+        {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{name} share {got:.6} is not the measured {want:.6}"
+            );
+        }
+        let rate = total / 2_542_242_843.0;
+        assert!(
+            ((model.mutation_rate - rate) / rate).abs() < 1e-3,
+            "mutation_rate {} is not the measured {rate}",
+            model.mutation_rate
+        );
+        assert!(
+            (model.homozygous_frequency - 0.38845).abs() < 1e-4,
+            "homozygous_frequency {} is not the measured 0.38845",
+            model.homozygous_frequency
+        );
+    }
+
+    /// The shipped asset, pinned by digest: the checks above read summaries, and a file with
+    /// the right summaries and different context rows would pass them.
+    ///
+    /// Regenerate deliberately, never to make this pass:
+    ///     sha256sum eidolon-core/src/models/model_data/default_mutation_model.json.gz
+    #[test]
+    fn the_shipped_default_asset_is_byte_for_byte_the_fitted_model() {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(DATA_FILE));
+        assert_eq!(
+            got, "3435a589cd642d62f1f0af5b6443e755def39d065b0f8ad21e1b0fb94b87b16d",
+            "the shipped mutation model is not the one fitted from GIAB HG002 (job 22443316). \
+             If the replacement is intentional, update this digest AND model_data/README.md."
+        );
+    }
+
+    /// The standalone indel and trinucleotide defaults must be the mutation default's own
+    /// components, so every mutation default describes the same sample. IndelModel::default()
+    /// is gen-mut-model's fallback for a VCF with no indels.
+    #[test]
+    fn the_standalone_defaults_are_the_mutation_defaults_components() {
+        let model = MutationModel::default().unwrap();
+        assert_eq!(
+            serde_json::to_value(IndelModel::default().unwrap()).unwrap(),
+            serde_json::to_value(&model.statistical_models.indel_model).unwrap(),
+            "default_indel_model.json.gz differs from the mutation default's indel model"
+        );
+        // trinuc_distros serializes from a HashMap, so compare it order-free.
+        let canon = |m: &SnpTrinucModel| {
+            let mut v = serde_json::to_value(m).unwrap();
+            let rows = v["trinuc_distros"].as_array_mut().unwrap();
+            rows.sort_by_key(|r| r[0].to_string());
+            v
+        };
+        assert_eq!(
+            canon(&SnpTrinucModel::default().unwrap()),
+            canon(&model.statistical_models.snp_trinuc_model),
+            "default_trinuc_model.json.gz differs from the mutation default's trinucleotide model"
         );
     }
 
@@ -565,13 +618,14 @@ mod tests {
     /// by this build no longer stores it.
     #[test]
     fn legacy_model_with_snp_transition_matrix_still_loads() {
-        let shipped: serde_json::Value =
-            serde_json::from_reader(GzDecoder::new(DATA_FILE)).unwrap();
+        // The NEAT2-derived default eidolon shipped until #752, which predates #763.
+        static LEGACY: &[u8] = include_bytes!("test_fixtures/neat2_mutation_model.json.gz");
+        let shipped: serde_json::Value = serde_json::from_reader(GzDecoder::new(LEGACY)).unwrap();
         assert!(
             shipped["statistical_models"]
                 .get("transition_matrix")
                 .is_some(),
-            "the shipped default no longer carries the legacy key, so this test \
+            "the legacy fixture does not carry the legacy key, so this test \
              no longer proves a legacy file loads"
         );
         let model: MutationModel =

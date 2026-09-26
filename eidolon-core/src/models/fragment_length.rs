@@ -3,10 +3,9 @@
 //! purposes. How this is done is a process called Chemistry Magic. For our purposes, we expect
 //! the data to be uniform enough that a mean and standard deviation will describe the set.
 
-use crate::models::lib::{model_reader, model_writer};
+use crate::models::lib::{model_from_bytes, model_reader, model_writer};
 use crate::rng::NeatRngError;
 use crate::structs::distributions::{DiscreteDistribution, DistributionErrors, NormalDistribution};
-use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::io;
@@ -43,8 +42,8 @@ pub enum FragmentLengthModel {
 }
 
 /// The shipped fallback, used when a config supplies neither `fragment_model` nor
-/// `fragment_mean`. Built from HCC1395 normal (SEQC2 `WGS_NS_N_1`, NovaSeq, chr20/21/22,
-/// 32.6M pairs) and cross-validated against chr1 of the same library.
+/// `fragment_mean`. Fitted from GIAB HG002 `NIST_Illumina_2x250bps` (61.6M pairs), the
+/// library the shipped quality model comes from (#752).
 ///
 /// Fragment length is set by library chemistry, so this is a real distribution rather than
 /// a universal one -- see `model_data/README.md` for full provenance and for how to build
@@ -75,15 +74,11 @@ impl FragmentLengthModel {
     // requires infallible `fn default() -> Self`, which doesn't fit.
     #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self, FragmentModelError> {
-        // The parameters of the default model from the original neat
-        // The lengths range from 1 to 799, though it skips from 1 to 32 before counting up.
-        // The weights are just numbers between 0 and 1.
-        // These are data gathered from publicly availble human data, but should reflect
-        // whatever chemistry was used at the time
-        let reader = GzDecoder::new(DATA_FILE);
-        let data: FragmentLengthModel =
-            serde_json::from_reader(reader).map_err(FragmentModelError::SerdeError)?;
-        Ok(data)
+        // GIAB HG002 2x250 (#752); provenance in model_data/README.md.
+        Ok(model_from_bytes(
+            DATA_FILE,
+            "default_fragment_length_model.json.gz",
+        )?)
     }
 
     pub fn default_normal() -> Result<Self, FragmentModelError> {
@@ -198,6 +193,59 @@ mod tests {
             }
             _ => panic!("Wrong type!!"),
         }
+    }
+
+    /// The shipped default is the GIAB HG002 fit (#752). Expected moments were measured from
+    /// the BAM with samtools, not eidolon (`scripts/delta/validate_frag_model.sh`, job
+    /// 22444161): over the model's own support, mean 408.55, sd 93.19, skew +0.207.
+    #[test]
+    fn the_shipped_default_is_the_hg002_fit() {
+        let FragmentLengthModel::Discrete { distribution } =
+            FragmentLengthModel::default().unwrap()
+        else {
+            panic!("the shipped default must be Discrete")
+        };
+        let values = distribution.values().unwrap();
+        let cum = distribution.weights().unwrap();
+        let mass: Vec<f64> = (0..cum.len())
+            .map(|i| if i == 0 { cum[0] } else { cum[i] - cum[i - 1] })
+            .collect();
+        let mean: f64 = values.iter().zip(&mass).map(|(&v, &m)| v as f64 * m).sum();
+        let sd = values
+            .iter()
+            .zip(&mass)
+            .map(|(&v, &m)| (v as f64 - mean).powi(2) * m)
+            .sum::<f64>()
+            .sqrt();
+        let skew: f64 = values
+            .iter()
+            .zip(&mass)
+            .map(|(&v, &m)| ((v as f64 - mean) / sd).powi(3) * m)
+            .sum();
+        assert!(
+            (mean - 408.55).abs() < 0.5,
+            "mean {mean:.2}, measured 408.55"
+        );
+        assert!((sd - 93.19).abs() < 0.5, "sd {sd:.2}, measured 93.19");
+        assert!(
+            (skew - 0.207).abs() < 0.01,
+            "skew {skew:.3}, measured 0.207"
+        );
+    }
+
+    /// Pinned by digest, since the moments above can match a different file.
+    ///
+    /// Regenerate deliberately, never to make this pass:
+    ///     sha256sum eidolon-core/src/models/model_data/default_fragment_length_model.json.gz
+    #[test]
+    fn the_shipped_default_asset_is_byte_for_byte_the_fitted_model() {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(DATA_FILE));
+        assert_eq!(
+            got, "137bb635b5fa8c75f3081d0f6a31053285e69cbb763d5537c9073fa13f4e13a2",
+            "the shipped fragment model is not the one fitted from GIAB HG002 (job 22443316). \
+             If the replacement is intentional, update this digest AND model_data/README.md."
+        );
     }
 
     #[test]
