@@ -6,9 +6,8 @@ use eidolon_core::{
     models::{mutation_model::MutationModel, snp_trinuc_model::TrinucFrame},
     structs::{
         bed_record::BedRecord,
-        nucleotides::{ALLOWED_NUCS, Nucleotide},
+        nucleotides::Nucleotide,
         sv_model::SvModel,
-        transition_matrix::TransitionMatrix,
         variants::{Genotype, Variant, VariantType},
     },
 };
@@ -20,12 +19,10 @@ pub fn runner(
     filtered_mutations: HashMap<String, Vec<Variant>>,
     bed_table: HashMap<String, Vec<BedRecord>>,
     output_file: &PathBuf,
-    transition_matrix_file: Option<PathBuf>,
 ) -> Result<(), GenMutationModelError> {
     let mut trinuc_count: HashMap<TrinucFrame, usize> = HashMap::new();
     let mut trinuc_transition_count: HashMap<(TrinucFrame, TrinucFrame), usize> = HashMap::new();
     let mut snp_count = 0;
-    let mut snp_transition_count: HashMap<(Nucleotide, Nucleotide), usize> = HashMap::new();
     let mut insertion_count: HashMap<usize, usize> = HashMap::new();
     let mut deletion_count: HashMap<usize, usize> = HashMap::new();
     let mut homozygous_count = 0;
@@ -139,9 +136,6 @@ pub fn runner(
                     *trinuc_transition_count
                         .entry((ref_frame, alt_frame))
                         .or_default() += 1;
-                    *snp_transition_count
-                        .entry((variant.reference[0], alt[0]))
-                        .or_default() += 1;
                 }
                 VariantType::Insertion => {
                     debug_assert!(
@@ -186,7 +180,6 @@ pub fn runner(
     // Compute probabilities.
     let mut trinuc_mut_prob: HashMap<TrinucFrame, f64> = HashMap::new();
     let mut trinuc_trans_prob: HashMap<(TrinucFrame, TrinucFrame), f64> = HashMap::new();
-    let mut snp_trans_frequency: HashMap<(Nucleotide, Nucleotide), f64> = HashMap::new();
 
     for (frame, count) in &trinuc_count {
         if *count == 0 {
@@ -201,20 +194,6 @@ pub fn runner(
         {
             for (&alt_f, &tc) in alts {
                 trinuc_trans_prob.insert((*frame, alt_f), (tc as f64) / (frame_count as f64));
-            }
-        }
-    }
-
-    for nuc1 in ALLOWED_NUCS {
-        let rolling_total: usize = ALLOWED_NUCS
-            .into_iter()
-            .filter_map(|nuc2| snp_transition_count.get(&(nuc1, nuc2)))
-            .sum();
-        if rolling_total > 0 {
-            for nuc2 in ALLOWED_NUCS {
-                if let Some(&c) = snp_transition_count.get(&(nuc1, nuc2)) {
-                    snp_trans_frequency.insert((nuc1, nuc2), (c as f64) / (rolling_total as f64));
-                }
             }
         }
     }
@@ -272,26 +251,16 @@ pub fn runner(
     let del_lengths: Vec<usize> = deletion_count.keys().cloned().collect();
     let del_weights: Vec<f64> = deletion_count.values().map(|&x| x as f64).collect();
 
-    let transition_matrix_override = match transition_matrix_file {
-        Some(ref path) => {
-            info!("Loading custom SNP transition matrix from TSV: {:?}", path);
-            Some(TransitionMatrix::from_tsv(path)?)
-        }
-        None => None,
-    };
-
     let result = MutationModel::from_raw_data(
         average_mutation_rate,
         homozygous_frequency,
         variant_probs,
-        snp_trans_frequency,
         trinuc_mut_prob,
         trinuc_trans_prob,
         ins_lengths,
         ins_weights,
         del_lengths,
         del_weights,
-        transition_matrix_override,
     );
 
     match result {
@@ -330,7 +299,7 @@ mod tests {
         let mutations = read_vcf(vcf_path).unwrap();
         let out_dir = tempdir().unwrap();
         let output_file = out_dir.path().join("test_model.json.gz");
-        runner(&reference, mutations, HashMap::new(), &output_file, None).unwrap();
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
         let model = MutationModel::from_file(&output_file).unwrap();
         assert!(
@@ -341,39 +310,6 @@ mod tests {
             model.homozygous_frequency > 0.0,
             "homozygous_frequency should be positive"
         );
-    }
-
-    #[test]
-    fn test_runner_with_tsv_transition_matrix() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
-        let vcf_path = PathBuf::from(format!("{}/test_data/vcfs/small_snps.vcf", manifest_dir));
-        let mutations = read_vcf(vcf_path).unwrap();
-        let out_dir = tempdir().unwrap();
-        let output_file = out_dir.path().join("test_model_tsv.json.gz");
-
-        let tsv_path = out_dir.path().join("matrix.tsv");
-        std::fs::write(
-            &tsv_path,
-            "A\tC\tG\tT\n\
-             0.0\t0.5\t0.3\t0.2\n\
-             0.5\t0.0\t0.3\t0.2\n\
-             0.4\t0.3\t0.0\t0.3\n\
-             0.3\t0.3\t0.4\t0.0\n",
-        )
-        .unwrap();
-
-        runner(
-            &reference,
-            mutations,
-            HashMap::new(),
-            &output_file,
-            Some(tsv_path),
-        )
-        .unwrap();
-        assert!(output_file.exists());
-        let model = MutationModel::from_file(&output_file).unwrap();
-        assert!(model.mutation_rate > 0.0);
     }
 
     #[test]
@@ -400,7 +336,7 @@ H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1\n",
 
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("indel_model.json.gz");
-        runner(&reference, mutations, HashMap::new(), &output_file, None).unwrap();
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
 
         let model = MutationModel::from_file(&output_file).unwrap();
@@ -429,7 +365,7 @@ H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
 
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("mismatch_model.json.gz");
-        runner(&reference, mutations, HashMap::new(), &output_file, None).unwrap();
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
     }
 
@@ -450,7 +386,7 @@ H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
         let bed_table = HashMap::from([("chrZ_nonexistent".to_string(), vec![bed_record])]);
 
         // We don't enforce one outcome here — just that it terminates without panicking.
-        let result = runner(&reference, mutations, bed_table, &output_file, None);
+        let result = runner(&reference, mutations, bed_table, &output_file);
         let _ = result; // either Ok or Err is acceptable today
     }
 
@@ -467,7 +403,7 @@ H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
         let bed_record = BedRecord::new_bed_record("H1N1_HA".to_string(), 1, 100).unwrap();
         let bed_table = HashMap::from([("H1N1_HA".to_string(), vec![bed_record])]);
 
-        runner(&reference, mutations, bed_table, &output_file, None).unwrap();
+        runner(&reference, mutations, bed_table, &output_file).unwrap();
 
         assert!(output_file.exists());
         let model = MutationModel::from_file(&output_file).unwrap();
@@ -511,7 +447,7 @@ H1N1_HA\t600\t.\tT\t<DUP>\t60\tPASS\tEND=700\tGT\t1/1\n",
         let output_file = out_dir.path().join("mixed_sv_model.json.gz");
         // Must not panic — symbolic records skip past the as_literal().unwrap()
         // sites and never reach the homozygous_count tally.
-        runner(&reference, mutations, HashMap::new(), &output_file, None).unwrap();
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
         let model = MutationModel::from_file(&output_file).unwrap();
         // Only the SNP contributes — and it's heterozygous, so homozygous_count
@@ -569,7 +505,7 @@ H1N1_HA\t7000\t.\tG\t<BND>\t60\tPASS\t.\tGT\t0/1\n",
 
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("sv_rich_model.json.gz");
-        runner(&reference, mutations, HashMap::new(), &output_file, None).unwrap();
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
 
         let model = MutationModel::from_file(&output_file).unwrap();
@@ -636,7 +572,7 @@ H1N1_HA\t600\t.\tT\t<DUP>\t60\tPASS\tEND=700\tGT\t1/1\n",
 
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("sv_only_model.json.gz");
-        runner(&reference, mutations, HashMap::new(), &output_file, None).unwrap();
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
 
         // Re-read the produced model — must deserialize cleanly (no NaN

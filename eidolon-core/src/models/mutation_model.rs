@@ -21,7 +21,7 @@ use crate::{
         distributions::{DiscreteDistribution, DistributionErrors},
         nucleotides::{Nucleotide, allowed_vec},
         sv_model::SvModel,
-        transition_matrix::{TransitionMatrix, TransitionMatrixError},
+        transition_matrix::TransitionMatrixError,
         variants::{Variant, VariantError, VariantType},
     },
 };
@@ -105,31 +105,13 @@ impl MutationModel {
         average_mutation_rate: f64,
         homozygous_frequency: f64,
         variant_probs: Vec<f64>,
-        snp_transition_frequency: HashMap<(Nucleotide, Nucleotide), f64>,
         trinuc_frequency: HashMap<TrinucFrame, f64>,
         trinuc_transition_frequency: HashMap<(TrinucFrame, TrinucFrame), f64>,
         ins_lengths: Vec<usize>,
         ins_weights: Vec<f64>,
         del_lengths: Vec<usize>,
         del_weights: Vec<f64>,
-        transition_matrix_override: Option<TransitionMatrix>,
     ) -> Result<Self, MutationModelError> {
-        let transition_matrix = if let Some(tm) = transition_matrix_override {
-            tm
-        } else {
-            // `TransitionMatrix::from` labels the four slots in ALLOWED_NUCS order
-            // (A, C, G, T). Rows and columns must be indexed in that same order.
-            let mut temp_trans_matrix: [[f64; 4]; 4] = [[0.0; 4]; 4];
-            for (key, value) in snp_transition_frequency {
-                temp_trans_matrix[usize::from(key.0)][usize::from(key.1)] = value;
-            }
-            TransitionMatrix::from(
-                temp_trans_matrix[usize::from(Nucleotide::A)],
-                temp_trans_matrix[usize::from(Nucleotide::C)],
-                temp_trans_matrix[usize::from(Nucleotide::G)],
-                temp_trans_matrix[usize::from(Nucleotide::T)],
-            )?
-        };
         // build transition matrices from data for snps and trinucs
         let snp_trinuc_model =
             SnpTrinucModel::from_raw_data(trinuc_frequency, trinuc_transition_frequency)?;
@@ -145,7 +127,6 @@ impl MutationModel {
             IndelModel::from_raw_data(ins_lengths, ins_weights, del_lengths, del_weights)?
         };
         let statistical_models = StatisticalModels {
-            transition_matrix,
             indel_model,
             snp_trinuc_model,
         };
@@ -342,7 +323,11 @@ struct StatisticalModels {
     // This struct links the Mutation model to the other statistical models for modeling different
     // variant types. If new variant types are added, then we will need to expand this struct to
     // include them.
-    transition_matrix: TransitionMatrix,
+    //
+    // SNP alt bases come from `snp_trinuc_model`, one transition matrix per flanking
+    // context. Older model files also carry a context-free `transition_matrix` here.
+    // Nothing ever read it at generation (see #758), so it is no longer built or
+    // stored, and serde ignores the key in older files.
     indel_model: IndelModel,
     snp_trinuc_model: SnpTrinucModel,
 }
@@ -547,25 +532,18 @@ mod tests {
     #[test]
     fn test_from_raw_data_no_indels() {
         // Exercises the indel_denom == 0 || empty vecs fallback to IndelModel::default()
-        let snp_trans: HashMap<(Nucleotide, Nucleotide), f64> = HashMap::from([
-            ((Nucleotide::A, Nucleotide::C), 0.25),
-            ((Nucleotide::A, Nucleotide::G), 0.5),
-            ((Nucleotide::A, Nucleotide::T), 0.25),
-        ]);
         let trinuc_freq: HashMap<TrinucFrame, f64> = HashMap::new();
         let trinuc_trans: HashMap<(TrinucFrame, TrinucFrame), f64> = HashMap::new();
         let result = MutationModel::from_raw_data(
             0.001,
             0.5,
             vec![1.0, 0.0, 0.0], // SNP only, no indels
-            snp_trans,
             trinuc_freq,
             trinuc_trans,
             vec![], // no insertion data
             vec![],
             vec![], // no deletion data
             vec![],
-            None,
         );
         assert!(
             result.is_ok(),
@@ -576,88 +554,40 @@ mod tests {
         assert_eq!(model.mutation_rate, 0.001);
     }
 
-    /// Every alt column of the transition matrix must be labeled with the base
-    /// whose count produced it. Falsified by any cell whose probability does not
-    /// match the value supplied for that exact (ref, alt) pair -- in particular a
-    /// non-zero self-transition, which is not a mutation at all.
+    /// Every model file written before #758's follow-up carries a context-free SNP
+    /// `transition_matrix` under `statistical_models`. That includes the shipped
+    /// default, the bundled `tools/cosmic_*.json.gz`, and any model a user fitted.
+    /// Generation never read it. Like `insertion_probability` (see `IndelModel`'s
+    /// legacy-load test), the key is left in the shipped files rather than tidied
+    /// out, so those files and a user's own models stay readable by the same path.
     ///
-    /// Known answer: the supplied spectrum is the human one, so Ti/Tv is ~2.1 by
-    /// construction and computable without reference to what the code returns.
+    /// Pins both halves: a file carrying the key still loads, and a model written
+    /// by this build no longer stores it.
     #[test]
-    fn the_transition_matrix_labels_each_alt_with_the_base_it_was_counted_for() {
-        let supplied: HashMap<(Nucleotide, Nucleotide), f64> = HashMap::from([
-            ((A, C), 0.17),
-            ((A, G), 0.69),
-            ((A, T), 0.14),
-            ((C, A), 0.16),
-            ((C, G), 0.17),
-            ((C, T), 0.67),
-            ((G, A), 0.67),
-            ((G, C), 0.17),
-            ((G, T), 0.16),
-            ((T, A), 0.14),
-            ((T, C), 0.69),
-            ((T, G), 0.17),
-        ]);
-        let model = MutationModel::from_raw_data(
-            0.001,
-            0.5,
-            vec![1.0, 0.0, 0.0],
-            supplied.clone(),
-            HashMap::new(),
-            HashMap::new(),
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            None,
-        )
-        .expect("a full SNP spectrum should build");
-
-        let matrix = &model.statistical_models.transition_matrix;
-        let mut ti = 0.0;
-        let mut tv = 0.0;
-        let mut checked = 0usize;
-        for reference in [A, C, G, T] {
-            let row = &matrix[&reference];
-            let labels = row.values().unwrap();
-            let cumulative = row.weights().unwrap();
-            let total: f64 = [A, C, G, T]
-                .iter()
-                .filter_map(|alt| supplied.get(&(reference, *alt)))
-                .sum();
-            // The stored weights are a CDF over `labels`, so de-cumulate to
-            // recover each labeled cell's own probability.
-            let mut previous = 0.0;
-            for (label, edge) in labels.iter().zip(cumulative.iter()) {
-                let probability = edge - previous;
-                previous = *edge;
-                let expected = supplied.get(&(reference, *label)).copied().unwrap_or(0.0) / total;
-                assert!(
-                    (probability - expected).abs() < 1e-9,
-                    "{reference:?}->{label:?} carries {probability:.6}, but {expected:.6} was \
-                     supplied for that pair -- the alt columns are mislabeled"
-                );
-                checked += 1;
-                if reference == *label {
-                    continue;
-                }
-                let is_transition =
-                    matches!((reference, *label), (A, G) | (G, A) | (C, T) | (T, C));
-                if is_transition {
-                    ti += probability;
-                } else {
-                    tv += probability;
-                }
-            }
-        }
-        // Denominator: a per-cell assertion proves nothing if the loop skipped cells.
-        assert_eq!(checked, 16, "expected all 16 cells, examined {checked}");
+    fn legacy_model_with_snp_transition_matrix_still_loads() {
+        let shipped: serde_json::Value =
+            serde_json::from_reader(GzDecoder::new(DATA_FILE)).unwrap();
         assert!(
-            (ti / tv - 2.125).abs() < 0.05,
-            "Ti/Tv is {:.3}; the supplied human spectrum is 2.125, so the transition \
-             and transversion cells are not where they are labeled",
-            ti / tv
+            shipped["statistical_models"]
+                .get("transition_matrix")
+                .is_some(),
+            "the shipped default no longer carries the legacy key, so this test \
+             no longer proves a legacy file loads"
+        );
+        let model: MutationModel =
+            serde_json::from_value(shipped).expect("a legacy model file must still deserialize");
+        let rewritten = serde_json::to_value(&model).unwrap();
+        assert!(
+            rewritten["statistical_models"]
+                .get("transition_matrix")
+                .is_none(),
+            "a freshly written model must not store the unused SNP transition matrix"
+        );
+        assert!(
+            rewritten["statistical_models"]
+                .get("snp_trinuc_model")
+                .is_some(),
+            "the model that does drive SNP alts must survive the round trip"
         );
     }
 
@@ -667,23 +597,16 @@ mod tests {
         // come through a separate channel on `gen-mut-model::runner`, so
         // the constructor must start with `sv_model: None`. Callers that
         // observed SVs assign the field after construction.
-        let snp_trans = HashMap::from([
-            ((Nucleotide::A, Nucleotide::C), 0.25),
-            ((Nucleotide::A, Nucleotide::G), 0.5),
-            ((Nucleotide::A, Nucleotide::T), 0.25),
-        ]);
         let model = MutationModel::from_raw_data(
             0.001,
             0.5,
             vec![1.0, 0.0, 0.0],
-            snp_trans,
             HashMap::new(),
             HashMap::new(),
             vec![],
             vec![],
             vec![],
             vec![],
-            None,
         )
         .unwrap();
         assert!(model.sv_model.is_none());

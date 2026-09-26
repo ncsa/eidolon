@@ -21,10 +21,6 @@ pub struct RunConfiguration {
     pub bed_table: HashMap<String, Vec<BedRecord>>,
     pub output_file: PathBuf,
     pub overwrite_output: bool,
-    /// Optional path to a 4×4 TSV specifying a custom SNP transition matrix.
-    /// Rows/columns are A/C/G/T. A single header line is ignored.
-    /// Overrides the transition matrix inferred from VCF data.
-    pub transition_matrix_file: Option<PathBuf>,
 }
 
 impl RunConfiguration {
@@ -73,16 +69,20 @@ impl RunConfiguration {
         }
         let mutations = read_vcf_lean(vcf_file)?;
 
-        let transition_matrix_file = scrape_config
+        // `transition_matrix_file` set a context-free SNP matrix that generation never
+        // read, so it was removed (#758). The old template ships the key with no value;
+        // that is accepted. A value means someone expects an effect it never had.
+        if let Some(path) = scrape_config
             .get("transition_matrix_file")
             .and_then(|v| v.as_str())
-            .map(|s| {
-                let p = PathBuf::from(s);
-                if !p.is_file() {
-                    panic!("transition_matrix_file not found: {:?}", p)
-                }
-                p
-            });
+            .filter(|s| !s.trim().is_empty() && s.trim() != ".")
+        {
+            panic!(
+                "transition_matrix_file ({path}) is no longer supported. It never affected \
+                 generated variants: SNP alt bases come from the per-trinucleotide-context \
+                 model fitted from the VCF. Remove the key to continue (see #758)."
+            )
+        }
 
         Ok(RunConfiguration {
             reference,
@@ -90,7 +90,6 @@ impl RunConfiguration {
             bed_table,
             output_file,
             overwrite_output,
-            transition_matrix_file,
         })
     }
 }
@@ -144,5 +143,36 @@ mod tests {
         let h1n1_variants = config.mutations.get("H1N1_HA").expect("H1N1_HA not found");
         assert_eq!(h1n1_variants.len(), 3);
         assert!(config.bed_table.is_empty());
+    }
+
+    fn config_with(extra: &str) -> Result<RunConfiguration, GenMutationModelError> {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let out = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "reference: {manifest_dir}/test_data/references/H1N1.fa\n\
+             vcf_file: {manifest_dir}/test_data/vcfs/small_snps.vcf\n\
+             output_file: {}\n\
+             overwrite_output: true\n{extra}",
+            out.path().join("model.json.gz").display()
+        );
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "{}", yaml).unwrap();
+        RunConfiguration::from(&tmp.path().to_path_buf())
+    }
+
+    /// Configs copied from the old template carry `transition_matrix_file:` with no
+    /// value. Those must keep working after the option's removal.
+    #[test]
+    fn an_empty_transition_matrix_file_key_is_accepted() {
+        assert!(config_with("transition_matrix_file:\n").is_ok());
+        assert!(config_with("transition_matrix_file: .\n").is_ok());
+    }
+
+    /// A value means the user expects the matrix to shape the model. It never did,
+    /// so the run must stop rather than silently ignore it.
+    #[test]
+    #[should_panic(expected = "transition_matrix_file (/any/matrix.tsv) is no longer supported")]
+    fn a_set_transition_matrix_file_is_refused() {
+        let _ = config_with("transition_matrix_file: /any/matrix.tsv\n");
     }
 }

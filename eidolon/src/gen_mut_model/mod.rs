@@ -46,7 +46,6 @@ pub fn main(config_file: &PathBuf) -> Result<(), GenMutationModelError> {
         filtered_mutations,
         run_config.bed_table,
         &run_config.output_file,
-        run_config.transition_matrix_file,
     )?;
 
     Ok(())
