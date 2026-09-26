@@ -204,8 +204,8 @@ a binned/current-chemistry library is #730.
 `gen-seq-error-model` whenever you can; that is what the tooling is for.
 
 **Fitted at 250 bp.** Generating at another read length rescales the curve to fit, which is
-what NEAT2 did and is an approximation — NEAT2 warned about it and eidolon does not yet
-(#742). `read_len` defaults to 250 so that taking both defaults needs no rescaling.
+what NEAT2 did and is an approximation. `gen-reads` logs a warning naming both lengths when
+it does (#742). `read_len` defaults to 250 so that taking both defaults needs no rescaling.
 
 Measured cost of rescaling, R1 at 151 bp against this model's native 250 bp: the per-cycle
 shape is preserved to a tenth of a Q at the 25%, 50% and 75% marks, and only the end of the
