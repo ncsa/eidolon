@@ -46,7 +46,9 @@ max_model_read_length: 1000
 bam_file: /path/to/aligned.bam
 
 # optional: custom 4x4 SNP transition matrix TSV (rows/columns: A C G T).
-# A single header line is allowed. Diagonal values are ignored.
+# A single header line is allowed. Diagonal values are ignored. Each row needs four
+# finite, non-negative values with some weight off the diagonal; a malformed row stops
+# the run and names its line.
 # Takes precedence over bam_file.
 transition_matrix_file: /path/to/matrix.tsv
 ```

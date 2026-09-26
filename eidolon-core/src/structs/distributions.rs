@@ -22,6 +22,10 @@ pub enum DistributionErrors {
     VectorNotFound,
     #[error("Input values and weights vector must be of the same length")]
     InputMismatchError,
+    #[error(
+        "Distribution weights must be finite and non-negative with a positive total; got {0:?}"
+    )]
+    InvalidWeights(Vec<f64>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,21 +39,15 @@ impl<T: Clone + Debug + Serialize + for<'de> Deserialize<'de>> DiscreteDistribut
         if w_vec.len() != v_vec.len() {
             return Err(DistributionErrors::InputMismatchError);
         }
-        let cumulative_probability = {
-            let sum_weights: f64 = w_vec.iter().sum();
-            if sum_weights > 0.0 {
-                let mut normalized_weights = Vec::with_capacity(w_vec.len());
-                // we no longer need the w_vec_64 after this, so we consume it
-                for weight in w_vec {
-                    normalized_weights.push(weight / sum_weights);
-                }
-                cumulative_sum(&mut normalized_weights)?
-            } else {
-                // Edge case. Really, this shouldn't be allowed in the data. We'll fix it when
-                // we rebuild the models.
-                vec![1.0_f64; w_vec.len()]
-            }
-        };
+        // No mass means no distribution. This used to fall back to "every draw is the first
+        // value", which is how an empty transition row mutated everything to A (#760). The
+        // right prior depends on what the distribution is, so the caller supplies it.
+        let sum_weights: f64 = w_vec.iter().sum();
+        if w_vec.iter().any(|w| !w.is_finite() || *w < 0.0) || sum_weights <= 0.0 {
+            return Err(DistributionErrors::InvalidWeights(w_vec.clone()));
+        }
+        let mut normalized_weights: Vec<f64> = w_vec.iter().map(|w| w / sum_weights).collect();
+        let cumulative_probability = cumulative_sum(&mut normalized_weights)?;
 
         Ok(DiscreteDistribution {
             values: v_vec.to_vec(),
@@ -152,17 +150,34 @@ mod test {
     use super::*;
     use crate::rng::NeatRng;
 
+    // An all-zero vector used to become "every draw is the first value", which is how an
+    // empty transition row mutated everything to A (#760). There is no correct value for a
+    // distribution with no mass, so it is refused; the caller supplies its own prior.
     #[test]
-    fn new_from_values() {
-        let l_vec = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let w_vec = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        assert_eq!(l_vec.len(), w_vec.len());
-        let distribution = DiscreteDistribution::new(&w_vec, &l_vec).unwrap();
-        assert_eq!(distribution.values().unwrap(), l_vec);
-        assert_eq!(
-            distribution.weights().unwrap(),
-            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-        );
+    fn weights_with_no_usable_mass_are_refused() {
+        let values = vec![1, 2, 3, 4];
+        for weights in [
+            vec![0.0, 0.0, 0.0, 0.0],
+            vec![],
+            vec![1.0, -1.0, 1.0, 1.0],
+            vec![1.0, f64::NAN, 1.0, 1.0],
+            vec![1.0, f64::INFINITY, 1.0, 1.0],
+        ] {
+            let v = values[..weights.len()].to_vec();
+            assert!(
+                matches!(
+                    DiscreteDistribution::new(&weights, &v),
+                    Err(DistributionErrors::InvalidWeights(_))
+                ),
+                "weights {weights:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_weights_alongside_positive_ones_are_accepted() {
+        let d = DiscreteDistribution::new(&vec![0.0, 3.0, 0.0, 1.0], &vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(d.weights().unwrap(), vec![0.0, 0.75, 0.75, 1.0]);
     }
 
     #[test]
@@ -322,25 +337,16 @@ mod test {
             }
         }
 
-        /// All-zero weights are treated as a degenerate case in `new()`: instead of
-        /// dividing by zero, the CDF is set to `[1.0; n]`. Locking in the resulting
-        /// behavior — bisect-left lands at index 0, so every sample returns `values[0]`.
-        /// This is *not* a uniform fallback (the uniform fallback for quality models
-        /// lives at the QualityScoreModel layer). Renaming this contract would be a
-        /// deliberate change, not a silent regression.
+        /// All-zero weights are refused whatever their length (#760).
         #[test]
-        fn proptest_all_zero_weights_always_returns_first_value(
+        fn proptest_all_zero_weights_are_refused(
             values in prop_vec(any::<u32>(), 2..=10),
-            rand in 0.0f64..=1.0,
         ) {
             let weights = vec![0.0f64; values.len()];
-            let d = DiscreteDistribution::new(&weights, &values).unwrap();
-            let s = d.sample(rand).unwrap();
-            prop_assert_eq!(
-                s, values[0],
-                "all-zero weights must return values[0] regardless of rand={}",
-                rand,
-            );
+            prop_assert!(matches!(
+                DiscreteDistribution::new(&weights, &values),
+                Err(DistributionErrors::InvalidWeights(_))
+            ));
         }
     }
 

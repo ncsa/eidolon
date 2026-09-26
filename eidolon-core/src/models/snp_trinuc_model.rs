@@ -307,6 +307,18 @@ impl SnpTrinucModel {
             .iter()
             .map(|frame| *trinuc_frequency.get(frame).unwrap_or(&1e-6f64))
             .collect();
+        // A fit with no SNPs at all (an indel-only VCF) observes no context preference.
+        // Weight every context equally, the same context-neutral placement an untrained
+        // model gives.
+        let snp_weights = if snp_weights.iter().sum::<f64>() > 0.0 {
+            snp_weights
+        } else {
+            info!(
+                "SNP trinucleotide model: no SNPs were observed, so every context is \
+                 weighted equally"
+            );
+            vec![1.0; all_frames.len()]
+        };
         let snp_distro = DiscreteDistribution::new(&snp_weights, &(0..all_frames.len()).collect())?;
 
         Ok(SnpTrinucModel {
@@ -515,6 +527,23 @@ mod tests {
             }
         }
         assert_eq!(rows_checked, 64);
+    }
+
+    // An indel-only fit observes no SNPs, so every context's mutation frequency is 0. The
+    // context weights must be uniform (context-neutral placement), not all mass on AAA.
+    #[test]
+    fn a_fit_with_no_snps_weights_every_context_equally() {
+        let freq: HashMap<TrinucFrame, f64> =
+            ALL_FRAMES.iter().map(|frame| (*frame, 0.0)).collect();
+        let model = SnpTrinucModel::from_raw_data(freq, HashMap::new()).unwrap();
+        let w = model.context_weights().unwrap();
+        assert_eq!(w.len(), 64);
+        for (frame, weight) in &w {
+            assert!(
+                (weight - 1.0 / 64.0).abs() < 1e-12,
+                "{frame} weight {weight}, expected 1/64"
+            );
+        }
     }
 
     #[test]

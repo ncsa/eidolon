@@ -23,6 +23,8 @@ pub fn runner(
     let mut trinuc_count: HashMap<TrinucFrame, usize> = HashMap::new();
     let mut trinuc_transition_count: HashMap<(TrinucFrame, TrinucFrame), usize> = HashMap::new();
     let mut snp_count = 0;
+    let mut snp_edge_skipped = 0;
+    let mut snp_ref_mismatch = 0;
     let mut insertion_count: HashMap<usize, usize> = HashMap::new();
     let mut deletion_count: HashMap<usize, usize> = HashMap::new();
     let mut homozygous_count = 0;
@@ -99,6 +101,7 @@ pub fn runner(
                     // VCF POS is 1-based; skip variants too close to contig edges.
                     if variant.location < 2 {
                         debug!("Skipping edge variant at position {}", variant.location);
+                        snp_edge_skipped += 1;
                         continue;
                     }
                     let loc = variant.location - 1; // 0-based
@@ -107,6 +110,7 @@ pub fn runner(
                             "Skipping edge variant at position {} (out of contig bounds)",
                             variant.location
                         );
+                        snp_edge_skipped += 1;
                         continue;
                     }
                     let canon = |n: Nucleotide| match n {
@@ -124,6 +128,7 @@ pub fn runner(
                             "Reference mismatch at position {}: VCF ref {:?}, FASTA base {:?}; skipping",
                             variant.location, variant.reference[0], n1
                         );
+                        snp_ref_mismatch += 1;
                         continue;
                     }
                     let ref_frame = TrinucFrame::from((n0, n1, n2));
@@ -162,6 +167,25 @@ pub fn runner(
                 Genotype::Heterozygous => {}
             }
         }
+    }
+
+    let snp_skipped = snp_edge_skipped + snp_ref_mismatch;
+    if snp_skipped > 0 {
+        warn!(
+            "{snp_skipped} of {snp_count} SNP(s) could not be used: {snp_ref_mismatch} did not \
+             match the reference base, {snp_edge_skipped} were at a contig edge"
+        );
+    }
+    // Without a single usable SNP there is no context information, yet snp_count would
+    // still give the model a SNP fraction, so it would generate SNPs from nothing.
+    if snp_count > 0 && snp_skipped == snp_count {
+        let err = GenMutationModelError::NoUsableSnps {
+            counted: snp_count,
+            ref_mismatch: snp_ref_mismatch,
+            edge: snp_edge_skipped,
+        };
+        error!("{err}");
+        return Err(err);
     }
 
     if trinuc_count.is_empty() {
@@ -224,9 +248,9 @@ pub fn runner(
     }
 
     let (variant_probs, homozygous_frequency, average_mutation_rate) = if sv_only_corpus {
-        // Uniform fallback for variant_probs — `DiscreteDistribution::new`
-        // rejects all-zero weights, so we feed it 1/3 each. Doesn't
-        // matter at sample time because mutation_rate is 0.
+        // Uniform variant_probs: `DiscreteDistribution::new` refuses
+        // all-zero weights, so feed it 1/3 each. Doesn't matter at sample
+        // time because mutation_rate is 0.
         (vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], 0.0, 0.0)
     } else {
         let snp_freq = (snp_count as f64) / allowed_variant_count;
@@ -367,6 +391,71 @@ H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
         let output_file = out_dir.path().join("mismatch_model.json.gz");
         runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
         assert!(output_file.exists());
+    }
+
+    // The SNPs are counted before they are checked against the reference, so a VCF whose
+    // every SNP mismatches used to give a model that generates SNPs with no context data:
+    // all of them landed in AAA. That must be refused, and nothing written.
+    #[test]
+    fn a_vcf_whose_snps_are_all_unusable_builds_no_model() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
+        let out_dir = tempdir().unwrap();
+
+        // Position 22 of H1N1_HA is C and 25 is C; both records claim REF=A. Position 1 is
+        // a contig edge.
+        let vcf_path = out_dir.path().join("all_bad.vcf");
+        std::fs::write(
+            &vcf_path,
+            "##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
+H1N1_HA\t1\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n\
+H1N1_HA\t22\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n\
+H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
+        )
+        .unwrap();
+
+        let mutations = read_vcf(vcf_path).unwrap();
+        let output_file = out_dir.path().join("all_bad_model.json.gz");
+        let result = runner(&reference, mutations, HashMap::new(), &output_file);
+        assert!(
+            matches!(
+                result,
+                Err(GenMutationModelError::NoUsableSnps {
+                    counted: 3,
+                    ref_mismatch: 2,
+                    edge: 1
+                })
+            ),
+            "expected NoUsableSnps {{ 3, 2, 1 }}, got {result:?}"
+        );
+        assert!(!output_file.exists(), "no model file may be written");
+    }
+
+    // Must not fire: an indel-only VCF has no SNPs to use, and that is fine.
+    #[test]
+    fn an_indel_only_vcf_still_builds_a_model() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
+        let out_dir = tempdir().unwrap();
+        let vcf_path = out_dir.path().join("indels_only.vcf");
+        std::fs::write(
+            &vcf_path,
+            "##fileformat=VCFv4.1\n\
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
+H1N1_HA\t50\t.\tT\tTAG\t60\tPASS\t.\tGT\t0/1\n\
+H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1\n",
+        )
+        .unwrap();
+        let mutations = read_vcf(vcf_path).unwrap();
+        let output_file = out_dir.path().join("indels_only_model.json.gz");
+        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
+        assert!(
+            MutationModel::from_file(&output_file)
+                .unwrap()
+                .mutation_rate
+                > 0.0
+        );
     }
 
     #[test]
