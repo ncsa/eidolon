@@ -2257,9 +2257,16 @@ mod tests {
     /// (`default()` and `from_raw_data`'s `None` arm). This reads the former while the
     /// runner's fallback path uses the latter, so a drift between the two copies would slip
     /// past. They are identical today.
+    /// The A row of the matrix a fit falls back on without `bam_file` or
+    /// `transition_matrix_file`. Built the way the runner builds it, not taken from the
+    /// shipped default(), whose matrix is fitted from HG002 (#752) and is a different matrix.
     fn default_a_row_cdf() -> [f64; 4] {
-        let m = SequencingErrorModel::default()
-            .expect("the default sequencing error model must be constructible");
+        let m = SequencingErrorModel::from_raw_data(
+            0.005,
+            eidolon_core::models::quality_scores::QualityScoreModel::default().unwrap(),
+            None,
+        )
+        .expect("the fallback sequencing error model must be constructible");
         let row = row_cdf(
             m.transition_distros(),
             eidolon_core::structs::nucleotides::Nucleotide::A,

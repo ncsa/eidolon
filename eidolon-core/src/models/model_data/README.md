@@ -81,7 +81,7 @@ defaults hardcoded in its sequencing error model.
 | `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
 | `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
 | insertion base composition | uniform over ACGT | `SIE_INS_NUCL` |
-| substitution transitions | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` |
+| substitution transitions | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` — now only the fallback for a fit without `bam_file`; the shipped matrix is fitted (below) |
 
 **Two of these were initially mistranslated in the Rust port.** The insertion fraction was
 used as the indel rate, the real indel rate was dropped, and the insertion split was
@@ -170,6 +170,37 @@ whole; `QualityScoreModel::default()` takes its R1 half, so the two cannot drift
 | **Reads fitted** | 3,391,610 per mate, taken 1-in-10 across the file |
 | **Degraded cut** | Q<25 averaged over the last 50 bases |
 | **Fitted by** | `scripts/delta/fit_hg002_pair.sbatch`, job 22233888 |
+| **Substitution matrix** | the HG002 BAM with its GIAB v4.2.1 variants masked: `scripts/delta/fit_hg002_defaults.sbatch`, job 22447983 |
+
+### Substitution matrix
+
+Fitted from the same library's aligned reads by `gen-seq-error-model` with `bam_file:` and
+`known_variants_vcf:` (#752). The refit reproduces job 22233888's `error_rate` and degraded
+fractions exactly, so the matrix is the only field that differs from that fit.
+
+| from → to | A | C | G | T |
+|---|---|---|---|---|
+| **A** | — | 0.392 | 0.310 | 0.299 |
+| **C** | 0.437 | — | 0.227 | 0.337 |
+| **G** | 0.344 | 0.216 | — | 0.440 |
+| **T** | 0.295 | 0.311 | 0.395 | — |
+
+**Masking.** 50,240,073 of 418,177,394 mismatches (12.01%) sat at the sample's own variant
+positions and were left out. They were HG002's variants, not sequencing errors: masking them
+lowered the transition share of every row by about 0.04, the direction a Ti/Tv 2.1 germline
+contribution predicts.
+
+**Strand symmetry, which the fit is not told about.** Reads align to both strands, so an
+error profile should equal its own reverse complement. Every pair agrees to within 0.007
+(A→C 0.392 / T→G 0.395, C→A 0.437 / G→T 0.440), and a test holds it to 0.015. The largest
+substitutions are C→A and G→T.
+
+**Not masked:** HG002 variants outside GIAB's high-confidence regions, which the truth VCF
+does not list. Their share is unmeasured; measuring it needs the BAM mismatch count
+restricted to a BED, which the fitter does not yet support.
+
+The matrix it replaces is NEAT2's `SSE_PROB` (see above). That one is not strand symmetric,
+for example C→T 0.210 against G→A 0.375, and it remains the fallback for a fit without a BAM.
 
 ### Shape
 

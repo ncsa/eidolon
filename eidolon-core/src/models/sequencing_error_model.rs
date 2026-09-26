@@ -618,6 +618,40 @@ mod tests {
         );
     }
 
+    /// The shipped substitution matrix is fitted from HG002's BAM with the sample's own GIAB
+    /// variants masked out (#752, job 22447983: 50,240,073 of 418,177,394 mismatches masked).
+    ///
+    /// Checked by a property the fit knows nothing about: reads align to both strands, so a
+    /// sequencing-error profile is its own reverse complement. X->Y must match comp(X)->comp(Y)
+    /// in all six pairs. The fit agrees to within 0.007; the tolerance is 0.015. The matrix it
+    /// replaced differed by 0.165 on C->T against G->A.
+    #[test]
+    fn the_shipped_substitution_matrix_is_strand_symmetric() {
+        use crate::structs::nucleotides::Nucleotide::{A, C, G, T};
+        let model = SequencingErrorModel::default().unwrap();
+        let tm = model.transition_distros();
+        let p = |from: Nucleotide, to: Nucleotide| -> f64 {
+            let cum = tm[&from].weights().unwrap();
+            let i = tm[&from]
+                .values()
+                .unwrap()
+                .iter()
+                .position(|n| *n == to)
+                .unwrap();
+            if i == 0 { cum[0] } else { cum[i] - cum[i - 1] }
+        };
+        for b in [A, C, G, T] {
+            assert_eq!(p(b, b), 0.0, "{b:?} row can draw itself");
+        }
+        for (x, y) in [(A, C), (A, G), (A, T), (C, A), (C, G), (C, T)] {
+            let (fwd, rev) = (p(x, y), p(x.complement(), y.complement()));
+            assert!(
+                (fwd - rev).abs() < 0.015,
+                "{x:?}->{y:?} is {fwd:.4} but its reverse complement is {rev:.4}"
+            );
+        }
+    }
+
     /// The shipped asset, pinned BY DIGEST.
     ///
     /// `the_shipped_default_is_the_hg002_fit` checks the model's metadata — read length,
@@ -633,10 +667,11 @@ mod tests {
         use sha2::{Digest, Sha256};
         let got = format!("{:x}", Sha256::digest(DEFAULT_MODEL_FILE));
         assert_eq!(
-            got, "824c8c5d957dab862e52369e485daa733fa02222d856f38632b6b63476f1bc6c",
+            got, "292bfb36dcd360cd8b0dd2282e676f6875cdb4bac661a5bc1a222a48cb1d3bd2",
             "the shipped model asset is not the one fitted from GIAB HG002 \
-             (job 22233888). If the replacement is intentional, update this digest AND the \
-             provenance block in model_data/README.md in the same commit."
+             (quality: job 22233888; substitution matrix: job 22447983). If the replacement is \
+             intentional, update this digest AND the provenance block in model_data/README.md \
+             in the same commit."
         );
     }
 
@@ -774,10 +809,10 @@ mod tests {
             [0.3754 / 0.9999, 0.6109 / 0.9999, 0.6109 / 0.9999, 1.0],
             [0.2505 / 0.9999, 0.5057 / 0.9999, 1.0, 1.0],
         ];
-        for (name, model) in [
-            ("default()", &default_model),
-            ("from_raw_data()", &fitted_model),
-        ] {
+        // The matrix gen-seq-error-model falls back on when fitted without bam_file or
+        // transition_matrix_file. The shipped default() no longer carries it: its matrix is
+        // fitted from HG002 (see the_shipped_substitution_matrix_is_strand_symmetric).
+        for (name, model) in [("from_raw_data()", &fitted_model)] {
             for (base, expected) in ALLOWED_NUCS.iter().zip(expected_matrix_cdf) {
                 assert_distribution(
                     &model.transition_distros[base],
