@@ -432,6 +432,49 @@ fn write_test_bam_with_tlens(
     }
 }
 
+/// Unpaired reads of `read_len` tiled across the contig at `depth`, so every base is covered.
+fn write_tiled_bam(path: &Path, contig: &[u8], contig_len: usize, read_len: usize, depth: usize) {
+    use noodles::bam;
+    use noodles::core::Position;
+    use noodles::sam::{
+        self as sam,
+        alignment::{
+            RecordBuf,
+            io::Write as _,
+            record::{
+                Flags, MappingQuality,
+                cigar::{Op, op::Kind},
+            },
+            record_buf::{Cigar, Sequence},
+        },
+        header::record::value::{Map, map::ReferenceSequence},
+    };
+    let header = sam::Header::builder()
+        .add_reference_sequence(
+            contig.to_vec(),
+            Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(contig_len).unwrap()),
+        )
+        .build();
+    let mut writer = bam::io::Writer::new(fs::File::create(path).unwrap());
+    writer.write_header(&header).unwrap();
+    let mut start = 0;
+    while start < contig_len {
+        let len = read_len.min(contig_len - start);
+        let cigar: Cigar = [Op::new(Kind::Match, len)].into_iter().collect();
+        for _ in 0..depth {
+            let mut r = RecordBuf::default();
+            *r.flags_mut() = Flags::empty();
+            *r.cigar_mut() = cigar.clone();
+            *r.reference_sequence_id_mut() = Some(0);
+            *r.alignment_start_mut() = Position::new(start + 1);
+            *r.sequence_mut() = Sequence::from(vec![b'A'; len]);
+            *r.mapping_quality_mut() = Some(MappingQuality::try_from(30u8).unwrap());
+            writer.write_alignment_record(&header, &r).unwrap();
+        }
+        start += read_len;
+    }
+}
+
 /// `gen-gc-bias-model` walks the reference in windows, accumulates per-GC%
 /// mean coverage, and writes a 101-bin weight vector. With uniform coverage
 /// (one unpaired read per base across the full contig), all bins should
@@ -441,12 +484,10 @@ fn write_test_bam_with_tlens(
 fn gc_bias_model_matches_baseline() {
     let tmp = tempfile::tempdir().unwrap();
     let bam = tmp.path().join("input.bam");
-    // H1N1_HA is 1701 bp. Write 5 unpaired reads stacked at position 1 — this
-    // produces flat coverage across the first 100 bp of the contig only, but
-    // that's enough for `min_windows_per_bin=1` to populate the model. Real
-    // BAMs would obviously cover more, but model fitting is deterministic on
-    // input regardless.
-    write_test_bam(&bam, b"H1N1_HA", 1701, 0, 0, 100, 5);
+    // H1N1_HA is 1701 bp, tiled end to end at depth 5 so coverage really is uniform. (It
+    // used to stack every read at position 1, covering 100 bp: the baseline then pinned one
+    // bin at 16.0 and the rest at 0.0, and a median-based fit refuses a mostly uncovered BAM.)
+    write_tiled_bam(&bam, b"H1N1_HA", 1701, 100, 5);
     let out = tmp.path().join("gc.json.gz");
     let yaml = write_temp_yaml(&format!(
         "reference: {}\nbam_file: {}\noutput_file: {}\noverwrite_output: true\n\
@@ -517,7 +558,7 @@ fn seq_error_model_matches_baseline() {
 fn gen_bam_models_gc_bias_byte_equal_to_standalone() {
     let tmp = tempfile::tempdir().unwrap();
     let bam = tmp.path().join("input.bam");
-    write_test_bam(&bam, b"H1N1_HA", 1701, 0, 0, 100, 5);
+    write_tiled_bam(&bam, b"H1N1_HA", 1701, 100, 5);
 
     let unified_out = tmp.path().join("gc_unified.json.gz");
     let unified_yaml = write_temp_yaml(&format!(

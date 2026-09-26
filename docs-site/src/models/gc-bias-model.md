@@ -1,5 +1,5 @@
 # Generating a GC Bias Model
-`eidolon` can learn a GC bias model from a reference FASTA and an aligned BAM file using the `eidolon gen-gc-bias-model` subcommand. It walks the BAM once to accumulate per-base reference coverage, tiles the reference in fixed-size windows, computes the GC% of each window, looks up the mean coverage over that window, and accumulates the data into a 101-bin weight table (one bin per integer GC percentage, 0–100%). The resulting model can be passed to `gen-reads` to make fragment start positions favour regions whose GC content matches the coverage bias observed in your data.
+`eidolon` can learn a GC bias model from a reference FASTA and an aligned BAM file using the `eidolon gen-gc-bias-model` subcommand. It walks the BAM once to accumulate per-base reference coverage, tiles the reference in fixed-size windows, computes the GC% of each window, looks up the mean coverage over that window, and builds a 101-bin weight table (one bin per integer GC percentage, 0–100%). Each bin's weight is its **median** window coverage divided by the median over all fitted windows. The median is used because a few pileup windows (collapsed repeats) can move a bin's mean arbitrarily far, and a simulator working from a single-copy reference cannot reproduce them. Every fit also writes `<output_file>.bins.tsv`, listing each bin's window count, median, mean, weight, and whether the weight was fitted or interpolated. The resulting model can be passed to `gen-reads` to make fragment start positions favour regions whose GC content matches the coverage bias observed in your data.
 
 ```bash
 $ eidolon gen-gc-bias-model -c gen_gc_bias_model_config.yml
@@ -42,8 +42,9 @@ window_size: 100
 # Default: window_size
 window_stride: 100
 
-# Bins with fewer windows than this receive a neutral weight of 1.0 rather than
-# a learned weight. Increase this to require more evidence before trusting a bin.
+# Bins with fewer windows than this are not fitted from their own windows: they take the
+# weight interpolated between the nearest fitted bins, or the nearest fitted bin's weight
+# past either end. Increase this to require more evidence before trusting a bin.
 # Default: 10
 min_windows_per_bin: 10
 ```
@@ -54,7 +55,7 @@ min_windows_per_bin: 10
 
 **Long reads:** Set `window_size` to approximately your typical read length (e.g. 5000–50000 for ONT or PacBio). Larger windows mean fewer windows per contig and faster model building. Non-overlapping windows (`window_stride: window_size`) are recommended so each observation is independent.
 
-**If the model has no effect in gen-reads:** If every GC% bin in your reference has fewer observations than `min_windows_per_bin`, all weights will be neutral (1.0) and no bias will be applied. This is logged as a warning. To diagnose, lower `min_windows_per_bin` or increase the region covered (use a larger reference or remove the BED restriction).
+**If the model has no effect in gen-reads:** If every GC% bin in your reference has fewer observations than `min_windows_per_bin`, all weights will be neutral (1.0) and no bias will be applied. Soft-masked (lowercase) reference bases are counted as the bases they are. A BAM that covers only part of the reference, such as an exome or a panel, is refused when the median window has no coverage: set `bed_file` to the regions it covers. This is logged as a warning. To diagnose, lower `min_windows_per_bin` or increase the region covered (use a larger reference or remove the BED restriction).
 
 ## Using the model in gen-reads
 
