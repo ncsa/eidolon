@@ -70,7 +70,8 @@ impl NucleotideSelector {
 pub enum Nucleotide {
     // A, C, G, T is the canonical order inherited from NEAT2, and every table indexed
     // by base assumes it. The discriminants match `ALLOWED_NUCS` and the `usize`
-    // conversions below, so `as usize` and `usize::from` agree for every base.
+    // conversions below, so `as usize` and `usize::from` agree for every base. X is the
+    // one exception: it is buffer filler, not a base, and `usize::from(X)` is 4.
     A = 0,
     C = 1,
     G = 2,
