@@ -46,4 +46,14 @@ pub enum GenMutationModelError {
     MutModelError(#[from] MutationModelError),
     #[error("Transition matrix error: {0}")]
     TransitionMatrixError(#[from] TransitionMatrixError),
+    #[error(
+        "The VCF has {counted} SNP(s) but none could be used: {ref_mismatch} did not match \
+         the reference base and {edge} were at a contig edge. A VCF called against a \
+         different reference build produces this. No model was written."
+    )]
+    NoUsableSnps {
+        counted: usize,
+        ref_mismatch: usize,
+        edge: usize,
+    },
 }
