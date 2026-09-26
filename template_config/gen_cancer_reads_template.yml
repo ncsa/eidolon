@@ -22,7 +22,7 @@ purity: 0.5             # tumor cell fraction, strictly in (0, 1):
                         #   tumor pass = purity * total, normal pass = the rest
 
 # ── Reads ─────────────────────────────────────────────────────────────────
-read_len: 151
+read_len: 250          # the shipped quality model's fitted length; another length rescales it
 paired_ended: true
 fragment_mean: 350      # required when paired_ended
 fragment_st_dev: 50     # required when paired_ended

@@ -72,7 +72,9 @@ impl Default for CancerConfig {
             output_prefix: "neat_cancer".to_string(),
             total_coverage: 30,
             purity: 0.5,
-            read_len: 151,
+            // gen-reads' default, which matches the shipped quality model's fitted length.
+            // Taken from there, not restated, so the two commands cannot drift (#754).
+            read_len: RunConfiguration::default().read_len,
             paired_ended: false,
             fragment_mean: None,
             fragment_st_dev: None,
@@ -511,6 +513,25 @@ mod tests {
         );
         s.insert("output_dir".into(), Value::String("/tmp".into()));
         s
+    }
+
+    // #754. The two commands share the shipped quality model, so an omitted read_len must
+    // mean the same length in both. gen-cancer-reads kept 151 when gen-reads moved to 250 to
+    // match the model, which rescaled the model on every cancer run that took the default.
+    #[test]
+    fn an_omitted_read_len_is_the_gen_reads_default() {
+        let cfg = CancerConfig::from_scrape(base_scrape()).unwrap();
+        let gen_reads_default = RunConfiguration::default().read_len;
+        assert_eq!(cfg.read_len, gen_reads_default);
+        assert_eq!(cfg.shared_run_config().read_len, gen_reads_default);
+    }
+
+    #[test]
+    fn an_explicit_read_len_is_kept() {
+        let mut scrape = base_scrape();
+        scrape.insert("read_len".into(), Value::Number(151.into()));
+        let cfg = CancerConfig::from_scrape(scrape).unwrap();
+        assert_eq!(cfg.shared_run_config().read_len, 151);
     }
 
     #[test]

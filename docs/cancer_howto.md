@@ -126,7 +126,7 @@ output_dir: ./out
 output_prefix: tumor70
 total_coverage: 60
 purity: 0.7
-read_len: 151
+read_len: 250
 paired_ended: true
 fragment_mean: 350
 fragment_st_dev: 50
