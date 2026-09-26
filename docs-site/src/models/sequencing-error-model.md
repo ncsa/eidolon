@@ -60,7 +60,7 @@ transition_matrix_file: /path/to/matrix.tsv
 ## SNP transition matrix priority
 1. `transition_matrix_file` (explicit TSV) — highest priority
 2. `bam_file` (inferred from MD-tagged BAM mismatches)
-3. Built-in default matrix (inherited from Python NEAT) — used when neither is provided
+3. The shipped default matrix (fitted from GIAB HG002 with its own variants masked; provenance in `model_data/README.md`) — used when neither is provided
 
 Supplying `bam_file` is a request to *fit* the matrix from data, so if the BAM yields no
 read-vs-reference mismatches, eidolon **errors out** instead of falling back to the default. A

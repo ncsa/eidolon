@@ -2246,20 +2246,14 @@ mod tests {
     /// transcribed constant did not, the check would compare against a value that is no
     /// longer the default — and could pass while the built matrix IS the new default.
     ///
-    /// DO NOT reach for `TransitionMatrix::default()`. Two differently-valued defaults share
-    /// that name: `TransitionMatrix::default()` is NEAT 2.0's *mutation* matrix (A row
-    /// 0.0/0.1695/0.6878/0.1427), while the sequencing-error default is a separate literal
-    /// inside `SequencingErrorModel` (A row 0.0/0.4918/0.3377/0.1705). Deriving from the
-    /// wrong one makes this test fail against correct code, which is how the distinction was
-    /// found.
+    /// DO NOT reach for `TransitionMatrix::default()`. That is NEAT 2.0's *mutation* matrix
+    /// (A row 0.0/0.1695/0.6878/0.1427), a different thing from the sequencing-error matrix.
+    /// Deriving from it makes this test fail against correct code, which is how the
+    /// distinction was found.
     ///
-    /// Residual, pre-existing: that literal appears TWICE in `sequencing_error_model.rs`
-    /// (`default()` and `from_raw_data`'s `None` arm). This reads the former while the
-    /// runner's fallback path uses the latter, so a drift between the two copies would slip
-    /// past. They are identical today.
     /// The A row of the matrix a fit falls back on without `bam_file` or
-    /// `transition_matrix_file`. Built the way the runner builds it, not taken from the
-    /// shipped default(), whose matrix is fitted from HG002 (#752) and is a different matrix.
+    /// `transition_matrix_file`, built the way the runner builds it. Since #752 that is the
+    /// shipped default's HG002 matrix, read from the same file.
     fn default_a_row_cdf() -> [f64; 4] {
         let m = SequencingErrorModel::from_raw_data(
             0.005,

@@ -81,7 +81,7 @@ defaults hardcoded in its sequencing error model.
 | `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
 | `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
 | insertion base composition | uniform over ACGT | `SIE_INS_NUCL` |
-| substitution transitions | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` — now only the fallback for a fit without `bam_file`; the shipped matrix is fitted (below) |
+| substitution transitions | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` — no longer used; the matrix is fitted (below) |
 
 **Two of these were initially mistranslated in the Rust port.** The insertion fraction was
 used as the indel rate, the real indel rate was dropped, and the insertion split was
@@ -200,7 +200,9 @@ does not list. Their share is unmeasured; measuring it needs the BAM mismatch co
 restricted to a BED, which the fitter does not yet support.
 
 The matrix it replaces is NEAT2's `SSE_PROB` (see above). That one is not strand symmetric,
-for example C→T 0.210 against G→A 0.375, and it remains the fallback for a fit without a BAM.
+for example C→T 0.210 against G→A 0.375. This matrix is also what `gen-seq-error-model`
+writes into a model fitted without `bam_file` or `transition_matrix_file`, read from this
+same file so the two cannot drift.
 
 ### Shape
 

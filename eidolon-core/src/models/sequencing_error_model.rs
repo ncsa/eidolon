@@ -238,14 +238,11 @@ impl SequencingErrorModel {
         quality_score_model: QualityScoreModel,
         transition_matrix: Option<TransitionMatrix>,
     ) -> Result<Self, SeqModelError> {
+        // No matrix source: the shipped default's own matrix, fitted from HG002 (#752), read
+        // from the same file so the two cannot drift.
         let transition_distros = match transition_matrix {
             Some(tm) => tm,
-            None => TransitionMatrix::from(
-                [0.0, 0.4918, 0.3377, 0.1705],
-                [0.5238, 0.0, 0.2661, 0.2101],
-                [0.3754, 0.2355, 0.0, 0.389],
-                [0.2505, 0.2552, 0.4942, 0.0],
-            )?,
+            None => Self::default()?.transition_distros,
         };
         let (default_ins_distr, default_del_distr) = indel_error_length_distributions()?;
         Ok(SequencingErrorModel {
@@ -652,6 +649,24 @@ mod tests {
         }
     }
 
+    /// A fit without `bam_file` or `transition_matrix_file` carries the shipped default's
+    /// matrix, the HG002 fit, rather than a second, older one. Two components that must agree,
+    /// so they are compared directly, row by row.
+    #[test]
+    fn a_fit_without_a_matrix_source_carries_the_shipped_matrix() {
+        let shipped = SequencingErrorModel::default().unwrap();
+        let fitted =
+            SequencingErrorModel::from_raw_data(0.005, QualityScoreModel::default().unwrap(), None)
+                .unwrap();
+        for base in ALLOWED_NUCS {
+            assert_eq!(
+                fitted.transition_distros()[&base].weights().unwrap(),
+                shipped.transition_distros()[&base].weights().unwrap(),
+                "row {base:?} of the no-BAM fallback differs from the shipped matrix"
+            );
+        }
+    }
+
     /// The shipped asset, pinned BY DIGEST.
     ///
     /// `the_shipped_default_is_the_hg002_fit` checks the model's metadata — read length,
@@ -803,25 +818,9 @@ mod tests {
             );
         }
 
-        let expected_matrix_cdf = [
-            [0.0, 0.4918, 0.8295, 1.0],
-            [0.5238, 0.5238, 0.7899, 1.0],
-            [0.3754 / 0.9999, 0.6109 / 0.9999, 0.6109 / 0.9999, 1.0],
-            [0.2505 / 0.9999, 0.5057 / 0.9999, 1.0, 1.0],
-        ];
-        // The matrix gen-seq-error-model falls back on when fitted without bam_file or
-        // transition_matrix_file. The shipped default() no longer carries it: its matrix is
-        // fitted from HG002 (see the_shipped_substitution_matrix_is_strand_symmetric).
-        for (name, model) in [("from_raw_data()", &fitted_model)] {
-            for (base, expected) in ALLOWED_NUCS.iter().zip(expected_matrix_cdf) {
-                assert_distribution(
-                    &model.transition_distros[base],
-                    ALLOWED_NUCS.to_vec(),
-                    &expected,
-                    &format!("{name}: sequencing-error transition matrix row {base:?}"),
-                );
-            }
-        }
+        // The substitution matrix is not pinned here: it is no longer a NEAT2 constant. The
+        // shipped default and the no-BAM fallback both carry the HG002 fit
+        // (a_fit_without_a_matrix_source_carries_the_shipped_matrix).
     }
 
     #[test]
