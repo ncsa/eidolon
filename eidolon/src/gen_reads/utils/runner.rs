@@ -155,6 +155,21 @@ pub fn run_neat(
     if quality_score_model_r2.is_some() {
         info!("Sequencing error model carries a separate R2 quality population; using it for R2");
     }
+    // A model fitted at one read length is stretched or compressed onto another, as NEAT2 did
+    // and warned about (#742). The measured cost is in model_data/README.md.
+    let fitted_len = quality_score_model.assumed_read_length;
+    if config.long_reads {
+        warn!(
+            "Long-read mode: the quality model was fitted at {fitted_len} bp, and its per-cycle \
+             profile is rescaled to each read's length."
+        );
+    } else if fitted_len != config.read_len {
+        warn!(
+            "The quality model was fitted at {fitted_len} bp and reads are {} bp; rescaling \
+             its per-cycle profile to fit. Fit a model at {} bp to use one as measured.",
+            config.read_len, config.read_len
+        );
+    }
 
     let gc_bias_model = match &config.gc_bias_model {
         Some(path) => {
