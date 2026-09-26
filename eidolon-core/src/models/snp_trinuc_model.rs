@@ -7,13 +7,13 @@
 use crate::models::lib::{model_reader, model_writer};
 use crate::rng::NeatRngError;
 use crate::structs::distributions::{DiscreteDistribution, DistributionErrors};
-use crate::structs::nucleotides::Nucleotide;
 use crate::structs::nucleotides::Nucleotide::{A, C, G, N, T};
+use crate::structs::nucleotides::{ALLOWED_NUCS, Nucleotide};
 use crate::structs::transition_matrix::{TransitionMatrix, TransitionMatrixError};
 use flate2::read::GzDecoder;
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use log::debug;
+use log::{debug, info};
 use serde;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -267,16 +267,39 @@ impl SnpTrinucModel {
             }
         }
 
+        // A row with no observed SNPs takes the matching row of the default matrix (#760).
+        // Building it from all-zero weights would put every draw on A. A context with no
+        // observations at all therefore gets the whole default matrix, as before.
+        let default = TransitionMatrix::default()?;
+        let mut unobserved_rows = 0usize;
         let mut trinuc_distros: HashMap<TrinucFrame, TransitionMatrix> = HashMap::new();
         for context in &all_contexts {
             let w = accum[context];
-            let has_data = w.iter().any(|row| row.iter().sum::<f64>() > 0.0);
-            let matrix = if has_data {
-                TransitionMatrix::from(w[0], w[1], w[2], w[3])?
-            } else {
-                TransitionMatrix::default()?
+            let mut row = |i: usize| -> Result<DiscreteDistribution<Nucleotide>, SnpTrinucError> {
+                if w[i].iter().sum::<f64>() > 0.0 {
+                    Ok(DiscreteDistribution::new(
+                        &w[i].to_vec(),
+                        &Vec::from(ALLOWED_NUCS),
+                    )?)
+                } else {
+                    unobserved_rows += 1;
+                    Ok(default[i].clone())
+                }
+            };
+            let matrix = TransitionMatrix {
+                a: row(0)?,
+                c: row(1)?,
+                g: row(2)?,
+                t: row(3)?,
             };
             trinuc_distros.insert(*context, matrix);
+        }
+        if unobserved_rows > 0 {
+            info!(
+                "SNP trinucleotide model: {unobserved_rows} of {} context rows had no observed \
+                 SNPs and use the default transition row",
+                all_contexts.len() * 4
+            );
         }
 
         // Weight each of the 64 frames by its observed mutation frequency
@@ -429,6 +452,69 @@ mod tests {
             (total - 1.0).abs() < 1e-6,
             "weights should be normalized, sum={total}"
         );
+    }
+
+    /// Per-alt probabilities of one row, recovered from its cumulative weights.
+    fn row_probs(matrix: &TransitionMatrix, from: Nucleotide) -> Vec<f64> {
+        let cum = matrix[&from].weights().unwrap();
+        let mut prev = 0.0;
+        cum.iter()
+            .map(|&c| {
+                let p = c - prev;
+                prev = c;
+                p
+            })
+            .collect()
+    }
+
+    /// A model fitted from one SNP, ACA→ATA: one observed row (C) in one context (ANA).
+    fn single_snp_model() -> SnpTrinucModel {
+        let mut transitions = HashMap::new();
+        transitions.insert(
+            (TrinucFrame::from((A, C, A)), TrinucFrame::from((A, T, A))),
+            1.0,
+        );
+        SnpTrinucModel::from_raw_data(HashMap::new(), transitions).unwrap()
+    }
+
+    // #760. A context with some rows observed and others not must not let an empty row
+    // become an all-to-A (or A→A) distribution. An empty row takes the matching row of
+    // the default matrix, the same prior a fully unobserved context already gets.
+    #[test]
+    fn an_unobserved_row_in_an_observed_context_takes_the_default_row() {
+        let model = single_snp_model();
+        let ana = &model.trinuc_distros[&TrinucFrame::from((A, N, A))];
+        let default = TransitionMatrix::default().unwrap();
+        for from in [A, G, T] {
+            assert_eq!(
+                ana[&from].weights().unwrap(),
+                default[&from].weights().unwrap(),
+                "empty {from:?} row in ANA should equal the default {from:?} row"
+            );
+        }
+    }
+
+    #[test]
+    fn an_observed_row_is_left_exactly_as_fitted() {
+        let model = single_snp_model();
+        let ana = &model.trinuc_distros[&TrinucFrame::from((A, N, A))];
+        // Only C→T was observed, so every draw from the C row must be T.
+        assert_eq!(row_probs(ana, C), vec![0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn no_row_of_a_sparse_fit_can_draw_a_self_transition() {
+        let model = single_snp_model();
+        assert_eq!(model.trinuc_distros.len(), 16, "all 16 contexts present");
+        let mut rows_checked = 0;
+        for (context, matrix) in &model.trinuc_distros {
+            for (i, from) in [A, C, G, T].into_iter().enumerate() {
+                let p = row_probs(matrix, from);
+                assert_eq!(p[i], 0.0, "{context} row {from:?} can draw itself: {p:?}");
+                rows_checked += 1;
+            }
+        }
+        assert_eq!(rows_checked, 64);
     }
 
     #[test]
