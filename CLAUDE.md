@@ -428,6 +428,19 @@ code, and renaming them would ripple through the sbatch and its test suite for n
 - Auto-generated code-intelligence MCP guidance. Genuinely useful for impact analysis
   when editing Rust **symbols**; treat its "MUST" language as scoped to symbol edits —
   it does not apply to shell scripts, docs, or test-only changes.
+- **A help, not a gate.** When the MCP tools are not loaded, or the CLI cannot pin down a
+  symbol (it has no file filter, so four `from_raw_data` functions come back "ambiguous"),
+  use the compiler and grep instead and say which was used. A probe build is often the
+  stronger evidence: adding a data-carrying variant to an enum makes every `as` cast on
+  it a compile error, which no graph query can promise.
+- **Re-index with `npx gitnexus analyze --skip-agents-md`.** A plain `analyze` rewrites
+  the symbol counts in the block below, leaving a diff in CLAUDE.md and AGENTS.md after
+  every refresh. `--no-stats` is meant to prevent that but has no effect in 1.6.4, even
+  with `--force` (checked 2026-09-25).
+- **The MCP server is configured per machine.** `.mcp.json` is gitignored, so on a fresh
+  checkout run `claude mcp add gitnexus -s project -- npx -y gitnexus@latest mcp` and
+  restart. Until 2026-09-25 the only registration was under the pre-rename `rusty-neat`
+  path, so the tools never loaded in eidolon.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
