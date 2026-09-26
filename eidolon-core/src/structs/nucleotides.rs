@@ -68,16 +68,19 @@ impl NucleotideSelector {
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, Serialize, Deserialize)]
 pub enum Nucleotide {
+    // A, C, G, T is the canonical order inherited from NEAT2, and every table indexed
+    // by base assumes it. The discriminants match `ALLOWED_NUCS` and the `usize`
+    // conversions below, so `as usize` and `usize::from` agree for every base.
     A = 0,
     C = 1,
-    T = 2,
-    G = 3,
+    G = 2,
+    T = 3,
     N = 4,
-    X = 5, // This is purely used to fill out buffers when writing files.
-    Maskeda,
-    Maskedc,
-    Maskedg,
-    Maskedt,
+    Maskeda = 5,
+    Maskedc = 6,
+    Maskedg = 7,
+    Maskedt = 8,
+    X = 9, // This is purely used to fill out buffers when writing files.
 }
 
 impl fmt::Display for Nucleotide {
@@ -264,6 +267,24 @@ pub fn sequence_array_to_string(input_array: &[Nucleotide]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discriminants_follow_the_canonical_acgt_order() {
+        for (slot, &base) in ALLOWED_NUCS.iter().enumerate() {
+            assert_eq!(base as usize, slot, "{base} discriminant");
+            assert_eq!(usize::from(base), slot, "usize::from({base})");
+            assert_eq!(Nucleotide::from(slot), base, "Nucleotide::from({slot})");
+        }
+        for base in [
+            Nucleotide::N,
+            Nucleotide::Maskeda,
+            Nucleotide::Maskedc,
+            Nucleotide::Maskedg,
+            Nucleotide::Maskedt,
+        ] {
+            assert_eq!(base as usize, usize::from(base), "{base:?}");
+        }
+    }
 
     #[test]
     fn test_get_unmasked_base() {

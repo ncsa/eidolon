@@ -117,15 +117,17 @@ impl MutationModel {
         let transition_matrix = if let Some(tm) = transition_matrix_override {
             tm
         } else {
+            // `TransitionMatrix::from` labels the four slots in ALLOWED_NUCS order
+            // (A, C, G, T). Rows and columns must be indexed in that same order.
             let mut temp_trans_matrix: [[f64; 4]; 4] = [[0.0; 4]; 4];
             for (key, value) in snp_transition_frequency {
-                temp_trans_matrix[key.0 as usize][key.1 as usize] = value;
+                temp_trans_matrix[usize::from(key.0)][usize::from(key.1)] = value;
             }
             TransitionMatrix::from(
-                temp_trans_matrix[Nucleotide::A as usize],
-                temp_trans_matrix[Nucleotide::C as usize],
-                temp_trans_matrix[Nucleotide::G as usize],
-                temp_trans_matrix[Nucleotide::T as usize],
+                temp_trans_matrix[usize::from(Nucleotide::A)],
+                temp_trans_matrix[usize::from(Nucleotide::C)],
+                temp_trans_matrix[usize::from(Nucleotide::G)],
+                temp_trans_matrix[usize::from(Nucleotide::T)],
             )?
         };
         // build transition matrices from data for snps and trinucs
@@ -572,6 +574,91 @@ mod tests {
         );
         let model = result.unwrap();
         assert_eq!(model.mutation_rate, 0.001);
+    }
+
+    /// Every alt column of the transition matrix must be labeled with the base
+    /// whose count produced it. Falsified by any cell whose probability does not
+    /// match the value supplied for that exact (ref, alt) pair -- in particular a
+    /// non-zero self-transition, which is not a mutation at all.
+    ///
+    /// Known answer: the supplied spectrum is the human one, so Ti/Tv is ~2.1 by
+    /// construction and computable without reference to what the code returns.
+    #[test]
+    fn the_transition_matrix_labels_each_alt_with_the_base_it_was_counted_for() {
+        let supplied: HashMap<(Nucleotide, Nucleotide), f64> = HashMap::from([
+            ((A, C), 0.17),
+            ((A, G), 0.69),
+            ((A, T), 0.14),
+            ((C, A), 0.16),
+            ((C, G), 0.17),
+            ((C, T), 0.67),
+            ((G, A), 0.67),
+            ((G, C), 0.17),
+            ((G, T), 0.16),
+            ((T, A), 0.14),
+            ((T, C), 0.69),
+            ((T, G), 0.17),
+        ]);
+        let model = MutationModel::from_raw_data(
+            0.001,
+            0.5,
+            vec![1.0, 0.0, 0.0],
+            supplied.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .expect("a full SNP spectrum should build");
+
+        let matrix = &model.statistical_models.transition_matrix;
+        let mut ti = 0.0;
+        let mut tv = 0.0;
+        let mut checked = 0usize;
+        for reference in [A, C, G, T] {
+            let row = &matrix[&reference];
+            let labels = row.values().unwrap();
+            let cumulative = row.weights().unwrap();
+            let total: f64 = [A, C, G, T]
+                .iter()
+                .filter_map(|alt| supplied.get(&(reference, *alt)))
+                .sum();
+            // The stored weights are a CDF over `labels`, so de-cumulate to
+            // recover each labeled cell's own probability.
+            let mut previous = 0.0;
+            for (label, edge) in labels.iter().zip(cumulative.iter()) {
+                let probability = edge - previous;
+                previous = *edge;
+                let expected = supplied.get(&(reference, *label)).copied().unwrap_or(0.0) / total;
+                assert!(
+                    (probability - expected).abs() < 1e-9,
+                    "{reference:?}->{label:?} carries {probability:.6}, but {expected:.6} was \
+                     supplied for that pair -- the alt columns are mislabeled"
+                );
+                checked += 1;
+                if reference == *label {
+                    continue;
+                }
+                let is_transition =
+                    matches!((reference, *label), (A, G) | (G, A) | (C, T) | (T, C));
+                if is_transition {
+                    ti += probability;
+                } else {
+                    tv += probability;
+                }
+            }
+        }
+        // Denominator: a per-cell assertion proves nothing if the loop skipped cells.
+        assert_eq!(checked, 16, "expected all 16 cells, examined {checked}");
+        assert!(
+            (ti / tv - 2.125).abs() < 0.05,
+            "Ti/Tv is {:.3}; the supplied human spectrum is 2.125, so the transition \
+             and transversion cells are not where they are labeled",
+            ti / tv
+        );
     }
 
     #[test]

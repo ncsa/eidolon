@@ -2662,7 +2662,7 @@ mod tests {
                 Nucleotide::A,
                 "A→A self-transition should be impossible"
             );
-            seen.insert(result as usize);
+            seen.insert(result);
         }
         assert_eq!(
             seen.len(),
