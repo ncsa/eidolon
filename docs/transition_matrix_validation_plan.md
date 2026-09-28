@@ -1,6 +1,16 @@
 # SNP transition matrix — validation status and Delta plan
 
-Status: **local tier complete; Delta tier specified and NOT yet run** (2026-08-12).
+Status: **local tier complete; aligner round trip run locally (2026-09-28); real-data tier
+NOT yet run.**
+
+**Round trip, run locally** (`eidolon/tests/transition_matrix_round_trip.rs`, release gate).
+An asymmetric matrix is planted (A→C 0.80, T→G 0.10). Reads are simulated on ecoli at 5x
+with `mutation_rate: 0`, aligned with bwa-mem2, and refitted through `bam_file:`. Every cell
+comes back within 0.007, from 228,326 mismatches. Generation applies substitution errors in
+reference orientation (R2 is generated forward, then reverse-complemented), which is the
+frame the BAM counter reads. A counter that complements reverse-strand reads fails the test:
+A→C 0.454, T→G off by 0.354. This covers steps 4–6 below for simulated reads. It does not
+cover step 1: whether a real BAM's mismatches are sequencing errors.
 
 Covers `gen-seq-error-model`'s `bam_file:` / `transition_matrix_file:` inputs — the
 BAM-derived SNP substitution matrix, which is one of the few model-builder capabilities
