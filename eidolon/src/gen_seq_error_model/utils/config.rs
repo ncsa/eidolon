@@ -58,6 +58,19 @@ pub struct RunConfiguration {
     /// cover are left out of the BAM-fitted transition matrix: they are variants, not
     /// sequencing errors. Requires bam_file.
     pub known_variants_vcf: Option<PathBuf>,
+    /// How `bam_file` fits the substitution matrix (#779). `overlap`, the default, counts
+    /// only where a fragment's two mates overlap and disagree, which cancels the sample's own
+    /// variants and library damage. `mismatch` counts every read-vs-reference mismatch.
+    pub bam_method: BamMethod,
+    /// Minimum MAPQ for a record to contribute to an overlap fit.
+    pub bam_min_mapq: u8,
+}
+
+/// See `RunConfiguration::bam_method`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BamMethod {
+    Overlap,
+    Mismatch,
 }
 
 impl RunConfiguration {
@@ -273,6 +286,27 @@ impl RunConfiguration {
             ));
         }
 
+        let bam_method = match scrape_config.get("bam_method").and_then(|v| v.as_str()) {
+            None | Some("overlap") => BamMethod::Overlap,
+            Some("mismatch") => BamMethod::Mismatch,
+            Some(other) => {
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "bam_method must be `overlap` or `mismatch`, got `{other}`"
+                )));
+            }
+        };
+        let bam_min_mapq = match scrape_config.get("bam_min_mapq") {
+            None => 20,
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| {
+                    GenSeqErrorModelError::ConfigurationError(format!(
+                        "bam_min_mapq must be an integer 0-255, got {v:?}"
+                    ))
+                })?,
+        };
+
         Ok(RunConfiguration {
             fastq_file,
             fastq_file_r2,
@@ -288,6 +322,8 @@ impl RunConfiguration {
             bam_file,
             transition_matrix_file,
             known_variants_vcf,
+            bam_method,
+            bam_min_mapq,
         })
     }
 }
@@ -307,6 +343,35 @@ mod tests {
         let p = dir.path().join("test.fastq");
         std::fs::write(&p, "@read1\nACGT\n+\nIIII\n").unwrap();
         p
+    }
+
+    #[test]
+    fn bam_method_defaults_to_overlap_and_refuses_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let base = format!(
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\nqual_offset: 33\n",
+            fastq.display(),
+            output.display()
+        );
+        let cfg = |extra: &str| {
+            RunConfiguration::from(&write_config(&format!("{base}{extra}")).path().to_path_buf())
+        };
+        let default = cfg("").unwrap();
+        assert_eq!(
+            (default.bam_method, default.bam_min_mapq),
+            (BamMethod::Overlap, 20)
+        );
+        assert_eq!(
+            cfg("bam_method: mismatch\n").unwrap().bam_method,
+            BamMethod::Mismatch
+        );
+        assert_eq!(cfg("bam_min_mapq: 5\n").unwrap().bam_min_mapq, 5);
+        assert!(
+            cfg("bam_method: pileup\n").is_err(),
+            "an unknown bam_method must be refused"
+        );
     }
 
     #[test]

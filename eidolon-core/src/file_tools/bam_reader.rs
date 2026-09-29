@@ -172,6 +172,19 @@ impl BamWalkFilter {
         }
     }
 
+    /// Mate-overlap fitting (#779): both mates mapped to the same contig, no duplicates or
+    /// QC failures, MAPQ above `min_mapq`.
+    pub fn for_overlaps(min_mapq: u8) -> Self {
+        Self {
+            min_mapq,
+            skip_flags: SKIP_FLAGS.union(Flags::DUPLICATE).union(Flags::QC_FAIL),
+            require_paired: true,
+            require_first_in_pair: false,
+            require_mate_mapped: true,
+            require_same_ref_as_mate: true,
+        }
+    }
+
     /// Matches the legacy `read_bam_transitions` filter: skip unmapped/secondary/
     /// supplementary only — no MAPQ filter, no pairing requirements.
     pub fn for_transitions() -> Self {
@@ -412,6 +425,206 @@ impl RecordObserver for TransitionObserver {
         }
         Ok(())
     }
+}
+
+/// What a mate-overlap fit saw (#779). Every category is reported so an exclusion is a number,
+/// not a silent drop.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct OverlapCounts {
+    /// Sequencing errors, `counts[reference base][erroneous base]`, ALLOWED_NUCS order.
+    pub counts: [[usize; 4]; 4],
+    /// Reference positions both mates of a fragment aligned a base to.
+    pub overlapped_bases: usize,
+    /// Overlapped positions where the two mates agree (variants included: both mates carry them).
+    pub agreements: usize,
+    /// Disagreements at a known-variant site, dropped: an error there can turn alt into ref.
+    pub masked: usize,
+    /// Disagreements where neither mate shows the reference base, dropped.
+    pub neither_reference: usize,
+    /// Kept records whose mate never arrived.
+    pub unpaired: usize,
+    /// `counts` split by the erroneous mate's sequencing cycle, in `OVERLAP_BINS` equal
+    /// fractions of read length. Overlaps sit at reads' 3' ends, so this is how to see whether
+    /// the spectrum changes along the read.
+    pub by_bin: [[[usize; 4]; 4]; OVERLAP_BINS],
+    /// Base observations per bin: each overlapped position counts once for each mate, in the
+    /// bin of that mate's cycle. The denominator for a per-bin error rate.
+    pub bin_bases: [usize; OVERLAP_BINS],
+}
+
+/// Read-position bins for `OverlapCounts::by_bin`.
+pub const OVERLAP_BINS: usize = 5;
+
+/// Counts sequencing errors where the two mates of a fragment overlap and disagree (#779).
+///
+/// Both mates read the same molecule, so a variant, a PCR error or damage already in the
+/// fragment shows identically in both reads; only sequencing errors make them differ. At a
+/// disagreement the mate that matches the reference is taken as right, and the other mate's
+/// base is the error. Pair with `BamWalkFilter::for_overlaps()`.
+#[derive(Debug, Default)]
+pub struct OverlapObserver {
+    pub counts: OverlapCounts,
+    mask: Option<KnownSites>,
+    contigs: Vec<String>,
+    /// Reads waiting for their mate, by name: their contig and aligned bases.
+    pending: HashMap<Vec<u8>, (usize, Vec<AlignedBase>)>,
+}
+
+/// One aligned base: 1-based reference position, the read's base, the reference base, and the
+/// read-position bin of its sequencing cycle.
+type AlignedBase = (usize, u8, u8, usize);
+
+/// A record's aligned (M/=/X) bases, with the reference base read from its MD tag. `None`
+/// when the record has no MD tag or no position.
+fn aligned_bases(record: &bam::Record) -> Result<Option<Vec<AlignedBase>>, BamReaderError> {
+    let md_bytes: Vec<u8> = match record.data().get(&Tag::MISMATCHED_POSITIONS) {
+        Some(Ok(Value::String(s))) => s.iter().copied().collect(),
+        _ => return Ok(None),
+    };
+    let mut ref_pos = match record.alignment_start() {
+        Some(Ok(p)) => usize::from(p),
+        _ => return Ok(None),
+    };
+    let sequence = record.sequence();
+    // A reverse-strand record stores its read reverse-complemented, so its first sequenced
+    // base (cycle 0) is the LAST one here.
+    let n = sequence.len();
+    let reverse = record.flags().is_reverse_complemented();
+    let bin = |read_pos: usize| {
+        let cycle = if reverse { n - 1 - read_pos } else { read_pos };
+        cycle * OVERLAP_BINS / n
+    };
+    let mut walker = MdWalker::new(parse_md(&md_bytes));
+    let mut read_pos = 0usize;
+    let mut out = Vec::with_capacity(n);
+    for op_result in record.cigar().iter() {
+        let op = op_result?;
+        let len = op.len();
+        match op.kind() {
+            CigarKind::Match | CigarKind::SequenceMatch | CigarKind::SequenceMismatch => {
+                for _ in 0..len {
+                    let mismatch = walker.next_alignment_base();
+                    if let Some(read_b) = sequence.get(read_pos) {
+                        out.push((ref_pos, read_b, mismatch.unwrap_or(read_b), bin(read_pos)));
+                    }
+                    read_pos += 1;
+                    ref_pos += 1;
+                }
+            }
+            CigarKind::Insertion | CigarKind::SoftClip => read_pos += len,
+            CigarKind::Deletion | CigarKind::Skip => {
+                walker.skip_deletion();
+                ref_pos += len;
+            }
+            CigarKind::HardClip | CigarKind::Pad => {}
+        }
+    }
+    Ok(Some(out))
+}
+
+impl OverlapObserver {
+    /// Compares two mates' aligned bases over the positions both cover.
+    fn compare(&mut self, contig: usize, a: &[AlignedBase], b: &[AlignedBase]) {
+        let sites = self
+            .mask
+            .as_ref()
+            .and_then(|m| self.contigs.get(contig).and_then(|c| m.get(c)));
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            let ((pa, ra, refa, bin_a), (pb, rb, _, bin_b)) = (a[i], b[j]);
+            if pa < pb {
+                i += 1;
+                continue;
+            }
+            if pb < pa {
+                j += 1;
+                continue;
+            }
+            i += 1;
+            j += 1;
+            let ia: usize = Nucleotide::from(ra as char).into();
+            let ib: usize = Nucleotide::from(rb as char).into();
+            let ir: usize = Nucleotide::from(refa as char).into();
+            if ia >= 4 || ib >= 4 || ir >= 4 {
+                continue; // an N in either read or the reference says nothing
+            }
+            self.counts.overlapped_bases += 1;
+            self.counts.bin_bases[bin_a] += 1;
+            self.counts.bin_bases[bin_b] += 1;
+            if ia == ib {
+                self.counts.agreements += 1;
+            } else if sites.is_some_and(|s| s.contains(&pa)) {
+                self.counts.masked += 1;
+            } else if ia == ir {
+                self.counts.counts[ir][ib] += 1;
+                self.counts.by_bin[bin_b][ir][ib] += 1;
+            } else if ib == ir {
+                self.counts.counts[ir][ia] += 1;
+                self.counts.by_bin[bin_a][ir][ia] += 1;
+            } else {
+                self.counts.neither_reference += 1;
+            }
+        }
+    }
+}
+
+impl OverlapObserver {
+    pub fn with_mask(mask: KnownSites) -> Self {
+        Self {
+            mask: Some(mask),
+            ..Self::default()
+        }
+    }
+}
+
+impl RecordObserver for OverlapObserver {
+    fn on_start(&mut self, header: &sam::Header) -> Result<(), BamReaderError> {
+        self.contigs = header
+            .reference_sequences()
+            .keys()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        Ok(())
+    }
+
+    fn observe(&mut self, record: &bam::Record) -> Result<(), BamReaderError> {
+        let (Some(name), Some(Ok(contig))) = (record.name(), record.reference_sequence_id()) else {
+            return Ok(());
+        };
+        let Some(bases) = aligned_bases(record)? else {
+            return Ok(());
+        };
+        let key: &[u8] = name.as_ref();
+        match self.pending.remove(key) {
+            Some((mate_contig, mate)) if mate_contig == contig => {
+                self.compare(contig, &mate, &bases)
+            }
+            Some(_) => {} // mates on different contigs share no positions
+            None => {
+                self.pending.insert(key.to_vec(), (contig, bases));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mate-overlap substitution counts for a BAM (#779), leaving out `mask`'s positions.
+pub fn read_bam_overlap_transitions(
+    path: &PathBuf,
+    mask: Option<KnownSites>,
+    min_mapq: u8,
+) -> Result<OverlapCounts, BamReaderError> {
+    let mut obs = match mask {
+        Some(m) => OverlapObserver::with_mask(m),
+        None => OverlapObserver::default(),
+    };
+    walk_bam(
+        path,
+        &BamWalkFilter::for_overlaps(min_mapq),
+        &mut [&mut obs],
+    )?;
+    obs.counts.unpaired = obs.pending.len();
+    Ok(obs.counts)
 }
 
 /// Accumulates per-base reference coverage from aligned records.
@@ -919,6 +1132,147 @@ mod tests {
             "the T row must total exactly the two real T->G events; \
              extra counts mean deleted or inserted bases leaked in"
         );
+    }
+
+    /// 40 bp reference for the overlap fixtures: A x5, C x5, G x5, T x5, twice.
+    const OVERLAP_REF: &[u8] = b"AAAAACCCCCGGGGGTTTTTAAAAACCCCCGGGGGTTTTT";
+
+    /// Paired, all-M records against OVERLAP_REF, with MD computed from the reference.
+    /// Each entry is `(name, flags, 1-based start, sequence, mate start)`.
+    fn write_pair_bam(path: &std::path::PathBuf, records: &[(&str, Flags, usize, &str, usize)]) {
+        use noodles::sam::{
+            self as sam,
+            alignment::{
+                RecordBuf,
+                io::Write as _,
+                record::{MappingQuality, cigar::Op, data::field::Tag},
+                record_buf::{Cigar, Sequence, data::field::Value as BufValue},
+            },
+            header::record::value::{Map, map::ReferenceSequence},
+        };
+        let header = sam::Header::builder()
+            .add_reference_sequence(
+                b"chr1".to_vec(),
+                Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(40).unwrap()),
+            )
+            .build();
+        let mut writer = bam::io::Writer::new(std::fs::File::create(path).unwrap());
+        writer.write_header(&header).unwrap();
+        for (name, flags, start, seq, mate) in records {
+            let reference = &OVERLAP_REF[start - 1..start - 1 + seq.len()];
+            let (mut md, mut run) = (String::new(), 0usize);
+            for (r, q) in reference.iter().zip(seq.bytes()) {
+                if *r == q {
+                    run += 1;
+                } else {
+                    md.push_str(&format!("{run}{}", *r as char));
+                    run = 0;
+                }
+            }
+            md.push_str(&run.to_string());
+            let mut rec = RecordBuf::default();
+            *rec.name_mut() = Some(name.as_bytes().into());
+            *rec.flags_mut() = *flags;
+            *rec.cigar_mut() = [Op::new(CigarOpKind::Match, seq.len())]
+                .into_iter()
+                .collect::<Cigar>();
+            *rec.sequence_mut() = Sequence::from(seq.as_bytes());
+            *rec.reference_sequence_id_mut() = Some(0);
+            *rec.alignment_start_mut() = noodles::core::Position::new(*start);
+            *rec.mate_reference_sequence_id_mut() = Some(0);
+            *rec.mate_alignment_start_mut() = noodles::core::Position::new(*mate);
+            *rec.mapping_quality_mut() = MappingQuality::new(60);
+            rec.data_mut()
+                .insert(Tag::MISMATCHED_POSITIONS, BufValue::from(md));
+            writer.write_alignment_record(&header, &rec).unwrap();
+        }
+    }
+
+    /// #779, KNOWN ANSWER built by hand. Mates are 20 bp at 1-20 and 11-30, so they overlap on
+    /// reference 11-20 (GGGGGTTTTT). Each pair plants one case from the issue's table:
+    ///
+    ///   p1  pos 12: G / A           an error in mate 2 -> G->A. Its mate-1 mismatch at pos 3
+    ///                               is outside the overlap and must NOT count.
+    ///   p2  pos 17: C / C           a hom variant: the mates agree, nothing counted
+    ///   p3  pos 13: C / T (ref G)   a het alt plus an error: neither is reference, dropped
+    ///   p4  pos 18: A / T (ref T)   an error turned alt back into ref: masked. Without the
+    ///                               mask it is misread as T->A, which is why the mask exists.
+    ///   p5  duplicate, with a disagreement   skipped by the filter
+    ///   p6  mate 1 only             unpaired
+    ///
+    /// Four pairs x 10 overlapped bases = 40; three disagree, so 37 agree.
+    #[test]
+    fn overlap_disagreements_count_only_sequencing_errors() {
+        let first = Flags::SEGMENTED | Flags::PROPERLY_SEGMENTED | Flags::FIRST_SEGMENT;
+        let second = Flags::SEGMENTED
+            | Flags::PROPERLY_SEGMENTED
+            | Flags::LAST_SEGMENT
+            | Flags::REVERSE_COMPLEMENTED;
+        let m1 = "AAAAACCCCCGGGGGTTTTT";
+        let m2 = "GGGGGTTTTTAAAAACCCCC";
+        let with = |s: &str, at: usize, b: char| -> String {
+            let mut v: Vec<char> = s.chars().collect();
+            v[at] = b;
+            v.into_iter().collect()
+        };
+        // Offsets: mate 1 covers 1-20 (index = pos - 1), mate 2 covers 11-30 (index = pos - 11).
+        let p1a = with(m1, 2, 'T');
+        let p1b = with(m2, 12 - 11, 'A');
+        let p2a = with(m1, 17 - 1, 'C');
+        let p2b = with(m2, 17 - 11, 'C');
+        let p3a = with(m1, 13 - 1, 'C');
+        let p3b = with(m2, 13 - 11, 'T');
+        let p4a = with(m1, 18 - 1, 'A');
+        let p5b = with(m2, 14 - 11, 'A');
+        let dup = Flags::DUPLICATE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlap.bam");
+        write_pair_bam(
+            &path,
+            &[
+                ("p1", first, 1, &p1a, 11),
+                ("p2", first, 1, &p2a, 11),
+                ("p3", first, 1, &p3a, 11),
+                ("p4", first, 1, &p4a, 11),
+                ("p5", first | dup, 1, m1, 11),
+                ("p6", first, 1, m1, 11),
+                ("p1", second, 11, &p1b, 1),
+                ("p2", second, 11, &p2b, 1),
+                ("p3", second, 11, &p3b, 1),
+                ("p4", second, 11, m2, 1),
+                ("p5", second | dup, 11, &p5b, 1),
+            ],
+        );
+        let mut mask = KnownSites::new();
+        mask.entry("chr1".to_string()).or_default().insert(18);
+
+        let got = read_bam_overlap_transitions(&path, Some(mask), 0).unwrap();
+        let mut counts = [[0usize; 4]; 4];
+        counts[2][0] = 1; // G -> A
+        // Read-position bins, by hand: over the overlap, mate 1 (forward, starts at 1) is at
+        // cycles 10-19 and mate 2 (reverse, starts at 11) at cycles 19 down to 10, so each pair
+        // puts 2+2 observations in bin 2 (cycles 10-11), 4+4 in bin 3 (12-15), 4+4 in bin 4.
+        // p1's error is mate 2's base at reference 12, its query offset 1 = cycle 18: bin 4.
+        let mut by_bin = [[[0usize; 4]; 4]; OVERLAP_BINS];
+        by_bin[4][2][0] = 1;
+        assert_eq!(
+            got,
+            OverlapCounts {
+                counts,
+                overlapped_bases: 40,
+                agreements: 37,
+                masked: 1,
+                neither_reference: 1,
+                unpaired: 1,
+                by_bin,
+                bin_bases: [0, 0, 16, 32, 32],
+            }
+        );
+
+        // The same fixture unmasked: p4's alt-to-ref error is misread as T->A.
+        let unmasked = read_bam_overlap_transitions(&path, None, 0).unwrap();
+        counts[3][0] = 1; // T -> A
+        assert_eq!((unmasked.counts, unmasked.masked), (counts, 0));
     }
 
     /// The samtools-MD fixture above, masked. Its four mismatches sit at known reference

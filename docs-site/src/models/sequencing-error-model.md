@@ -49,6 +49,12 @@ bam_file: /path/to/aligned.bam
 # records cover are left out of the matrix, since they are variants, not sequencing errors.
 known_variants_vcf: /path/to/sample_variants.vcf.gz
 
+# optional: how bam_file fits the matrix. `overlap` (default) counts only disagreements
+# between overlapping mates, which read the same molecule, so variants and library damage
+# cancel. `mismatch` counts every read-vs-reference mismatch.
+bam_method: overlap
+bam_min_mapq: 20
+
 # optional: custom 4x4 SNP transition matrix TSV (rows/columns: A C G T).
 # A single header line is allowed. Diagonal values are ignored. Each row needs four
 # finite, non-negative values with some weight off the diagonal; a malformed row stops
