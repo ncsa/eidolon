@@ -741,6 +741,31 @@ every fixture was contiguous; a bandwidth five times too wide passed the entire 
 Each was found by mutating, and only after the fixture was rebuilt to make the mutation
 visible.
 
+### 5.8 A confident diagnosis, falsified by the test written to confirm it (2026-09-28)
+
+Reviewing #776, which swapped a BAM-fitted substitution matrix into the shipped default,
+Claude told the user that the fit and its use were in different frames. The claim: generation
+applied errors in read orientation, while the BAM counter worked in reference orientation,
+so the fitted matrix was symmetric by construction. It proposed complementing reverse-strand
+reads in the counter. The claim cited `fastq_tools.rs:1052-1054`, a comment about how
+variants are indexed, not about how errors are drawn.
+
+The round-trip test written to demonstrate the defect was expected to fail. It passed: a
+planted asymmetric matrix came back to within 0.007. Both paired writers generate R2
+forward, draw its errors, then reverse-complement the record, so errors are applied in
+reference orientation, the counter's own frame. Applying the proposed fix as a **mutation**
+broke the test (A→C 0.454 against 0.80 planted). The fix would have introduced the very
+defect it was meant to cure.
+
+Two things survived. The **strand-symmetry test** #776 offered as evidence does not
+discriminate: germline SNPs and mapping errors are symmetric too, and the unmasked,
+contaminated matrix passes it. The round trip also found a **real frame inconsistency** in
+the SV junction writers (#777), which draw R2's errors after reverse-complementing.
+
+**Rule this earns:** a diagnosis drawn from reading code is a hypothesis. Write the test that
+would show the defect before proposing its fix. A test expected to fail that passes is a
+finding, not a nuisance, and the proposed fix belongs in the mutation run.
+
 ---
 
 ## 6. Case study: BND
