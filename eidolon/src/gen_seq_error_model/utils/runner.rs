@@ -65,7 +65,7 @@ const MIN_OVERLAP_ERRORS: usize = 10_000;
 fn overlap_counts(
     path: &PathBuf,
     config: &RunConfiguration,
-) -> Result<[[usize; 4]; 4], GenSeqErrorModelError> {
+) -> Result<[[f64; 4]; 4], GenSeqErrorModelError> {
     let mask = match &config.known_variants_vcf {
         Some(vcf) => {
             let sites = read_known_sites(vcf)?;
@@ -97,7 +97,7 @@ fn overlap_counts(
             c.overlapped_bases
         )));
     }
-    Ok(c.counts)
+    Ok(per_cycle_spectrum(&c))
 }
 
 /// One row per read-position bin (#779): the observations, errors and substitution counts
@@ -135,16 +135,89 @@ fn write_overlap_bin_report(path: &PathBuf, c: &OverlapCounts) -> std::io::Resul
     std::fs::write(path, body)
 }
 
+/// Mismatch counts as weights, logging the count first (the mismatch path's only report).
+fn as_weights(counts: [[usize; 4]; 4]) -> [[f64; 4]; 4] {
+    let total: usize = counts.iter().flatten().sum();
+    info!("Observed {total} SNP mismatches across all records");
+    counts.map(|row| row.map(|n| n as f64))
+}
+
+/// Fewest errors a read-position bin needs to be weighted on its own; sparser bins merge with
+/// their neighbors first, so one noisy bin cannot carry a full bin's weight.
+const MIN_BIN_ERRORS: usize = 10_000;
+
+/// The substitution mix of a whole read, from per-bin overlap counts (#779).
+///
+/// Overlaps sit at reads' 3' ends, so a bin near the end contributes far more observed bases
+/// than one near the start (HG002: 8.8G against 0.7G). Pooling the raw counts gives the
+/// overlap region's spectrum. Dividing each bin's counts by its observations gives per-base
+/// rates, and summing those counts every part of the read equally: the errors a whole read
+/// gets, which is what generation applies.
+fn per_cycle_spectrum(c: &OverlapCounts) -> [[f64; 4]; 4] {
+    // Group adjacent bins from the read's start until each group holds MIN_BIN_ERRORS; a
+    // trailing remainder joins the last group. Each group is (counts, bases, bins spanned).
+    let mut groups: Vec<([[usize; 4]; 4], usize, usize)> = Vec::new();
+    let mut cur = ([[0usize; 4]; 4], 0usize, 0usize);
+    for (bin, m) in c.by_bin.iter().enumerate() {
+        for (from, row) in m.iter().enumerate() {
+            for (to, &n) in row.iter().enumerate() {
+                cur.0[from][to] += n;
+            }
+        }
+        cur.1 += c.bin_bases[bin];
+        cur.2 += 1;
+        if cur.0.iter().flatten().sum::<usize>() >= MIN_BIN_ERRORS {
+            groups.push(std::mem::take(&mut cur));
+        }
+    }
+    if cur.2 > 0 {
+        match groups.last_mut() {
+            Some(last) => {
+                for from in 0..4 {
+                    for to in 0..4 {
+                        last.0[from][to] += cur.0[from][to];
+                    }
+                }
+                last.1 += cur.1;
+                last.2 += cur.2;
+            }
+            None => groups.push(cur),
+        }
+    }
+    // Per-base rate times the number of bins the group spans: every cycle counts equally.
+    let mut w = [[0.0f64; 4]; 4];
+    for (counts, bases, width) in groups {
+        if bases == 0 {
+            continue;
+        }
+        for from in 0..4 {
+            for to in 0..4 {
+                w[from][to] += counts[from][to] as f64 / bases as f64 * width as f64;
+            }
+        }
+    }
+    w
+}
+
 /// Normalizes a raw 4×4 mismatch count matrix into a `TransitionMatrix`.
 ///
 /// Each row is normalized independently. Rows with no observed mismatches get
 /// equal probability distributed across the three off-diagonal positions.
+#[cfg(test)]
 fn build_transition_matrix_from_counts(
     counts: [[usize; 4]; 4],
 ) -> Result<TransitionMatrix, GenSeqErrorModelError> {
+    build_transition_matrix_from_weights(counts.map(|row| row.map(|n| n as f64)))
+}
+
+/// As `build_transition_matrix_from_counts`, from non-negative weights rather than counts:
+/// the overlap fit's per-cycle rates (#779) are not integers.
+fn build_transition_matrix_from_weights(
+    counts: [[f64; 4]; 4],
+) -> Result<TransitionMatrix, GenSeqErrorModelError> {
     let mut weights = [[0.0f64; 4]; 4];
     for i in 0..4 {
-        let total: f64 = counts[i].iter().sum::<usize>() as f64;
+        let total: f64 = counts[i].iter().sum::<f64>();
         if total == 0.0 {
             for j in 0..4 {
                 if i != j {
@@ -153,7 +226,7 @@ fn build_transition_matrix_from_counts(
             }
         } else {
             for j in 0..4 {
-                weights[i][j] = counts[i][j] as f64 / total;
+                weights[i][j] = counts[i][j] / total;
             }
             weights[i][i] = 0.0;
         }
@@ -802,7 +875,7 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             info!("Inferring SNP transition matrix from BAM: {:?}", path);
             let counts = match config.bam_method {
                 BamMethod::Overlap => overlap_counts(path, config)?,
-                BamMethod::Mismatch => match &config.known_variants_vcf {
+                BamMethod::Mismatch => as_weights(match &config.known_variants_vcf {
                     None => read_bam_transitions(path)?,
                     Some(vcf) => {
                         let sites = read_known_sites(vcf)?;
@@ -821,10 +894,13 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                         );
                         counts
                     }
-                },
+                }),
             };
-            let total_mismatches: usize = counts.iter().flatten().sum();
-            if total_mismatches == 0 {
+            // Every row empty means the BAM yielded no evidence at all. The overlap path has
+            // already refused thin evidence and logged its counts; this is the mismatch path's
+            // guard, and a backstop for both.
+            let total: f64 = counts.iter().flatten().sum();
+            if total == 0.0 {
                 // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
                 // fitting the transition matrix -- so a BAM that yields no evidence cannot be
                 // honoured at all. Silently substituting the default produces a model that is
@@ -844,11 +920,7 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                     path.display()
                 )));
             } else {
-                info!(
-                    "Observed {} SNP mismatches across all records",
-                    total_mismatches
-                );
-                Some(build_transition_matrix_from_counts(counts)?)
+                Some(build_transition_matrix_from_weights(counts)?)
             }
         } else {
             None
@@ -2507,6 +2579,83 @@ mod tests {
             msg.contains("bam_method: mismatch"),
             "the refusal must name the alternative: {msg}"
         );
+    }
+
+    /// KNOWN ANSWER, by hand, every bin populated as in real reads. Bins 0-1: 1,000,000 observed
+    /// bases each, A->C 10,000 and A->G 30,000 each. Bins 2-4: 100,000,000 bases each, A->C
+    /// 900,000 and A->G 100,000 each. Pooled counts give A->C 2.72M / 3.08M = 0.883. Per-base
+    /// rates summed over the five bins give A->C 2(0.010) + 3(0.009) = 0.047 and A->G
+    /// 2(0.030) + 3(0.001) = 0.063, so the whole read's A->C is 0.047 / 0.110. Every bin clears
+    /// MIN_BIN_ERRORS, so none is merged.
+    #[test]
+    fn the_overlap_matrix_weights_every_part_of_the_read_equally() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000_000, 1_000_000, 100_000_000, 100_000_000, 100_000_000];
+        for bin in 0..2 {
+            c.by_bin[bin][0][1] = 10_000;
+            c.by_bin[bin][0][2] = 30_000;
+        }
+        for bin in 2..5 {
+            c.by_bin[bin][0][1] = 900_000;
+            c.by_bin[bin][0][2] = 100_000;
+        }
+        let w = per_cycle_spectrum(&c);
+        let share = w[0][1] / (w[0][1] + w[0][2]);
+        assert!((share - 0.047 / 0.110).abs() < 1e-12, "A->C {share}");
+    }
+
+    /// A bin with too few errors is merged with its neighbor before reweighting, or its
+    /// sampling noise counts as much as a full bin's (the round trip's first bin held 99 errors,
+    /// about 8 per cell, and reweighting unmerged moved its worst cell from 0.007 to 0.024).
+    ///
+    /// KNOWN ANSWER. Bin 0: 1,000 bases, 10 errors, all A->C (a rate like its neighbor's, but a
+    /// spectrum that is pure noise). Bin 1: 1,000,000 bases, 10,000 A->C and 10,000 A->G.
+    /// Unmerged, the per-base rates give A->C 0.010 + 0.010 against A->G 0 + 0.010: A->C 0.667.
+    /// Merged into one group (10,010 against 10,000 over 1,001,000 bases), A->C is 0.50025.
+    #[test]
+    fn a_sparse_bin_is_merged_before_reweighting() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000, 1_000_000, 0, 0, 0];
+        c.by_bin[0][0][1] = 10;
+        c.by_bin[1][0][1] = 10_000;
+        c.by_bin[1][0][2] = 10_000;
+        let w = per_cycle_spectrum(&c);
+        let share = w[0][1] / (w[0][1] + w[0][2]);
+        assert!((share - 10_010.0 / 20_010.0).abs() < 1e-9, "A->C {share}");
+    }
+
+    /// A merged group stands for every bin it spans. KNOWN ANSWER: bins 0 and 1 (1M bases each)
+    /// hold 5,000 A->C and 5,000 A->G, each under MIN_BIN_ERRORS, so they merge into one group
+    /// spanning 2 bins with per-base rates 0.0025 / 0.0025. Bins 2-4 (100M bases each) hold
+    /// 900,000 A->C and 100,000 A->G. Weighted by span, A->C = 2(0.0025) + 3(0.009) = 0.032 and
+    /// A->G = 2(0.0025) + 3(0.001) = 0.008: 0.8. Ignoring the span gives 0.843.
+    #[test]
+    fn a_merged_group_is_weighted_by_the_bins_it_spans() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000_000, 1_000_000, 100_000_000, 100_000_000, 100_000_000];
+        c.by_bin[0][0][1] = 5_000;
+        c.by_bin[1][0][2] = 5_000;
+        for bin in 2..5 {
+            c.by_bin[bin][0][1] = 900_000;
+            c.by_bin[bin][0][2] = 100_000;
+        }
+        let w = per_cycle_spectrum(&c);
+        let share = w[0][1] / (w[0][1] + w[0][2]);
+        assert!((share - 0.8).abs() < 1e-12, "A->C {share}");
+    }
+
+    /// Must not fire: bins that share one spectrum give that spectrum, however unequal their
+    /// observation counts.
+    #[test]
+    fn a_spectrum_that_does_not_change_along_the_read_is_left_alone() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000, 0, 0, 0, 100_000];
+        c.by_bin[0][0][1] = 3;
+        c.by_bin[0][0][2] = 1;
+        c.by_bin[4][0][1] = 300;
+        c.by_bin[4][0][2] = 100;
+        let w = per_cycle_spectrum(&c);
+        assert!((w[0][1] / (w[0][1] + w[0][2]) - 0.75).abs() < 1e-12);
     }
 
     #[test]
