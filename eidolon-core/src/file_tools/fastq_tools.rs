@@ -367,6 +367,12 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut reads1_flagged: Vec<usize> = Vec::new();
         let mut read2_variants: HashMap<usize, &Variant> = HashMap::new();
         let mut reads2_flagged: Vec<usize> = Vec::new();
+        // One allele per variant per FRAGMENT (#780): both mates read the same molecule, so
+        // a variant both reads cover must show the same allele in both. Keyed by reference
+        // position here, re-keyed by each read's offset below.
+        let mut fragment_alleles: HashMap<usize, bool> = HashMap::new();
+        let mut read1_alleles: HashMap<usize, bool> = HashMap::new();
+        let mut read2_alleles: HashMap<usize, bool> = HashMap::new();
         // Only the variants overlapping this fragment's two read windows matter.
         // block_map.flagged_positions is sorted (from_interval), so binary-search
         // each window instead of scanning every variant on the contig. The old
@@ -423,7 +429,17 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             let Some(proj) = project(pos) else { continue };
             if proj >= start && proj < start + effective_read_len {
                 let var_pos = proj - start;
-                read1_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                let variant = &block_map.variant_map[&pos];
+                let is_alt = match fragment_alleles.get(&pos) {
+                    Some(&a) => a,
+                    None => {
+                        let a = draw_allele(variant, rng)?;
+                        fragment_alleles.insert(pos, a);
+                        a
+                    }
+                };
+                read1_alleles.insert(var_pos, is_alt);
+                read1_variants.insert(var_pos, variant);
                 reads1_flagged.push(var_pos);
             }
         }
@@ -444,7 +460,17 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 let Some(proj) = project(pos) else { continue };
                 if proj >= w_lo && proj < end {
                     let var_pos = proj - w_lo;
-                    read2_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                    let variant = &block_map.variant_map[&pos];
+                    let is_alt = match fragment_alleles.get(&pos) {
+                        Some(&a) => a,
+                        None => {
+                            let a = draw_allele(variant, rng)?;
+                            fragment_alleles.insert(pos, a);
+                            a
+                        }
+                    };
+                    read2_alleles.insert(var_pos, is_alt);
+                    read2_variants.insert(var_pos, variant);
                     reads2_flagged.push(var_pos);
                 }
             }
@@ -531,7 +557,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
 
         let quality_scores_1 =
             quality_score_model.generate_quality_scores(effective_read_len, rng)?;
-        let mut r1_record = match generate_read(
+        let mut r1_record = match generate_read_with_alleles(
             fragment,
             frag_ops,
             frag_dels,
@@ -550,6 +576,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             tlen,
             paired_ended,
             ad_counter,
+            &read1_alleles,
         ) {
             Ok(record) => record,
             Err(FastqToolsError::TruncatedRead(msg)) => {
@@ -651,7 +678,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                     }
                     _ => None,
                 };
-            match generate_read(
+            match generate_read_with_alleles(
                 r2_sub,
                 r2_ops,
                 r2_dels,
@@ -670,6 +697,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 tlen_r2,
                 true,
                 ad_counter,
+                &read2_alleles,
             ) {
                 Ok(mut record) => {
                     if r2_ref_pos.is_none() {
@@ -981,10 +1009,67 @@ fn stream_gzip_files(files: &[PathBuf], output: &PathBuf) -> Result<(), FastqToo
     Ok(())
 }
 
+/// Whether a read (or a fragment, #780) carries a variant's alternate allele. An explicit
+/// `allele_fraction` (input VCF, #398) sets the chance; otherwise homozygous is always alt and
+/// heterozygous is a coin flip. Homozygous draws no rng, so default runs stay byte-identical.
+fn draw_allele(variant: &Variant, rng: &mut NeatRng) -> Result<bool, FastqToolsError> {
+    Ok(if let Some(f) = variant.allele_fraction {
+        rng.random()? < f
+    } else {
+        (variant.genotype == Genotype::Homozygous) || (rng.random()? < 0.5)
+    })
+}
+
+/// `generate_read_with_alleles` with no allele decisions made in advance: each variant the
+/// read covers draws its own allele. Right for a read with no mate sharing its molecule.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_read(
+    sequence: &[Nucleotide],
+    hap_ops: Option<&[char]>,
+    hap_dels: Option<&[(usize, usize)]>,
+    flagged_positions: &[usize],
+    variant_map: &HashMap<usize, &Variant>,
+    read_length: usize,
+    name: String,
+    read_strand: Strand,
+    quality_scores: Vec<usize>,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+    contig: String,
+    position: usize,
+    mate_contig: String,
+    mate_position: usize,
+    template_length: i32,
+    is_paired: bool,
+    ad_counter: &mut AdCounter,
+) -> Result<ReadRecord, FastqToolsError> {
+    generate_read_with_alleles(
+        sequence,
+        hap_ops,
+        hap_dels,
+        flagged_positions,
+        variant_map,
+        read_length,
+        name,
+        read_strand,
+        quality_scores,
+        sequencing_error_model,
+        rng,
+        contig,
+        position,
+        mate_contig,
+        mate_position,
+        template_length,
+        is_paired,
+        ad_counter,
+        &HashMap::new(),
+    )
+}
+
 // `cigar_ops.push('D')` runs in a loop per deletion-error base; pushing the
 // same byte N times is the entire CIGAR encoding, not a copy-paste mistake.
 #[allow(clippy::same_item_push)]
-pub fn generate_read(
+pub fn generate_read_with_alleles(
     sequence: &[Nucleotide],
     // Baseline CIGAR op per base of `sequence`, from
     // `InsertionCoordinateMap::cigar_ops_for_segments`: 'M' where the base came from the
@@ -1022,6 +1107,9 @@ pub fn generate_read(
     template_length: i32,
     is_paired: bool,
     ad_counter: &mut AdCounter,
+    // Allele decisions already made for this read's fragment, keyed like `variant_map` (#780).
+    // A variant absent here draws its own allele.
+    alleles: &HashMap<usize, bool>,
 ) -> Result<ReadRecord, FastqToolsError> {
     if sequence.len() < read_length {
         return Err(FastqToolsError::TruncatedRead(format!("{:?}", sequence)));
@@ -1087,10 +1175,9 @@ pub fn generate_read(
             // fall back to the Genotype default: homozygous always alt, het ~0.5.
             // The else-branch keeps the exact same short-circuit (homozygous draws
             // no rng) so default runs stay byte-identical.
-            let is_alt = if let Some(f) = variant.allele_fraction {
-                rng.random()? < f
-            } else {
-                (variant.genotype == Genotype::Homozygous) || (rng.random()? < 0.5)
+            let is_alt = match alleles.get(&fragment_position) {
+                Some(&decided) => decided,
+                None => draw_allele(variant, rng)?,
             };
             if is_alt {
                 let alt = variant.alternate.as_literal().unwrap();
