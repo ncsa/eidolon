@@ -133,10 +133,10 @@ printf 'fastq_file: %s\nfastq_file_r2: %s\noutput_file: %s\noverwrite_output: tr
     "$PAIR_WORK/sub_r1.fastq.gz" "$PAIR_WORK/sub_r2.fastq.gz" "$WORK/seqerr_hg002.json.gz" "$BAM" "$VCF" > "$WORK/seqerr.yml"
 fit seqerr gen-seq-error-model "$WORK/seqerr.yml" "$WORK/seqerr_hg002.json.gz"
 echo "[seqerr] must match the shipped model: error_rate 0.003774, degraded R1 11.02%, R2 25.98%"
-sed 's/\x1b\[[0-9;]*m//g' "$WORK/seqerr.log" | grep -E "error_rate|[Dd]egraded population|mismatches|Masking" || true
+sed 's/\x1b\[[0-9;]*m//g' "$WORK/seqerr.log" | grep -E "error_rate|[Dd]egraded population|mismatches|Masking|Overlap fit" || true
 echo
 
 archive_run hg002_defaults "$WORK" \
-    mut_hg002.json.gz frag_hg002.json.gz gc_hg002.json.gz gc_hg002.json.gz.bins.tsv seqerr_hg002.json.gz \
+    mut_hg002.json.gz frag_hg002.json.gz gc_hg002.json.gz gc_hg002.json.gz.bins.tsv seqerr_hg002.json.gz seqerr_hg002.json.gz.overlap_bins.tsv \
     mut.yml frag.yml gc.yml seqerr.yml mut.log frag.log frag_validate.log gc.log seqerr.log
 echo "DONE."
