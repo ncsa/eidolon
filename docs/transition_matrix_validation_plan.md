@@ -20,6 +20,15 @@ planted matrix within 0.007 from 74,938 errors, while `bam_method: mismatch` on 
 misses C→T by 0.218. Getting there needed #780: gen-reads had drawn het alleles per read, so a
 fragment's mates disagreed at het sites.
 
+**Per-cycle reweighting.** Overlaps sit at reads' 3' ends: HG002's last fifth of the read
+held 8.8G observations against 0.7G in the first, and 71% of counted errors. Its early cycles
+are transition-rich and its late cycles transversion-rich, so pooled counts give the overlap
+region's spectrum, not a whole read's. The fit now divides each read-position bin's counts
+by its observations and sums the rates. Bins under 10,000 errors first merge with their
+neighbors, weighted by the bins they span, because one noisy bin would otherwise carry a full
+bin's weight. Unmerged, that moved the round trip's worst cell from 0.007 to 0.024; merged, it
+is 0.005. On HG002 the reweighting shifts no cell by more than 0.028.
+
 Covers `gen-seq-error-model`'s `bam_file:` / `transition_matrix_file:` inputs — the
 BAM-derived SNP substitution matrix, which is one of the few model-builder capabilities
 with no counterpart in NEAT 4 (its builders never open a BAM for this). Because it is
