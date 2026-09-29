@@ -443,7 +443,17 @@ pub struct OverlapCounts {
     pub neither_reference: usize,
     /// Kept records whose mate never arrived.
     pub unpaired: usize,
+    /// `counts` split by the erroneous mate's sequencing cycle, in `OVERLAP_BINS` equal
+    /// fractions of read length. Overlaps sit at reads' 3' ends, so this is how to see whether
+    /// the spectrum changes along the read.
+    pub by_bin: [[[usize; 4]; 4]; OVERLAP_BINS],
+    /// Base observations per bin: each overlapped position counts once for each mate, in the
+    /// bin of that mate's cycle. The denominator for a per-bin error rate.
+    pub bin_bases: [usize; OVERLAP_BINS],
 }
+
+/// Read-position bins for `OverlapCounts::by_bin`.
+pub const OVERLAP_BINS: usize = 5;
 
 /// Counts sequencing errors where the two mates of a fragment overlap and disagree (#779).
 ///
@@ -460,8 +470,9 @@ pub struct OverlapObserver {
     pending: HashMap<Vec<u8>, (usize, Vec<AlignedBase>)>,
 }
 
-/// One aligned base: 1-based reference position, the read's base, the reference base.
-type AlignedBase = (usize, u8, u8);
+/// One aligned base: 1-based reference position, the read's base, the reference base, and the
+/// read-position bin of its sequencing cycle.
+type AlignedBase = (usize, u8, u8, usize);
 
 /// A record's aligned (M/=/X) bases, with the reference base read from its MD tag. `None`
 /// when the record has no MD tag or no position.
@@ -475,9 +486,17 @@ fn aligned_bases(record: &bam::Record) -> Result<Option<Vec<AlignedBase>>, BamRe
         _ => return Ok(None),
     };
     let sequence = record.sequence();
+    // A reverse-strand record stores its read reverse-complemented, so its first sequenced
+    // base (cycle 0) is the LAST one here.
+    let n = sequence.len();
+    let reverse = record.flags().is_reverse_complemented();
+    let bin = |read_pos: usize| {
+        let cycle = if reverse { n - 1 - read_pos } else { read_pos };
+        cycle * OVERLAP_BINS / n
+    };
     let mut walker = MdWalker::new(parse_md(&md_bytes));
     let mut read_pos = 0usize;
-    let mut out = Vec::with_capacity(sequence.len());
+    let mut out = Vec::with_capacity(n);
     for op_result in record.cigar().iter() {
         let op = op_result?;
         let len = op.len();
@@ -486,7 +505,7 @@ fn aligned_bases(record: &bam::Record) -> Result<Option<Vec<AlignedBase>>, BamRe
                 for _ in 0..len {
                     let mismatch = walker.next_alignment_base();
                     if let Some(read_b) = sequence.get(read_pos) {
-                        out.push((ref_pos, read_b, mismatch.unwrap_or(read_b)));
+                        out.push((ref_pos, read_b, mismatch.unwrap_or(read_b), bin(read_pos)));
                     }
                     read_pos += 1;
                     ref_pos += 1;
@@ -512,7 +531,7 @@ impl OverlapObserver {
             .and_then(|m| self.contigs.get(contig).and_then(|c| m.get(c)));
         let (mut i, mut j) = (0, 0);
         while i < a.len() && j < b.len() {
-            let ((pa, ra, refa), (pb, rb, _)) = (a[i], b[j]);
+            let ((pa, ra, refa, bin_a), (pb, rb, _, bin_b)) = (a[i], b[j]);
             if pa < pb {
                 i += 1;
                 continue;
@@ -530,14 +549,18 @@ impl OverlapObserver {
                 continue; // an N in either read or the reference says nothing
             }
             self.counts.overlapped_bases += 1;
+            self.counts.bin_bases[bin_a] += 1;
+            self.counts.bin_bases[bin_b] += 1;
             if ia == ib {
                 self.counts.agreements += 1;
             } else if sites.is_some_and(|s| s.contains(&pa)) {
                 self.counts.masked += 1;
             } else if ia == ir {
                 self.counts.counts[ir][ib] += 1;
+                self.counts.by_bin[bin_b][ir][ib] += 1;
             } else if ib == ir {
                 self.counts.counts[ir][ia] += 1;
+                self.counts.by_bin[bin_a][ir][ia] += 1;
             } else {
                 self.counts.neither_reference += 1;
             }
@@ -1226,6 +1249,12 @@ mod tests {
         let got = read_bam_overlap_transitions(&path, Some(mask), 0).unwrap();
         let mut counts = [[0usize; 4]; 4];
         counts[2][0] = 1; // G -> A
+        // Read-position bins, by hand: over the overlap, mate 1 (forward, starts at 1) is at
+        // cycles 10-19 and mate 2 (reverse, starts at 11) at cycles 19 down to 10, so each pair
+        // puts 2+2 observations in bin 2 (cycles 10-11), 4+4 in bin 3 (12-15), 4+4 in bin 4.
+        // p1's error is mate 2's base at reference 12, its query offset 1 = cycle 18: bin 4.
+        let mut by_bin = [[[0usize; 4]; 4]; OVERLAP_BINS];
+        by_bin[4][2][0] = 1;
         assert_eq!(
             got,
             OverlapCounts {
@@ -1235,6 +1264,8 @@ mod tests {
                 masked: 1,
                 neither_reference: 1,
                 unpaired: 1,
+                by_bin,
+                bin_bases: [0, 0, 16, 32, 32],
             }
         );
 

@@ -12,6 +12,14 @@ frame the BAM counter reads. A counter that complements reverse-strand reads fai
 A→C 0.454, T→G off by 0.354. This covers steps 4–6 below for simulated reads. It does not
 cover step 1: whether a real BAM's mismatches are sequencing errors.
 
+**Overlap fitting (#779), the default since.** Reference mismatches in a real BAM include
+the sample's variants, mapping errors and library damage, so `bam_file:` now fits from
+disagreements between overlapping mates by default (`bam_method: overlap`). The same round
+trip plants germline variants (`mutation_rate: 0.005`) as well: the overlap fit recovers the
+planted matrix within 0.007 from 74,938 errors, while `bam_method: mismatch` on the same BAM
+misses C→T by 0.218. Getting there needed #780: gen-reads had drawn het alleles per read, so a
+fragment's mates disagreed at het sites.
+
 Covers `gen-seq-error-model`'s `bam_file:` / `transition_matrix_file:` inputs — the
 BAM-derived SNP substitution matrix, which is one of the few model-builder capabilities
 with no counterpart in NEAT 4 (its builders never open a BAM for this). Because it is

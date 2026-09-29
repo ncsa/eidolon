@@ -17,9 +17,14 @@
 //! reverse-strand reads (read orientation, i.e. disagreeing with generation) returns 0.454
 //! for A->C, T->G off by 0.354, and this test fails.
 //!
-//! The denominator is asserted: the fit must see enough mismatches for the tolerance to mean
-//! something, and simulation runs with mutation_rate 0, so every mismatch is a sequencing
-//! error.
+//! MUST NOT FIRE, #779: the reads also carry planted germline variants (mutation_rate 0.005,
+//! het and hom). `bam_file:` fits from mate-overlap disagreements by default, where a variant
+//! shows in both mates and cancels, so the planted matrix must still come back. The CONTROL
+//! fits the same BAM with `bam_method: mismatch`, which counts the variants as errors and must
+//! miss the planted matrix: that proves the variants were there to contaminate it.
+//!
+//! The denominator is asserted: the overlap fit must count enough errors for the tolerance to
+//! mean something. Fragments are 250 bp, so 150 bp mates overlap.
 //!
 //! Fixture: ecoli (4.6 Mb, one contig), which aligns unambiguously. Needs bwa-mem2, so it is
 //! `#[ignore]` and runs in release-gates.
@@ -144,9 +149,9 @@ fn a_planted_substitution_matrix_survives_simulation_alignment_and_refit() {
     cfg.paired_ended = true;
     cfg.read_len = READ_LEN;
     cfg.coverage = 5;
-    cfg.fragment_mean = Some(350.0);
+    cfg.fragment_mean = Some(250.0);
     cfg.fragment_st_dev = Some(30.0);
-    cfg.mutation_rate = Some(0.0);
+    cfg.mutation_rate = Some(0.005);
     cfg.rng_seed = "round-trip".to_string();
     cfg.sequence_error_model = Some(planted_model);
     let yaml = cfg.write_yaml();
@@ -191,21 +196,68 @@ fn a_planted_substitution_matrix_survives_simulation_alignment_and_refit() {
     sam_to_bam(&sam, &bam);
 
     let (fitted_model, log) = fit(&work, "fitted", &format!("bam_file: {}\n", bam.display()));
+    let (control_model, _) = fit(
+        &work,
+        "control",
+        &format!("bam_file: {}\nbam_method: mismatch\n", bam.display()),
+    );
 
-    // Denominator: ~0.8M bases at 1% error per contig pass at 5x is ~230k substitution
-    // errors; require well over the count the tolerance needs.
+    // Denominator: the overlap fit's own count of the errors it used.
     let observed: usize = log
         .lines()
         .find_map(|l| {
-            l.split("Observed ")
-                .nth(1)
-                .and_then(|r| r.split(' ').next())
-                .and_then(|n| n.parse().ok())
+            let head = l.split(" errors counted").next()?;
+            if head.len() == l.len() {
+                return None;
+            }
+            head.rsplit(' ').next()?.parse().ok()
         })
-        .expect("the fit did not report its mismatch count");
+        .expect("the fit did not report its error count");
     assert!(
-        observed > 50_000,
-        "only {observed} mismatches: too few to test a 0.03 tolerance"
+        observed > 20_000,
+        "only {observed} overlap errors: too few to test a 0.03 tolerance"
+    );
+
+    // The read-position report: five bins whose errors sum to the fit's own total, and whose
+    // observations are two per overlapped base (one per mate).
+    let bins = std::fs::read_to_string(work.join("fitted.json.gz.overlap_bins.tsv"))
+        .expect("the overlap fit must write its read-position report");
+    let rows: Vec<Vec<&str>> = bins
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').collect())
+        .collect();
+    assert_eq!(rows.len(), 5, "one row per read-position bin:\n{bins}");
+    let bin_errors: usize = rows.iter().map(|r| r[3].parse::<usize>().unwrap()).sum();
+    assert_eq!(
+        bin_errors, observed,
+        "the bins must account for every counted error"
+    );
+    eprintln!("{bins}");
+
+    let worst_cell = |m: &[[f64; 4]; 4]| -> (f64, String) {
+        let bases = ['A', 'C', 'G', 'T'];
+        let mut worst = (0.0f64, String::new());
+        for r in 0..4 {
+            for c in 0..4 {
+                let d = (m[r][c] - PLANTED[r][c]).abs();
+                if r != c && d > worst.0 {
+                    worst = (d, format!("{}->{}", bases[r], bases[c]));
+                }
+            }
+        }
+        worst
+    };
+    let control = worst_cell(&matrix(&control_model));
+    eprintln!(
+        "control (mismatch method): worst cell {} off by {:.3}",
+        control.1, control.0
+    );
+    assert!(
+        control.0 > 0.05,
+        "the mismatch fit is within {:.3} of the planted matrix, so the planted variants did \
+         not contaminate it and this test cannot show the overlap fit excludes them",
+        control.0
     );
 
     let fitted = matrix(&fitted_model);
@@ -227,7 +279,7 @@ fn a_planted_substitution_matrix_survives_simulation_alignment_and_refit() {
         }
     }
     eprintln!(
-        "mismatches fitted: {observed}; worst cell {} off by {:.3}",
+        "overlap errors fitted: {observed}; worst cell {} off by {:.3}",
         worst.1, worst.0
     );
     assert!(
