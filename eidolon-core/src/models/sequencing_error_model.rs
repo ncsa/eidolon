@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf};
 use thiserror::Error;
 
-/// The shipped default model, fitted from GIAB HG002 2x250. See `SequencingErrorModel::default`.
+/// The shipped default model: quality from GIAB HG002 2x250, substitution matrix from two
+/// NovaSeq libraries. See `SequencingErrorModel::default`.
 pub(crate) static DEFAULT_MODEL_FILE: &[u8] =
     include_bytes!("model_data/default_sequencing_error_model.json.gz");
 
@@ -216,11 +217,10 @@ impl SequencingErrorModel {
     /// bare `QualityScoreModel`: `quality_score_model_r2` is a field out here on the outer
     /// struct. Loading the file whole is what lets the default use both.
     ///
-    /// The non-quality fields in the file are the same values this function used to hardcode
-    /// — the fit ran without `bam_file` or `transition_matrix_file`, so it recorded the
-    /// default substitution matrix, `indel_probability` 0.01, `insertion_fraction` 0.4 and
-    /// the shipped indel-context curve. Swapping to the file therefore changes the quality
-    /// model and `error_rate`, and nothing else.
+    /// The substitution matrix in the file is the mean of two NovaSeq overlap fits (#779),
+    /// not HG002's: it was substituted into the file after the quality fit. The remaining
+    /// non-quality fields are the inherited values — `indel_probability` 0.01,
+    /// `insertion_fraction` 0.4 and the shipped indel-context curve.
     ///
     /// The provenance stamp (`_eidolon`) is ignored rather than checked: this file ships
     /// inside the binary that reads it, so the two cannot disagree.
@@ -238,14 +238,11 @@ impl SequencingErrorModel {
         quality_score_model: QualityScoreModel,
         transition_matrix: Option<TransitionMatrix>,
     ) -> Result<Self, SeqModelError> {
+        // No fitted matrix: take the shipped default's, read from the same file `default()`
+        // loads, so a fit without a BAM and the default cannot carry different matrices.
         let transition_distros = match transition_matrix {
             Some(tm) => tm,
-            None => TransitionMatrix::from(
-                [0.0, 0.4918, 0.3377, 0.1705],
-                [0.5238, 0.0, 0.2661, 0.2101],
-                [0.3754, 0.2355, 0.0, 0.389],
-                [0.2505, 0.2552, 0.4942, 0.0],
-            )?,
+            None => Self::default()?.transition_distros,
         };
         let (default_ins_distr, default_del_distr) = indel_error_length_distributions()?;
         Ok(SequencingErrorModel {
@@ -633,10 +630,11 @@ mod tests {
         use sha2::{Digest, Sha256};
         let got = format!("{:x}", Sha256::digest(DEFAULT_MODEL_FILE));
         assert_eq!(
-            got, "824c8c5d957dab862e52369e485daa733fa02222d856f38632b6b63476f1bc6c",
-            "the shipped model asset is not the one fitted from GIAB HG002 \
-             (job 22233888). If the replacement is intentional, update this digest AND the \
-             provenance block in model_data/README.md in the same commit."
+            got, "78f4fe06d4ee693fc961314fea76c957589cf280b8e0b9adb9146d377b329c97",
+            "the shipped model asset is not HG002's quality fit (job 22233888) carrying the NovaSeq \
+             mean substitution matrix (jobs 22559735, 22571948). If the replacement is intentional, \
+             update this digest AND the provenance block in model_data/README.md in the same \
+             commit."
         );
     }
 
@@ -768,12 +766,26 @@ mod tests {
             );
         }
 
-        let expected_matrix_cdf = [
-            [0.0, 0.4918, 0.8295, 1.0],
-            [0.5238, 0.5238, 0.7899, 1.0],
-            [0.3754 / 0.9999, 0.6109 / 0.9999, 0.6109 / 0.9999, 1.0],
-            [0.2505 / 0.9999, 0.5057 / 0.9999, 1.0, 1.0],
+        // The equal-weight mean of two NovaSeq 6000 overlap fits (#779), each reweighted per
+        // read position: GIAB HG001 SRR14724533 (job 22559735) and NA12878 SRR10965088
+        // (job 22571948). Rows as shipped, then as CDFs.
+        let fitted_rows = [
+            [0.0, 0.292486, 0.154389, 0.553125],
+            [0.715089, 0.0, 0.167773, 0.117138],
+            [0.139896, 0.144100, 0.0, 0.716004],
+            [0.545701, 0.156356, 0.297943, 0.0],
         ];
+        let expected_matrix_cdf = fitted_rows.map(|row| {
+            let total: f64 = row.iter().sum();
+            let mut cdf = [0.0; 4];
+            let mut acc = 0.0;
+            for (i, w) in row.iter().enumerate() {
+                acc += w / total;
+                cdf[i] = acc;
+            }
+            cdf[3] = 1.0;
+            cdf
+        });
         for (name, model) in [
             ("default()", &default_model),
             ("from_raw_data()", &fitted_model),
