@@ -621,8 +621,8 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut r2_record = if paired_ended {
             // R2 draws from the R2 fit when the model carries one (#723).
             let qsm_r2 = r2_quality_model(quality_score_model, quality_score_model_r2);
-            let quality_scores_2 =
-                laid_down_for_the_flip(qsm_r2.generate_quality_scores(effective_read_len, rng)?);
+            // Cycle order; `generate_reverse_mate` lays it down for the flip.
+            let quality_scores_2 = qsm_r2.generate_quality_scores(effective_read_len, rng)?;
             let r2_pos = r2_ref_pos
                 .or(r1_ref_pos)
                 .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
@@ -678,7 +678,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                     }
                     _ => None,
                 };
-            match generate_read_with_alleles(
+            match generate_reverse_mate(
                 r2_sub,
                 r2_ops,
                 r2_dels,
@@ -686,7 +686,6 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 &read2_variants,
                 effective_read_len,
                 format!("{}/2", base_name),
-                Strand::Forward,
                 quality_scores_2,
                 sequencing_error_model,
                 rng,
@@ -695,19 +694,20 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 sequence_block.contig.clone(),
                 r1_pos,
                 tlen_r2,
-                true,
                 ad_counter,
                 &read2_alleles,
-            ) {
-                Ok(mut record) => {
+                |record| {
                     if r2_ref_pos.is_none() {
                         record.is_unmapped = true;
                         record.cigar_ops = vec!['S'; record.sequence.len()];
                     }
-                    // Flip to the reverse mate FIRST, then append the R2 adapter at
-                    // the (now 3') end — so R2 carries the R2 adapter in read
-                    // orientation, exactly as a trimmer expects.
-                    let mut rec = reverse_complement_record(record);
+                    Ok(())
+                },
+            ) {
+                Ok(mut rec) => {
+                    // The record is already the flipped reverse mate; append the R2 adapter
+                    // at its (now 3') end, so R2 carries the R2 adapter in read orientation,
+                    // exactly as a trimmer expects.
                     if adapters_on {
                         rec = append_adapter_readthrough(
                             rec,
@@ -927,11 +927,9 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         };
         apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
 
-        let r2_quality = laid_down_for_the_flip(
-            r2_quality_model(quality_score_model, quality_score_model_r2)
-                .generate_quality_scores(read_length, rng)?,
-        );
-        let mut r2 = match generate_read(
+        let r2_quality = r2_quality_model(quality_score_model, quality_score_model_r2)
+            .generate_quality_scores(read_length, rng)?;
+        let r2 = match generate_reverse_mate(
             &fragment.r2_sequence,
             // Chimeric reads are stitched from reference pieces: every base is 'M', and
             // no haplotype deletion applies.
@@ -941,7 +939,6 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
             &HashMap::new(),
             read_length,
             format!("{name}/2"),
-            Strand::Forward,
             r2_quality,
             sequencing_error_model,
             rng,
@@ -950,15 +947,15 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
             contig_name.to_string(),
             fragment.r1_position,
             -fragment.template_length,
-            true,
             &mut ad_counter,
+            &HashMap::new(),
+            // The baseline ops are top-strand, so they go on before the flip.
+            |record| apply_haplotype_baseline_cigar(record, &fragment.r2_baseline_ops),
         ) {
             Ok(record) => record,
             Err(FastqToolsError::TruncatedRead(_)) => continue,
             Err(error) => return Err(error),
         };
-        apply_haplotype_baseline_cigar(&mut r2, &fragment.r2_baseline_ops)?;
-        r2 = reverse_complement_record(r2);
 
         write_read_to_fastq(&r1, buffer1)?;
         write_read_to_fastq(&r2, buffer2)?;
@@ -1399,6 +1396,69 @@ fn reverse_complement_record(mut record: ReadRecord) -> ReadRecord {
     record.quality_scores.reverse();
     record.is_reverse = true;
     record
+}
+
+/// Build a reverse-strand mate: the ONE construction every R2 in eidolon goes through (#777).
+///
+/// `window` is the fragment's right end on the TOP strand, starting at the first base R2
+/// covers (plus any buffer past it for deletion errors to consume). `cycle_quality` is the R2
+/// quality draw in cycle order, as `generate_quality_scores` returns it. The steps, in order:
+///
+///   1. lay the quality down backwards (`laid_down_for_the_flip`, #734);
+///   2. generate FORWARD over `window`, so each sequencing error is drawn against the top-strand
+///      base -- the frame the substitution matrix is fitted in (`transition_matrix_round_trip.rs`);
+///   3. run `before_flip` on the forward record (CIGAR fix-ups that are defined top-strand);
+///   4. flip into read orientation (`reverse_complement_record`).
+///
+/// Every step is load-bearing. Drawing errors on an already reverse-complemented window applies
+/// the matrix's reverse complement, which is what the SV junction writers did until #777; an
+/// asymmetric user matrix then came back mirrored on their R2 reads only. Skipping step 1
+/// reverses the emitted quality profile (#734). The ordinary paired writer, the haplotype paired
+/// writer and gen-reads' four junction writers all call this, so they cannot drift again.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_reverse_mate(
+    window: &[Nucleotide],
+    hap_ops: Option<&[char]>,
+    hap_dels: Option<&[(usize, usize)]>,
+    flagged_positions: &[usize],
+    variant_map: &HashMap<usize, &Variant>,
+    read_length: usize,
+    name: String,
+    cycle_quality: Vec<usize>,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+    contig: String,
+    position: usize,
+    mate_contig: String,
+    mate_position: usize,
+    template_length: i32,
+    ad_counter: &mut AdCounter,
+    alleles: &HashMap<usize, bool>,
+    before_flip: impl FnOnce(&mut ReadRecord) -> Result<(), FastqToolsError>,
+) -> Result<ReadRecord, FastqToolsError> {
+    let mut record = generate_read_with_alleles(
+        window,
+        hap_ops,
+        hap_dels,
+        flagged_positions,
+        variant_map,
+        read_length,
+        name,
+        Strand::Forward,
+        laid_down_for_the_flip(cycle_quality),
+        sequencing_error_model,
+        rng,
+        contig,
+        position,
+        mate_contig,
+        mate_position,
+        template_length,
+        true,
+        ad_counter,
+        alleles,
+    )?;
+    before_flip(&mut record)?;
+    Ok(reverse_complement_record(record))
 }
 
 /// Append 3' sequencing-adapter readthrough to a FINAL-oriented read (#125).

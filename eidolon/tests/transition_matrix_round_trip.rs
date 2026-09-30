@@ -6,9 +6,10 @@
 //! must give the planted matrix back, cell by cell. It is FALSIFIED by any cell off by more
 //! than the tolerance.
 //!
-//! THE FRAME. Both paired writers generate R2 forward, draw its errors, and only then
-//! reverse-complement the record (`fastq_tools.rs`, `reverse_complement_record`), so
-//! substitution errors are applied in REFERENCE orientation. The BAM counter reads mismatches
+//! THE FRAME. Every R2 writer generates R2 forward, draws its errors, and only then
+//! reverse-complements the record (`fastq_tools.rs`, `generate_reverse_mate`), so
+//! substitution errors are applied in REFERENCE orientation. The SV junction writers joined
+//! that path in #777; `junction_r2_error_frame.rs` pins them. The BAM counter reads mismatches
 //! in reference orientation too. The two must agree, and this test is what says so.
 //!
 //! WHY THE PLANTED MATRIX IS ASYMMETRIC. A matrix that equals its own reverse complement
