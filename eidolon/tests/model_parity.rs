@@ -597,3 +597,181 @@ fn gen_bam_models_gc_bias_byte_equal_to_standalone() {
         "unified gen-bam-models GC-bias output diverged from standalone gen-gc-bias-model"
     );
 }
+
+// ── Soft-masking (#771) ──────────────────────────────────────────────────────
+
+/// Parse a FASTA into (name, sequence) pairs.
+fn read_fasta(path: &Path) -> Vec<(String, String)> {
+    let mut contigs: Vec<(String, String)> = Vec::new();
+    for line in fs::read_to_string(path).unwrap().lines() {
+        if let Some(name) = line.strip_prefix('>') {
+            contigs.push((name.trim().to_string(), String::new()));
+        } else {
+            contigs.last_mut().unwrap().1.push_str(line.trim());
+        }
+    }
+    contigs
+}
+
+fn write_fasta(path: &Path, contigs: &[(String, String)]) {
+    let mut out = String::new();
+    for (name, seq) in contigs {
+        out.push_str(&format!(">{name}\n{seq}\n"));
+    }
+    fs::write(path, out).unwrap();
+}
+
+/// Lowercase alternating 50 bp blocks, so masked and unmasked copies of the same
+/// trinucleotide both occur, as they do in a repeat-masked genome.
+fn block_mask(seq: &str) -> String {
+    seq.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if (i / 50) % 2 == 1 {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// SNPs every 37 bp across every contig, REF taken from the uppercase reference, so the
+/// fit sees many contexts on every contig rather than `small_snps.vcf`'s three sites.
+fn write_spread_snp_vcf(path: &Path, contigs: &[(String, String)]) -> usize {
+    let mut out = String::from(
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+    );
+    let mut n = 0;
+    for (name, seq) in contigs {
+        let bases = seq.as_bytes();
+        let mut pos = 20; // 0-based, clear of both contig edges
+        while pos + 20 < bases.len() {
+            let r = bases[pos].to_ascii_uppercase() as char;
+            let alt = match r {
+                'A' => Some('G'),
+                'C' => Some('T'),
+                'G' => Some('A'),
+                'T' => Some('C'),
+                _ => None,
+            };
+            if let Some(alt) = alt {
+                let gt = if n % 5 == 0 { "1/1" } else { "0/1" };
+                out.push_str(&format!(
+                    "{name}\t{}\t.\t{r}\t{alt}\t60\tPASS\t.\tGT\t{gt}\n",
+                    pos + 1
+                ));
+                n += 1;
+            }
+            pos += 37;
+        }
+    }
+    fs::write(path, out).unwrap();
+    n
+}
+
+fn fit_mut_model(
+    dir: &Path,
+    tag: &str,
+    reference: &Path,
+    vcf: &Path,
+    bed: Option<&Path>,
+) -> String {
+    let out = dir.join(format!("{tag}.json.gz"));
+    let bed = bed.map_or(".".to_string(), |b| b.display().to_string());
+    let yaml = write_temp_yaml(&format!(
+        "reference: {}\nvcf_file: {}\noutput_file: {}\noverwrite_output: true\nbed_file: {bed}\n",
+        reference.display(),
+        vcf.display(),
+        out.display()
+    ));
+    eidolon()
+        .args(["gen-mut-model", "-c"])
+        .arg(yaml.path())
+        .assert()
+        .success();
+    canonical_model_json(&out)
+}
+
+/// #771: `gen-mut-model` divides observed SNPs by trinucleotide occurrences. A soft-masked
+/// (lowercase) base is the same base, so both halves must canonicalize it identically; if
+/// occurrences are counted under a masked frame the SNPs never look up, repeat contexts are
+/// undercounted and their probabilities inflated.
+///
+/// Known answer: the fit on the reference, on its fully lowercased copy, and on a
+/// block-masked copy is the identical model, through both the whole-genome and the BED
+/// counting branches. Must-not-fire: the uppercase fit itself is unchanged, which
+/// `mut_model_matches_baseline` pins.
+#[test]
+fn mut_model_is_identical_on_a_soft_masked_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let contigs = read_fasta(&h1n1_reference());
+    assert_eq!(contigs.len(), 8, "H1N1 fixture should have 8 contigs");
+
+    let upper = dir.join("upper.fa");
+    write_fasta(&upper, &contigs);
+    let lower = dir.join("lower.fa");
+    let lowered: Vec<_> = contigs
+        .iter()
+        .map(|(n, s)| (n.clone(), s.to_ascii_lowercase()))
+        .collect();
+    write_fasta(&lower, &lowered);
+    let blocks = dir.join("blocks.fa");
+    let blocked: Vec<_> = contigs
+        .iter()
+        .map(|(n, s)| (n.clone(), block_mask(s)))
+        .collect();
+    write_fasta(&blocks, &blocked);
+    // The copies must actually differ in case, or this compares a file with itself.
+    let upper_text = fs::read_to_string(&upper).unwrap();
+    assert!(!upper_text.lines().skip(1).any(|l| l.contains('a')));
+    assert!(fs::read_to_string(&lower).unwrap().contains("acg"));
+    assert_ne!(upper_text, fs::read_to_string(&blocks).unwrap());
+
+    let vcf = dir.join("spread.vcf");
+    let n_snps = write_spread_snp_vcf(&vcf, &contigs);
+    assert!(n_snps > 300, "expected a spread of SNPs, got {n_snps}");
+
+    let bed = dir.join("regions.bed");
+    let bed_body: String = contigs
+        .iter()
+        .map(|(n, s)| format!("{n}\t10\t{}\n", s.len() - 10))
+        .collect();
+    fs::write(&bed, bed_body).unwrap();
+
+    let mut failures = Vec::new();
+    for bed_arg in [None, Some(bed.as_path())] {
+        let branch = if bed_arg.is_some() {
+            "BED"
+        } else {
+            "whole-genome"
+        };
+        let reference = fit_mut_model(dir, "upper", &upper, &vcf, bed_arg);
+        for (tag, fasta) in [("lower", &lower), ("blocks", &blocks)] {
+            let masked = fit_mut_model(dir, tag, fasta, &vcf, bed_arg);
+            if masked != reference {
+                let differing = reference
+                    .lines()
+                    .zip(masked.lines())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let first = reference
+                    .lines()
+                    .zip(masked.lines())
+                    .find(|(a, b)| a != b)
+                    .map(|(a, b)| format!("uppercase `{}` vs {tag} `{}`", a.trim(), b.trim()));
+                failures.push(format!(
+                    "{branch}/{tag}: {} vs {} lines, {differing} differ; first: {first:?}",
+                    reference.lines().count(),
+                    masked.lines().count()
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a soft-masked reference gave a different model than the uppercase one:\n{}",
+        failures.join("\n")
+    );
+}
