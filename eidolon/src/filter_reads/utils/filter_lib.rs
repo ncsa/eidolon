@@ -233,7 +233,7 @@ pub fn filter_vcf(
             let chrom = line_vec[0];
             let pos: usize = line_vec[1].parse()?;
             if let Some(records) = bed_table.get(line_vec[0])
-                && records.iter().any(|r| r.contains(chrom, pos))
+                && records.iter().any(|r| r.contains_vcf_pos(chrom, pos))
             {
                 outfile.write_all(line.as_bytes())?;
                 outfile.write_all(b"\n")?;
@@ -480,6 +480,38 @@ mod tests {
             "no data lines should be written: {:?}",
             data
         );
+    }
+
+    /// #770: VCF POS is 1-based, BED is 0-based half-open. `chr1 100 200`
+    /// covers POS 101..=200, so the record on the region's last base (200) is
+    /// kept and the one on the base before it (100) is dropped.
+    #[test]
+    fn test_filter_vcf_bed_edges_use_one_based_pos() {
+        let temp_dir: TempDir = tempfile::tempdir().unwrap();
+        let vcf_content = concat!(
+            "##fileformat=VCFv4.1\n",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+            "chr1\t100\t.\tA\tG\t37\tPASS\t.\tGT\t0/1\n",
+            "chr1\t101\t.\tA\tG\t37\tPASS\t.\tGT\t0/1\n",
+            "chr1\t200\t.\tA\tG\t37\tPASS\t.\tGT\t0/1\n",
+            "chr1\t201\t.\tA\tG\t37\tPASS\t.\tGT\t0/1\n",
+        );
+        let input = temp_dir.path().join("edges.vcf");
+        std::fs::write(&input, vcf_content).unwrap();
+        let bed_table = HashMap::from([(
+            "chr1".to_string(),
+            vec![BedRecord::new_bed_record("chr1".to_string(), 100, 200).unwrap()],
+        )]);
+        let output = temp_dir.path().join("edges.vcf.gz");
+        filter_vcf(&bed_table, &input, false, &output).unwrap();
+
+        let kept: Vec<String> = read_gzip_lines(&output)
+            .unwrap()
+            .map(|l| l.unwrap())
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.split('\t').nth(1).unwrap().to_string())
+            .collect();
+        assert_eq!(kept, vec!["101", "200"]);
     }
 
     #[test]
