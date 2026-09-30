@@ -81,7 +81,6 @@ defaults hardcoded in its sequencing error model.
 | `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
 | `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
 | insertion base composition | uniform over ACGT | `SIE_INS_NUCL` |
-| substitution transitions | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` |
 
 **Two of these were initially mistranslated in the Rust port.** The insertion fraction was
 used as the indel rate, the real indel rate was dropped, and the insertion split was
@@ -93,6 +92,73 @@ HCC1395 normal are insertions, a fraction of **0.387**.
 
 `indel_probability` has not been measured. On Illumina data the indel error rate is around
 1e-5/base; at Q35 this constant gives ~3.2e-6. Changing it needs its own measurement.
+
+### Substitution matrix (#779)
+
+Which base a substitution error produces. It does not set how many errors occur; the quality
+model does that.
+
+**What ships: the equal-weight mean of two NovaSeq 6000 libraries**, each fitted from
+mate-overlap disagreements (`bam_method: overlap`) and reweighted per read position.
+
+| | HG001 | NA12878 |
+|---|---|---|
+| **Run** | `SRR14724533` (PRJNA734598, GIAB, library `HG001.novaseq.wg`) | `SRR10965088` (PRJNA603060) |
+| **Pairs fitted** | first 40,000,000 | first 20,000,000 |
+| **Read length** | all 151 bp (untrimmed) | all 151 bp (untrimmed) |
+| **Errors counted** | 3,013,200 from 670,724,588 overlapped bases | 656,012 from 69,929,158 |
+| **Disagreement rate** | 0.45% | 0.94% |
+| **Jobs** (stage / fit) | 22559734 / 22559735 | 22571945 / 22571948 |
+
+Both were aligned to GRCh38 with bwa-mem2 and duplicate-marked by
+`scripts/delta/stage_raw_pairs.sbatch`, then fitted by `fit_overlap_matrix.sbatch`, with no
+variant mask. The two are the same individual sequenced by different labs, so their
+difference is library-to-library, not sample-to-sample.
+
+| from \ to | A | C | G | T |
+|---|---|---|---|---|
+| A | — | 0.292 | 0.154 | 0.553 |
+| C | 0.715 | — | 0.168 | 0.117 |
+| G | 0.140 | 0.144 | — | 0.716 |
+| T | 0.546 | 0.156 | 0.298 | — |
+
+Complementary rows agree in both libraries and in the mean (A→T 0.553 against T→A 0.546;
+C→A 0.715 against G→T 0.716).
+
+#### Why this, and not something else
+
+- **Why NovaSeq.** The matrix is instrument-specific. The same fit on HG002
+  `NIST_Illumina_2x250bps` (HiSeq 2500) differs from NovaSeq by up to 0.31 per cell: A→T
+  0.295, C→A 0.511, C→T 0.297. On NovaSeq, transitions fall from about 28% of errors early
+  in the read to 3% late; on HiSeq 2500 they stay above 25%. NovaSeq is current chemistry,
+  so it is the default. Nothing is averaged across instruments: a HiSeq/NovaSeq mean would
+  describe neither.
+- **Why a mean of two.** The two NovaSeq libraries differ by up to 0.11 per cell (A→T 0.606
+  against 0.501, C→T 0.092 against 0.143), which is too far to ship either one as
+  representative. Their shape agrees: the same cells dominate, and NA12878 lies between
+  HG001 and HiSeq in every cell. The mean is within 0.055 of each library in every cell.
+- **Why equal weights.** Weighting by errors counted would give HG001 82% of the mean.
+  Each library is one observation of what a NovaSeq run looks like, so each counts once.
+- **Why not HCC1395.** SEQC2's HCC1395 normal (NovaSeq) was fitted and excluded. Its reads
+  are trimmed upstream, the SRA copy (`SRR7890943`) included (min 35 bp, 36.5% under 151
+  bp, mean 150.4), and its disagreement rate falls along the read (0.059% to 0.014%), where
+  both untrimmed libraries do not. Check read lengths before trusting any library: a mean
+  length hides trimming.
+
+**Why this was not taken further.** The matrix decides which wrong base appears, so it
+touches roughly one base in every 200 to 500. Its main downstream effect is on low-VAF
+artifacts that need two errors at one site to agree: the chance two C errors agree is 0.33
+for a uniform row, 0.39 for HiSeq 2500 and 0.55 for this mean. Per-instrument defaults and
+more libraries were judged not worth the cost. **For another instrument, fit your own**
+with `gen-seq-error-model` and `bam_file:`.
+
+**This matrix and the quality model come from different libraries.** The quality model below
+is HG002's HiSeq 2500 fit. The two are independent in generation (the quality score decides
+whether a base is an error, the matrix decides which base it becomes), but they do not
+describe one run.
+
+Until v3.4.0 the default was NEAT2's `SSE_PROB` (A row 0.4918 C / 0.3377 G / 0.1705 T),
+inherited static default with no recorded source.
 
 ### Indel-error lengths
 

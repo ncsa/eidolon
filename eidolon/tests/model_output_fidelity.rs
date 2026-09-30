@@ -748,12 +748,13 @@ fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usi
 ///
 /// Setup: an all-A reference, so every true base is an A and every substitution must come
 /// from the matrix's A row. Two runs at the same seed — one with the default matrix
-/// (0.4918 C / 0.3377 G / 0.1705 T), one with the A row forced entirely to T.
+/// (0.292 C / 0.154 G / 0.553 T, NovaSeq mean, #779), one with the A row forced entirely to
+/// G. G is the default's rarest A→ substitution, so forcing it moves the spectrum furthest.
 ///
 /// This is differential rather than absolute because a forced run does NOT reach 100% T.
 /// `insertion_bias` is uniform over ACGT, so indel errors put inserted bases into the
 /// output that never consult the transition matrix. That floor is a few hundred C and G no
-/// matter what the matrix says — correct behavior, and the reason an absolute `>98% T`
+/// matter what the matrix says — correct behavior, and the reason an absolute `>98% G`
 /// assertion would fail on working code. The control run pins where the substitution
 /// spectrum sits without the override, so the comparison isolates the matrix's effect.
 ///
@@ -766,13 +767,13 @@ fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usi
 fn built_seq_error_transition_matrix_decides_the_substituted_base() {
     let tmp = tempfile::tempdir().unwrap();
 
-    // A row: all weight on T. Diagonals are ignored by the loader. The remaining rows are
+    // A row: all weight on G. Diagonals are ignored by the loader. The remaining rows are
     // never consulted — an all-A reference has no other true base.
-    let tsv = tmp.path().join("a_to_t.tsv");
+    let tsv = tmp.path().join("a_to_g.tsv");
     fs::write(
         &tsv,
         "A\tC\tG\tT\n\
-         0.0\t0.0\t0.0\t1.0\n\
+         0.0\t0.0\t1.0\t0.0\n\
          1.0\t0.0\t0.0\t0.0\n\
          1.0\t0.0\t0.0\t0.0\n\
          1.0\t0.0\t0.0\t0.0\n",
@@ -784,11 +785,11 @@ fn built_seq_error_transition_matrix_decides_the_substituted_base() {
 
     let subs_def = c_def + g_def + t_def;
     let subs_for = c_for + g_for + t_for;
-    let share_def = t_def as f64 / subs_def as f64;
-    let share_for = t_for as f64 / subs_for as f64;
+    let share_def = g_def as f64 / subs_def as f64;
+    let share_for = g_for as f64 / subs_for as f64;
     eprintln!(
-        "[fidelity] default matrix: C={c_def} G={g_def} T={t_def} → T share {:.3}\n\
-         [fidelity] forced A→T:     C={c_for} G={g_for} T={t_for} → T share {:.3}",
+        "[fidelity] default matrix: C={c_def} G={g_def} T={t_def} → G share {:.3}\n\
+         [fidelity] forced A→G:     C={c_for} G={g_for} T={t_for} → G share {:.3}",
         share_def, share_for
     );
 
@@ -798,20 +799,20 @@ fn built_seq_error_transition_matrix_decides_the_substituted_base() {
         "too few substitutions to compare (default {subs_def}, forced {subs_for})"
     );
 
-    // The control must look like the default matrix — mostly C, T in the minority.
+    // The control must look like the default matrix — mostly T, G in the minority.
     assert!(
         share_def < 0.35,
-        "default-matrix run put {:.1}% of substitutions on T; the default A row is only \
-         0.1705 T, so this run is not using the default matrix and the comparison below \
+        "default-matrix run put {:.1}% of substitutions on G; the default A row is only \
+         0.154 G, so this run is not using the default matrix and the comparison below \
          proves nothing",
         share_def * 100.0
     );
 
-    // Forcing the A row to T must dominate the spectrum. The residual C/G is the uniform
+    // Forcing the A row to G must dominate the spectrum. The residual C/G is the uniform
     // insertion floor described above, not a matrix that went unread.
     assert!(
         share_for > 0.80,
-        "forcing the A row to T only moved the T share to {:.1}% (C={c_for}, G={g_for}) — \
+        "forcing the A row to G only moved the G share to {:.1}% (C={c_for}, T={t_for}) — \
          the model's transition matrix is NOT deciding the substituted base in output reads",
         share_for * 100.0
     );
@@ -819,7 +820,7 @@ fn built_seq_error_transition_matrix_decides_the_substituted_base() {
     // State the causal claim directly: the override, not chance, moved the spectrum.
     assert!(
         share_for > share_def * 2.0,
-        "T share barely moved between the default ({:.3}) and forced ({:.3}) runs",
+        "G share barely moved between the default ({:.3}) and forced ({:.3}) runs",
         share_def,
         share_for
     );
