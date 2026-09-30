@@ -71,6 +71,17 @@ impl BedRecord {
         }
     }
 
+    /// Whether a VCF record at 1-based `POS` falls inside this 0-based,
+    /// half-open BED interval. `[s, e)` covers `POS` values `s + 1 ..= e`.
+    ///
+    /// Use this, not [`contains`](Self::contains), for any position read from a
+    /// VCF's `POS` column (or a `Variant::location`, which stores it
+    /// unconverted). `POS = 0` (the VCF telomere convention) is outside every
+    /// interval.
+    pub fn contains_vcf_pos(&self, contig: &str, pos: usize) -> bool {
+        pos >= 1 && self.contains(contig, pos - 1)
+    }
+
     pub fn overlaps(&self, contig: &str, start: usize, end: usize) -> bool {
         if self.contig != contig {
             return false;
@@ -173,6 +184,28 @@ mod test {
         assert!(!record.contains("chr1", 200)); // end is exclusive
         assert!(!record.contains("chr1", 99)); // before start
         assert!(!record.contains("chr2", 150)); // wrong contig
+    }
+
+    /// #770 known answer: `chr1 100 200` covers 1-based POS 101..=200.
+    #[test]
+    fn contains_vcf_pos_converts_one_based_pos() {
+        let record = BedRecord::new_bed_record("chr1".to_string(), 100, 200).unwrap();
+        assert!(record.contains_vcf_pos("chr1", 101), "first base of region");
+        assert!(record.contains_vcf_pos("chr1", 200), "last base of region");
+        assert!(!record.contains_vcf_pos("chr1", 100), "base before region");
+        assert!(!record.contains_vcf_pos("chr1", 201), "base after region");
+        assert!(!record.contains_vcf_pos("chr2", 150), "wrong contig");
+    }
+
+    /// POS 0 is the VCF telomere convention; it must not underflow or match a
+    /// region starting at 0.
+    #[test]
+    fn contains_vcf_pos_zero_is_outside() {
+        let record = BedRecord::new_bed_record("chr1".to_string(), 0, 10).unwrap();
+        assert!(!record.contains_vcf_pos("chr1", 0));
+        assert!(record.contains_vcf_pos("chr1", 1));
+        assert!(record.contains_vcf_pos("chr1", 10));
+        assert!(!record.contains_vcf_pos("chr1", 11));
     }
 
     #[test]

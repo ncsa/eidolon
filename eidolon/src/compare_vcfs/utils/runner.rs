@@ -90,7 +90,7 @@ pub fn runner(config: &RunConfiguration) -> Result<(), CompareVcfsError> {
     fs::create_dir_all(&config.output_dir)?;
 
     // Load chrom aliases once and apply them to every BED at load time so
-    // downstream `contains(chrom, pos)` calls use reference-canonical names.
+    // downstream `contains_vcf_pos(chrom, pos)` calls use reference-canonical names.
     let aliases = load_chrom_aliases(config.chrom_aliases.as_deref())?;
 
     let mut target_bed = match &config.target_bed {
@@ -412,7 +412,7 @@ fn filter_vcf(
             if let Some(bed) = target_bed {
                 let regions = bed.get(chrom);
                 let in_target = regions
-                    .map(|rs| rs.iter().any(|r| r.contains(chrom, v.location)))
+                    .map(|rs| rs.iter().any(|r| r.contains_vcf_pos(chrom, v.location)))
                     .unwrap_or(false);
                 if !in_target {
                     skipped.outside_target_bed += 1;
@@ -681,6 +681,29 @@ mod tests {
         assert!(kept.contains_key("chr1"));
         assert!(!kept.contains_key("chr2"));
         assert_eq!(skipped.outside_simulated_contigs, 1);
+    }
+
+    /// #770: `Variant::location` from `read_vcf` is the 1-based POS. Target
+    /// BED `chr1 100 200` covers POS 101..=200: the variant on the region's
+    /// last base is scored, the one on the base before it is not.
+    #[test]
+    fn filter_target_bed_edges_use_one_based_pos() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "chr1".into(),
+            [100, 101, 200, 201]
+                .into_iter()
+                .map(|p| snp(p, Nucleotide::A, Nucleotide::C, Some("PASS")))
+                .collect::<Vec<_>>(),
+        );
+        let bed = HashMap::from([(
+            "chr1".to_string(),
+            vec![BedRecord::new_bed_record("chr1".to_string(), 100, 200).unwrap()],
+        )]);
+        let (kept, skipped) = filter_vcf(&raw, Some(&bed), None, false, false);
+        let locs: Vec<usize> = kept["chr1"].iter().map(|v| v.location).collect();
+        assert_eq!(locs, vec![101, 200]);
+        assert_eq!(skipped.outside_target_bed, 2);
     }
 
     #[test]
