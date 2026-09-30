@@ -14,6 +14,21 @@ use eidolon_core::{
 
 use crate::gen_mut_model::errors::GenMutationModelError;
 
+/// The trinucleotide centered on `i`, with soft-masking removed.
+///
+/// A context's mutation probability is observed SNPs over occurrences, so the two counts
+/// must key their frames identically. Both the occurrence counter (BED and whole-genome
+/// branches) and the SNP arm build frames through this one function; a lowercase base
+/// counted under a `Masked*` frame is one the SNP side never looks up, which undercounts
+/// occurrences in repeats and inflates their probabilities (#771).
+fn canonical_trinuc(sequence: &[Nucleotide], i: usize) -> (Nucleotide, Nucleotide, Nucleotide) {
+    (
+        sequence[i - 1].get_unmasked_base(),
+        sequence[i].get_unmasked_base(),
+        sequence[i + 1].get_unmasked_base(),
+    )
+}
+
 pub fn runner(
     reference: &PathBuf,
     filtered_mutations: HashMap<String, Vec<Variant>>,
@@ -61,8 +76,7 @@ pub fn runner(
                     }
                     bed_track_len += r_end - r_start;
                     for i in (r_start + 1)..(r_end - 1) {
-                        let frame =
-                            TrinucFrame::from((sequence[i - 1], sequence[i], sequence[i + 1]));
+                        let frame = TrinucFrame::from(canonical_trinuc(&sequence, i));
                         *trinuc_count.entry(frame).or_default() += 1;
                     }
                 }
@@ -70,7 +84,7 @@ pub fn runner(
         } else {
             for &(start, end) in &non_n {
                 for i in (start + 1)..(end - 1) {
-                    let frame = TrinucFrame::from((sequence[i - 1], sequence[i], sequence[i + 1]));
+                    let frame = TrinucFrame::from(canonical_trinuc(&sequence, i));
                     *trinuc_count.entry(frame).or_default() += 1;
                 }
             }
@@ -113,16 +127,7 @@ pub fn runner(
                         snp_edge_skipped += 1;
                         continue;
                     }
-                    let canon = |n: Nucleotide| match n {
-                        Nucleotide::Maskeda => Nucleotide::A,
-                        Nucleotide::Maskedc => Nucleotide::C,
-                        Nucleotide::Maskedg => Nucleotide::G,
-                        Nucleotide::Maskedt => Nucleotide::T,
-                        other => other,
-                    };
-                    let n0 = canon(sequence[loc - 1]);
-                    let n1 = canon(sequence[loc]);
-                    let n2 = canon(sequence[loc + 1]);
+                    let (n0, n1, n2) = canonical_trinuc(&sequence, loc);
                     if n1 != variant.reference[0] {
                         warn!(
                             "Reference mismatch at position {}: VCF ref {:?}, FASTA base {:?}; skipping",
