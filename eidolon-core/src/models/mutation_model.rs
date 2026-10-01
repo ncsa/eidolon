@@ -112,6 +112,13 @@ impl MutationModel {
         del_lengths: Vec<usize>,
         del_weights: Vec<f64>,
     ) -> Result<Self, MutationModelError> {
+        // SNP, Insertion, Deletion, respectively. Checked before anything indexes it.
+        if variant_probs.len() != 3 {
+            error!(
+                "Input to mutation model from raw incorrect. Variant probs should have a length of 3: SNP, INS, DEL"
+            );
+            return Err(MutationModelError::InputError);
+        }
         // build transition matrices from data for snps and trinucs
         let snp_trinuc_model =
             SnpTrinucModel::from_raw_data(trinuc_frequency, trinuc_transition_frequency)?;
@@ -130,13 +137,6 @@ impl MutationModel {
             indel_model,
             snp_trinuc_model,
         };
-        // SNP, Insertion, Deletion, respectively.
-        if variant_probs.len() != 3 {
-            error!(
-                "Input to mutation model from raw incorrect. Variant probs should have a length of 3: SNP, INS, DEL"
-            );
-            return Err(MutationModelError::InputError);
-        }
         let variant_distribution =
             DiscreteDistribution::new(&variant_probs, &(allowed_variant_types()))?;
         Ok(MutationModel {
@@ -363,6 +363,35 @@ mod tests {
     use super::*;
     use crate::models::snp_trinuc_model::TrinucFrame;
     use crate::structs::nucleotides::Nucleotide::{A, C, G, T};
+
+    /// `variant_probs` is SNP, insertion, deletion. A vector of any other length is refused
+    /// with `InputError`, never a panic: the indel weights used to be indexed before the
+    /// length was checked, so a short vector panicked on `[1]` or `[2]`.
+    #[test]
+    fn from_raw_data_refuses_variant_probs_of_the_wrong_length() {
+        for probs in [vec![], vec![0.9], vec![0.9, 0.1], vec![0.7, 0.1, 0.1, 0.1]] {
+            let n = probs.len();
+            let result = std::panic::catch_unwind(|| {
+                MutationModel::from_raw_data(
+                    0.001,
+                    0.3,
+                    probs,
+                    HashMap::new(),
+                    HashMap::new(),
+                    vec![1],
+                    vec![1.0],
+                    vec![1],
+                    vec![1.0],
+                )
+            });
+            match result {
+                Ok(Err(MutationModelError::InputError)) => {}
+                Ok(Err(other)) => panic!("length {n}: expected InputError, got {other:?}"),
+                Ok(Ok(_)) => panic!("length {n}: accepted a variant_probs of the wrong length"),
+                Err(_) => panic!("length {n}: panicked instead of returning InputError"),
+            }
+        }
+    }
 
     #[test]
     fn test_model_read_write() {

@@ -73,6 +73,9 @@ is held for named GC presets (#576) and within-bin coverage spread (#775).
   four finite, non-negative values with mass off the diagonal. A five-row file used to panic.
 - **gen-cancer-reads' `read_len` default is gen-reads' (250)** (#754), and gen-reads warns when
   it rescales a quality model fitted at another read length (#742).
+- **`MutationModel::from_raw_data` refuses a `variant_probs` of the wrong length** with
+  `InputError` instead of panicking. It indexed the insertion and deletion weights before
+  checking the length.
 
 ### Fitting your own substitution matrix
 
