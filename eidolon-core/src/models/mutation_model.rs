@@ -369,7 +369,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let output_file = temp_dir.path().join("test.json.gz");
         let model: MutationModel = MutationModel::default().unwrap();
-        assert_eq!(model.mutation_rate, 0.0015160841216223734);
+        assert_eq!(model.mutation_rate, 0.0015162229753914642);
         model.write_to_file(&output_file).unwrap();
         let loaded = MutationModel::from_file(&output_file).unwrap();
         assert_eq!(loaded.mutation_rate, model.mutation_rate);
@@ -426,8 +426,14 @@ mod tests {
     /// WITHOUT eidolon: `bedtools intersect` of the v4.2.1 truth VCF's biallelic records (by
     /// POS) with its `noinconsistent` high-confidence BED gives 3,364,039 SNPs, 237,674
     /// insertions and 252,894 deletions over 2,542,242,843 bp, 38.845% homozygous. The model
-    /// counts 353 fewer at BED edges (#770), hence the tolerances. Provenance is in
-    /// model_data/README.md.
+    /// reproduces those counts exactly (Delta job 22583871, after #770), so the shares are held
+    /// to 1e-9: the pre-#770 fit, 357 SNPs short and 4 deletions over, fails them.
+    ///
+    /// The rate is held to 1e-8, not 1e-9, for one measured reason: gen-mut-model's
+    /// denominator is 2,542,242,838 bp, 5 bp short of the BED, because it skips intervals
+    /// under 3 bp (no full trinucleotide) while their variants still count. That is 2e-9
+    /// relative. The pre-#770 fit is 2.3e-4 off and still fails.
+    /// Provenance is in model_data/README.md.
     #[test]
     fn the_shipped_default_is_the_hg002_fit() {
         let model = MutationModel::default().unwrap();
@@ -440,13 +446,13 @@ mod tests {
             .zip(shares.iter().zip(expected))
         {
             assert!(
-                (got - want).abs() < 1e-4,
-                "{name} share {got:.6} is not the measured {want:.6}"
+                (got - want).abs() < 1e-9,
+                "{name} share {got:.9} is not the measured {want:.9}"
             );
         }
         let rate = total / 2_542_242_843.0;
         assert!(
-            ((model.mutation_rate - rate) / rate).abs() < 1e-3,
+            ((model.mutation_rate - rate) / rate).abs() < 1e-8,
             "mutation_rate {} is not the measured {rate}",
             model.mutation_rate
         );
@@ -467,8 +473,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         let got = format!("{:x}", Sha256::digest(DATA_FILE));
         assert_eq!(
-            got, "3435a589cd642d62f1f0af5b6443e755def39d065b0f8ad21e1b0fb94b87b16d",
-            "the shipped mutation model is not the one fitted from GIAB HG002 (job 22443316). \
+            got, "0f4f2d820ff6a545db1ba407ea6b4875bb80ca02cf4d01e170563d9bdc7f64e4",
+            "the shipped mutation model is not the one fitted from GIAB HG002 (job 22583871). \
              If the replacement is intentional, update this digest AND model_data/README.md."
         );
     }
