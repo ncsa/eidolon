@@ -25,7 +25,7 @@ use clap::{Arg, ArgAction, Command, value_parser};
 use eidolon_core::file_tools::folder_tools::check_parent;
 use log::*;
 use simplelog::{ColorChoice, CombinedLogger, Config, TermLogger, TerminalMode, WriteLogger};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::{
@@ -225,8 +225,27 @@ fn main() -> Result<(), NeatErrors> {
         )
         .subcommands(neat_commands());
 
+    // Multicall mode takes the invoked file name as the command, so a binary named after a
+    // subcommand runs it directly. Any other name, such as a release asset's
+    // `eidolon-x86_64-unknown-linux-gnu`, parses as `eidolon` instead of stopping with
+    // "unrecognized subcommand" (#794). Compared on the file stem, so `.exe` resolves.
+    let mut args: Vec<std::ffi::OsString> = env::args_os().collect();
+    let known =
+        |name: &str| name == "eidolon" || cmd.get_subcommands().any(|c| c.get_name() == name);
+    let invoked_stem = args
+        .first()
+        .and_then(|a| Path::new(a).file_stem())
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
+    if !invoked_stem.as_deref().is_some_and(known) {
+        match args.first_mut() {
+            Some(first) => *first = "eidolon".into(),
+            None => args.push("eidolon".into()),
+        }
+    }
+
     // This parses the command arguments
-    let matches = cmd.get_matches();
+    let matches = cmd.get_matches_from(args);
     let mut subcommand = matches.subcommand();
     // Default is `info`, not `trace`. The per-base debug events in
     // gen-reads (sequencing-error generation, read-position logs, etc.)
