@@ -284,21 +284,23 @@ cleaner than a native one, never dirtier. For comparison, the pre-v3.4.0 default
 
 `default_mutation_model.json.gz` is fitted by `gen-mut-model` from the GIAB HG002 v4.2.1
 GRCh38 truth VCF, restricted to its `noinconsistent` high-confidence BED, against an unmasked
-GRCh38 (`scripts/delta/fit_hg002_defaults.sbatch`, job 22443316, #752).
+GRCh38 (`scripts/delta/fit_hg002_defaults.sbatch`, job 22583871, #752; refit after #770).
 `default_indel_model.json.gz` and `default_trinuc_model.json.gz` are its own indel and
 trinucleotide components, extracted unchanged, so every mutation default describes the same
 sample. A test enforces that.
 
 | | |
 |---|---|
-| `mutation_rate` | 0.0015161 |
+| `mutation_rate` | 0.0015162 |
 | `homozygous_frequency` | 0.3884 |
 | SNP / insertion / deletion | 0.8727 / 0.0617 / 0.0655 |
 | CpG context weight | 4.48x the mean context |
 
 **Checked against the VCF without eidolon.** `bedtools intersect` of the biallelic records
 (by POS) with the BED gives 3,364,039 SNPs, 237,674 insertions and 252,894 deletions over
-2,542,242,843 bp. The model counts 353 fewer, all at BED edges (#770). Each of the 64
+2,542,242,843 bp. The model reproduces all three counts exactly. The first fit (job 22443316)
+counted 357 fewer SNPs and 4 more deletions, all at BED edges; that was the 1-based VCF
+POS being tested against 0-based BED intervals, fixed in #770. Each of the 64
 per-context SNP rows, rebuilt from those SNPs and the reference, agrees with the model to
 3.4e-4. The insertion and deletion length distributions agree to 3e-5. Ti/Tv of the source
 SNPs is 2.102.
