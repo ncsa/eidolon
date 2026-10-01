@@ -26,8 +26,8 @@ system:
 | `eidolon-x86_64-pc-windows-msvc.exe` | Windows |
 
 The binary is self-contained — it needs nothing beyond a standard C library, so there is
-no environment to set up. Download it, **rename it to `eidolon`**, make it executable, and
-run it:
+no environment to set up. Download it, make it executable, and run it. Renaming it to
+`eidolon` is the usual convenience:
 
 ```bash
 mv eidolon-x86_64-unknown-linux-gnu eidolon
@@ -37,10 +37,11 @@ chmod +x eidolon
 
 On Windows, rename it to `eidolon.exe`.
 
-**The rename is required.** eidolon reads the name it was invoked by to choose its command,
-which is how the deprecated `rneat` alias works. Run under its download name, it stops
-with `unrecognized subcommand 'eidolon-x86_64-unknown-linux-gnu'`. Removing that
-requirement is tracked for the next patch release.
+**Before v3.5.1 the rename is required.** Those releases stop with
+`unrecognized subcommand 'eidolon-x86_64-unknown-linux-gnu'` when run under the download
+name, because the binary reads the name it was invoked by to choose its command (#794).
+From v3.5.1 any name works. A binary named after a subcommand, such as `gen-reads`, still
+runs that subcommand directly.
 
 Let us know if one of these does not work on your system.
 

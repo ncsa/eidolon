@@ -1,3 +1,33 @@
+10/1/2026
+=========
+## eidolon v3.5.1 — release binaries run under their download name
+
+One change from v3.5.0, in how the binary picks its command. Simulation output, models and
+every other behavior are unchanged.
+
+### Fixed
+
+- **A release binary now runs under any file name** (#794). Every release since v2.0.0 stopped
+  with `unrecognized subcommand 'eidolon-x86_64-unknown-linux-gnu'` when run as downloaded,
+  because the binary reads the name it was invoked by to choose its command. Any name that is
+  not `eidolon` or a subcommand now runs as `eidolon`. A binary named after a subcommand, such
+  as `gen-reads`, still runs that subcommand directly, and the `rneat` alias is unaffected.
+- **The install page** no longer says the rename is required, except for releases before
+  v3.5.1. Its explanation no longer credits the multi-call dispatch to the `rneat` alias,
+  which is a separate binary.
+
+### Evidence
+
+- A new test copies the real built binary to each release asset's name and to an arbitrary
+  name, and requires the same `--version` as `eidolon`. Before the fix it failed with the
+  release error.
+- A binary named `gen-reads` must still run `gen-reads`. Making every name fall back to
+  `eidolon` fails that test.
+- Full suite and clippy pass.
+
+**Not verified:** the Windows `.exe` asset. The name is compared on its file stem, so
+`eidolon-x86_64-pc-windows-msvc.exe` should resolve, but it has not been run on Windows.
+
 9/30/2026
 =========
 ## eidolon v3.5.0 — germline defaults fitted from one human genome
