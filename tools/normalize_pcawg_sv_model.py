@@ -100,7 +100,16 @@ def main():
     fit_sv = fit.get("sv_model")
     if not fit_sv:
         sys.exit("fitted model has no sv_model — did gen-mut-model fit SVs?")
-    base_sv = base.get("sv_model") or {}
+    base_sv = base.get("sv_model")
+    if not base_sv:
+        # INS length, the CNV fallback and homozygous_frequency come from the base's
+        # sv_model. Without one they would default silently: INS length to a degenerate
+        # [0, 0], homozygous_frequency to 0.1 (#761). A model from
+        # `fetch_cosmic_corpus.sh --train` has no sv_model; graft the shipped pan-cancer
+        # one onto it first (graft_sv_model.py).
+        sys.exit(f"base model {args.base_model} has no sv_model, so INS length and "
+                 "homozygous_frequency have no source. Use a base that carries one, such "
+                 "as tools/cosmic_v104_pancancer_model.json.gz.")
 
     means = side["notes"]["per_donor_means"]  # DEL/DUP/INV/BND (+ CNV raw)
 
