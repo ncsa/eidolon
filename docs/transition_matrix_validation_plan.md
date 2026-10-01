@@ -1,6 +1,33 @@
 # SNP transition matrix — validation status and Delta plan
 
-Status: **local tier complete; Delta tier specified and NOT yet run** (2026-08-12).
+Status: **local tier complete; aligner round trip run locally (2026-09-28); real-data tier
+NOT yet run.**
+
+**Round trip, run locally** (`eidolon/tests/transition_matrix_round_trip.rs`, release gate).
+An asymmetric matrix is planted (A→C 0.80, T→G 0.10). Reads are simulated on ecoli at 5x
+with `mutation_rate: 0`, aligned with bwa-mem2, and refitted through `bam_file:`. Every cell
+comes back within 0.007, from 228,326 mismatches. Generation applies substitution errors in
+reference orientation (R2 is generated forward, then reverse-complemented), which is the
+frame the BAM counter reads. A counter that complements reverse-strand reads fails the test:
+A→C 0.454, T→G off by 0.354. This covers steps 4–6 below for simulated reads. It does not
+cover step 1: whether a real BAM's mismatches are sequencing errors.
+
+**Overlap fitting (#779), the default since.** Reference mismatches in a real BAM include
+the sample's variants, mapping errors and library damage, so `bam_file:` now fits from
+disagreements between overlapping mates by default (`bam_method: overlap`). The same round
+trip plants germline variants (`mutation_rate: 0.005`) as well: the overlap fit recovers the
+planted matrix within 0.007 from 74,938 errors, while `bam_method: mismatch` on the same BAM
+misses C→T by 0.218. Getting there needed #780: gen-reads had drawn het alleles per read, so a
+fragment's mates disagreed at het sites.
+
+**Per-cycle reweighting.** Overlaps sit at reads' 3' ends: HG002's last fifth of the read
+held 8.8G observations against 0.7G in the first, and 71% of counted errors. Its early cycles
+are transition-rich and its late cycles transversion-rich, so pooled counts give the overlap
+region's spectrum, not a whole read's. The fit now divides each read-position bin's counts
+by its observations and sums the rates. Bins under 10,000 errors first merge with their
+neighbors, weighted by the bins they span, because one noisy bin would otherwise carry a full
+bin's weight. Unmerged, that moved the round trip's worst cell from 0.007 to 0.024; merged, it
+is 0.005. On HG002 the reweighting shifts no cell by more than 0.028.
 
 Covers `gen-seq-error-model`'s `bam_file:` / `transition_matrix_file:` inputs — the
 BAM-derived SNP substitution matrix, which is one of the few model-builder capabilities

@@ -268,3 +268,120 @@ fn an_explicit_quality_model_override_applies_to_both_mates() {
          mate)"
     );
 }
+
+/// Records (in 4-line FASTQ `lines`) whose name starts with `@<prefix>`, as quality lines.
+fn quality_lines_named(lines: &[String], prefix: &str) -> Vec<String> {
+    let tag = format!("@{prefix}");
+    lines
+        .chunks(4)
+        .filter(|rec| rec[0].starts_with(&tag))
+        .flat_map(|rec| rec.iter().cloned())
+        .collect()
+}
+
+/// #753 — SV junction reads must draw R2 from R2's fit, like every other read.
+///
+/// The four junction writers (BND, INV, DEL, DUP) build their own read pairs and each drew R2's
+/// quality from R1's model. Their reads are exactly what an SV caller uses, and no other test
+/// runs per-mate quality with SVs on.
+///
+/// KNOWN ANSWER, as above: R1 fitted all-Q40, R2 all-Q20, so every junction R2 must read Q20 and
+/// every junction R1 Q40. The denominator is asserted per writer, since a writer that produced
+/// no reads would otherwise pass vacuously. H1N1 is used for its eight contigs: de novo BND is
+/// inter-chromosomal only.
+#[test]
+fn sv_junction_reads_draw_each_mate_from_its_own_fit() {
+    let (_g, work) = fresh_workdir();
+    let r1_fq = work.join("sv_r1.fastq");
+    let r2_fq = work.join("sv_r2.fastq");
+    write_flat_fastq(&r1_fq, 200, R1_QUAL);
+    write_flat_fastq(&r2_fq, 200, R2_QUAL);
+    let model = fit(&work, &r1_fq, Some(&r2_fq), "sv");
+
+    let mut cfg = GenReadsConfig::new(h1n1_reference(), work.clone(), "gen_sv");
+    cfg.paired_ended = true;
+    cfg.read_len = READ_LEN;
+    cfg.coverage = 20;
+    cfg.rng_seed = "753".to_string();
+    cfg.sequence_error_model = Some(model);
+    cfg.sv_rate_scale = Some(40.0);
+    // De novo generation plants no INV on this fixture, so one is supplied: without it the
+    // INV writer would go untested. Same event as sv_support_matrix.rs's INV cell.
+    let inv_vcf = work.join("inv.vcf");
+    std::fs::write(
+        &inv_vcf,
+        "##fileformat=VCFv4.2\n\
+         ##contig=<ID=H1N1_PB2,length=2313>\n\
+         ##ALT=<ID=INV,Description=\"INV\">\n\
+         ##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"SVTYPE\">\n\
+         ##INFO=<ID=END,Number=1,Type=Integer,Description=\"END\">\n\
+         ##INFO=<ID=SVLEN,Number=.,Type=Integer,Description=\"SVLEN\">\n\
+         ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
+         H1N1_PB2\t500\tinv\tA\t<INV>\t60\tPASS\tSVTYPE=INV;END=1700;SVLEN=1200\tGT\t0/1\n",
+    )
+    .unwrap();
+    cfg.input_vcf = Some(inv_vcf);
+    let yaml = cfg.write_yaml();
+    let out = eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(yaml.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "generation failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out1 = read_gzip_fastq_lines(&work.join("gen_sv_r1.fastq.gz"));
+    let out2 = read_gzip_fastq_lines(&work.join("gen_sv_r2.fastq.gz"));
+
+    // Longest prefix first, so plain BND ("EIDOLON_chimeric_" + contig) is what is left over.
+    let writers = [
+        ("INV", "EIDOLON_chimeric_INV_"),
+        ("DEL", "EIDOLON_chimeric_DEL_"),
+        ("DUP", "EIDOLON_chimeric_DUP_"),
+    ];
+    let mut failures = Vec::new();
+    let mut check = |name: &str, r1: Vec<String>, r2: Vec<String>| {
+        let n1 = r1.len() / 4;
+        let n2 = r2.len() / 4;
+        eprintln!("{name}: {n1} R1 / {n2} junction reads");
+        if n1 == 0 || n2 == 0 {
+            failures.push(format!("{name}: no junction reads ({n1} R1, {n2} R2)"));
+            return;
+        }
+        let (m1, _) = mean_quality(&r1);
+        let (m2, _) = mean_quality(&r2);
+        eprintln!("{name}: R1 Q{m1:.3}, R2 Q{m2:.3}");
+        if (m1 - 40.0).abs() >= 0.5 {
+            failures.push(format!("{name}: junction R1 must be Q40, got Q{m1:.3}"));
+        }
+        if (m2 - 20.0).abs() >= 0.5 {
+            failures.push(format!(
+                "{name}: junction R2 must be Q20, got Q{m2:.3} (Q40 means R1's model)"
+            ));
+        }
+    };
+    for (name, prefix) in writers {
+        check(
+            name,
+            quality_lines_named(&out1, prefix),
+            quality_lines_named(&out2, prefix),
+        );
+    }
+    let is_bnd = |lines: &[String]| -> Vec<String> {
+        lines
+            .chunks(4)
+            .filter(|rec| {
+                rec[0].starts_with("@EIDOLON_chimeric_")
+                    && !writers
+                        .iter()
+                        .any(|(_, p)| rec[0].starts_with(&format!("@{p}")))
+            })
+            .flat_map(|rec| rec.iter().cloned())
+            .collect()
+    };
+    check("BND", is_bnd(&out1), is_bnd(&out2));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

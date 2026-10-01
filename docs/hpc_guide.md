@@ -66,7 +66,7 @@ do not need sharding at all. One single-threaded process:
 ```yaml
 # sim.yml
 reference: /path/to/genome.fa
-read_len: 151
+read_len: 250
 coverage: 30
 ploidy: 2
 paired_ended: true

@@ -103,6 +103,20 @@ where
     Ok(value)
 }
 
+/// Read a model embedded in the binary, through the same provenance check as `model_reader`.
+///
+/// The shipped defaults are `include_bytes!` blobs, not files. Parsing them straight into the
+/// model type works for a struct, which ignores the `_eidolon` key, but not for an enum like
+/// `FragmentLengthModel`, which rejects it. `label` names the blob in log messages.
+pub fn model_from_bytes<T>(bytes: &[u8], label: &str) -> Result<T, std::io::Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut value: serde_json::Value = serde_json::from_reader(GzDecoder::new(bytes))?;
+    check_provenance(&mut value, &PathBuf::from(label))?;
+    Ok(serde_json::from_value(value)?)
+}
+
 /// Validate and remove the provenance stamp, leaving the model's own fields behind.
 ///
 /// A file whose `format_version` is AHEAD of this build is refused. That is the whole point of
@@ -168,11 +182,10 @@ mod tests {
     use serde_json::json;
     use std::io::Read;
 
-    /// A real pre-stamp model file. These shipped defaults are loaded by every eidolon run and
-    /// were written long before provenance existed, which makes them the honest backward-
-    /// compatibility fixture rather than a synthetic one built to pass.
-    static PRE_STAMP_MODEL: &[u8] =
-        include_bytes!("model_data/default_fragment_length_model.json.gz");
+    /// A real pre-stamp model file: the NEAT2-derived mutation model eidolon shipped as its
+    /// default until #752. It was written long before stamps existed, which makes it the
+    /// honest backward-compatibility fixture rather than a synthetic one built to pass.
+    static PRE_STAMP_MODEL: &[u8] = include_bytes!("test_fixtures/neat2_mutation_model.json.gz");
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct Toy {

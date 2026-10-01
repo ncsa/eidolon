@@ -367,6 +367,12 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut reads1_flagged: Vec<usize> = Vec::new();
         let mut read2_variants: HashMap<usize, &Variant> = HashMap::new();
         let mut reads2_flagged: Vec<usize> = Vec::new();
+        // One allele per variant per FRAGMENT (#780): both mates read the same molecule, so
+        // a variant both reads cover must show the same allele in both. Keyed by reference
+        // position here, re-keyed by each read's offset below.
+        let mut fragment_alleles: HashMap<usize, bool> = HashMap::new();
+        let mut read1_alleles: HashMap<usize, bool> = HashMap::new();
+        let mut read2_alleles: HashMap<usize, bool> = HashMap::new();
         // Only the variants overlapping this fragment's two read windows matter.
         // block_map.flagged_positions is sorted (from_interval), so binary-search
         // each window instead of scanning every variant on the contig. The old
@@ -423,7 +429,17 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             let Some(proj) = project(pos) else { continue };
             if proj >= start && proj < start + effective_read_len {
                 let var_pos = proj - start;
-                read1_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                let variant = &block_map.variant_map[&pos];
+                let is_alt = match fragment_alleles.get(&pos) {
+                    Some(&a) => a,
+                    None => {
+                        let a = draw_allele(variant, rng)?;
+                        fragment_alleles.insert(pos, a);
+                        a
+                    }
+                };
+                read1_alleles.insert(var_pos, is_alt);
+                read1_variants.insert(var_pos, variant);
                 reads1_flagged.push(var_pos);
             }
         }
@@ -444,7 +460,17 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 let Some(proj) = project(pos) else { continue };
                 if proj >= w_lo && proj < end {
                     let var_pos = proj - w_lo;
-                    read2_variants.insert(var_pos, &block_map.variant_map[&pos]);
+                    let variant = &block_map.variant_map[&pos];
+                    let is_alt = match fragment_alleles.get(&pos) {
+                        Some(&a) => a,
+                        None => {
+                            let a = draw_allele(variant, rng)?;
+                            fragment_alleles.insert(pos, a);
+                            a
+                        }
+                    };
+                    read2_alleles.insert(var_pos, is_alt);
+                    read2_variants.insert(var_pos, variant);
                     reads2_flagged.push(var_pos);
                 }
             }
@@ -531,7 +557,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
 
         let quality_scores_1 =
             quality_score_model.generate_quality_scores(effective_read_len, rng)?;
-        let mut r1_record = match generate_read(
+        let mut r1_record = match generate_read_with_alleles(
             fragment,
             frag_ops,
             frag_dels,
@@ -550,6 +576,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             tlen,
             paired_ended,
             ad_counter,
+            &read1_alleles,
         ) {
             Ok(record) => record,
             Err(FastqToolsError::TruncatedRead(msg)) => {
@@ -594,8 +621,8 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
         let mut r2_record = if paired_ended {
             // R2 draws from the R2 fit when the model carries one (#723).
             let qsm_r2 = r2_quality_model(quality_score_model, quality_score_model_r2);
-            let quality_scores_2 =
-                laid_down_for_the_flip(qsm_r2.generate_quality_scores(effective_read_len, rng)?);
+            // Cycle order; `generate_reverse_mate` lays it down for the flip.
+            let quality_scores_2 = qsm_r2.generate_quality_scores(effective_read_len, rng)?;
             let r2_pos = r2_ref_pos
                 .or(r1_ref_pos)
                 .unwrap_or_else(|| abs_end.saturating_sub(effective_read_len));
@@ -651,7 +678,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                     }
                     _ => None,
                 };
-            match generate_read(
+            match generate_reverse_mate(
                 r2_sub,
                 r2_ops,
                 r2_dels,
@@ -659,7 +686,6 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 &read2_variants,
                 effective_read_len,
                 format!("{}/2", base_name),
-                Strand::Forward,
                 quality_scores_2,
                 sequencing_error_model,
                 rng,
@@ -668,18 +694,20 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                 sequence_block.contig.clone(),
                 r1_pos,
                 tlen_r2,
-                true,
                 ad_counter,
-            ) {
-                Ok(mut record) => {
+                &read2_alleles,
+                |record| {
                     if r2_ref_pos.is_none() {
                         record.is_unmapped = true;
                         record.cigar_ops = vec!['S'; record.sequence.len()];
                     }
-                    // Flip to the reverse mate FIRST, then append the R2 adapter at
-                    // the (now 3') end — so R2 carries the R2 adapter in read
-                    // orientation, exactly as a trimmer expects.
-                    let mut rec = reverse_complement_record(record);
+                    Ok(())
+                },
+            ) {
+                Ok(mut rec) => {
+                    // The record is already the flipped reverse mate; append the R2 adapter
+                    // at its (now 3') end, so R2 carries the R2 adapter in read orientation,
+                    // exactly as a trimmer expects.
                     if adapters_on {
                         rec = append_adapter_readthrough(
                             rec,
@@ -826,11 +854,12 @@ pub struct HaplotypePairedFragment {
 
 /// The quality model R2 draws from: its own when the fit produced one, R1's otherwise (#723).
 ///
-/// One helper for all three R2 sites — the paired writer, the haplotype paired writer, and the
-/// R2 adapter readthrough — so they cannot drift. Three copies of `unwrap_or` is three chances
-/// for one of them to keep using R1 after the others stopped, and every aggregate measure over
-/// the pair would still look right.
-fn r2_quality_model<'a>(
+/// One helper for every R2 site — the paired writer, the haplotype paired writer, the R2
+/// adapter readthrough, and gen-reads' four SV junction writers (BND, INV, DEL, DUP) — so they
+/// cannot drift. Each copy of `unwrap_or` is a chance for one of them to keep using R1 after
+/// the others stopped, and every aggregate measure over the pair would still look right. The
+/// junction writers did exactly that (#753).
+pub fn r2_quality_model<'a>(
     r1: &'a QualityScoreModel,
     r2: Option<&'a QualityScoreModel>,
 ) -> &'a QualityScoreModel {
@@ -898,11 +927,9 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
         };
         apply_haplotype_baseline_cigar(&mut r1, &fragment.r1_baseline_ops)?;
 
-        let r2_quality = laid_down_for_the_flip(
-            r2_quality_model(quality_score_model, quality_score_model_r2)
-                .generate_quality_scores(read_length, rng)?,
-        );
-        let mut r2 = match generate_read(
+        let r2_quality = r2_quality_model(quality_score_model, quality_score_model_r2)
+            .generate_quality_scores(read_length, rng)?;
+        let r2 = match generate_reverse_mate(
             &fragment.r2_sequence,
             // Chimeric reads are stitched from reference pieces: every base is 'M', and
             // no haplotype deletion applies.
@@ -912,7 +939,6 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
             &HashMap::new(),
             read_length,
             format!("{name}/2"),
-            Strand::Forward,
             r2_quality,
             sequencing_error_model,
             rng,
@@ -921,15 +947,15 @@ pub fn write_haplotype_paired_fragments<B1: Write, B2: Write>(
             contig_name.to_string(),
             fragment.r1_position,
             -fragment.template_length,
-            true,
             &mut ad_counter,
+            &HashMap::new(),
+            // The baseline ops are top-strand, so they go on before the flip.
+            |record| apply_haplotype_baseline_cigar(record, &fragment.r2_baseline_ops),
         ) {
             Ok(record) => record,
             Err(FastqToolsError::TruncatedRead(_)) => continue,
             Err(error) => return Err(error),
         };
-        apply_haplotype_baseline_cigar(&mut r2, &fragment.r2_baseline_ops)?;
-        r2 = reverse_complement_record(r2);
 
         write_read_to_fastq(&r1, buffer1)?;
         write_read_to_fastq(&r2, buffer2)?;
@@ -980,10 +1006,67 @@ fn stream_gzip_files(files: &[PathBuf], output: &PathBuf) -> Result<(), FastqToo
     Ok(())
 }
 
+/// Whether a read (or a fragment, #780) carries a variant's alternate allele. An explicit
+/// `allele_fraction` (input VCF, #398) sets the chance; otherwise homozygous is always alt and
+/// heterozygous is a coin flip. Homozygous draws no rng, so default runs stay byte-identical.
+fn draw_allele(variant: &Variant, rng: &mut NeatRng) -> Result<bool, FastqToolsError> {
+    Ok(if let Some(f) = variant.allele_fraction {
+        rng.random()? < f
+    } else {
+        (variant.genotype == Genotype::Homozygous) || (rng.random()? < 0.5)
+    })
+}
+
+/// `generate_read_with_alleles` with no allele decisions made in advance: each variant the
+/// read covers draws its own allele. Right for a read with no mate sharing its molecule.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_read(
+    sequence: &[Nucleotide],
+    hap_ops: Option<&[char]>,
+    hap_dels: Option<&[(usize, usize)]>,
+    flagged_positions: &[usize],
+    variant_map: &HashMap<usize, &Variant>,
+    read_length: usize,
+    name: String,
+    read_strand: Strand,
+    quality_scores: Vec<usize>,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+    contig: String,
+    position: usize,
+    mate_contig: String,
+    mate_position: usize,
+    template_length: i32,
+    is_paired: bool,
+    ad_counter: &mut AdCounter,
+) -> Result<ReadRecord, FastqToolsError> {
+    generate_read_with_alleles(
+        sequence,
+        hap_ops,
+        hap_dels,
+        flagged_positions,
+        variant_map,
+        read_length,
+        name,
+        read_strand,
+        quality_scores,
+        sequencing_error_model,
+        rng,
+        contig,
+        position,
+        mate_contig,
+        mate_position,
+        template_length,
+        is_paired,
+        ad_counter,
+        &HashMap::new(),
+    )
+}
+
 // `cigar_ops.push('D')` runs in a loop per deletion-error base; pushing the
 // same byte N times is the entire CIGAR encoding, not a copy-paste mistake.
 #[allow(clippy::same_item_push)]
-pub fn generate_read(
+pub fn generate_read_with_alleles(
     sequence: &[Nucleotide],
     // Baseline CIGAR op per base of `sequence`, from
     // `InsertionCoordinateMap::cigar_ops_for_segments`: 'M' where the base came from the
@@ -1021,6 +1104,9 @@ pub fn generate_read(
     template_length: i32,
     is_paired: bool,
     ad_counter: &mut AdCounter,
+    // Allele decisions already made for this read's fragment, keyed like `variant_map` (#780).
+    // A variant absent here draws its own allele.
+    alleles: &HashMap<usize, bool>,
 ) -> Result<ReadRecord, FastqToolsError> {
     if sequence.len() < read_length {
         return Err(FastqToolsError::TruncatedRead(format!("{:?}", sequence)));
@@ -1086,10 +1172,9 @@ pub fn generate_read(
             // fall back to the Genotype default: homozygous always alt, het ~0.5.
             // The else-branch keeps the exact same short-circuit (homozygous draws
             // no rng) so default runs stay byte-identical.
-            let is_alt = if let Some(f) = variant.allele_fraction {
-                rng.random()? < f
-            } else {
-                (variant.genotype == Genotype::Homozygous) || (rng.random()? < 0.5)
+            let is_alt = match alleles.get(&fragment_position) {
+                Some(&decided) => decided,
+                None => draw_allele(variant, rng)?,
             };
             if is_alt {
                 let alt = variant.alternate.as_literal().unwrap();
@@ -1311,6 +1396,69 @@ fn reverse_complement_record(mut record: ReadRecord) -> ReadRecord {
     record.quality_scores.reverse();
     record.is_reverse = true;
     record
+}
+
+/// Build a reverse-strand mate: the ONE construction every R2 in eidolon goes through (#777).
+///
+/// `window` is the fragment's right end on the TOP strand, starting at the first base R2
+/// covers (plus any buffer past it for deletion errors to consume). `cycle_quality` is the R2
+/// quality draw in cycle order, as `generate_quality_scores` returns it. The steps, in order:
+///
+///   1. lay the quality down backwards (`laid_down_for_the_flip`, #734);
+///   2. generate FORWARD over `window`, so each sequencing error is drawn against the top-strand
+///      base -- the frame the substitution matrix is fitted in (`transition_matrix_round_trip.rs`);
+///   3. run `before_flip` on the forward record (CIGAR fix-ups that are defined top-strand);
+///   4. flip into read orientation (`reverse_complement_record`).
+///
+/// Every step is load-bearing. Drawing errors on an already reverse-complemented window applies
+/// the matrix's reverse complement, which is what the SV junction writers did until #777; an
+/// asymmetric user matrix then came back mirrored on their R2 reads only. Skipping step 1
+/// reverses the emitted quality profile (#734). The ordinary paired writer, the haplotype paired
+/// writer and gen-reads' four junction writers all call this, so they cannot drift again.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_reverse_mate(
+    window: &[Nucleotide],
+    hap_ops: Option<&[char]>,
+    hap_dels: Option<&[(usize, usize)]>,
+    flagged_positions: &[usize],
+    variant_map: &HashMap<usize, &Variant>,
+    read_length: usize,
+    name: String,
+    cycle_quality: Vec<usize>,
+    sequencing_error_model: &SequencingErrorModel,
+    rng: &mut NeatRng,
+    contig: String,
+    position: usize,
+    mate_contig: String,
+    mate_position: usize,
+    template_length: i32,
+    ad_counter: &mut AdCounter,
+    alleles: &HashMap<usize, bool>,
+    before_flip: impl FnOnce(&mut ReadRecord) -> Result<(), FastqToolsError>,
+) -> Result<ReadRecord, FastqToolsError> {
+    let mut record = generate_read_with_alleles(
+        window,
+        hap_ops,
+        hap_dels,
+        flagged_positions,
+        variant_map,
+        read_length,
+        name,
+        Strand::Forward,
+        laid_down_for_the_flip(cycle_quality),
+        sequencing_error_model,
+        rng,
+        contig,
+        position,
+        mate_contig,
+        mate_position,
+        template_length,
+        true,
+        ad_counter,
+        alleles,
+    )?;
+    before_flip(&mut record)?;
+    Ok(reverse_complement_record(record))
 }
 
 /// Append 3' sequencing-adapter readthrough to a FINAL-oriented read (#125).

@@ -41,7 +41,7 @@ build-from-source instructions are in the docs.
 ```yaml
 # my_config.yml
 reference: /path/to/reference.fa
-read_len: 151
+read_len: 250
 coverage: 10
 ploidy: 2
 output_dir: /path/to/output

@@ -86,8 +86,7 @@ Input VCF expectations:
 - symbolic SV records (`<DEL>` / `<DUP>` / `<CNV>` / `<INV>` / `<BND>` with
   `SVTYPE` / `END` / `SVLEN`) are fit into an `sv_model` when present, which is
   what `sv_rate_scale` draws from at simulation time;
-- `bed_file:` restricts the fit to regions; `transition_matrix_file:` overrides the
-  inferred SNP transition matrix. See `template_config/gen_mut_model_template.yml`.
+- `bed_file:` restricts the fit to regions. See `template_config/gen_mut_model_template.yml`.
 
 The fitted `mutation_rate` is `variant_count / reference_length` — corpus-aggregated
 if the VCF pools many tumors, so treat it as a spectrum descriptor, not a per-tumor
@@ -127,7 +126,7 @@ output_dir: ./out
 output_prefix: tumor70
 total_coverage: 60
 purity: 0.7
-read_len: 151
+read_len: 250
 paired_ended: true
 fragment_mean: 350
 fragment_st_dev: 50

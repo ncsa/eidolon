@@ -11,42 +11,42 @@ repeatability.
 
 | model / parameter | source | measured |
 |---|---|---|
-| `default_fragment_length_model.json.gz` | HCC1395 normal | yes |
+| `default_fragment_length_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
 | `error_rate` | GIAB HG002 2x250, fitted | yes — 0.003774, measured |
 | `indel_probability` | NEAT2 static default | no |
 | `insertion_fraction` | NEAT2 static default | yes — confirmed at 0.387 |
 | indel-error lengths | HCC1395 normal | yes |
 | homopolymer context curve | HCC1395 normal | yes |
 | `default_sequencing_error_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
-| `default_mutation_model.json.gz` (+ `_bkup`) | unrecorded | no |
-| `default_indel_model.json.gz` | unrecorded | no |
-| `default_trinuc_model.json.gz` | unrecorded | no |
+| `default_mutation_model.json.gz` | GIAB HG002 v4.2.1 truth VCF, fitted | yes — see below |
+| `default_indel_model.json.gz` | the mutation default's own indel model | yes, with it |
+| `default_trinuc_model.json.gz` | the mutation default's own trinucleotide model | yes, with it |
+| `default_mutation_model_bkup.json.gz` | NEAT2 `MutModel_NA12878.p.gz`, first conversion | not loaded; provenance only |
 
 ## `default_fragment_length_model.json.gz`
 
 | | |
 |---|---|
-| **Source** | HCC1395 matched **normal**, SEQC2 Somatic Mutation WG reference sample |
-| **Read group** | `WGS_NS_N_1` (NovaSeq replicate 1, `WGS_NS_N_1.bwa.dedup.bam`) |
-| **Origin** | `ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/seqc/Somatic_Mutation_WG/data/WGS` |
-| **Reference** | GRCh38, chr-prefixed |
-| **Region** | chr20 + chr21 + chr22 |
-| **Pairs used** | 32,627,236 of 32,669,084 collected (0.13% trimmed as outliers) |
-| **Built with** | `eidolon gen-frag-length-model`, `min_reads: 100`, default `distribution: discrete` |
-| **Built at** | eidolon `3.2.1+2f98bb6`, 2026-08-30 |
+| **Source** | GIAB HG002, `NIST_Illumina_2x250bps`, aligned to GRCh38 (21x) — the library the quality model comes from |
+| **Pairs used** | 61,588,264; 0.19% trimmed as outliers (discordant and chimeric pairs) |
+| **Built with** | `eidolon gen-frag-length-model`, `min_reads: 100`, `distribution: discrete` |
+| **Fitted by** | `scripts/delta/fit_hg002_defaults.sbatch`, jobs 22443316 / 22444161 (#752) |
 
-Shape: 1087 bins over 8–1094 bp, no gaps. Mean 431.8, sd 112.3, **skew +0.528**,
-p05/p50/p95/p99 = 258/424/623/746.
+Shape: 982 bins over 3–984 bp, no gaps. Mean 408.5, sd 93.2, skew +0.207,
+p05/p50/p95/p99 = 262/404/567/649.
 
-**Cross-validated against a different chromosome.** A model built from chr20/21/22 was
-checked against chr1's fragments from the same library (27.6M independent pairs) with
-`scripts/delta/validate_frag_model.sh`: mean within **0.34%**, sd **0.12%**, skew **0.011**,
-p99 **0.13%** — against tolerances of 2% / 5% / 0.15 / 5%. A model built from chr1 itself
-did only marginally better (0.01% / 0.03% / 0.001 / 0.00%).
+**Checked against the BAM with samtools**, not eidolon (`scripts/delta/validate_frag_model.sh`,
+same filter as the builder): over the model's support the BAM reads mean 408.55, sd 93.19,
+skew +0.207, and the model agrees to 0.00% on mean, sd and p99. That checks the builder. It is
+not a held-out check: the model is fitted from the whole genome, so there is no unseen
+chromosome to test it on.
 
-Updating this model was motivated by careful analysis of public data. The previous default
-produced left-skewed (−0.434) fragments where the real data we analyzed was consistently
-right-skewed.
+At 250 bp reads, 4.71% of the mass falls below the sampler's `read_len + 10` floor.
+
+**Chemistry is older than the model it replaced.** The previous default came from HCC1395's
+NovaSeq normal (mean 431.8, sd 112.3, skew +0.528). This one is HiSeq 2500. It was chosen so
+the shipped defaults describe one library rather than the individually newest source per
+component (#752).
 
 ## Sequencing error model
 
@@ -81,7 +81,6 @@ defaults hardcoded in its sequencing error model.
 | `indel_probability` | 0.01 | `SIE_RATE` — odds a sequencing error is an indel |
 | `insertion_fraction` | 0.4 | `SIE_INS_FREQ` — odds such an indel is an insertion |
 | insertion base composition | uniform over ACGT | `SIE_INS_NUCL` |
-| substitution transitions | 0.4918 / 0.3377 / 0.1705 … | `SSE_PROB` |
 
 **Two of these were initially mistranslated in the Rust port.** The insertion fraction was
 used as the indel rate, the real indel rate was dropped, and the insertion split was
@@ -93,6 +92,73 @@ HCC1395 normal are insertions, a fraction of **0.387**.
 
 `indel_probability` has not been measured. On Illumina data the indel error rate is around
 1e-5/base; at Q35 this constant gives ~3.2e-6. Changing it needs its own measurement.
+
+### Substitution matrix (#779)
+
+Which base a substitution error produces. It does not set how many errors occur; the quality
+model does that.
+
+**What ships: the equal-weight mean of two NovaSeq 6000 libraries**, each fitted from
+mate-overlap disagreements (`bam_method: overlap`) and reweighted per read position.
+
+| | HG001 | NA12878 |
+|---|---|---|
+| **Run** | `SRR14724533` (PRJNA734598, GIAB, library `HG001.novaseq.wg`) | `SRR10965088` (PRJNA603060) |
+| **Pairs fitted** | first 40,000,000 | first 20,000,000 |
+| **Read length** | all 151 bp (untrimmed) | all 151 bp (untrimmed) |
+| **Errors counted** | 3,013,200 from 670,724,588 overlapped bases | 656,012 from 69,929,158 |
+| **Disagreement rate** | 0.45% | 0.94% |
+| **Jobs** (stage / fit) | 22559734 / 22559735 | 22571945 / 22571948 |
+
+Both were aligned to GRCh38 with bwa-mem2 and duplicate-marked by
+`scripts/delta/stage_raw_pairs.sbatch`, then fitted by `fit_overlap_matrix.sbatch`, with no
+variant mask. The two are the same individual sequenced by different labs, so their
+difference is library-to-library, not sample-to-sample.
+
+| from \ to | A | C | G | T |
+|---|---|---|---|---|
+| A | — | 0.292 | 0.154 | 0.553 |
+| C | 0.715 | — | 0.168 | 0.117 |
+| G | 0.140 | 0.144 | — | 0.716 |
+| T | 0.546 | 0.156 | 0.298 | — |
+
+Complementary rows agree in both libraries and in the mean (A→T 0.553 against T→A 0.546;
+C→A 0.715 against G→T 0.716).
+
+#### Why this, and not something else
+
+- **Why NovaSeq.** The matrix is instrument-specific. The same fit on HG002
+  `NIST_Illumina_2x250bps` (HiSeq 2500) differs from NovaSeq by up to 0.31 per cell: A→T
+  0.295, C→A 0.511, C→T 0.297. On NovaSeq, transitions fall from about 28% of errors early
+  in the read to 3% late; on HiSeq 2500 they stay above 25%. NovaSeq is current chemistry,
+  so it is the default. Nothing is averaged across instruments: a HiSeq/NovaSeq mean would
+  describe neither.
+- **Why a mean of two.** The two NovaSeq libraries differ by up to 0.11 per cell (A→T 0.606
+  against 0.501, C→T 0.092 against 0.143), which is too far to ship either one as
+  representative. Their shape agrees: the same cells dominate, and NA12878 lies between
+  HG001 and HiSeq in every cell. The mean is within 0.055 of each library in every cell.
+- **Why equal weights.** Weighting by errors counted would give HG001 82% of the mean.
+  Each library is one observation of what a NovaSeq run looks like, so each counts once.
+- **Why not HCC1395.** SEQC2's HCC1395 normal (NovaSeq) was fitted and excluded. Its reads
+  are trimmed upstream, the SRA copy (`SRR7890943`) included (min 35 bp, 36.5% under 151
+  bp, mean 150.4), and its disagreement rate falls along the read (0.059% to 0.014%), where
+  both untrimmed libraries do not. Check read lengths before trusting any library: a mean
+  length hides trimming.
+
+**Why this was not taken further.** The matrix decides which wrong base appears, so it
+touches roughly one base in every 200 to 500. Its main downstream effect is on low-VAF
+artifacts that need two errors at one site to agree: the chance two C errors agree is 0.33
+for a uniform row, 0.39 for HiSeq 2500 and 0.55 for this mean. Per-instrument defaults and
+more libraries were judged not worth the cost. **For another instrument, fit your own**
+with `gen-seq-error-model` and `bam_file:`.
+
+**This matrix and the quality model come from different libraries.** The quality model below
+is HG002's HiSeq 2500 fit. The two are independent in generation (the quality score decides
+whether a base is an error, the matrix decides which base it becomes), but they do not
+describe one run.
+
+Until v3.4.0 the default was NEAT2's `SSE_PROB` (A row 0.4918 C / 0.3377 G / 0.1705 T),
+inherited static default with no recorded source.
 
 ### Indel-error lengths
 
@@ -204,8 +270,8 @@ a binned/current-chemistry library is #730.
 `gen-seq-error-model` whenever you can; that is what the tooling is for.
 
 **Fitted at 250 bp.** Generating at another read length rescales the curve to fit, which is
-what NEAT2 did and is an approximation — NEAT2 warned about it and eidolon does not yet
-(#742). `read_len` defaults to 250 so that taking both defaults needs no rescaling.
+what NEAT2 did and is an approximation. `gen-reads` logs a warning naming both lengths when
+it does (#742). `read_len` defaults to 250 so that taking both defaults needs no rescaling.
 
 Measured cost of rescaling, R1 at 151 bp against this model's native 250 bp: the per-cycle
 shape is preserved to a tenth of a Q at the 25%, 50% and 75% marks, and only the end of the
@@ -214,18 +280,41 @@ average below Q20 fall from 5.70% to 1.28%. The direction is conservative: a res
 cleaner than a native one, never dirtier. For comparison, the pre-v3.4.0 default produced
 0.00% of those reads at any length. A 151 bp model is #744.
 
-## Models with unrecorded provenance
+## The variant models: GIAB HG002
 
-These predate the Rust port. Round-trip serialization is the only property currently
-asserted for them.
+`default_mutation_model.json.gz` is fitted by `gen-mut-model` from the GIAB HG002 v4.2.1
+GRCh38 truth VCF, restricted to its `noinconsistent` high-confidence BED, against an unmasked
+GRCh38 (`scripts/delta/fit_hg002_defaults.sbatch`, job 22583871, #752; refit after #770).
+`default_indel_model.json.gz` and `default_trinuc_model.json.gz` are its own indel and
+trinucleotide components, extracted unchanged, so every mutation default describes the same
+sample. A test enforces that.
 
-- `default_mutation_model.json.gz` (+ `_bkup`)
-- `default_indel_model.json.gz` — variant indel lengths, `ins_dist` (70 values) and
-  `del_dist` (72)
-- `default_trinuc_model.json.gz`
+| | |
+|---|---|
+| `mutation_rate` | 0.0015162 |
+| `homozygous_frequency` | 0.3884 |
+| SNP / insertion / deletion | 0.8727 / 0.0617 / 0.0655 |
+| CpG context weight | 4.48x the mean context |
 
-Each needs the same treatment as the models above: a recorded source, a measurement against
-real data, and a test asserting the default is usable.
+**Checked against the VCF without eidolon.** `bedtools intersect` of the biallelic records
+(by POS) with the BED gives 3,364,039 SNPs, 237,674 insertions and 252,894 deletions over
+2,542,242,843 bp. The model reproduces all three counts exactly. The first fit (job 22443316)
+counted 357 fewer SNPs and 4 more deletions, all at BED edges; that was the 1-based VCF
+POS being tested against 0-based BED intervals, fixed in #770. Each of the 64
+per-context SNP rows, rebuilt from those SNPs and the reference, agrees with the model to
+3.4e-4. The insertion and deletion length distributions agree to 3e-5. Ti/Tv of the source
+SNPs is 2.102.
+
+**What it is not:** a callset. Rates are per base of GIAB's high-confidence regions, which
+exclude the hardest parts of the genome. Multi-allelic sites (47,781) are not used.
+
+### Previous default
+
+NEAT2's `MutModel_NA12878.p.gz`, converted: `mutation_rate` 0.0010987, `homozygous_frequency`
+1/3 (NEAT2 used 0.01), SNP / insertion / deletion 0.95 / 0.03 / 0.02. That file is kept as
+`eidolon-core/src/models/test_fixtures/neat2_mutation_model.json.gz`, the fixture for loading
+pre-stamp and pre-#763 models. `default_mutation_model_bkup.json.gz` is NEAT2's first
+conversion and is kept for provenance only.
 
 ## Building a custom model
 

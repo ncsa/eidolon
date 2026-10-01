@@ -19,7 +19,8 @@ use crate::{
             fasta_stream::{FastaStream, map_buffer, resolve_iupac_bases},
             fastq_tools::{
                 HaplotypeContext, PlacedFragment, Strand, combine_temp_fastqs, generate_read,
-                reverse_complement, write_block_fastq, write_read_to_fastq,
+                generate_reverse_mate, r2_quality_model, reverse_complement, write_block_fastq,
+                write_read_to_fastq,
             },
             file_io::{VectorBuffer, append_to_file},
             vcf_tools::{read_vcf, write_vcf},
@@ -154,6 +155,21 @@ pub fn run_neat(
     };
     if quality_score_model_r2.is_some() {
         info!("Sequencing error model carries a separate R2 quality population; using it for R2");
+    }
+    // A model fitted at one read length is stretched or compressed onto another, as NEAT2 did
+    // and warned about (#742). The measured cost is in model_data/README.md.
+    let fitted_len = quality_score_model.assumed_read_length;
+    if config.long_reads {
+        warn!(
+            "Long-read mode: the quality model was fitted at {fitted_len} bp, and its per-cycle \
+             profile is rescaled to each read's length."
+        );
+    } else if fitted_len != config.read_len {
+        warn!(
+            "The quality model was fitted at {fitted_len} bp and reads are {} bp; rescaling \
+             its per-cycle profile to fit. Fit a model at {} bp to use one as measured.",
+            config.read_len, config.read_len
+        );
     }
 
     let gc_bias_model = match &config.gc_bias_model {
@@ -2388,32 +2404,18 @@ fn generate_chimeric_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
-        let r2_record = generate_read(
-            &reverse_complement(seq1),
-            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
-            None,
-            None,
-            &[],
-            &HashMap::new(),
-            read_len,
+        let tail = fragment_tail_pad(&ctx.reference, &c2, s2, e2, rev2, read_len);
+        let r2_record = generate_junction_r2(
+            ctx,
+            &seq1,
+            &tail,
             format!("{}/2", base_name),
-            Strand::Reverse,
-            quality_scores_2,
-            ctx.seq_error_model,
+            (c2.clone(), s2),
+            (c1.clone(), s1),
+            frag_len,
             rng,
-            c2.clone(),
-            s2,
-            c1.clone(),
-            s1,
-            -(frag_len as i32),
-            true,
             &mut throwaway_ad,
-        )
-        .map_err(GenerateReadsError::from)?;
+        )?;
         r2 = Some(r2_record);
     }
 
@@ -2495,32 +2497,18 @@ fn generate_inv_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
-        let r2_record = generate_read(
-            &reverse_complement(seq1),
-            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
-            None,
-            None,
-            &[],
-            &HashMap::new(),
-            read_len,
+        let tail = fragment_tail_pad(&ctx.reference, &c2, s2, e2, rev2, read_len);
+        let r2_record = generate_junction_r2(
+            ctx,
+            &seq1,
+            &tail,
             format!("{}/2", base_name),
-            Strand::Reverse,
-            quality_scores_2,
-            ctx.seq_error_model,
+            (c2.clone(), s2),
+            (c1.clone(), s1),
+            frag_len,
             rng,
-            c2.clone(),
-            s2,
-            c1.clone(),
-            s1,
-            -(frag_len as i32),
-            true,
             &mut throwaway_ad,
-        )
-        .map_err(GenerateReadsError::from)?;
+        )?;
         r2 = Some(r2_record);
     }
 
@@ -2601,32 +2589,18 @@ fn generate_del_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
-        let r2_record = generate_read(
-            &reverse_complement(seq1),
-            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
-            None,
-            None,
-            &[],
-            &HashMap::new(),
-            read_len,
+        let tail = fragment_tail_pad(&ctx.reference, &c2, s2, e2, rev2, read_len);
+        let r2_record = generate_junction_r2(
+            ctx,
+            &seq1,
+            &tail,
             format!("{}/2", base_name),
-            Strand::Reverse,
-            quality_scores_2,
-            ctx.seq_error_model,
+            (c2.clone(), s2),
+            (c1.clone(), s1),
+            frag_len,
             rng,
-            c2.clone(),
-            s2,
-            c1.clone(),
-            s1,
-            -(frag_len as i32),
-            true,
             &mut throwaway_ad,
-        )
-        .map_err(GenerateReadsError::from)?;
+        )?;
         r2 = Some(r2_record);
     }
 
@@ -2729,32 +2703,18 @@ fn generate_dup_pair(
 
     let mut r2 = None;
     if ctx.config.paired_ended {
-        let quality_scores_2 = ctx
-            .quality_score_model
-            .generate_quality_scores(read_len, rng)
-            .map_err(GenerateReadsError::from)?;
-        let r2_record = generate_read(
-            &reverse_complement(seq1),
-            // Reference-derived bases only: no haplotype mask, no haplotype deletion.
-            None,
-            None,
-            &[],
-            &HashMap::new(),
-            read_len,
+        let tail = fragment_tail_pad(&ctx.reference, &c2, s2, e2, rev2, read_len);
+        let r2_record = generate_junction_r2(
+            ctx,
+            &seq1,
+            &tail,
             format!("{}/2", base_name),
-            Strand::Reverse,
-            quality_scores_2,
-            ctx.seq_error_model,
+            (c2.clone(), s2),
+            (c1.clone(), s1),
+            frag_len,
             rng,
-            c2.clone(),
-            s2,
-            c1.clone(),
-            s1,
-            -(frag_len as i32),
-            true,
             &mut throwaway_ad,
-        )
-        .map_err(GenerateReadsError::from)?;
+        )?;
         r2 = Some(r2_record);
     }
 
@@ -2929,6 +2889,99 @@ fn get_bnd_pieces(
 /// while `rev1`/`rev2` describe only how each REFERENCE piece is read. Reverse-complementing
 /// it would put real bases in the read in an order the truth VCF does not claim — the same
 /// silent truth/reads disagreement as omitting it (#498).
+/// R2 of an SV junction pair, built by `generate_reverse_mate` exactly as every other R2 is.
+///
+/// R2 covers the RIGHT end of the stitched fragment, so its window is the last `read_len`
+/// bases of `seq1` on the top strand, generated forward and flipped afterwards. That keeps the
+/// substitution matrix in reference orientation (#777) -- until then these four writers
+/// generated over `reverse_complement(seq1)` and drew every error on the bottom strand -- and
+/// keeps R2's quality in cycle order (#734), both via the shared helper.
+///
+/// `tail` is the reference continuing past the fragment's right end (`fragment_tail_pad`).
+/// Walking the old reverse-complemented fragment left `frag_len - read_len` bases of slack
+/// for sequencing deletions to consume; the forward window ends exactly at the fragment
+/// end, so without `tail` any R2 deletion error would truncate the read and drop the pair.
+/// With it the rule matches the ordinary writer, which pads its fragments by `read_len` and
+/// clamps the pad at the contig end: R2 truncates only when its deletions outrun the pad.
+#[allow(clippy::too_many_arguments)]
+fn generate_junction_r2(
+    ctx: &ContigContext,
+    seq1: &[Nucleotide],
+    tail: &[Nucleotide],
+    name: String,
+    (contig, position): (String, usize),
+    (mate_contig, mate_position): (String, usize),
+    frag_len: usize,
+    rng: &mut NeatRng,
+    ad_counter: &mut AdCounter,
+) -> Result<ReadRecord, GenerateReadsError> {
+    let read_len = ctx.config.read_len;
+    let quality = r2_quality_model(ctx.quality_score_model, ctx.quality_score_model_r2)
+        .generate_quality_scores(read_len, rng)
+        .map_err(GenerateReadsError::from)?;
+    let Some(start) = seq1.len().checked_sub(read_len) else {
+        return Err(GenerateReadsError::FqToolsError(
+            eidolon_core::file_tools::fastq_tools::FastqToolsError::TruncatedRead(format!(
+                "junction fragment {name}: {} bases, shorter than a {read_len} bp read",
+                seq1.len()
+            )),
+        ));
+    };
+    let window: Vec<Nucleotide> = seq1[start..].iter().chain(tail).copied().collect();
+    generate_reverse_mate(
+        &window,
+        // Reference-derived bases only: no haplotype mask, no haplotype deletion.
+        None,
+        None,
+        &[],
+        &HashMap::new(),
+        read_len,
+        name,
+        quality,
+        ctx.seq_error_model,
+        rng,
+        contig,
+        position,
+        mate_contig,
+        mate_position,
+        -(frag_len as i32),
+        ad_counter,
+        &HashMap::new(),
+        |_| Ok(()),
+    )
+    .map_err(GenerateReadsError::from)
+}
+
+/// Up to `n` reference bases continuing a fragment past its last piece, in that piece's
+/// orientation: `REF[end..end + n]` for a forward piece, and for a reverse-complemented piece
+/// the reverse complement of `REF[start - n..start]`, since reading it onward walks leftward
+/// on the reference. Clipped at the contig ends.
+///
+/// This is a truncation buffer for `generate_junction_r2`, read only after a sequencing
+/// deletion. It continues the last piece's reference, not the molecule, so where the fragment
+/// ended exactly at a piece boundary (a BND fragment ending inside its insert, an INV piece
+/// clipped at the inversion's edge) the few bases a deletion pulls in come from the wrong
+/// side of that boundary. Unmutated reference, and drawn without the RNG.
+fn fragment_tail_pad(
+    reference: &HashMap<String, Vec<Nucleotide>>,
+    contig: &str,
+    start: usize,
+    end: usize,
+    reverse: bool,
+    n: usize,
+) -> Vec<Nucleotide> {
+    let Some(seq) = reference.get(contig) else {
+        return Vec::new();
+    };
+    if reverse {
+        let s = start.min(seq.len());
+        reverse_complement(seq[s.saturating_sub(n)..s].to_vec())
+    } else {
+        let e = end.min(seq.len());
+        seq[e..(e + n).min(seq.len())].to_vec()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn get_stitched_sequence(
     ctx: &ContigContext,
@@ -3854,6 +3907,27 @@ fn intersect_with_bed(
 
 #[cfg(test)]
 mod tests {
+
+    /// `fragment_tail_pad` continues the last piece in the piece's OWN orientation. Known
+    /// answer on `ACGTTGCA` (0-based): a forward piece `[2, 4)` = `GT` continues with
+    /// `REF[4..7]` = `TGC`; a reverse-complemented piece `[4, 6)` reads `rc(TG)` = `CA` and
+    /// continues leftward, `rc(REF[1..4])` = `rc(CGT)` = `ACG`. Both clip at the contig ends.
+    #[test]
+    fn fragment_tail_pad_continues_the_last_piece_in_its_orientation() {
+        let seq: Vec<Nucleotide> = "ACGTTGCA".chars().map(Nucleotide::from).collect();
+        let reference: HashMap<String, Vec<Nucleotide>> = HashMap::from([("c".to_string(), seq)]);
+        let s = |v: Vec<Nucleotide>| v.into_iter().map(char::from).collect::<String>();
+        assert_eq!(s(fragment_tail_pad(&reference, "c", 2, 4, false, 3)), "TGC");
+        assert_eq!(s(fragment_tail_pad(&reference, "c", 4, 6, true, 3)), "ACG");
+        // Clipped: forward at the right edge, reverse at the left edge.
+        assert_eq!(s(fragment_tail_pad(&reference, "c", 2, 6, false, 5)), "CA");
+        assert_eq!(s(fragment_tail_pad(&reference, "c", 1, 6, true, 5)), "T");
+        assert_eq!(s(fragment_tail_pad(&reference, "c", 0, 3, true, 5)), "");
+        assert_eq!(
+            s(fragment_tail_pad(&reference, "missing", 0, 3, false, 5)),
+            ""
+        );
+    }
 
     /// The fragment budget is CONSERVED: an inserted breakend sequence comes out of the
     /// fragment, it does not extend it.

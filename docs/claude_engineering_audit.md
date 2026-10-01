@@ -362,6 +362,35 @@ can partially apply.
 Tracked in [#734](https://github.com/ncsa/eidolon/issues/734), fixed in
 [#735](https://github.com/ncsa/eidolon/pull/735).
 
+#### Enum discriminants vs slot order (2026-09-24)
+
+`enum Nucleotide` declared `A=0, C=1, T=2, G=3`. `ALLOWED_NUCS`, both hand-written `usize`
+conversions and NEAT2's `NUC_IND` all use A, C, G, T. `MutationModel::from_raw_data` indexed
+its 4×4 SNP matrix with `key.1 as usize`, which is the discriminant, while
+`TransitionMatrix::from` labeled the slots in `ALLOWED_NUCS` order. So every model fitted by
+`gen-mut-model` carried its G and T alt columns swapped: a G→G and T→T self-transition, and
+Ti/Tv 0.833 on HG002 against 2.100 once relabeled.
+
+Delta job 22346830 reported `overall: PASS` on that model. The model built, deserialized and
+drove `gen-reads`, and nothing asserted a property of the matrix's contents.
+
+Two things the obvious story got wrong:
+
+1. **The first fix was the wrong layer.** Switching the one site to `usize::from` (#759) fixed
+   the symptom. The root cause was two orderings that could disagree at all, so the enum was
+   reordered to match `ALLOWED_NUCS`. That also corrected the masked variants, which had been
+   off by one between the cast and `usize::from`. A probe build found the remaining `as` casts:
+   adding a data-carrying variant makes every `as` cast on the enum a compile error.
+2. **The impact claim was never checked.** #758 said a fitted model "over-produces
+   transversions roughly 2.5:1". The 4×4 matrix is written to the model file but never read at
+   generation: SNP alts come from the per-context trinucleotide model, which always used
+   `usize::from`. Fixed-seed output was byte-identical before and after the fix. The defect was
+   in what the file said, not in any read. Rule 5 applies to impact as much as to cause.
+
+The review that established (2) also found that the same all-zero-row fallback does reach
+generated reads through the trinucleotide model (#760), and that seven bundled COSMIC models
+carry the swap (#761).
+
 ### 5.3 Verification theatre
 
 Tests and harnesses that report success without being able to report failure.
@@ -711,6 +740,31 @@ decision — was never exercised at all, because smoothing only runs on a gappy 
 every fixture was contiguous; a bandwidth five times too wide passed the entire suite.
 Each was found by mutating, and only after the fixture was rebuilt to make the mutation
 visible.
+
+### 5.8 A confident diagnosis, falsified by the test written to confirm it (2026-09-28)
+
+Reviewing #776, which swapped a BAM-fitted substitution matrix into the shipped default,
+Claude told the user that the fit and its use were in different frames. The claim: generation
+applied errors in read orientation, while the BAM counter worked in reference orientation,
+so the fitted matrix was symmetric by construction. It proposed complementing reverse-strand
+reads in the counter. The claim cited `fastq_tools.rs:1052-1054`, a comment about how
+variants are indexed, not about how errors are drawn.
+
+The round-trip test written to demonstrate the defect was expected to fail. It passed: a
+planted asymmetric matrix came back to within 0.007. Both paired writers generate R2
+forward, draw its errors, then reverse-complement the record, so errors are applied in
+reference orientation, the counter's own frame. Applying the proposed fix as a **mutation**
+broke the test (A→C 0.454 against 0.80 planted). The fix would have introduced the very
+defect it was meant to cure.
+
+Two things survived. The **strand-symmetry test** #776 offered as evidence does not
+discriminate: germline SNPs and mapping errors are symmetric too, and the unmasked,
+contaminated matrix passes it. The round trip also found a **real frame inconsistency** in
+the SV junction writers (#777), which draw R2's errors after reverse-complementing.
+
+**Rule this earns:** a diagnosis drawn from reading code is a hypothesis. Write the test that
+would show the defect before proposing its fix. A test expected to fail that passes is a
+finding, not a nuisance, and the proposed fix belongs in the mutation run.
 
 ---
 

@@ -21,7 +21,7 @@ use crate::{
         distributions::{DiscreteDistribution, DistributionErrors},
         nucleotides::{Nucleotide, allowed_vec},
         sv_model::SvModel,
-        transition_matrix::{TransitionMatrix, TransitionMatrixError},
+        transition_matrix::TransitionMatrixError,
         variants::{Variant, VariantError, VariantType},
     },
 };
@@ -105,29 +105,20 @@ impl MutationModel {
         average_mutation_rate: f64,
         homozygous_frequency: f64,
         variant_probs: Vec<f64>,
-        snp_transition_frequency: HashMap<(Nucleotide, Nucleotide), f64>,
         trinuc_frequency: HashMap<TrinucFrame, f64>,
         trinuc_transition_frequency: HashMap<(TrinucFrame, TrinucFrame), f64>,
         ins_lengths: Vec<usize>,
         ins_weights: Vec<f64>,
         del_lengths: Vec<usize>,
         del_weights: Vec<f64>,
-        transition_matrix_override: Option<TransitionMatrix>,
     ) -> Result<Self, MutationModelError> {
-        let transition_matrix = if let Some(tm) = transition_matrix_override {
-            tm
-        } else {
-            let mut temp_trans_matrix: [[f64; 4]; 4] = [[0.0; 4]; 4];
-            for (key, value) in snp_transition_frequency {
-                temp_trans_matrix[key.0 as usize][key.1 as usize] = value;
-            }
-            TransitionMatrix::from(
-                temp_trans_matrix[Nucleotide::A as usize],
-                temp_trans_matrix[Nucleotide::C as usize],
-                temp_trans_matrix[Nucleotide::G as usize],
-                temp_trans_matrix[Nucleotide::T as usize],
-            )?
-        };
+        // SNP, Insertion, Deletion, respectively. Checked before anything indexes it.
+        if variant_probs.len() != 3 {
+            error!(
+                "Input to mutation model from raw incorrect. Variant probs should have a length of 3: SNP, INS, DEL"
+            );
+            return Err(MutationModelError::InputError);
+        }
         // build transition matrices from data for snps and trinucs
         let snp_trinuc_model =
             SnpTrinucModel::from_raw_data(trinuc_frequency, trinuc_transition_frequency)?;
@@ -143,17 +134,9 @@ impl MutationModel {
             IndelModel::from_raw_data(ins_lengths, ins_weights, del_lengths, del_weights)?
         };
         let statistical_models = StatisticalModels {
-            transition_matrix,
             indel_model,
             snp_trinuc_model,
         };
-        // SNP, Insertion, Deletion, respectively.
-        if variant_probs.len() != 3 {
-            error!(
-                "Input to mutation model from raw incorrect. Variant probs should have a length of 3: SNP, INS, DEL"
-            );
-            return Err(MutationModelError::InputError);
-        }
         let variant_distribution =
             DiscreteDistribution::new(&variant_probs, &(allowed_variant_types()))?;
         Ok(MutationModel {
@@ -340,7 +323,11 @@ struct StatisticalModels {
     // This struct links the Mutation model to the other statistical models for modeling different
     // variant types. If new variant types are added, then we will need to expand this struct to
     // include them.
-    transition_matrix: TransitionMatrix,
+    //
+    // SNP alt bases come from `snp_trinuc_model`, one transition matrix per flanking
+    // context. Older model files also carry a context-free `transition_matrix` here.
+    // Nothing ever read it at generation (see #758), so it is no longer built or
+    // stored, and serde ignores the key in older files.
     indel_model: IndelModel,
     snp_trinuc_model: SnpTrinucModel,
 }
@@ -377,12 +364,41 @@ mod tests {
     use crate::models::snp_trinuc_model::TrinucFrame;
     use crate::structs::nucleotides::Nucleotide::{A, C, G, T};
 
+    /// `variant_probs` is SNP, insertion, deletion. A vector of any other length is refused
+    /// with `InputError`, never a panic: the indel weights used to be indexed before the
+    /// length was checked, so a short vector panicked on `[1]` or `[2]`.
+    #[test]
+    fn from_raw_data_refuses_variant_probs_of_the_wrong_length() {
+        for probs in [vec![], vec![0.9], vec![0.9, 0.1], vec![0.7, 0.1, 0.1, 0.1]] {
+            let n = probs.len();
+            let result = std::panic::catch_unwind(|| {
+                MutationModel::from_raw_data(
+                    0.001,
+                    0.3,
+                    probs,
+                    HashMap::new(),
+                    HashMap::new(),
+                    vec![1],
+                    vec![1.0],
+                    vec![1],
+                    vec![1.0],
+                )
+            });
+            match result {
+                Ok(Err(MutationModelError::InputError)) => {}
+                Ok(Err(other)) => panic!("length {n}: expected InputError, got {other:?}"),
+                Ok(Ok(_)) => panic!("length {n}: accepted a variant_probs of the wrong length"),
+                Err(_) => panic!("length {n}: panicked instead of returning InputError"),
+            }
+        }
+    }
+
     #[test]
     fn test_model_read_write() {
         let temp_dir = tempfile::tempdir().unwrap();
         let output_file = temp_dir.path().join("test.json.gz");
         let model: MutationModel = MutationModel::default().unwrap();
-        assert_eq!(model.mutation_rate, 0.0010987132390211135);
+        assert_eq!(model.mutation_rate, 0.0015162229753914642);
         model.write_to_file(&output_file).unwrap();
         let loaded = MutationModel::from_file(&output_file).unwrap();
         assert_eq!(loaded.mutation_rate, model.mutation_rate);
@@ -391,38 +407,15 @@ mod tests {
     /// The embedded default model must carry real trinucleotide biology, not a
     /// context-neutral or corrupted weight vector.
     ///
-    /// #372 wired `context_weights()` into placement, but that only helps if the
-    /// model FILE carries meaningful weights. `default_mutation_model_bkup.json.gz`
-    /// holds the older context-neutral default (CpG share exactly 6.25% = uniform);
-    /// the replacement must actually elevate CpG, which is where SBS1 lives and the
-    /// single most mutable context in any real genome.
+    /// #372 wired `context_weights()` into placement, but that only helps if the model FILE
+    /// carries meaningful weights. CpG is where SBS1 lives and the single most mutable context
+    /// in any real genome, so a correctly built default elevates it. The HG002 default (#752)
+    /// averages 4.48x across the four CpG contexts.
     ///
     /// This is a data assertion, not a code one: it fails if the shipped default is
-    /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level
-    /// metric.
-    ///
-    /// ## Provenance of the repaired file, so it can be audited rather than trusted
-    ///
-    /// `default_mutation_model.json.gz` was repaired by hand, which a diff of a
-    /// gzipped blob cannot show. Both halves are reconstructible from files already
-    /// in this directory, and a reviewer can check them without trusting the commit:
-    ///
-    /// - **`snp_distro`** de-cumulated equals `default_trinuc_model.json.gz`'s
-    ///   `snp_distro` to 2.9e-15.
-    /// - **`transition_matrix`** equals `default_mutation_model_bkup.json.gz`'s to
-    ///   within one ULP — rows `a` and `t` are exactly equal, `c` and `g` differ by
-    ///   5.6e-17 and 1.1e-16, i.e. double round-trip noise, not a different fit.
-    ///
-    /// The two files are otherwise NOT interchangeable, which is the whole point of
-    /// the assertion below: `_bkup` predates the trinucleotide work (it stores
-    /// `snp_model`, not `snp_trinuc_model`) and its `snp_distro` is exactly uniform —
-    /// CpG share 6.2500%, i.e. 4/64 — so it is context-neutral by construction. The
-    /// corrupt file was a botched upgrade *from* that state: it took a real
-    /// context-weighted `snp_distro` and cumulated it twice, which flattened CpG back
-    /// to ~1.0x while looking nothing like the uniform original.
-    ///
-    /// Both files also still carry the dead `insertion_probability` key; see
-    /// `IndelModel`'s legacy-load test for why that is left alone.
+    /// regenerated wrongly, which is invisible to Ts/Tv and to every caller-level metric. An
+    /// earlier shipped file failed it by cumulating `snp_distro` twice, which flattens CpG to
+    /// ~1.0x.
     #[test]
     fn default_model_context_weights_elevate_cpg() {
         let model = MutationModel::default().unwrap();
@@ -455,6 +448,88 @@ mod tests {
              A monotonically-increasing-with-index weight vector here is the \
              signature of a snp_distro that was cumulated twice — de-cumulating it \
              a second time recovers default_trinuc_model.json.gz exactly."
+        );
+    }
+
+    /// The shipped default is the GIAB HG002 fit (#752), checked against numbers measured
+    /// WITHOUT eidolon: `bedtools intersect` of the v4.2.1 truth VCF's biallelic records (by
+    /// POS) with its `noinconsistent` high-confidence BED gives 3,364,039 SNPs, 237,674
+    /// insertions and 252,894 deletions over 2,542,242,843 bp, 38.845% homozygous. The model
+    /// reproduces those counts exactly (Delta job 22583871, after #770), so the shares are held
+    /// to 1e-9: the pre-#770 fit, 357 SNPs short and 4 deletions over, fails them.
+    ///
+    /// The rate is held to 1e-8, not 1e-9, for one measured reason: gen-mut-model's
+    /// denominator is 2,542,242,838 bp, 5 bp short of the BED, because it skips intervals
+    /// under 3 bp (no full trinucleotide) while their variants still count. That is 2e-9
+    /// relative. The pre-#770 fit is 2.3e-4 off and still fails.
+    /// Provenance is in model_data/README.md.
+    #[test]
+    fn the_shipped_default_is_the_hg002_fit() {
+        let model = MutationModel::default().unwrap();
+        let cum = model.variant_dist.weights().unwrap();
+        let shares = [cum[0], cum[1] - cum[0], cum[2] - cum[1]];
+        let total = (3_364_039 + 237_674 + 252_894) as f64;
+        let expected = [3_364_039.0 / total, 237_674.0 / total, 252_894.0 / total];
+        for (name, (got, want)) in ["SNP", "insertion", "deletion"]
+            .iter()
+            .zip(shares.iter().zip(expected))
+        {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{name} share {got:.9} is not the measured {want:.9}"
+            );
+        }
+        let rate = total / 2_542_242_843.0;
+        assert!(
+            ((model.mutation_rate - rate) / rate).abs() < 1e-8,
+            "mutation_rate {} is not the measured {rate}",
+            model.mutation_rate
+        );
+        assert!(
+            (model.homozygous_frequency - 0.38845).abs() < 1e-4,
+            "homozygous_frequency {} is not the measured 0.38845",
+            model.homozygous_frequency
+        );
+    }
+
+    /// The shipped asset, pinned by digest: the checks above read summaries, and a file with
+    /// the right summaries and different context rows would pass them.
+    ///
+    /// Regenerate deliberately, never to make this pass:
+    ///     sha256sum eidolon-core/src/models/model_data/default_mutation_model.json.gz
+    #[test]
+    fn the_shipped_default_asset_is_byte_for_byte_the_fitted_model() {
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(DATA_FILE));
+        assert_eq!(
+            got, "0f4f2d820ff6a545db1ba407ea6b4875bb80ca02cf4d01e170563d9bdc7f64e4",
+            "the shipped mutation model is not the one fitted from GIAB HG002 (job 22583871). \
+             If the replacement is intentional, update this digest AND model_data/README.md."
+        );
+    }
+
+    /// The standalone indel and trinucleotide defaults must be the mutation default's own
+    /// components, so every mutation default describes the same sample. IndelModel::default()
+    /// is gen-mut-model's fallback for a VCF with no indels.
+    #[test]
+    fn the_standalone_defaults_are_the_mutation_defaults_components() {
+        let model = MutationModel::default().unwrap();
+        assert_eq!(
+            serde_json::to_value(IndelModel::default().unwrap()).unwrap(),
+            serde_json::to_value(&model.statistical_models.indel_model).unwrap(),
+            "default_indel_model.json.gz differs from the mutation default's indel model"
+        );
+        // trinuc_distros serializes from a HashMap, so compare it order-free.
+        let canon = |m: &SnpTrinucModel| {
+            let mut v = serde_json::to_value(m).unwrap();
+            let rows = v["trinuc_distros"].as_array_mut().unwrap();
+            rows.sort_by_key(|r| r[0].to_string());
+            v
+        };
+        assert_eq!(
+            canon(&SnpTrinucModel::default().unwrap()),
+            canon(&model.statistical_models.snp_trinuc_model),
+            "default_trinuc_model.json.gz differs from the mutation default's trinucleotide model"
         );
     }
 
@@ -545,25 +620,18 @@ mod tests {
     #[test]
     fn test_from_raw_data_no_indels() {
         // Exercises the indel_denom == 0 || empty vecs fallback to IndelModel::default()
-        let snp_trans: HashMap<(Nucleotide, Nucleotide), f64> = HashMap::from([
-            ((Nucleotide::A, Nucleotide::C), 0.25),
-            ((Nucleotide::A, Nucleotide::G), 0.5),
-            ((Nucleotide::A, Nucleotide::T), 0.25),
-        ]);
         let trinuc_freq: HashMap<TrinucFrame, f64> = HashMap::new();
         let trinuc_trans: HashMap<(TrinucFrame, TrinucFrame), f64> = HashMap::new();
         let result = MutationModel::from_raw_data(
             0.001,
             0.5,
             vec![1.0, 0.0, 0.0], // SNP only, no indels
-            snp_trans,
             trinuc_freq,
             trinuc_trans,
             vec![], // no insertion data
             vec![],
             vec![], // no deletion data
             vec![],
-            None,
         );
         assert!(
             result.is_ok(),
@@ -574,29 +642,60 @@ mod tests {
         assert_eq!(model.mutation_rate, 0.001);
     }
 
+    /// Every model file written before #758's follow-up carries a context-free SNP
+    /// `transition_matrix` under `statistical_models`. That includes the shipped
+    /// default, the bundled `tools/cosmic_*.json.gz`, and any model a user fitted.
+    /// Generation never read it. Like `insertion_probability` (see `IndelModel`'s
+    /// legacy-load test), the key is left in the shipped files rather than tidied
+    /// out, so those files and a user's own models stay readable by the same path.
+    ///
+    /// Pins both halves: a file carrying the key still loads, and a model written
+    /// by this build no longer stores it.
+    #[test]
+    fn legacy_model_with_snp_transition_matrix_still_loads() {
+        // The NEAT2-derived default eidolon shipped until #752, which predates #763.
+        static LEGACY: &[u8] = include_bytes!("test_fixtures/neat2_mutation_model.json.gz");
+        let shipped: serde_json::Value = serde_json::from_reader(GzDecoder::new(LEGACY)).unwrap();
+        assert!(
+            shipped["statistical_models"]
+                .get("transition_matrix")
+                .is_some(),
+            "the legacy fixture does not carry the legacy key, so this test \
+             no longer proves a legacy file loads"
+        );
+        let model: MutationModel =
+            serde_json::from_value(shipped).expect("a legacy model file must still deserialize");
+        let rewritten = serde_json::to_value(&model).unwrap();
+        assert!(
+            rewritten["statistical_models"]
+                .get("transition_matrix")
+                .is_none(),
+            "a freshly written model must not store the unused SNP transition matrix"
+        );
+        assert!(
+            rewritten["statistical_models"]
+                .get("snp_trinuc_model")
+                .is_some(),
+            "the model that does drive SNP alts must survive the round trip"
+        );
+    }
+
     #[test]
     fn from_raw_data_leaves_sv_model_none() {
         // `from_raw_data` is the SNP/indel-only training path. SV stats
         // come through a separate channel on `gen-mut-model::runner`, so
         // the constructor must start with `sv_model: None`. Callers that
         // observed SVs assign the field after construction.
-        let snp_trans = HashMap::from([
-            ((Nucleotide::A, Nucleotide::C), 0.25),
-            ((Nucleotide::A, Nucleotide::G), 0.5),
-            ((Nucleotide::A, Nucleotide::T), 0.25),
-        ]);
         let model = MutationModel::from_raw_data(
             0.001,
             0.5,
             vec![1.0, 0.0, 0.0],
-            snp_trans,
             HashMap::new(),
             HashMap::new(),
             vec![],
             vec![],
             vec![],
             vec![],
-            None,
         )
         .unwrap();
         assert!(model.sv_model.is_none());

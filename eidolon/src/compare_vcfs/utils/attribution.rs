@@ -104,7 +104,7 @@ pub struct AttributionResult {
     pub counts: BTreeMap<Reason, usize>,
 }
 
-/// `BedRecord::contains` is O(N) over a contig's regions. For our small in-
+/// `BedRecord::contains_vcf_pos` is O(N) over a contig's regions. For our small in-
 /// repo cases this is fine; if we ever hit pathological BEDs we can swap in
 /// a sorted-interval lookup later. Returns true when no regions are defined
 /// for the contig only when the BED is empty for that contig — same default
@@ -115,7 +115,7 @@ fn position_in_intervals(
     intervals: &HashMap<String, Vec<BedRecord>>,
 ) -> bool {
     match intervals.get(chrom) {
-        Some(records) => records.iter().any(|r| r.contains(chrom, pos)),
+        Some(records) => records.iter().any(|r| r.contains_vcf_pos(chrom, pos)),
         None => false,
     }
 }
@@ -172,7 +172,7 @@ pub fn apply_aliases_to_beds(
         {
             let v = beds.remove(&k).unwrap();
             // Rewrite the BedRecord's internal contig name so subsequent
-            // `record.contains(chrom, pos)` calls use the canonical name.
+            // `record.contains_vcf_pos(chrom, pos)` calls use the canonical name.
             // BedRecord::new_bed_record returns Result, but our start/end
             // already pass the start < end check (otherwise the original
             // BedRecord wouldn't exist), so unwrap is safe.
@@ -357,6 +357,25 @@ mod tests {
             Some(&target),
         );
         assert_eq!(reasons, vec![Reason::Unknown]);
+    }
+
+    /// #770: FN `pos` is the 1-based VCF POS. `chr1 100 200` covers
+    /// POS 101..=200 for both the mutation and the target BED.
+    #[test]
+    fn bed_edges_use_one_based_pos() {
+        let b = bed("chr1", 100, 200);
+        for (pos, inside) in [(100, false), (101, true), (200, true), (201, false)] {
+            let want = if inside {
+                vec![Reason::Unknown]
+            } else {
+                vec![Reason::OutsideMutationBed, Reason::OutsideTargetBed]
+            };
+            assert_eq!(
+                attribute_fn("chr1", pos, None, Some(&b), Some(&b)),
+                want,
+                "POS {pos}"
+            );
+        }
     }
 
     #[test]

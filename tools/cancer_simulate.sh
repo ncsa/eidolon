@@ -47,7 +47,7 @@ NORMAL_MUTATION_RATE=""
 # Pass `--tumor-mutation-rate model` to defer to the model's own fitted rate.
 TUMOR_MUTATION_RATE="1e-5"
 GERMLINE_VCF=""
-READ_LEN="151"
+READ_LEN="250"
 PAIRED_END="false"
 FRAGMENT_MEAN=""
 FRAGMENT_ST_DEV=""
@@ -106,7 +106,7 @@ Germline VCF (optional):
                      multiple tumor scenarios over the same germline).
 
 Read parameters:
-  --read-len         Read length in bp (default: 151)
+  --read-len         Read length in bp (default: 250)
   --paired-ended     Generate paired-end reads. Requires --fragment-mean and
                      --fragment-st-dev. (default: single-ended)
   --fragment-mean    Mean insert length, paired-end only

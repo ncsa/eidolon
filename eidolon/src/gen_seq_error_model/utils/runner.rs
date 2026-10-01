@@ -1,9 +1,16 @@
-use crate::gen_seq_error_model::{errors::GenSeqErrorModelError, utils::config::RunConfiguration};
+use crate::gen_seq_error_model::{
+    errors::GenSeqErrorModelError,
+    utils::config::{BamMethod, RunConfiguration},
+};
 use eidolon_core::file_tools::file_io::is_gzipped_file;
 use eidolon_core::{
     file_tools::{
-        bam_reader::read_bam_transitions,
+        bam_reader::{
+            OVERLAP_BINS, OverlapCounts, read_bam_overlap_transitions, read_bam_transitions,
+            read_bam_transitions_masked,
+        },
         file_io::{read_gzip_lines, read_lines},
+        vcf_tools::read_known_sites,
     },
     models::{quality_scores::QualityScoreModel, sequencing_error_model::SequencingErrorModel},
     structs::transition_matrix::TransitionMatrix,
@@ -49,16 +56,168 @@ fn snap_to_bin(score: usize, bins: &[usize]) -> usize {
     }
 }
 
+/// Fewest counted errors an overlap fit accepts (#779). About 2,500 per row, which puts the
+/// sampling error of a cell near 0.3 at ~0.009: comparable to the round trip's tolerance.
+const MIN_OVERLAP_ERRORS: usize = 10_000;
+
+/// Substitution counts from mate-overlap disagreements (#779), reported by category and refused
+/// when there is too little evidence to fit a matrix from.
+fn overlap_counts(
+    path: &PathBuf,
+    config: &RunConfiguration,
+) -> Result<[[f64; 4]; 4], GenSeqErrorModelError> {
+    let mask = match &config.known_variants_vcf {
+        Some(vcf) => {
+            let sites = read_known_sites(vcf)?;
+            let n_sites: usize = sites.values().map(|s| s.len()).sum();
+            info!("Masking {n_sites} reference positions from {vcf:?}");
+            Some(sites)
+        }
+        None => None,
+    };
+    let c = read_bam_overlap_transitions(path, mask, config.bam_min_mapq)?;
+    let errors: usize = c.counts.iter().flatten().sum();
+    info!(
+        "Overlap fit: {} overlapped bases; {} agree; {errors} errors counted; {} at masked sites \
+         and {} with neither mate on the reference, both dropped; {} records without a mate",
+        c.overlapped_bases, c.agreements, c.masked, c.neither_reference, c.unpaired
+    );
+    let mut report = config.output_file.clone().into_os_string();
+    report.push(".overlap_bins.tsv");
+    let report = PathBuf::from(report);
+    write_overlap_bin_report(&report, &c)?;
+    info!("Overlap errors by read position: {report:?}");
+    if errors < MIN_OVERLAP_ERRORS {
+        return Err(GenSeqErrorModelError::ConfigurationError(format!(
+            "bam_file {path:?} gave {errors} sequencing errors from overlapping mates, fewer than \
+             the {MIN_OVERLAP_ERRORS} a substitution matrix needs ({} overlapped bases). Overlap \
+             fitting needs paired reads whose fragments are shorter than the two reads combined. \
+             For a library without that, set `bam_method: mismatch` to count every \
+             read-vs-reference mismatch instead, or remove bam_file to use the default matrix.",
+            c.overlapped_bases
+        )));
+    }
+    Ok(per_cycle_spectrum(&c))
+}
+
+/// One row per read-position bin (#779): the observations, errors and substitution counts
+/// behind the pooled matrix, so a shift in the spectrum along the read is visible.
+fn write_overlap_bin_report(path: &PathBuf, c: &OverlapCounts) -> std::io::Result<()> {
+    const BASES: [char; 4] = ['A', 'C', 'G', 'T'];
+    let mut body = String::from("bin\tcycles_pct\tbases\terrors\terror_rate");
+    for f in 0..4 {
+        for t in 0..4 {
+            if f != t {
+                body.push_str(&format!("\t{}>{}", BASES[f], BASES[t]));
+            }
+        }
+    }
+    body.push('\n');
+    for (b, m) in c.by_bin.iter().enumerate() {
+        let errors: usize = m.iter().flatten().sum();
+        let bases = c.bin_bases[b];
+        let rate = if bases > 0 {
+            errors as f64 / bases as f64
+        } else {
+            0.0
+        };
+        let (lo, hi) = (b * 100 / OVERLAP_BINS, (b + 1) * 100 / OVERLAP_BINS);
+        body.push_str(&format!("{b}\t{lo}-{hi}\t{bases}\t{errors}\t{rate:.6}"));
+        for (f, row) in m.iter().enumerate() {
+            for (t, n) in row.iter().enumerate() {
+                if f != t {
+                    body.push_str(&format!("\t{n}"));
+                }
+            }
+        }
+        body.push('\n');
+    }
+    std::fs::write(path, body)
+}
+
+/// Mismatch counts as weights, logging the count first (the mismatch path's only report).
+fn as_weights(counts: [[usize; 4]; 4]) -> [[f64; 4]; 4] {
+    let total: usize = counts.iter().flatten().sum();
+    info!("Observed {total} SNP mismatches across all records");
+    counts.map(|row| row.map(|n| n as f64))
+}
+
+/// Fewest errors a read-position bin needs to be weighted on its own; sparser bins merge with
+/// their neighbors first, so one noisy bin cannot carry a full bin's weight.
+const MIN_BIN_ERRORS: usize = 10_000;
+
+/// The substitution mix of a whole read, from per-bin overlap counts (#779).
+///
+/// Overlaps sit at reads' 3' ends, so a bin near the end contributes far more observed bases
+/// than one near the start (HG002: 8.8G against 0.7G). Pooling the raw counts gives the
+/// overlap region's spectrum. Dividing each bin's counts by its observations gives per-base
+/// rates, and summing those counts every part of the read equally: the errors a whole read
+/// gets, which is what generation applies.
+fn per_cycle_spectrum(c: &OverlapCounts) -> [[f64; 4]; 4] {
+    // Group adjacent bins from the read's start until each group holds MIN_BIN_ERRORS; a
+    // trailing remainder joins the last group. Each group is (counts, bases, bins spanned).
+    let mut groups: Vec<([[usize; 4]; 4], usize, usize)> = Vec::new();
+    let mut cur = ([[0usize; 4]; 4], 0usize, 0usize);
+    for (bin, m) in c.by_bin.iter().enumerate() {
+        for (from, row) in m.iter().enumerate() {
+            for (to, &n) in row.iter().enumerate() {
+                cur.0[from][to] += n;
+            }
+        }
+        cur.1 += c.bin_bases[bin];
+        cur.2 += 1;
+        if cur.0.iter().flatten().sum::<usize>() >= MIN_BIN_ERRORS {
+            groups.push(std::mem::take(&mut cur));
+        }
+    }
+    if cur.2 > 0 {
+        match groups.last_mut() {
+            Some(last) => {
+                for from in 0..4 {
+                    for to in 0..4 {
+                        last.0[from][to] += cur.0[from][to];
+                    }
+                }
+                last.1 += cur.1;
+                last.2 += cur.2;
+            }
+            None => groups.push(cur),
+        }
+    }
+    // Per-base rate times the number of bins the group spans: every cycle counts equally.
+    let mut w = [[0.0f64; 4]; 4];
+    for (counts, bases, width) in groups {
+        if bases == 0 {
+            continue;
+        }
+        for from in 0..4 {
+            for to in 0..4 {
+                w[from][to] += counts[from][to] as f64 / bases as f64 * width as f64;
+            }
+        }
+    }
+    w
+}
+
 /// Normalizes a raw 4×4 mismatch count matrix into a `TransitionMatrix`.
 ///
 /// Each row is normalized independently. Rows with no observed mismatches get
 /// equal probability distributed across the three off-diagonal positions.
+#[cfg(test)]
 fn build_transition_matrix_from_counts(
     counts: [[usize; 4]; 4],
 ) -> Result<TransitionMatrix, GenSeqErrorModelError> {
+    build_transition_matrix_from_weights(counts.map(|row| row.map(|n| n as f64)))
+}
+
+/// As `build_transition_matrix_from_counts`, from non-negative weights rather than counts:
+/// the overlap fit's per-cycle rates (#779) are not integers.
+fn build_transition_matrix_from_weights(
+    counts: [[f64; 4]; 4],
+) -> Result<TransitionMatrix, GenSeqErrorModelError> {
     let mut weights = [[0.0f64; 4]; 4];
     for i in 0..4 {
-        let total: f64 = counts[i].iter().sum::<usize>() as f64;
+        let total: f64 = counts[i].iter().sum::<f64>();
         if total == 0.0 {
             for j in 0..4 {
                 if i != j {
@@ -67,7 +226,7 @@ fn build_transition_matrix_from_counts(
             }
         } else {
             for j in 0..4 {
-                weights[i][j] = counts[i][j] as f64 / total;
+                weights[i][j] = counts[i][j] / total;
             }
             weights[i][i] = 0.0;
         }
@@ -714,9 +873,34 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             Some(TransitionMatrix::from_tsv(path)?)
         } else if let Some(path) = &config.bam_file {
             info!("Inferring SNP transition matrix from BAM: {:?}", path);
-            let counts = read_bam_transitions(path)?;
-            let total_mismatches: usize = counts.iter().flatten().sum();
-            if total_mismatches == 0 {
+            let counts = match config.bam_method {
+                BamMethod::Overlap => overlap_counts(path, config)?,
+                BamMethod::Mismatch => as_weights(match &config.known_variants_vcf {
+                    None => read_bam_transitions(path)?,
+                    Some(vcf) => {
+                        let sites = read_known_sites(vcf)?;
+                        let n_sites: usize = sites.values().map(|s| s.len()).sum();
+                        info!("Masking {n_sites} reference positions from {vcf:?}");
+                        let (counts, masked) = read_bam_transitions_masked(path, sites)?;
+                        let kept: usize = counts.iter().flatten().sum();
+                        let seen = kept + masked;
+                        info!(
+                            "Masked {masked} of {seen} mismatches ({:.2}%) at known variant sites",
+                            if seen > 0 {
+                                100.0 * masked as f64 / seen as f64
+                            } else {
+                                0.0
+                            }
+                        );
+                        counts
+                    }
+                }),
+            };
+            // Every row empty means the BAM yielded no evidence at all. The overlap path has
+            // already refused thin evidence and logged its counts; this is the mismatch path's
+            // guard, and a backstop for both.
+            let total: f64 = counts.iter().flatten().sum();
+            if total == 0.0 {
                 // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
                 // fitting the transition matrix -- so a BAM that yields no evidence cannot be
                 // honoured at all. Silently substituting the default produces a model that is
@@ -736,11 +920,7 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                     path.display()
                 )));
             } else {
-                info!(
-                    "Observed {} SNP mismatches across all records",
-                    total_mismatches
-                );
-                Some(build_transition_matrix_from_counts(counts)?)
+                Some(build_transition_matrix_from_weights(counts)?)
             }
         } else {
             None
@@ -820,8 +1000,15 @@ fn write_test_bam(
         },
     };
 
+    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
     let n = read_bases.len();
-    let header = sam::Header::default();
+    // One contig, every record at position 1, so a known-variants mask can address bases.
+    let header = sam::Header::builder()
+        .add_reference_sequence(
+            b"chr1".to_vec(),
+            Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(1_000).unwrap()),
+        )
+        .build();
 
     // Build MD string: match counts interspersed with ref bases at mismatches
     let md_str: Option<String> = if with_md {
@@ -852,6 +1039,8 @@ fn write_test_bam(
         *record.flags_mut() = Flags::empty();
         *record.cigar_mut() = cigar;
         *record.sequence_mut() = Sequence::from(read_bases);
+        *record.reference_sequence_id_mut() = Some(0);
+        *record.alignment_start_mut() = noodles::core::Position::new(1);
 
         if let Some(ref md) = md_str {
             record
@@ -896,6 +1085,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         }
     }
 
@@ -2180,6 +2372,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: None,
             transition_matrix_file: Some(tsv_path),
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         runner(&config).unwrap();
         assert!(output_path.exists());
@@ -2217,15 +2412,10 @@ mod tests {
     ///
     /// DO NOT reach for `TransitionMatrix::default()`. Two differently-valued defaults share
     /// that name: `TransitionMatrix::default()` is NEAT 2.0's *mutation* matrix (A row
-    /// 0.0/0.1695/0.6878/0.1427), while the sequencing-error default is a separate literal
-    /// inside `SequencingErrorModel` (A row 0.0/0.4918/0.3377/0.1705). Deriving from the
-    /// wrong one makes this test fail against correct code, which is how the distinction was
-    /// found.
-    ///
-    /// Residual, pre-existing: that literal appears TWICE in `sequencing_error_model.rs`
-    /// (`default()` and `from_raw_data`'s `None` arm). This reads the former while the
-    /// runner's fallback path uses the latter, so a drift between the two copies would slip
-    /// past. They are identical today.
+    /// 0.0/0.1695/0.6878/0.1427), while the sequencing-error default is the matrix in the
+    /// shipped model file (A row 0.0/0.292/0.154/0.553, NovaSeq mean, #779). Deriving from
+    /// the wrong one makes this test fail against correct code, which is how the distinction
+    /// was found. `from_raw_data`'s fallback reads the same file, so there is one copy.
     fn default_a_row_cdf() -> [f64; 4] {
         let m = SequencingErrorModel::default()
             .expect("the default sequencing error model must be constructible");
@@ -2264,6 +2454,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         runner(&config).unwrap();
 
@@ -2329,6 +2522,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         runner(&config).unwrap();
 
@@ -2355,6 +2551,158 @@ mod tests {
         );
     }
 
+    /// #752: a sample's own variants mismatch the reference in every read carrying them, so
+    /// they must not be fitted as sequencing errors. Same fixture as above (ref AAAACCCC, read
+    /// CCGTAAAG at chr1:1). Masking positions 1-2 removes both A->C, leaving the A row at
+    /// G 0.5 / T 0.5; the C row is untouched.
+    /// #779: an overlap fit needs mates that overlap. These records are unpaired, so there is
+    /// no overlap evidence at all, and the fit must refuse and say how to proceed rather than
+    /// fit a matrix from nothing.
+    #[test]
+    fn an_overlap_fit_without_enough_evidence_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let bam_path = temp.path().join("unpaired.bam");
+        write_test_bam(&bam_path, 8, b"AAAACCCC", b"CCGTAAAG", true);
+        let mut config = make_config(fastq_path, temp.path().join("model.json.gz"));
+        config.bam_file = Some(bam_path);
+        config.bam_method = BamMethod::Overlap;
+        let err = runner(&config).expect_err("no overlap evidence must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bam_method: mismatch"),
+            "the refusal must name the alternative: {msg}"
+        );
+    }
+
+    /// KNOWN ANSWER, by hand, every bin populated as in real reads. Bins 0-1: 1,000,000 observed
+    /// bases each, A->C 10,000 and A->G 30,000 each. Bins 2-4: 100,000,000 bases each, A->C
+    /// 900,000 and A->G 100,000 each. Pooled counts give A->C 2.72M / 3.08M = 0.883. Per-base
+    /// rates summed over the five bins give A->C 2(0.010) + 3(0.009) = 0.047 and A->G
+    /// 2(0.030) + 3(0.001) = 0.063, so the whole read's A->C is 0.047 / 0.110. Every bin clears
+    /// MIN_BIN_ERRORS, so none is merged.
+    #[test]
+    fn the_overlap_matrix_weights_every_part_of_the_read_equally() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000_000, 1_000_000, 100_000_000, 100_000_000, 100_000_000];
+        for bin in 0..2 {
+            c.by_bin[bin][0][1] = 10_000;
+            c.by_bin[bin][0][2] = 30_000;
+        }
+        for bin in 2..5 {
+            c.by_bin[bin][0][1] = 900_000;
+            c.by_bin[bin][0][2] = 100_000;
+        }
+        let w = per_cycle_spectrum(&c);
+        let share = w[0][1] / (w[0][1] + w[0][2]);
+        assert!((share - 0.047 / 0.110).abs() < 1e-12, "A->C {share}");
+    }
+
+    /// A bin with too few errors is merged with its neighbor before reweighting, or its
+    /// sampling noise counts as much as a full bin's (the round trip's first bin held 99 errors,
+    /// about 8 per cell, and reweighting unmerged moved its worst cell from 0.007 to 0.024).
+    ///
+    /// KNOWN ANSWER. Bin 0: 1,000 bases, 10 errors, all A->C (a rate like its neighbor's, but a
+    /// spectrum that is pure noise). Bin 1: 1,000,000 bases, 10,000 A->C and 10,000 A->G.
+    /// Unmerged, the per-base rates give A->C 0.010 + 0.010 against A->G 0 + 0.010: A->C 0.667.
+    /// Merged into one group (10,010 against 10,000 over 1,001,000 bases), A->C is 0.50025.
+    #[test]
+    fn a_sparse_bin_is_merged_before_reweighting() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000, 1_000_000, 0, 0, 0];
+        c.by_bin[0][0][1] = 10;
+        c.by_bin[1][0][1] = 10_000;
+        c.by_bin[1][0][2] = 10_000;
+        let w = per_cycle_spectrum(&c);
+        let share = w[0][1] / (w[0][1] + w[0][2]);
+        assert!((share - 10_010.0 / 20_010.0).abs() < 1e-9, "A->C {share}");
+    }
+
+    /// A merged group stands for every bin it spans. KNOWN ANSWER: bins 0 and 1 (1M bases each)
+    /// hold 5,000 A->C and 5,000 A->G, each under MIN_BIN_ERRORS, so they merge into one group
+    /// spanning 2 bins with per-base rates 0.0025 / 0.0025. Bins 2-4 (100M bases each) hold
+    /// 900,000 A->C and 100,000 A->G. Weighted by span, A->C = 2(0.0025) + 3(0.009) = 0.032 and
+    /// A->G = 2(0.0025) + 3(0.001) = 0.008: 0.8. Ignoring the span gives 0.843.
+    #[test]
+    fn a_merged_group_is_weighted_by_the_bins_it_spans() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000_000, 1_000_000, 100_000_000, 100_000_000, 100_000_000];
+        c.by_bin[0][0][1] = 5_000;
+        c.by_bin[1][0][2] = 5_000;
+        for bin in 2..5 {
+            c.by_bin[bin][0][1] = 900_000;
+            c.by_bin[bin][0][2] = 100_000;
+        }
+        let w = per_cycle_spectrum(&c);
+        let share = w[0][1] / (w[0][1] + w[0][2]);
+        assert!((share - 0.8).abs() < 1e-12, "A->C {share}");
+    }
+
+    /// Must not fire: bins that share one spectrum give that spectrum, however unequal their
+    /// observation counts.
+    #[test]
+    fn a_spectrum_that_does_not_change_along_the_read_is_left_alone() {
+        let mut c = OverlapCounts::default();
+        c.bin_bases = [1_000, 0, 0, 0, 100_000];
+        c.by_bin[0][0][1] = 3;
+        c.by_bin[0][0][2] = 1;
+        c.by_bin[4][0][1] = 300;
+        c.by_bin[4][0][2] = 100;
+        let w = per_cycle_spectrum(&c);
+        assert!((w[0][1] / (w[0][1] + w[0][2]) - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn known_variant_positions_are_not_fitted_as_errors() {
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("test.fastq");
+        make_test_fastq(&fastq_path, 20, 4);
+        let bam_path = temp.path().join("mixed.bam");
+        write_test_bam(&bam_path, 8, b"AAAACCCC", b"CCGTAAAG", true);
+        let vcf = temp.path().join("known.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\n\
+             chr1\t1\t.\tA\tC\nchr1\t2\t.\tA\tC\n",
+        )
+        .unwrap();
+        let output_path = temp.path().join("model.json.gz");
+        let config = RunConfiguration {
+            fastq_file: fastq_path,
+            fastq_file_r2: None,
+            output_file: output_path.clone(),
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
+            binned_quality_bins: None,
+            bam_file: Some(bam_path),
+            transition_matrix_file: None,
+            known_variants_vcf: Some(vcf),
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
+        };
+        runner(&config).unwrap();
+        let tm = SequencingErrorModel::from_file(&output_path)
+            .unwrap()
+            .transition_distros()
+            .clone();
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::A),
+            &[0.0, 0.0, 0.5, 1.0],
+            "A row with both A->C masked (1 G, 1 T)",
+        );
+        assert_row_cdf_eq(
+            &row_cdf(&tm, Nucleotide::C),
+            &[0.75, 0.75, 1.0, 1.0],
+            "C row, which the mask does not touch",
+        );
+    }
     #[test]
     fn test_build_transition_matrix_from_counts_is_not_transposed() {
         // Guards the ref/read axis directly on the pure function, where the fixture can be
@@ -2444,6 +2792,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         let err = runner(&config).expect_err("an MD-less bam_file must not silently default");
         let msg = err.to_string();
@@ -2496,6 +2847,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         let err = runner(&config).expect_err("zero mismatches is no evidence, MD tags or not");
         assert!(
@@ -2549,6 +2903,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         runner(&config).unwrap();
 
@@ -2613,6 +2970,9 @@ mod tests {
             binned_quality_bins: None,
             bam_file: Some(bam_path),
             transition_matrix_file: Some(tsv_path),
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
         };
         runner(&config).unwrap();
 
@@ -2662,7 +3022,7 @@ mod tests {
                 Nucleotide::A,
                 "A→A self-transition should be impossible"
             );
-            seen.insert(result as usize);
+            seen.insert(result);
         }
         assert_eq!(
             seen.len(),

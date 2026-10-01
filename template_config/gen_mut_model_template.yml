@@ -11,13 +11,3 @@ output_file:
 bed_file: .
 # overwrite output [optional] - set to "true" to overwrite output of gen-mut-model (default: false)
 overwrite_output: false
-# path to a custom 4x4 SNP transition matrix TSV [optional] - rows and columns are A/C/G/T.
-# A single header line is allowed and will be skipped. Diagonal values are zeroed automatically.
-# If set, overrides the transition matrix inferred from the VCF.
-# Example TSV format:
-#   A    C    G    T
-#   0.0  0.5  0.3  0.2
-#   0.5  0.0  0.3  0.2
-#   0.4  0.3  0.0  0.3
-#   0.3  0.3  0.4  0.0
-transition_matrix_file:

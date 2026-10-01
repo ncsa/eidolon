@@ -54,6 +54,23 @@ pub struct RunConfiguration {
     /// Rows/columns are A/C/G/T. A single header line is ignored.
     /// Takes precedence over bam_file.
     pub transition_matrix_file: Option<PathBuf>,
+    /// Optional VCF of the sample's own variants. Mismatches at the positions its records
+    /// cover are left out of the BAM-fitted transition matrix: they are variants, not
+    /// sequencing errors. Requires bam_file.
+    pub known_variants_vcf: Option<PathBuf>,
+    /// How `bam_file` fits the substitution matrix (#779). `overlap`, the default, counts
+    /// only where a fragment's two mates overlap and disagree, which cancels the sample's own
+    /// variants and library damage. `mismatch` counts every read-vs-reference mismatch.
+    pub bam_method: BamMethod,
+    /// Minimum MAPQ for a record to contribute to an overlap fit.
+    pub bam_min_mapq: u8,
+}
+
+/// See `RunConfiguration::bam_method`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BamMethod {
+    Overlap,
+    Mismatch,
 }
 
 impl RunConfiguration {
@@ -244,6 +261,52 @@ impl RunConfiguration {
             })
             .transpose()?;
 
+        let known_variants_vcf = scrape_config
+            .get("known_variants_vcf")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                let p = PathBuf::from(s);
+                if !p.is_file() {
+                    Err(GenSeqErrorModelError::ConfigurationError(format!(
+                        "known_variants_vcf not found: {:?}",
+                        p
+                    )))
+                } else {
+                    Ok(p)
+                }
+            })
+            .transpose()?;
+        // The mask applies to BAM mismatches and nothing else, so without a BAM a set value
+        // would be silently ignored.
+        if known_variants_vcf.is_some() && bam_file.is_none() {
+            return Err(GenSeqErrorModelError::ConfigurationError(
+                "known_variants_vcf masks mismatches in bam_file, but no bam_file is set. \
+                 Set bam_file, or remove known_variants_vcf."
+                    .to_string(),
+            ));
+        }
+
+        let bam_method = match scrape_config.get("bam_method").and_then(|v| v.as_str()) {
+            None | Some("overlap") => BamMethod::Overlap,
+            Some("mismatch") => BamMethod::Mismatch,
+            Some(other) => {
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "bam_method must be `overlap` or `mismatch`, got `{other}`"
+                )));
+            }
+        };
+        let bam_min_mapq = match scrape_config.get("bam_min_mapq") {
+            None => 20,
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| {
+                    GenSeqErrorModelError::ConfigurationError(format!(
+                        "bam_min_mapq must be an integer 0-255, got {v:?}"
+                    ))
+                })?,
+        };
+
         Ok(RunConfiguration {
             fastq_file,
             fastq_file_r2,
@@ -258,6 +321,9 @@ impl RunConfiguration {
             binned_quality_bins,
             bam_file,
             transition_matrix_file,
+            known_variants_vcf,
+            bam_method,
+            bam_min_mapq,
         })
     }
 }
@@ -277,6 +343,77 @@ mod tests {
         let p = dir.path().join("test.fastq");
         std::fs::write(&p, "@read1\nACGT\n+\nIIII\n").unwrap();
         p
+    }
+
+    #[test]
+    fn bam_method_defaults_to_overlap_and_refuses_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let base = format!(
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\nqual_offset: 33\n",
+            fastq.display(),
+            output.display()
+        );
+        let cfg = |extra: &str| {
+            RunConfiguration::from(&write_config(&format!("{base}{extra}")).path().to_path_buf())
+        };
+        let default = cfg("").unwrap();
+        assert_eq!(
+            (default.bam_method, default.bam_min_mapq),
+            (BamMethod::Overlap, 20)
+        );
+        assert_eq!(
+            cfg("bam_method: mismatch\n").unwrap().bam_method,
+            BamMethod::Mismatch
+        );
+        assert_eq!(cfg("bam_min_mapq: 5\n").unwrap().bam_min_mapq, 5);
+        assert!(
+            cfg("bam_method: pileup\n").is_err(),
+            "an unknown bam_method must be refused"
+        );
+    }
+
+    #[test]
+    fn known_variants_vcf_is_parsed_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let fastq = make_fastq(&dir);
+        let output = dir.path().join("model.json.gz");
+        let bam = dir.path().join("x.bam");
+        std::fs::write(&bam, b"").unwrap();
+        let vcf = dir.path().join("known.vcf");
+        std::fs::write(&vcf, "##fileformat=VCFv4.2\n").unwrap();
+        let base = format!(
+            "fastq_file: {}\noutput_file: {}\noverwrite_output: true\nqual_offset: 33\n",
+            fastq.display(),
+            output.display()
+        );
+        let cfg = |extra: String| {
+            RunConfiguration::from(&write_config(&format!("{base}{extra}")).path().to_path_buf())
+        };
+
+        let ok = cfg(format!(
+            "bam_file: {}\nknown_variants_vcf: {}\n",
+            bam.display(),
+            vcf.display()
+        ))
+        .unwrap();
+        assert_eq!(ok.known_variants_vcf, Some(vcf.clone()));
+
+        // A missing file, and a mask with no BAM to mask, are both refused.
+        assert!(
+            cfg(format!(
+                "bam_file: {}\nknown_variants_vcf: {}\n",
+                bam.display(),
+                dir.path().join("nope.vcf").display()
+            ))
+            .is_err(),
+            "a known_variants_vcf that does not exist must be refused"
+        );
+        assert!(
+            cfg(format!("known_variants_vcf: {}\n", vcf.display())).is_err(),
+            "known_variants_vcf without bam_file does nothing and must be refused"
+        );
     }
 
     #[test]

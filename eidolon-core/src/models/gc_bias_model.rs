@@ -120,15 +120,16 @@ impl GcBiasModel {
 
     /// Returns the model weight for the GC fraction of `sequence`, ignoring N bases.
     /// An empty slice or an all-N slice returns 1.0 (neutral) so N-masked regions are
-    /// never filtered out regardless of the model's other weights.
+    /// never filtered out regardless of the model's other weights. Soft-masked bases count
+    /// as the base they mask, as `gen-gc-bias-model` counts them (#771).
     pub fn weight_for_sequence(&self, sequence: &[Nucleotide]) -> f64 {
         let gc_count = sequence
             .iter()
-            .filter(|&nuc| *nuc == Nucleotide::G || *nuc == Nucleotide::C)
+            .filter(|nuc| matches!(nuc.get_unmasked_base(), Nucleotide::G | Nucleotide::C))
             .count() as f64;
         let sequence_count = sequence
             .iter()
-            .filter(|&base| *base != Nucleotide::N)
+            .filter(|base| base.get_unmasked_base() != Nucleotide::N)
             .count() as f64;
         if sequence_count == 0.0 {
             return 1.0;
@@ -343,6 +344,22 @@ mod tests {
         let sequence = vec![A, C, G, T, N, N];
 
         assert!((model.weight_for_sequence(&sequence) - 0.8).abs() < 1e-12);
+    }
+
+    // #771: a soft-masked base is the base it masks, as `gen-gc-bias-model` counts it.
+    #[test]
+    fn test_weight_for_sequence_reads_soft_masked_gc_as_gc() {
+        use crate::structs::nucleotides::Nucleotide::{Maskeda, Maskedc, Maskedg, Maskedt};
+        let weights: Vec<f64> = (0..=100).map(|gc| 0.5 + gc as f64 / 100.0).collect();
+        let model = GcBiasModel::from_weights(weights, 150).unwrap();
+        let upper = vec![C, G, G, A, T, C, N];
+        let masked = vec![Maskedc, Maskedg, G, Maskeda, Maskedt, C, N];
+        // 4 GC of 6 called bases = 67% GC, whichever case the bases are in.
+        assert_eq!(model.weight_for_sequence(&upper), 0.5 + 0.67);
+        assert_eq!(
+            model.weight_for_sequence(&masked),
+            model.weight_for_sequence(&upper)
+        );
     }
 
     #[test]

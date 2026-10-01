@@ -294,7 +294,6 @@ mod tests {
     #[test]
     fn context_weighted_placement_concentrates_snps_at_upweighted_context() {
         use eidolon_core::structs::nucleotides::Nucleotide::{A, C, G};
-        use eidolon_core::structs::transition_matrix::TransitionMatrix;
 
         // make_block is ACGTACGT…, so C positions (p % 4 == 1) carry the context ACG.
         // Up-weight ACG heavily → #372 SNP placement should concentrate there;
@@ -305,14 +304,12 @@ mod tests {
             0.01,
             0.0,
             vec![1.0, 0.0, 0.0], // all SNP
-            HashMap::new(),
             trinuc_freq,
             HashMap::new(),
             vec![],
             vec![],
             vec![],
             vec![],
-            Some(TransitionMatrix::default().unwrap()),
         )
         .unwrap();
 
@@ -337,7 +334,6 @@ mod tests {
     #[test]
     fn indels_stay_context_neutral_even_with_a_peaked_snp_context() {
         use eidolon_core::structs::nucleotides::Nucleotide::{A, C, G};
-        use eidolon_core::structs::transition_matrix::TransitionMatrix;
 
         // Peak the ACG SNP context but make every variant an insertion. Because w(ctx)
         // drives SNP placement only, the indels must NOT concentrate at ACG (they stay
@@ -348,14 +344,12 @@ mod tests {
             0.01,
             0.0,
             vec![0.0, 1.0, 0.0], // all insertions
-            HashMap::new(),
             trinuc_freq,
             HashMap::new(),
             vec![1, 2],
             vec![1.0, 1.0],
             vec![1, 2],
             vec![1.0, 1.0],
-            Some(TransitionMatrix::default().unwrap()),
         )
         .unwrap();
 

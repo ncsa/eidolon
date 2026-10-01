@@ -21,6 +21,8 @@ pub enum TransitionMatrixError {
     IoError(#[from] std::io::Error),
     #[error("Transition matrix file has {0} data rows (expected 4)")]
     InvalidRowCount(usize),
+    #[error("Transition matrix file, line {line}: {reason}")]
+    InvalidRow { line: usize, reason: String },
 }
 
 impl From<DistributionErrors> for TransitionMatrixError {
@@ -117,32 +119,67 @@ impl TransitionMatrix {
     /// Load a 4×4 SNP transition matrix from a whitespace-delimited TSV file.
     ///
     /// Rows and columns correspond to A/C/G/T (from-base and to-base).
-    /// An optional header row is skipped if its first token is non-numeric.
+    /// The first non-blank line is skipped as a header if its first token is non-numeric.
     /// Diagonal values are zeroed so self-transitions are impossible.
+    ///
+    /// Every data row must hold exactly four finite, non-negative numbers with some
+    /// off-diagonal mass, and there must be exactly four rows. Anything else is refused,
+    /// naming the line: a row with no off-diagonal mass would otherwise send every draw to
+    /// the first base (#760).
     pub fn from_tsv(path: &PathBuf) -> Result<Self, TransitionMatrixError> {
         let content = std::fs::read_to_string(path)?;
         let mut rows: Vec<[f64; 4]> = Vec::new();
+        let mut seen_first_line = false;
 
-        for line in content.lines() {
+        for (i, line) in content.lines().enumerate() {
+            let line_no = i + 1;
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.is_empty() {
                 continue;
             }
-            if rows.is_empty() && tokens[0].parse::<f64>().is_err() {
-                continue; // skip header
+            let is_first = !seen_first_line;
+            seen_first_line = true;
+            if is_first && tokens[0].parse::<f64>().is_err() {
+                continue; // header
             }
-            let vals: Vec<f64> = tokens.iter().filter_map(|s| s.parse().ok()).collect();
-            if vals.len() >= 4 {
-                rows.push([vals[0], vals[1], vals[2], vals[3]]);
+            let invalid = |reason: String| TransitionMatrixError::InvalidRow {
+                line: line_no,
+                reason,
+            };
+            if tokens.len() != 4 {
+                return Err(invalid(format!(
+                    "expected 4 values (A C G T), found {}: {line:?}",
+                    tokens.len()
+                )));
             }
+            let mut row = [0.0f64; 4];
+            for (slot, token) in row.iter_mut().zip(&tokens) {
+                *slot = token
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{token:?} is not a finite, non-negative number: {line:?}"
+                        ))
+                    })?;
+            }
+            let r = rows.len();
+            if r < 4 {
+                row[r] = 0.0; // zero diagonal so self-transitions are impossible
+                if row.iter().sum::<f64>() <= 0.0 {
+                    return Err(invalid(format!(
+                        "the {:?} row has no weight off the diagonal, so it cannot say what \
+                         {:?} mutates to: {line:?}",
+                        ALLOWED_NUCS[r], ALLOWED_NUCS[r]
+                    )));
+                }
+            }
+            rows.push(row);
         }
 
-        if rows.len() < 4 {
+        if rows.len() != 4 {
             return Err(TransitionMatrixError::InvalidRowCount(rows.len()));
-        }
-
-        for (i, row) in rows.iter_mut().enumerate() {
-            row[i] = 0.0; // zero diagonal so self-transitions are impossible
         }
 
         Self::from(rows[0], rows[1], rows[2], rows[3])
@@ -238,6 +275,73 @@ mod tests {
             TransitionMatrix::from_tsv(&tsv),
             Err(TransitionMatrixError::InvalidRowCount(2))
         ));
+    }
+
+    const TSV_HEADER: &str = "A\tC\tG\tT\n";
+    const GOOD_ROWS: [&str; 4] = [
+        "0.0\t0.5\t0.3\t0.2",
+        "0.5\t0.0\t0.3\t0.2",
+        "0.4\t0.3\t0.0\t0.3",
+        "0.3\t0.3\t0.4\t0.0",
+    ];
+
+    /// Writes the header and four good rows, with `row` (0 = A) replaced by `bad`.
+    fn tsv_with_row(dir: &tempfile::TempDir, row: usize, bad: &str) -> PathBuf {
+        let mut rows = GOOD_ROWS.map(String::from);
+        rows[row] = bad.to_string();
+        let path = dir.path().join(format!("row{row}.tsv"));
+        std::fs::write(&path, format!("{TSV_HEADER}{}\n", rows.join("\n"))).unwrap();
+        path
+    }
+
+    // A user-supplied row with no off-diagonal mass used to become "every draw is A" (#760):
+    // errors at A vanished and errors at C, G or T all became A. Each malformed row must be
+    // refused, and the error must name the line so the user can find it. Line 1 is the
+    // header, so row A is line 2 and row C is line 3.
+    #[test]
+    fn a_malformed_transition_row_is_refused_with_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        for (row, bad, line) in [
+            (1, "0\t0\t0\t0", 3),            // all zero
+            (1, "0\t5\t0\t0", 3),            // only the diagonal, which is ignored
+            (0, "0\t0.5\t-0.3\t0.2", 2),     // negative
+            (2, "0.4\tnan\t0\t0.3", 4),      // non-finite
+            (3, "0.3\t0.3\t0.4", 5),         // three values
+            (3, "0.3\t0.3\t0.4\t0\t0.1", 5), // five values
+            (0, "0\t0.5\tx\t0.2", 2),        // non-numeric
+        ] {
+            let path = tsv_with_row(&dir, row, bad);
+            match TransitionMatrix::from_tsv(&path) {
+                Err(TransitionMatrixError::InvalidRow { line: got, .. }) => {
+                    assert_eq!(got, line, "row {bad:?} reported at the wrong line")
+                }
+                other => panic!("row {bad:?} should be refused at line {line}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_transition_file_with_extra_rows_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("five.tsv");
+        std::fs::write(
+            &path,
+            format!("{TSV_HEADER}{}\n{}\n", GOOD_ROWS.join("\n"), GOOD_ROWS[0]),
+        )
+        .unwrap();
+        assert!(matches!(
+            TransitionMatrix::from_tsv(&path),
+            Err(TransitionMatrixError::InvalidRowCount(5))
+        ));
+    }
+
+    // Must not fire: a good file loads with each row's off-diagonal weights exactly as given.
+    #[test]
+    fn a_good_transition_file_loads_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = tsv_with_row(&dir, 0, GOOD_ROWS[0]);
+        let tm = TransitionMatrix::from_tsv(&path).unwrap();
+        assert_eq!(tm.c.weights().unwrap(), vec![0.5, 0.5, 0.8, 1.0]);
     }
 
     #[test]

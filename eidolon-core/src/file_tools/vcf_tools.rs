@@ -357,6 +357,47 @@ pub fn read_vcf_lean(vcf_file: PathBuf) -> Result<HashMap<String, Vec<Variant>>,
     }
 }
 
+/// Every reference position a VCF's records cover, as contig -> 1-based positions: the mask
+/// `gen-seq-error-model` uses to keep a sample's own variants out of its error counts.
+///
+/// Unlike the model readers this keeps every record, multi-allelic and symbolic included, and
+/// covers each record's whole REF span, so a deletion masks every base it removes. Only the
+/// CHROM, POS and REF columns are read.
+pub fn read_known_sites(
+    vcf_file: &PathBuf,
+) -> Result<HashMap<String, std::collections::HashSet<usize>>, VcfToolsError> {
+    fn collect<P: Read>(
+        lines: Lines<BufReader<P>>,
+    ) -> Result<HashMap<String, std::collections::HashSet<usize>>, VcfToolsError> {
+        let mut sites: HashMap<String, std::collections::HashSet<usize>> = HashMap::new();
+        for line in lines {
+            let line = line?;
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let mut cols = line.split('\t');
+            let (Some(chrom), Some(pos), _, Some(reference)) =
+                (cols.next(), cols.next(), cols.next(), cols.next())
+            else {
+                return Err(VcfToolsError::MalformedVcf(format!(
+                    "fewer than 4 columns: {line}"
+                )));
+            };
+            let pos: usize = pos.parse()?;
+            sites
+                .entry(chrom.to_string())
+                .or_default()
+                .extend(pos..pos + reference.len().max(1));
+        }
+        Ok(sites)
+    }
+    if is_gzipped_file(vcf_file)? {
+        collect(read_gzip_lines(vcf_file)?)
+    } else {
+        collect(read_lines(vcf_file)?)
+    }
+}
+
 fn process_gzip_vcf(filename: &PathBuf) -> Result<HashMap<String, Vec<Variant>>, VcfToolsError> {
     let reader = read_gzip_lines(filename)?;
     read_open_vcf(reader)
@@ -569,6 +610,38 @@ fn extract_gt_str<'a>(fmt: &'a str, smp: &'a str) -> Result<Option<&'a str>, Vcf
 
 #[cfg(test)]
 mod tests {
+
+    /// Known answer, built by hand: a SNP masks its position, a 3-base REF masks all three,
+    /// and a multi-allelic record is kept (the model readers drop it). Headers are not
+    /// records. The same file gzipped gives the same mask.
+    #[test]
+    fn known_sites_cover_every_ref_base_of_every_record() {
+        let body = "##fileformat=VCFv4.2\n\
+                    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+                    chr1\t100\t.\tA\tG\t.\tPASS\t.\n\
+                    chr1\t200\t.\tACG\tA\t.\tPASS\t.\n\
+                    chr2\t50\t.\tC\tT,G\t.\tPASS\t.\n";
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("k.vcf");
+        std::fs::write(&plain, body).unwrap();
+        let gz = dir.path().join("k.vcf.gz");
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gz).unwrap(),
+            flate2::Compression::default(),
+        );
+        enc.write_all(body.as_bytes()).unwrap();
+        enc.finish().unwrap();
+
+        for path in [&plain, &gz] {
+            let sites = read_known_sites(path).unwrap();
+            let mut chr1: Vec<usize> = sites["chr1"].iter().copied().collect();
+            chr1.sort();
+            assert_eq!(chr1, vec![100, 200, 201, 202], "{path:?}");
+            assert_eq!(sites["chr2"].iter().copied().collect::<Vec<_>>(), vec![50]);
+            assert_eq!(sites.len(), 2, "only contigs with records: {path:?}");
+        }
+    }
+
     use super::*;
     use crate::structs::{
         nucleotides::Nucleotide,
