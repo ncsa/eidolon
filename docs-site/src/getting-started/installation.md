@@ -26,8 +26,23 @@ system:
 | `eidolon-x86_64-pc-windows-msvc.exe` | Windows |
 
 The binary is self-contained — it needs nothing beyond a standard C library, so there is
-no environment to set up. Download it, make it executable, and run it. Let us know if one
-of these does not work on your system.
+no environment to set up. Download it, **rename it to `eidolon`**, make it executable, and
+run it:
+
+```bash
+mv eidolon-x86_64-unknown-linux-gnu eidolon
+chmod +x eidolon
+./eidolon --version
+```
+
+On Windows, rename it to `eidolon.exe`.
+
+**The rename is required.** eidolon reads the name it was invoked by to choose its command,
+which is how the deprecated `rneat` alias works. Run under its download name, it stops
+with `unrecognized subcommand 'eidolon-x86_64-unknown-linux-gnu'`. Removing that
+requirement is tracked for the next patch release.
+
+Let us know if one of these does not work on your system.
 
 ## Building from source
 
