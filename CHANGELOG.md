@@ -1,3 +1,132 @@
+9/30/2026
+=========
+## eidolon v3.5.0 — germline defaults fitted from one human genome
+
+The shipped germline defaults now come from GIAB HG002, the library the quality model already
+came from, instead of a mix of NEAT2 values and a second sample. The sequencing-error
+substitution matrix is fitted from current NovaSeq data by a new method that cancels the
+sample's own variants. Several generation fixes change output at the same seed: a variant's
+allele is now decided once per fragment, and SV junction reads use R2's quality model and the
+reference-oriented error matrix.
+
+**Output differs from v3.4.0 at the same seed.** Re-baseline anything measured against 3.4.0.
+
+### New defaults
+
+| default | now | was |
+|---|---|---|
+| mutation rate, SNP/indel shares, homozygous fraction | GIAB HG002 v4.2.1 truth VCF within its high-confidence BED: rate 0.0015162, SNP/ins/del 0.873/0.062/0.066, 0.388 homozygous | NEAT2 NA12878: 0.0010987, 0.95/0.03/0.02, 1/3 |
+| trinucleotide SNP contexts, variant indel lengths | the same HG002 fit (CpG 4.48x the mean context) | NEAT2 NA12878 |
+| fragment length | HG002 2x250 BAM: mean 408.5, sd 93.2 | HCC1395 normal (NovaSeq): 431.8, 112.3 |
+| sequencing-error substitution matrix | mean of two NovaSeq 6000 libraries (HG001, NA12878), fitted from mate-overlap disagreements | NEAT2 `SSE_PROB`, no recorded source |
+
+The mutation fit reproduces `bedtools intersect` of the truth VCF and BED exactly: 3,364,039
+SNPs, 237,674 insertions and 252,894 deletions. The three variant defaults
+(`default_mutation_model`, `default_indel_model`, `default_trinuc_model`) are one fit, and a
+test enforces it. Provenance for every default is in
+`eidolon-core/src/models/model_data/README.md`.
+
+**The substitution matrix is instrument-specific,** which is why NovaSeq was chosen over
+HG002's HiSeq 2500. The two differ by up to 0.31 per cell. It decides which base an error
+becomes, not how many errors occur; the quality model sets that. The two NovaSeq libraries
+differ by up to 0.11 per cell, and the shipped mean is within 0.055 of each. For another
+instrument, fit your own (below).
+
+**GC bias stays uniform by default.** HG002's GC fit exists and the fitter is repaired, but it
+is held for named GC presets (#576) and within-bin coverage spread (#775).
+
+### Fixed: changes to generated reads
+
+- **A fragment's two mates now carry the same allele** (#780). A heterozygous or VAF variant
+  in the mate overlap was drawn separately for R1 and R2, so 73 of 170 het pairs disagreed.
+  It is now 0, with the alt share unchanged.
+- **SV junction R2 reads use R2's quality model** (#753). They drew from R1's, so with the
+  per-mate default they carried R1's degraded fraction (0.110) instead of R2's (0.260).
+- **SV junction R2 reads draw substitution errors in reference orientation** (#777), like every
+  other R2; every R2 is now built by one function. This was negligible for a fitted matrix and
+  mattered for an asymmetric `transition_matrix_file`.
+- **Soft-masked references are counted as their uppercase bases** (#771). gen-reads' GC
+  weighting read a masked G/C as neither, so repeats were weighted as lower GC than the model
+  was fitted at. Novel SV insertion bases inside a masked repeat now follow the local
+  composition. **gen-reads output on a soft-masked reference changes.** Uppercase references
+  are unaffected.
+- **A distribution with no mass is refused** (#760) instead of drawing its first value. A
+  trinucleotide row with no observed SNPs sent every mutation in that context to A; it now
+  takes the default row.
+
+### Fixed: tools
+
+- **VCF positions are converted before BED membership checks** (#770). Four callers compared a
+  1-based VCF POS to 0-based BED intervals, including a variant on the base before a region and
+  excluding one on its last base. This affected `compare-vcfs` scoring and attribution under
+  `target_bed`, `filter-reads`' VCF filter and `gen-mut-model`'s BED filter.
+- **`gen-mut-model` labels the SNP transition matrix's G and T columns correctly** (#758), and
+  no longer builds that context-free matrix at all, since generation never read it (#763).
+  Generated reads were never affected; contexts come from the trinucleotide model.
+- **`gen-mut-model` refuses a VCF whose SNPs are all unusable** (#760), such as one called
+  against another build, instead of writing a model that put every SNP in AAA. It reports
+  how many SNPs mismatched the reference.
+- **`gen-gc-bias-model` fits medians, not means** (#774), interpolates bins with too few
+  windows instead of snapping them to 1.0, writes a per-bin support report
+  (`<output_file>.bins.tsv`) and refuses a BAM whose median window is uncovered.
+- **gen-seq-error-model's `transition_matrix_file` is validated** (#760): exactly four rows of
+  four finite, non-negative values with mass off the diagonal. A five-row file used to panic.
+- **gen-cancer-reads' `read_len` default is gen-reads' (250)** (#754), and gen-reads warns when
+  it rescales a quality model fitted at another read length (#742).
+
+### Fitting your own substitution matrix
+
+`gen-seq-error-model` with `bam_file:` now fits from **mate-overlap disagreements** by default
+(`bam_method: overlap`, #782). Both mates read the same molecule, so the sample's variants, PCR
+errors and library damage appear in both and cancel; only sequencing errors remain. Counts are
+reweighted per read position, so the overlap's late-cycle bias does not skew the matrix (#783).
+Every exclusion is reported, and a fit with fewer than 10,000 counted errors is refused.
+
+- The library needs fragments shorter than the two reads combined. For one without overlap,
+  `bam_method: mismatch` counts every read-vs-reference mismatch, as before.
+- `known_variants_vcf:` masks a VCF's sites out of either method (#773).
+- `scripts/delta/stage_raw_pairs.sbatch` and `fit_overlap_matrix.sbatch` stage and fit a
+  public run. Check that its reads are untrimmed first: SEQC2's HCC1395 run was trimmed before
+  upload, and its fit was excluded for it.
+
+### Compatibility
+
+- **A mutation model written by this release does not load in an older eidolon.** It has no
+  `transition_matrix` field (#763), and older binaries require one. They fail with a "missing
+  field" error, not silently. Older models load here.
+- **`gen-mut-model`'s `transition_matrix_file` is removed.** An empty value is accepted; a set
+  value stops the run with an explanation. `gen-seq-error-model`'s option of the same name is
+  separate and unchanged.
+- **`gen-seq-error-model` with `bam_file:` now defaults to the overlap method.** Set
+  `bam_method: mismatch` to reproduce a v3.4.0 fit.
+
+### Evidence
+
+On real data (NCSA Delta):
+- The mutation refit matches bedtools' counts exactly (job 22583871).
+- The two NovaSeq overlap fits count 3.0M and 656k errors (jobs 22559735, 22571948).
+- The HG002 realism panel on the current defaults (job 22583881) shows no regression against
+  the previous run on the same ten loci. Insert width and tail match real (0.9x, 1.0x).
+
+Locally:
+- A planted substitution matrix survives simulation, bwa-mem2 alignment and refit through both
+  the mismatch and overlap paths, within 0.007 and 0.005 (release gates).
+- Each fix above has a known-answer test written first and checked by mutation.
+- Full suite 1055 passed; release gates 7/7.
+
+### Not verified
+
+- **Cancer simulation was not re-run.** The bundled COSMIC tumor models carry the #758 G/T swap
+  in their unused 4x4 matrix only; their rebuild is #761.
+- Whether the new substitution matrix changes a variant caller's low-VAF false positives is
+  unmeasured.
+- The realism gaps are unchanged and tracked:
+  - background candidate breakpoints (`cand_per_mb`, #692);
+  - MAPQ 0 (#658);
+  - insert-size skew (#696);
+  - depth structure, under the uniform GC default.
+- `indel_probability` is still the inherited 0.01 (#746).
+
 9/22/2026
 =========
 ## eidolon v3.4.0 — a quality model measured from real, named data
