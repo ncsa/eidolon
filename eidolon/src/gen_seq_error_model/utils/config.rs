@@ -1,9 +1,30 @@
+use crate::config_keys::check_keys;
 use crate::gen_seq_error_model::errors::GenSeqErrorModelError;
 use eidolon_core::file_tools::file_io::check_overwrite;
 use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "bam_file",
+    "bam_method",
+    "bam_min_mapq",
+    "binned_quality_bins",
+    "degradation_tail_cut",
+    "degradation_tail_window",
+    "fastq_file",
+    "fastq_file_r2",
+    "fit_quality_degradation",
+    "known_variants_vcf",
+    "max_model_read_length",
+    "max_reads",
+    "output_file",
+    "overwrite_output",
+    "qual_offset",
+    "transition_matrix_file",
+];
 
 #[derive(Debug, Clone)]
 pub struct RunConfiguration {
@@ -83,6 +104,12 @@ impl RunConfiguration {
         })?;
         let scrape_config: HashMap<String, Value> = serde_yml::from_reader(f)
             .map_err(|e| GenSeqErrorModelError::ConfigurationError(e.to_string()))?;
+        check_keys(
+            scrape_config.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "gen-seq-error-model",
+        )
+        .map_err(GenSeqErrorModelError::ConfigurationError)?;
 
         let fastq_file = PathBuf::from(
             scrape_config

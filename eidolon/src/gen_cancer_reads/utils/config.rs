@@ -11,9 +11,39 @@ use std::path::{Path, PathBuf};
 use log::warn;
 use serde_yml::Value;
 
+use crate::config_keys::check_keys;
 use crate::gen_cancer_reads::errors::GenCancerReadsError;
 use crate::gen_reads::utils::config::RunConfiguration;
 use crate::gen_reads::utils::subclone::{Subclone, SubcloneModel};
+
+/// Every top-level key `from_scrape` reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "reference",
+    "output_dir",
+    "output_prefix",
+    "output_filename",
+    "total_coverage",
+    "coverage",
+    "purity",
+    "read_len",
+    "paired_ended",
+    "fragment_mean",
+    "fragment_st_dev",
+    "fragment_model",
+    "rng_seed",
+    "rng_seed_root",
+    "normal_model",
+    "tumor_model",
+    "normal_mutation_rate",
+    "tumor_mutation_rate",
+    "germline_vcf",
+    "somatic_vcf",
+    "subclones",
+    "subclones_file",
+    "sv_rate_scale",
+    "keep_per_pass",
+    "overwrite_output",
+];
 
 /// Default tumor-pass somatic SNP/indel rate (typical solid tumor; see #235).
 /// The de-novo mutations added in the tumor pass are somatic, so this — not the
@@ -103,6 +133,12 @@ impl CancerConfig {
     }
 
     fn from_scrape(scrape: HashMap<String, Value>) -> Result<CancerConfig, GenCancerReadsError> {
+        check_keys(
+            scrape.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "gen-cancer-reads",
+        )
+        .map_err(GenCancerReadsError::ConfigError)?;
         let mut cfg = CancerConfig::default();
 
         // A subclonal architecture may be given inline (`subclones:`) OR loaded from a
@@ -178,7 +214,7 @@ impl CancerConfig {
                 "sv_rate_scale" => cfg.sv_rate_scale = as_f64(value, "sv_rate_scale")?,
                 "keep_per_pass" => cfg.keep_per_pass = as_bool(value, "keep_per_pass")?,
                 "overwrite_output" => cfg.overwrite_output = as_bool(value, "overwrite_output")?,
-                _ => continue,
+                other => unreachable!("`{other}` is in KNOWN_KEYS but has no arm in from_scrape"),
             }
         }
 
@@ -893,5 +929,51 @@ mod tests {
             CancerConfig::from_scrape(s),
             Err(GenCancerReadsError::ConfigError(_))
         ));
+    }
+
+    // #496: the issue's own typo, `tumor_mutation_model` for `tumor_model`, now stops the
+    // run instead of silently simulating the tumor with the germline model.
+    #[test]
+    fn the_issue_496_typo_is_rejected() {
+        let mut s = HashMap::new();
+        s.insert(
+            "reference".to_string(),
+            Value::String("test_data/references/H1N1.fa".to_string()),
+        );
+        s.insert(
+            "tumor_mutation_model".to_string(),
+            Value::String("tools/cosmic_v104_pancancer_model.json.gz".to_string()),
+        );
+        match CancerConfig::from_scrape(s) {
+            Err(GenCancerReadsError::ConfigError(msg)) => {
+                assert!(msg.contains("`tumor_mutation_model`"), "{msg}");
+                assert!(msg.contains("in gen-cancer-reads"), "{msg}");
+            }
+            other => panic!("expected an unknown-key ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_known_key_has_an_arm() {
+        for key in KNOWN_KEYS.iter().filter(|k| **k != "reference") {
+            let mut s = HashMap::new();
+            s.insert(
+                "reference".to_string(),
+                Value::String("test_data/references/H1N1.fa".to_string()),
+            );
+            // Null is not ".", so it reaches the key's arm. Any Ok/Err is fine; a panic is not.
+            s.insert(key.to_string(), Value::Null);
+            let result = std::panic::catch_unwind(|| CancerConfig::from_scrape(s));
+            assert!(
+                result.is_ok(),
+                "`{key}` panicked: it has no arm in from_scrape"
+            );
+            if let Ok(Err(GenCancerReadsError::ConfigError(msg))) = &result {
+                assert!(
+                    !msg.contains("unknown config key"),
+                    "`{key}` is in KNOWN_KEYS but was rejected: {msg}"
+                );
+            }
+        }
     }
 }

@@ -9,7 +9,6 @@ mutation_rate: .
 
 produce_bam: true
 produce_vcf: true
-produce_fasta: true
 produce_fastq: false
 
 overwrite_output: true
