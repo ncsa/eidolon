@@ -81,6 +81,26 @@ fn every_shipped_template_is_accepted_as_written() {
     }
 }
 
+/// CASES is a hand list, so a template added to `template_config/` without a row here would
+/// never be checked. Every file in the directory must have exactly one row.
+#[test]
+fn cases_cover_every_shipped_template() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("template_config");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<String> = CASES.iter().map(|(_, f)| f.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        listed, on_disk,
+        "CASES and template_config/ disagree; add a (subcommand, file) row for each template"
+    );
+}
+
 #[test]
 fn the_issue_496_typo_names_the_key() {
     let yaml = template("gen_cancer_reads_template.yml")
