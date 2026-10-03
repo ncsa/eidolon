@@ -2,12 +2,21 @@
 // various side functions. It is build with a ConfigurationBuilder, which can take either a
 // config yaml file or command line arguments and turn them into the configuration.
 
+use crate::config_keys::check_keys;
 use log::*;
 use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::string::String;
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "bed_file",
+    "files_to_filter",
+    "filter_key",
+    "overwrite_output",
+];
 
 #[derive(Debug, Clone)]
 pub struct RunConfiguration {
@@ -39,6 +48,13 @@ impl RunConfiguration {
         let scrape_config: HashMap<String, Value> =
             serde_yml::from_reader(file).expect("Error reading yaml file!");
         // Fill in the bed_file first, all hinges on that
+        if let Err(msg) = check_keys(
+            scrape_config.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "filter-reads",
+        ) {
+            panic!("{msg}")
+        }
         let bed_file = PathBuf::from(scrape_config["bed_file"].as_str().unwrap());
         if !bed_file.is_file() {
             panic!("Invalid bed file {:?}", bed_file)

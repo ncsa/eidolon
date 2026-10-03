@@ -2,10 +2,29 @@
 // flag values only; the VCFs themselves are read inside `runner` so this
 // struct stays cheap to construct/test.
 use crate::compare_vcfs::errors::CompareVcfsError;
+use crate::config_keys::check_keys;
 use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "called_vcf",
+    "chrom_aliases",
+    "contigs_simulated",
+    "equivalence_window",
+    "fast",
+    "golden_vcf",
+    "include_filtered",
+    "include_homs",
+    "mutation_bed",
+    "output_dir",
+    "overwrite_output",
+    "reference",
+    "target_bed",
+    "write_fp_vcf",
+];
 
 #[derive(Debug, Clone)]
 pub struct RunConfiguration {
@@ -47,6 +66,12 @@ impl RunConfiguration {
             ))
         })?;
         let scrape: HashMap<String, Value> = serde_yml::from_reader(file)?;
+        check_keys(
+            scrape.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "compare-vcfs",
+        )
+        .map_err(CompareVcfsError::ConfigurationError)?;
 
         let golden_vcf = require_path(&scrape, "golden_vcf")?;
         reject_bcf(&golden_vcf)?;

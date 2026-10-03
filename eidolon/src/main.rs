@@ -7,6 +7,7 @@ extern crate simplelog;
 
 pub mod compare_af;
 pub mod compare_vcfs;
+pub mod config_keys;
 pub mod filter_reads;
 pub mod gen_bam_models;
 pub mod gen_cancer_reads;

@@ -2,6 +2,7 @@
 // At least one of `frag_length` or `gc_bias` must be present. The shared
 // BAM walk uses `BamWalkFilter::for_coverage()` with the top-level
 // `min_mapq` (default 0); each observer self-filters for its own criteria.
+use crate::config_keys::check_keys;
 use crate::gen_frag_length_model::utils::runner::DistributionKind;
 use serde_yml::Value;
 use std::collections::HashMap;
@@ -14,6 +15,28 @@ use eidolon_core::{
 };
 
 use crate::gen_bam_models::errors::GenBamModelsError;
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+/// Every key the `frag_length` section parser reads.
+pub const FRAG_LENGTH_KEYS: &[&str] = &[
+    "distribution",
+    "min_reads",
+    "output_file",
+    "overwrite_output",
+];
+
+/// Every key the `gc_bias` section parser reads.
+pub const GC_BIAS_KEYS: &[&str] = &[
+    "bed_file",
+    "min_windows_per_bin",
+    "output_file",
+    "overwrite_output",
+    "reference",
+    "window_size",
+    "window_stride",
+];
+
+pub const KNOWN_KEYS: &[&str] = &["bam_file", "frag_length", "gc_bias", "min_mapq"];
 
 #[derive(Debug, Clone)]
 pub struct FragLengthSection {
@@ -50,6 +73,12 @@ impl RunConfiguration {
     pub fn from(yml_file: &PathBuf) -> Result<Self, GenBamModelsError> {
         let file = fs::File::open(yml_file)?;
         let scrape: HashMap<String, Value> = serde_yml::from_reader(file)?;
+        check_keys(
+            scrape.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "gen-bam-models",
+        )
+        .map_err(GenBamModelsError::ConfigError)?;
 
         let bam_file = PathBuf::from(
             scrape
@@ -95,6 +124,12 @@ fn parse_frag_length_section(v: &Value) -> Result<FragLengthSection, GenBamModel
     let map = v.as_mapping().ok_or_else(|| {
         GenBamModelsError::ConfigError("frag_length section must be a mapping".to_string())
     })?;
+    check_keys(
+        map.keys().filter_map(|k| k.as_str()),
+        FRAG_LENGTH_KEYS,
+        "gen-bam-models frag_length",
+    )
+    .map_err(GenBamModelsError::ConfigError)?;
 
     let get_str = |k: &str| {
         map.get(Value::String(k.to_string()))
@@ -137,6 +172,12 @@ fn parse_gc_bias_section(v: &Value) -> Result<GcBiasSection, GenBamModelsError> 
     let map = v.as_mapping().ok_or_else(|| {
         GenBamModelsError::ConfigError("gc_bias section must be a mapping".to_string())
     })?;
+    check_keys(
+        map.keys().filter_map(|k| k.as_str()),
+        GC_BIAS_KEYS,
+        "gen-bam-models gc_bias",
+    )
+    .map_err(GenBamModelsError::ConfigError)?;
 
     let get_str = |k: &str| {
         map.get(Value::String(k.to_string()))

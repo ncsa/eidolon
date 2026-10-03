@@ -1,6 +1,7 @@
 // This is the run configuration for this particular run, which holds the parameters needed by the
 // various side functions. It is build with a ConfigurationBuilder, which can take either a
 // config yaml file or command line arguments and turn them into the configuration.
+use crate::config_keys::check_keys;
 use crate::gen_gc_bias_model::errors::GenGcBiasModelError;
 use eidolon_core::{
     file_tools::{bed_reader::read_bed, file_io::check_overwrite},
@@ -10,6 +11,19 @@ use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "bam_file",
+    "bed_file",
+    "min_mapq",
+    "min_windows_per_bin",
+    "output_file",
+    "overwrite_output",
+    "reference",
+    "window_size",
+    "window_stride",
+];
 
 /// Parameters consumed by `run_from_coverage` — the FASTA-sweep + model-write
 /// stage. Does not carry BAM/walker state because `run_from_coverage` works
@@ -47,6 +61,12 @@ impl RunConfiguration {
     pub fn from(yml_file: &PathBuf) -> Result<Self, GenGcBiasModelError> {
         let file = fs::File::open(yml_file)?;
         let scrape_config: HashMap<String, Value> = serde_yml::from_reader(file)?;
+        check_keys(
+            scrape_config.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "gen-gc-bias-model",
+        )
+        .map_err(GenGcBiasModelError::ConfigError)?;
 
         let reference =
             PathBuf::from(scrape_config["reference"].as_str().ok_or_else(|| {
