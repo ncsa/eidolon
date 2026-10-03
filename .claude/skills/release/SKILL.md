@@ -33,7 +33,29 @@ opening the PR and state the file count in the PR body.
    git diff --stat <lasttag>..HEAD -- eidolon/src eidolon-core/src
    ```
    If that is empty, the binary is unchanged and the release notes must say so — otherwise a
-   patch release reads as a behaviour fix.
+   patch release reads as a behavior fix.
+
+   **Open the release ticket** (`Release vX.Y.Z`) before anything else. It is the record of
+   what was tested for this release; issues close when their PR reaches `develop`, so this
+   ticket is where release-level verification lives. List the PRs merged since the last tag:
+   ```bash
+   git log --first-parent --merges --format='%s' <lasttag>..origin/develop
+   ```
+   Then write the ticket in three parts:
+   - **Per PR:** a line with the PR, its issue and one sentence of what changed, then a
+     checkbox for each test or check the PR body names as still owed — its "Not verified"
+     section, any "needs a CHANGELOG line", any Delta run it deferred. A PR that owes
+     nothing gets one line saying so.
+   - **Release procedure:** checkboxes for the gates this sequence runs — full
+     `cargo test --workspace`, `release-gates` (`-- --ignored`) green on the release PR,
+     `clippy -D warnings`, `scripts/release_shakeout.sh` (say which mode:
+     `SKIP_LARGE_DATA=1` or full), the junk-file check, five binary assets, docs site
+     serving, conda sha256 PR.
+   - **Not verified for this release:** anything left unchecked, with the reason.
+   Check each box as it is done and record the evidence beside it — job ID, SHA, the
+   number measured. An item that will not be done before the tag is moved to "Not
+   verified" with its reason, never left silently unchecked. Close the ticket at the
+   report step.
 
 2. **Check the tree for junk before it reaches `main`.** A broad `git add -A` picks up
    files a shell redirect created by accident. An empty file named `=10` reached `main` this
@@ -117,7 +139,8 @@ opening the PR and state the file count in the PR body.
    ```
 
 11. **Report** the tag, the asset count, whether the docs site serves, and anything not
-    verified.
+    verified. Update the release ticket to match, link it from the release notes, and
+    close it.
 
 ## Gotchas that have actually bitten
 

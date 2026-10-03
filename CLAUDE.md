@@ -11,6 +11,12 @@ Hand-written guidance below; the GitNexus block that follows is auto-generated
   PR have missed the merge more than once. Check with
   `git merge-base --is-ancestor <sha> origin/develop`; recover a missed commit with
   `git cherry-pick`.
+- **Close the issue when its PR merges to `develop`.** GitHub auto-closes `Closes #N`
+  only on merge to `main`, so close it by hand once the commits are confirmed on
+  `origin/develop`, with a comment naming the PR and merge SHA. From then on the change
+  is part of `develop`: a further problem gets a **new bug ticket**, not a reopen. Closing
+  is not a claim of verification — the PR's "Not verified" items carry into the release
+  ticket (see the release skill), which is where release-level testing is recorded.
 
 ## Vetting standard (standing requirement)
 "It ran and produced output" is not evidence of correctness, and it is the bar this repo
