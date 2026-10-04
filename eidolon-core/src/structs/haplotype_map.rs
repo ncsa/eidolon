@@ -345,6 +345,35 @@ impl InsertionCoordinateMap {
         None
     }
 
+    /// Haplotype position of an exclusive reference end: where reference `[.., ref_end)`
+    /// stops on the haplotype. When base `ref_end - 1` survives this is one past its
+    /// haplotype position. When it is deleted there is no such base, and the end is where
+    /// the deletion sits, since the haplotype holds nothing between the surviving bases on
+    /// either side of it. `None` only past the reference end.
+    ///
+    /// A sub-region's alt window took `reference_base_to_haplotype(sub_end - 1)` and fell
+    /// back to `haplotype_len()` when that base was deleted, widening the window to the end
+    /// of the contig (#691).
+    pub fn reference_end_to_haplotype(&self, ref_end: usize) -> Option<usize> {
+        if ref_end > self.reference_len {
+            return None;
+        }
+        let Some(last) = ref_end.checked_sub(1) else {
+            return Some(0);
+        };
+        if let Some(p) = self.reference_base_to_haplotype(last) {
+            return Some(p + 1);
+        }
+        self.blocks.iter().find_map(|b| match *b {
+            Block::Deletion {
+                hap_at,
+                ref_start,
+                ref_len,
+            } if (ref_start..ref_start + ref_len).contains(&last) => Some(hap_at),
+            _ => None,
+        })
+    }
+
     /// Reference position for a haplotype position, or `None` when it falls
     /// inside inserted sequence — which genuinely has no reference coordinate.
     pub fn haplotype_base_to_reference(&self, haplotype_pos: usize) -> Option<usize> {
@@ -810,6 +839,41 @@ mod tests {
                 .any(|s| matches!(s, HaplotypeSegment::Deletion { .. })),
             "interval starting at the junction does not span it: {after:?}"
         );
+    }
+
+    /// Known answer for an exclusive end, on the same 1000 bp / 200-deleted-after-499 map.
+    /// An end whose last base is deleted lands where the deletion sits (500), never at
+    /// `haplotype_len()` (800) — that fallback is #691.
+    #[test]
+    fn an_end_inside_a_deletion_lands_where_the_deletion_sits() {
+        let map = InsertionCoordinateMap::with_deletions(1_000, [], [(499, 200)]).unwrap();
+        assert_eq!(map.reference_end_to_haplotype(0), Some(0));
+        // Last base is the anchor: one past it.
+        assert_eq!(map.reference_end_to_haplotype(500), Some(500));
+        // Last base deleted, first and last of the run.
+        assert_eq!(map.reference_end_to_haplotype(501), Some(500));
+        assert_eq!(map.reference_end_to_haplotype(700), Some(500));
+        // First surviving base after the deletion.
+        assert_eq!(map.reference_end_to_haplotype(701), Some(501));
+        assert_eq!(map.reference_end_to_haplotype(1_000), Some(800));
+        assert_eq!(map.reference_end_to_haplotype(1_001), None);
+    }
+
+    /// MUST NOT FIRE: wherever the last base survives, the end is exactly what the
+    /// window code computed before, `reference_base_to_haplotype(end - 1) + 1`.
+    #[test]
+    fn an_end_on_a_surviving_base_matches_the_base_projection() {
+        let map = InsertionCoordinateMap::with_deletions(1_000, [(100, vec![C; 10])], [(200, 30)])
+            .unwrap();
+        for end in 1..=1_000 {
+            if let Some(p) = map.reference_base_to_haplotype(end - 1) {
+                assert_eq!(
+                    map.reference_end_to_haplotype(end),
+                    Some(p + 1),
+                    "end {end}"
+                );
+            }
+        }
     }
 
     /// Insertions and deletions compose: shifts accumulate with sign.
