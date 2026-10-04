@@ -662,6 +662,28 @@ pub enum ParsedAlt {
     Symbolic { sv_type: SvType, raw_alt: String },
 }
 
+/// A symbolic ALT with any breakend bases uppercased, as literal bases are when parsed
+/// (#790). Only the sequence changes: a mate's `contig:pos` between `[` or `]` keeps its
+/// case, since contig names are case-sensitive, and a `<...>` ID is returned as written.
+fn uppercase_breakend_bases(alt: &str) -> String {
+    if alt.starts_with('<') {
+        return alt.to_string();
+    }
+    let mut in_mate = false;
+    alt.chars()
+        .map(|c| {
+            if c == '[' || c == ']' {
+                in_mate = !in_mate;
+                c
+            } else if in_mate {
+                c
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
 fn parse_alternate(reference: &str, alt: &str) -> Result<ParsedAlt, VariantError> {
     if reference.is_empty() {
         return Err(VariantError::InvalidVcf(
@@ -687,7 +709,7 @@ fn parse_alternate(reference: &str, alt: &str) -> Result<ParsedAlt, VariantError
         return match SvType::from_alt_string(alt) {
             Some(sv_type) => Ok(ParsedAlt::Symbolic {
                 sv_type,
-                raw_alt: alt.to_string(),
+                raw_alt: uppercase_breakend_bases(alt),
             }),
             None => Err(VariantError::InvalidVcf(format!(
                 "ALT is neither literal bases nor a recognized symbolic / breakend form: {alt}"
@@ -1011,6 +1033,27 @@ mod tests {
     fn test_empty_alternate_returns_malformed_alt() {
         let result = Variant::new(SNP, 0, &vec![Nucleotide::A], &vec![], &mut vec![1, 1]);
         assert!(matches!(result, Err(VariantError::MalformedAlt)));
+    }
+
+    /// #790 known answers: an input breakend's bases are uppercased in every form; the
+    /// mate's contig, a case-sensitive name, is not, and a `<...>` ID is untouched.
+    #[test]
+    fn an_input_breakend_alt_is_uppercased_except_its_mate_contig() {
+        for (alt, want) in [
+            ("t]chr2:300]", "T]chr2:300]"),
+            ("t[chr2:300[", "T[chr2:300["),
+            ("]chrX_alt:5]acg", "]chrX_alt:5]ACG"),
+            ("[scaffold_1a:1[g", "[scaffold_1a:1[G"),
+            ("c.", "C."),
+            (".c", ".C"),
+            ("<DEL>", "<DEL>"),
+            ("<INS:ME:Alu>", "<INS:ME:Alu>"),
+        ] {
+            match parse_alternate("A", alt).unwrap() {
+                ParsedAlt::Symbolic { raw_alt, .. } => assert_eq!(raw_alt, want, "{alt}"),
+                ParsedAlt::Literal(vt) => panic!("{alt} parsed as literal {vt:?}"),
+            }
+        }
     }
 
     fn assert_literal(parsed: ParsedAlt, expected: VariantType) {

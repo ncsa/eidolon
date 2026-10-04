@@ -24,9 +24,13 @@ input_vcf: /path/to/variants.vcf.gz
 | Symbolic SV | ALT is `<DEL>` / `<DUP>` / `<CNV>` / `<INS>` / `<INV>` / breakend / other `<TAG>` | Yes — see "Symbolic / structural variants" below |
 | Literal complex | multi-base REF **and** multi-base ALT (literal bases) | **No** — skipped with warning |
 
+## Lowercase bases
+
+Bases are case-insensitive. A soft-masked (lowercase) reference is read as plain A/C/G/T, so it simulates exactly as its uppercase copy does. REF and ALT bases from the input VCF are written to the output VCF in uppercase, breakend ALTs included: `t]chr2:300]` is written `T]chr2:300]`. The mate's contig name keeps its case, since contig names are case-sensitive, and `<...>` IDs such as `<INS:ME:Alu>` are written as given. VCF 4.2 treats lowercase bases as uppercase, so this changes no variant, only how it is spelled.
+
 ## Symbolic / structural variants
 
-Symbolic ALTs (VCF 4.2 §1.4) are accepted and round-tripped to the output VCF verbatim, with `INFO/END`, `INFO/SVLEN`, and `INFO/CN` preserved. As of v1.10, `eidolon` can also generate symbolic SVs *de novo* from a learned model — opt in by setting `sv_rate_scale: 1.0` (or higher) in your gen-reads YAML; see "De novo SV generation" below.
+Symbolic ALTs (VCF 4.2 §1.4) are accepted and round-tripped to the output VCF verbatim apart from base case (see "Lowercase bases" below), with `INFO/END`, `INFO/SVLEN`, and `INFO/CN` preserved. As of v1.10, `eidolon` can also generate symbolic SVs *de novo* from a learned model — opt in by setting `sv_rate_scale: 1.0` (or higher) in your gen-reads YAML; see "De novo SV generation" below.
 
 | SV | Effect on read depth | Effect on read sequence |
 |----|----------------------|-------------------------|
