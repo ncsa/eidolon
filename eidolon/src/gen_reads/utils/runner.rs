@@ -298,7 +298,9 @@ pub fn run_neat(
             .iter()
             .filter_map(|name| reference.get(name).map(|s| (name.clone(), s.len())))
             .collect();
-        Some(Arc::new(BamContext::new(&contig_lengths)))
+        Some(Arc::new(
+            BamContext::new(&contig_lengths).with_reference(Arc::clone(&reference)),
+        ))
     } else {
         None
     };
