@@ -146,10 +146,23 @@ jobs:
         echo "$n harness suite(s) passed"
     # Every suite must also fail when the code under it is broken. A suite that cannot is
     # decoration, and this is the step that says so.
+    #
+    # Exit 0 is not enough: a suite with no --mutate mode ignores the flag, reruns its normal
+    # assertions and exits 0, so this step once passed three suites that mutated nothing
+    # (#755). Each suite's mutation summary must be its last line.
     - name: Prove the harness tests are non-vacuous
       run: |
+        n=0
         for t in scripts/delta/tests/*.sh; do
           [ -e "$t" ] || continue
           echo "──── $t --mutate"
-          bash "$t" --mutate || exit 1
+          out="$(bash "$t" --mutate 2>&1)" || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          last="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)"
+          case "$last" in
+            *"all mutations caught"*|*" 0 mutation(s) survived"*) n=$((n+1)) ;;
+            *) echo "::error::$t ran no mutations: --mutate must end with a mutation summary, got: $last"; exit 1 ;;
+          esac
         done
+        [ "$n" -gt 0 ] || { echo "no suite proved non-vacuous — the glob matched nothing" >&2; exit 1; }
+        echo "$n harness suite(s) proved non-vacuous"
