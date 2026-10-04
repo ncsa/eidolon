@@ -17,8 +17,9 @@ use noodles::sam::{
         record::{
             Flags, MappingQuality,
             cigar::op::{Kind as CigarKind, Op},
+            data::field::Tag,
         },
-        record_buf::{Cigar, QualityScores, RecordBuf, Sequence},
+        record_buf::{Cigar, QualityScores, RecordBuf, Sequence, data::field::Value},
     },
     header::record::value::{Map, map::ReferenceSequence},
 };
@@ -170,6 +171,9 @@ const BGZF_EOF_BLOCK: [u8; BGZF_EOF_LEN] = [
 pub struct BamContext {
     pub(crate) header: sam::Header,
     pub(crate) contig_index: HashMap<String, usize>,
+    /// The reference the reads were simulated from. When present, every record written
+    /// through this context carries `NM` (#536).
+    pub(crate) reference: Option<Arc<HashMap<String, Vec<Nucleotide>>>>,
 }
 
 impl BamContext {
@@ -188,8 +192,71 @@ impl BamContext {
         Self {
             header: builder.build(),
             contig_index,
+            reference: None,
         }
     }
+
+    /// Attach the reference so records carry `NM`, the edit distance to it (#536).
+    pub fn with_reference(mut self, reference: Arc<HashMap<String, Vec<Nucleotide>>>) -> Self {
+        self.reference = Some(reference);
+        self
+    }
+}
+
+/// `NM` for a finished BAM record: mismatched aligned bases plus inserted plus deleted
+/// bases, against the reference (#536). `None` for an unmapped record, which has no
+/// alignment to measure.
+///
+/// Computed from the record as written, in reference orientation, so it describes exactly
+/// the SEQ, CIGAR and POS a reader sees. A soft-clipped base is not an edit. An `N` on
+/// either side counts as a mismatch, as `samtools calmd` counts it. An aligned base past
+/// the end of the contig has no reference base to differ from and is not counted, which
+/// also matches calmd; such a record is malformed in its own right, and that is not NM's
+/// to correct.
+///
+/// Without it, `samtools stats` and MultiQC read the golden BAM's error rate as zero:
+/// they take mismatches from `NM`, and an absent tag looks like a perfect read.
+pub fn edit_distance(record: &RecordBuf, reference: &[Nucleotide]) -> Option<u32> {
+    if record.flags().is_unmapped() {
+        return None;
+    }
+    let mut ref_pos = record.alignment_start()?.get() - 1;
+    let seq = record.sequence().as_ref();
+    let mut read_pos = 0usize;
+    let mut nm = 0u32;
+    for op in record.cigar().as_ref() {
+        let len = op.len();
+        match op.kind() {
+            CigarKind::Match | CigarKind::SequenceMatch | CigarKind::SequenceMismatch => {
+                for i in 0..len {
+                    let read_base = Nucleotide::from(char::from(seq[read_pos + i]));
+                    let differs = match reference.get(ref_pos + i) {
+                        Some(&ref_base) => {
+                            read_base != ref_base
+                                || read_base == Nucleotide::N
+                                || ref_base == Nucleotide::N
+                        }
+                        None => false,
+                    };
+                    nm += u32::from(differs);
+                }
+                read_pos += len;
+                ref_pos += len;
+            }
+            CigarKind::Insertion => {
+                nm += len as u32;
+                read_pos += len;
+            }
+            CigarKind::Deletion => {
+                nm += len as u32;
+                ref_pos += len;
+            }
+            CigarKind::SoftClip => read_pos += len,
+            CigarKind::Skip => ref_pos += len,
+            CigarKind::HardClip | CigarKind::Pad => {}
+        }
+    }
+    Some(nm)
 }
 
 /// Abstraction over BAM record staging for both single-file and per-contig writers.
@@ -296,6 +363,18 @@ impl BamRecordStager for BamBodyWriter {
             &record.sequence,
             &record.quality_scores,
         );
+        let mut bam_record = bam_record;
+        if let Some(contig) = self
+            .context
+            .reference
+            .as_ref()
+            .and_then(|r| r.get(&record.contig))
+            && let Some(nm) = edit_distance(&bam_record, contig)
+        {
+            bam_record
+                .data_mut()
+                .insert(Tag::EDIT_DISTANCE, Value::from(nm as i32));
+        }
         self.carry.push(bam_record);
         Ok(())
     }
@@ -547,6 +626,123 @@ mod tests {
             mate_position: 0,
             template_length: 0,
         }
+    }
+
+    // ── NM (#536) ────────────────────────────────────────────────────────────────
+    //
+    // Known answers worked by hand against REF = ACGTACGTAC. Each record goes through
+    // `build_bam_record`, as staging does, so a reverse read is measured in the reference
+    // orientation the BAM states.
+
+    const NM_REF: &str = "ACGTACGTAC";
+
+    fn nm_of(seq: &str, ops: &str, pos: usize, reverse: bool) -> Option<u32> {
+        let reference: Vec<Nucleotide> = NM_REF.chars().map(Nucleotide::from).collect();
+        let ops: Vec<char> = ops.chars().collect();
+        let built = build_bam_record(
+            "r",
+            0,
+            pos,
+            // Paired: single-end flags are empty, so the reverse bit would never be set.
+            read_flags_with_mapping(true, reverse, false),
+            60,
+            rle_to_cigar(&ops),
+            0,
+            0,
+            0,
+            seq,
+            &vec![30; seq.len()],
+        );
+        edit_distance(&built, &reference)
+    }
+
+    #[test]
+    fn nm_counts_mismatches_insertions_and_deletions() {
+        // Perfect match: zero, and present (Some), not absent.
+        assert_eq!(nm_of("ACGT", "MMMM", 0, false), Some(0));
+        // AGGA vs ACGT: C and T positions differ.
+        assert_eq!(nm_of("AGGA", "MMMM", 0, false), Some(2));
+        // AC + TT inserted + GT, against ACGT: two inserted bases.
+        assert_eq!(nm_of("ACTTGT", "MMIIMM", 0, false), Some(2));
+        // AC, G deleted, TA: one deleted base.
+        assert_eq!(nm_of("ACTA", "MMDMM", 0, false), Some(1));
+        // An N in the read is a mismatch, as samtools calmd counts it.
+        assert_eq!(nm_of("ANGT", "MMMM", 0, false), Some(1));
+    }
+
+    /// MUST NOT FIRE: soft-clipped bases are not edits, though GGG would mismatch ACG.
+    #[test]
+    fn nm_does_not_count_soft_clipped_bases() {
+        assert_eq!(nm_of("ACGTGGG", "MMMMSSS", 0, false), Some(0));
+    }
+
+    /// A reverse read arrives in READ orientation and is flipped by `build_bam_record`.
+    /// Reference-oriented it is 1 inserted base then GTA at position 2 (REF GTA): NM 1.
+    /// Read-oriented it is TACA with ops MMMI; walking that against the reference gives 4.
+    #[test]
+    fn nm_is_measured_in_reference_orientation() {
+        assert_eq!(nm_of("TACA", "MMMI", 2, true), Some(1));
+    }
+
+    /// A base aligned past the contig end is not counted, as samtools calmd does not count
+    /// it. REF is 10 bp; ACGTAA at position 6 covers GTAC then two bases with no reference.
+    #[test]
+    fn nm_does_not_count_bases_past_the_contig_end() {
+        assert_eq!(nm_of("GTACAA", "MMMMMM", 6, false), Some(0));
+    }
+
+    #[test]
+    fn nm_is_absent_for_an_unmapped_record() {
+        let reference: Vec<Nucleotide> = NM_REF.chars().map(Nucleotide::from).collect();
+        let built = build_bam_record(
+            "r",
+            0,
+            0,
+            read_flags_with_mapping(false, false, true),
+            60,
+            Cigar::default(),
+            0,
+            0,
+            0,
+            "ACGT",
+            &[30; 4],
+        );
+        assert_eq!(edit_distance(&built, &reference), None);
+    }
+
+    /// End to end through the production writer: a context carrying the reference writes
+    /// `NM:i:0` on a perfect read, present rather than absent.
+    #[test]
+    fn a_body_writer_with_a_reference_writes_nm() {
+        let temp = tempdir().unwrap();
+        let reference: HashMap<String, Vec<Nucleotide>> = HashMap::from([(
+            "chr1".to_string(),
+            "ACGTACGTAC".chars().map(Nucleotide::from).collect(),
+        )]);
+        let contigs = vec![("chr1".to_string(), 10usize)];
+        let context = Arc::new(BamContext::new(&contigs).with_reference(Arc::new(reference)));
+        let body = temp.path().join("body.bam");
+        {
+            let mut bw = BamBodyWriter::new(body.clone(), Arc::clone(&context)).unwrap();
+            let mut mismatched = make_read("r2", 4);
+            mismatched.sequence = "AGTT".to_string(); // vs ACGT at 4: C and G positions differ
+            bw.stage_read_record(&make_read("r1", 0)).unwrap();
+            bw.stage_read_record(&mismatched).unwrap();
+            bw.flush_all().unwrap();
+        }
+        let out = temp.path().join("nm.bam");
+        concat_temp_bams(&context, &[body], &out).unwrap();
+
+        let mut reader = bam::io::Reader::new(std::fs::File::open(&out).unwrap());
+        let header = reader.read_header().unwrap();
+        let nms: Vec<Option<i64>> = reader
+            .records()
+            .map(|r| {
+                let rec = RecordBuf::try_from_alignment_record(&header, &r.unwrap()).unwrap();
+                rec.data().get(&Tag::EDIT_DISTANCE).and_then(|v| v.as_int())
+            })
+            .collect();
+        assert_eq!(nms, vec![Some(0), Some(2)]);
     }
 
     /// Flatten a built `Cigar` into (kind, len) pairs for exact comparison.
