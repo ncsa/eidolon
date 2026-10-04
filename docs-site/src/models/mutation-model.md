@@ -33,6 +33,7 @@ overwrite_output: false
 - Single sample only — multi-sample VCFs are not yet supported (tracked in #412)
 - Each variant record must have `GT` in the `FORMAT` column; `eidolon` hard-errors if GT is missing
 - `QUAL=.` is accepted and treated as quality score 0
+- Insertion and deletion lengths are each fitted from the VCF. If one type is absent (an insertions-only VCF, say), that type's length distribution is the default one and a warning says so; the type that was observed keeps its fitted lengths. With no indels at all, both use the defaults.
 - A SNP whose `REF` does not match the reference base, or that sits at a contig edge, is skipped with a warning giving the counts. If **every** SNP is skipped, `gen-mut-model` errors out rather than writing a model with no SNP context data. That usually means the VCF was called against a different reference build.
 
 Caveats: Only one sample can be read at this point (#412). Currently, high-mutation regions and common variants features from Python NEAT are not yet implemented (#413).

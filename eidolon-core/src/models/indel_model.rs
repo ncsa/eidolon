@@ -16,6 +16,7 @@ use crate::{
     },
 };
 use flate2::read::GzDecoder;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf};
 use thiserror::Error;
@@ -58,6 +59,40 @@ impl IndelModel {
         let del_dist = DiscreteDistribution::new(&del_weights, &del_lens)?;
         Ok(IndelModel { ins_dist, del_dist })
     }
+    /// Fit from observed lengths, where either type may have gone unobserved. Each observed
+    /// type keeps its own fitted distribution; only an unobserved one takes the default
+    /// distribution for that type, and that is logged.
+    ///
+    /// A training VCF with insertions and no deletions (or the reverse) used to discard the
+    /// lengths it did observe and carry the default for both types (#766).
+    pub fn from_observed(
+        ins_lens: Vec<usize>,
+        ins_weights: Vec<f64>,
+        del_lens: Vec<usize>,
+        del_weights: Vec<f64>,
+    ) -> Result<Self, IndelModelError> {
+        let fallback = if ins_lens.is_empty() || del_lens.is_empty() {
+            Some(Self::default()?)
+        } else {
+            None
+        };
+        let ins_dist = match &fallback {
+            Some(d) if ins_lens.is_empty() => {
+                warn!("no insertions observed; insertion lengths use the default distribution");
+                d.ins_dist.clone()
+            }
+            _ => DiscreteDistribution::new(&ins_weights, &ins_lens)?,
+        };
+        let del_dist = match &fallback {
+            Some(d) if del_lens.is_empty() => {
+                warn!("no deletions observed; deletion lengths use the default distribution");
+                d.del_dist.clone()
+            }
+            _ => DiscreteDistribution::new(&del_weights, &del_lens)?,
+        };
+        Ok(IndelModel { ins_dist, del_dist })
+    }
+
     // Returns Result because it deserializes an embedded model file; std::Default
     // requires infallible `fn default() -> Self`, which doesn't fit.
     #[allow(clippy::should_implement_trait)]
