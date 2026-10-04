@@ -64,8 +64,14 @@ pub fn generate_variants(
     let w_at = |p: usize| -> f64 {
         // Interior positions have a trinucleotide context; contig-edge positions fall
         // back to the mean weight (no ±1 flank available).
+        // Unmasked: the model is keyed on A/C/G/T, so a soft-masked context like `aCg` missed
+        // every key and fell back to the mean, leaving the signature out of masked sequence.
         if p >= 1 && p + 1 < seq.len() {
-            let ctx = TrinucFrame::from(&[seq[p - 1], seq[p], seq[p + 1]]);
+            let ctx = TrinucFrame::from(&[
+                seq[p - 1].get_unmasked_base(),
+                seq[p].get_unmasked_base(),
+                seq[p + 1].get_unmasked_base(),
+            ]);
             *ctx_weights.get(&ctx).unwrap_or(&mean_w)
         } else {
             mean_w

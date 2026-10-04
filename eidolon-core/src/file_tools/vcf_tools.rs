@@ -14,7 +14,7 @@ use crate::file_tools::file_io::{
     create_output_file, is_gzipped_file, read_gzip_lines, read_lines,
 };
 use crate::structs::mutated_map::{AdCounter, MutatedMap};
-use crate::structs::nucleotides::sequence_array_to_string;
+use crate::structs::nucleotides::{Nucleotide, sequence_array_to_string};
 use crate::structs::variants::{AlternateType, Provenance, Variant, VariantError};
 
 #[derive(Debug, Error)]
@@ -183,8 +183,8 @@ pub fn write_vcf(
 
         for variant in records {
             let alt_str = match &variant.alternate {
-                AlternateType::Literal(bases) => sequence_array_to_string(bases),
-                AlternateType::Symbolic(sv) => sv.raw_alt.clone(),
+                AlternateType::Literal(bases) => vcf_bases(bases),
+                AlternateType::Symbolic(sv) => uppercase_symbolic_alt(&sv.raw_alt),
             };
             let prov = variant.provenance.as_str();
             let is_symbolic = variant.alternate.is_symbolic();
@@ -258,7 +258,7 @@ pub fn write_vcf(
                 contig,
                 variant.location + 1,
                 id_str,
-                sequence_array_to_string(&variant.reference),
+                vcf_bases(&variant.reference),
                 alt_str,
                 info_str,
                 sample_str,
@@ -267,6 +267,39 @@ pub fn write_vcf(
         }
     }
     Ok(())
+}
+
+/// REF or literal ALT bases for the truth VCF, uppercase whatever the reference's case.
+///
+/// A soft-masked reference marks repeats in lowercase, and SV records took their bases
+/// straight from it, so a masked region wrote `t` where small variants, unmasked when they
+/// are created, wrote `T` (#790). Canonicalizing here covers every variant class at once.
+fn vcf_bases(bases: &[Nucleotide]) -> String {
+    let unmasked: Vec<Nucleotide> = bases.iter().map(|b| b.get_unmasked_base()).collect();
+    sequence_array_to_string(&unmasked)
+}
+
+/// A symbolic ALT with its bases uppercased (#790). Only a breakend's sequence changes: the
+/// mate's `contig:pos` between `[` or `]` keeps its case, since contig names are
+/// case-sensitive, and so does a `<...>` symbolic ID.
+fn uppercase_symbolic_alt(raw: &str) -> String {
+    let mut in_mate = false;
+    let mut in_id = false;
+    raw.chars()
+        .map(|c| {
+            match c {
+                '[' | ']' => in_mate = !in_mate,
+                '<' => in_id = true,
+                '>' => in_id = false,
+                _ => {}
+            }
+            if in_mate || in_id {
+                c
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
 }
 
 /// Drop the eidolon-emitted routing tokens that this writer owns, from an INFO field
@@ -610,6 +643,33 @@ fn extract_gt_str<'a>(fmt: &'a str, smp: &'a str) -> Result<Option<&'a str>, Vcf
 
 #[cfg(test)]
 mod tests {
+
+    /// #790 known answers. Breakend sequence is uppercased in every ALT form; the mate's
+    /// contig, a case-sensitive name, is not, and neither is a `<...>` symbolic ID.
+    #[test]
+    fn a_symbolic_alt_uppercases_only_its_bases() {
+        for (raw, want) in [
+            ("t]chr2:300]", "T]chr2:300]"),
+            ("t[chr2:300[", "T[chr2:300["),
+            ("]chrX_alt:5]acg", "]chrX_alt:5]ACG"),
+            ("[scaffold_1a:1[g", "[scaffold_1a:1[G"),
+            ("tgc]H1N1_na:9]", "TGC]H1N1_na:9]"),
+            ("c.", "C."),
+            (".c", ".C"),
+            ("<DEL>", "<DEL>"),
+            ("<DUP:TANDEM>", "<DUP:TANDEM>"),
+            ("<custom_lower>", "<custom_lower>"),
+        ] {
+            assert_eq!(uppercase_symbolic_alt(raw), want, "{raw}");
+        }
+    }
+
+    /// #790: REF and literal ALT are written uppercase from soft-masked bases.
+    #[test]
+    fn vcf_bases_unmasks_every_base() {
+        let bases: Vec<Nucleotide> = "acgtNACGT".chars().map(Nucleotide::from).collect();
+        assert_eq!(vcf_bases(&bases), "ACGTNACGT");
+    }
 
     /// Known answer, built by hand: a SNP masks its position, a 3-base REF masks all three,
     /// and a multi-allelic record is kept (the model readers drop it). Headers are not
