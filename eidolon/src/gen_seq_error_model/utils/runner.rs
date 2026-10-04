@@ -3,6 +3,7 @@ use crate::gen_seq_error_model::{
     utils::config::{BamMethod, RunConfiguration},
 };
 use eidolon_core::file_tools::file_io::is_gzipped_file;
+use eidolon_core::rng::NeatRng;
 use eidolon_core::{
     file_tools::{
         bam_reader::{
@@ -427,11 +428,63 @@ fn accumulate_qual(
     Ok(true)
 }
 
+/// Fixed so a capped fit is reproducible, and shared by both mates so R1 and R2 of the same
+/// length keep the same record numbers.
+const MAX_READS_SAMPLING_SEED: &str = "gen-seq-error-model max_reads (#721)";
+
+/// Which records a `max_reads`-capped fit keeps (#721).
+///
+/// The cap used to keep the FIRST N records. Illumina FASTQs are written in flowcell order,
+/// so that was one corner of one lane: the first 200,000 records of the HG002 library were
+/// all lane 1, tile 1101. Each record is now kept with probability `max_reads / total`, so
+/// the sample is spread across the whole file and holds about `max_reads` records.
+struct ReadSampler {
+    /// `None` keeps every record: no cap, or a cap at or above the file's size.
+    keep_probability: Option<f64>,
+    rng: NeatRng,
+}
+
+impl ReadSampler {
+    fn new(max_reads: usize, total_records: usize) -> Result<Self, GenSeqErrorModelError> {
+        let keep_probability = (max_reads > 0 && total_records > max_reads)
+            .then(|| max_reads as f64 / total_records as f64);
+        let rng = NeatRng::new_from_seed(&vec![MAX_READS_SAMPLING_SEED.to_string()])
+            .map_err(|e| GenSeqErrorModelError::ConfigurationError(e.to_string()))?;
+        Ok(Self {
+            keep_probability,
+            rng,
+        })
+    }
+
+    fn keep(&mut self) -> Result<bool, GenSeqErrorModelError> {
+        match self.keep_probability {
+            None => Ok(true),
+            Some(p) => self
+                .rng
+                .gen_bool(p)
+                .map_err(|e| GenSeqErrorModelError::ConfigurationError(e.to_string())),
+        }
+    }
+}
+
+/// Records in a FASTQ, counted by lines. A first pass for `max_reads`, which needs the total
+/// to sample uniformly; the fitting pass validates every record, so a malformed file is
+/// still reported there.
+fn count_fastq_records(path: &PathBuf) -> Result<usize, GenSeqErrorModelError> {
+    let lines = if is_gzipped_file(path)? {
+        read_gzip_lines(path)?.count()
+    } else {
+        read_lines(path)?.count()
+    };
+    Ok(lines / 4)
+}
+
 /// Read one mate's FASTQ into its own `MateCounts`, pooling the option-set and base counts.
 ///
 /// `max_reads` applies PER MATE rather than across the pair: a shared budget would spend it
 /// all on R1 and fit R2 from whatever was left, which is nothing at the default of 0-means-all
-/// and is silently lopsided otherwise.
+/// and is silently lopsided otherwise. Within a mate it is a uniform sample, not the head of
+/// the file; see `ReadSampler`.
 fn accumulate_one_file(
     path: &PathBuf,
     config: &RunConfiguration,
@@ -447,13 +500,30 @@ fn accumulate_one_file(
         Box::new(read_lines(path)?)
     };
     let qual_offset = config.qual_offset;
-    let mate_start = *reads_processed;
-    'records: loop {
-        if config.max_reads > 0 && (*reads_processed) - mate_start >= config.max_reads {
-            break;
+    let mut sampler = if config.max_reads > 0 {
+        let total = count_fastq_records(path)?;
+        let sampler = ReadSampler::new(config.max_reads, total)?;
+        match sampler.keep_probability {
+            Some(p) => info!(
+                "max_reads {}: sampling {:?} uniformly, keeping each of its {} records with \
+                 probability {:.6}",
+                config.max_reads, path, total, p
+            ),
+            None => info!(
+                "max_reads {} is at least the {} records in {:?}; using every record",
+                config.max_reads, total, path
+            ),
         }
+        sampler
+    } else {
+        ReadSampler::new(0, 0)?
+    };
+    // Every record read, kept or not: line numbers in error messages count from this, while
+    // `m.records_seen` counts only the records the fit used.
+    let mut records_read = 0usize;
+    'records: loop {
         // Line number of this record's header, 1-based, for error messages.
-        let first_line = m.records_seen * 4 + 1;
+        let first_line = records_read * 4 + 1;
 
         // The header is the ONLY line whose absence is a clean end of file. Missing any of the
         // other three means the last record is truncated, which is a corrupt file, not an end.
@@ -467,6 +537,10 @@ fn accumulate_one_file(
         let qual = next_record_line(&mut iter, first_line, first_line + 3)?;
 
         validate_record(&header, &seq, &plus, &qual, first_line)?;
+        records_read += 1;
+        if !sampler.keep()? {
+            continue;
+        }
         m.records_seen += 1;
         m.min_qual_len = m.min_qual_len.min(qual.len());
 
@@ -531,6 +605,12 @@ fn accumulate_one_file(
         )? {
             (*reads_processed) += 1;
         }
+    }
+    if sampler.keep_probability.is_some() {
+        info!(
+            "max_reads {}: fitted {} of {} records in {:?}",
+            config.max_reads, m.records_seen, records_read, path
+        );
     }
     Ok(())
 }
@@ -1807,18 +1887,17 @@ mod tests {
     /// rather than a silent lopsided fit, but the declared semantics are that each mate gets
     /// its own N.
     ///
-    /// KNOWN ANSWER, computable from the fixtures: each file's first 10 records carry one
-    /// quality value and its remaining 90 carry another. With a per-mate budget of 10 the
-    /// union option set is exactly {Q20, Q40} -- the two capped-in values -- and Q30/Q10 never
-    /// enter the model. An ignored budget admits all four; a shared budget starves R2.
+    /// KNOWN ANSWER: every R1 record is Q40 and every R2 record Q20, 100 of each, capped at 10
+    /// per mate. Whichever records the sampler keeps, R1 must be fitted all-Q40 and R2 must
+    /// exist and be fitted all-Q20. A shared budget starves R2.
     #[test]
     fn max_reads_applies_to_each_mate() {
         let temp = tempfile::tempdir().unwrap();
         let r1_path = temp.path().join("capped_r1.fastq");
         let r2_path = temp.path().join("capped_r2.fastq");
-        // 'I' = Q40, '?' = Q30, '5' = Q20, '+' = Q10 under Phred+33.
-        write_groups(&r1_path, &[(10, "I".repeat(50)), (90, "?".repeat(50))]);
-        write_groups(&r2_path, &[(10, "5".repeat(50)), (90, "+".repeat(50))]);
+        // 'I' = Q40, '5' = Q20 under Phred+33.
+        write_groups(&r1_path, &[(100, "I".repeat(50))]);
+        write_groups(&r2_path, &[(100, "5".repeat(50))]);
 
         let output_path = temp.path().join("model.json.gz");
         let mut config = make_config(r1_path, output_path.clone());
@@ -1830,25 +1909,91 @@ mod tests {
         let q1 = model.quality_score_model();
         let q2 = model
             .quality_score_model_r2()
-            .expect("R2 must be fitted from its own 10 records, not from R1's leftovers");
-        assert_eq!(
-            q1.quality_score_options,
-            vec![20, 40],
-            "the option set is the union over the two capped mates; Q30 or Q10 here means \
-             `max_reads` did not apply"
-        );
+            .expect("R2 must be fitted from its own sample, not from R1's leftovers");
+        assert_eq!(q1.quality_score_options, vec![20, 40]);
 
         let mut rng = eidolon_core::rng::NeatRng::new_from_seed(&vec!["723".to_string()]).unwrap();
         let s1 = q1.generate_quality_scores(50, &mut rng).unwrap();
         let s2 = q2.generate_quality_scores(50, &mut rng).unwrap();
-        assert!(
-            s1.iter().all(|&s| s == 40),
-            "R1 was capped to its 10 all-Q40 records: {s1:?}"
+        assert!(s1.iter().all(|&s| s == 40), "R1 is all-Q40: {s1:?}");
+        assert!(s2.iter().all(|&s| s == 20), "R2 is all-Q20: {s2:?}");
+    }
+
+    /// #721 KNOWN ANSWER: the first 500 records are Q40 and the last 500 Q10, as a flowcell
+    /// whose later tiles read worse would be. A cap of 100 must see both halves, so the
+    /// option set is {Q10, Q40}. Taking the head of the file, as the cap did before, fits
+    /// from the Q40 half only and gives {Q40}.
+    #[test]
+    fn a_capped_fit_samples_the_whole_file_not_its_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("two_halves.fastq");
+        write_groups(&fastq_path, &[(500, "I".repeat(50)), (500, "+".repeat(50))]);
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.max_reads = 100;
+        runner(&config).unwrap();
+
+        let q = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_eq!(
+            q.quality_score_model().quality_score_options,
+            vec![10, 40],
+            "a capped fit saw only one half of the file: `max_reads` is taking the head (#721)"
         );
+    }
+
+    /// The sampler keeps about `max_reads` records, spread evenly. KNOWN ANSWER: 1,000 of
+    /// 100,000 is p = 0.01, so the count is Binomial(100000, 0.01): mean 1,000, sigma ~31.5,
+    /// and each tenth of the file expects 100 (sigma ~10). Bounds are +/-5 sigma. A head
+    /// sampler puts all 1,000 in the first tenth.
+    #[test]
+    fn the_sampler_keeps_about_max_reads_spread_across_the_file() {
+        let mut sampler = ReadSampler::new(1_000, 100_000).unwrap();
+        let mut per_tenth = [0usize; 10];
+        for i in 0..100_000 {
+            if sampler.keep().unwrap() {
+                per_tenth[i / 10_000] += 1;
+            }
+        }
+        let kept: usize = per_tenth.iter().sum();
         assert!(
-            s2.iter().all(|&s| s == 20),
-            "R2 was capped to its 10 all-Q20 records: {s2:?}"
+            (843..=1_157).contains(&kept),
+            "kept {kept} of 100,000 at p = 0.01"
         );
+        for (t, &n) in per_tenth.iter().enumerate() {
+            assert!(
+                (50..=150).contains(&n),
+                "tenth {t} kept {n}, expected ~100: {per_tenth:?}"
+            );
+        }
+    }
+
+    /// MUST NOT FIRE: a cap at or above the file's size, or no cap, keeps every record.
+    #[test]
+    fn the_sampler_keeps_everything_when_the_cap_does_not_bind() {
+        for (max_reads, total) in [(0, 500), (500, 500), (1_000, 500)] {
+            let mut sampler = ReadSampler::new(max_reads, total).unwrap();
+            assert!(
+                sampler.keep_probability.is_none(),
+                "max_reads {max_reads}, total {total}"
+            );
+            assert!((0..total).all(|_| sampler.keep().unwrap()));
+        }
+    }
+
+    /// MUST NOT FIRE, end to end: a cap that does not bind writes the same model as no cap.
+    #[test]
+    fn a_cap_above_the_file_size_fits_the_same_model_as_no_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("small.fastq");
+        write_groups(&fastq_path, &[(60, "I".repeat(50)), (40, "+".repeat(50))]);
+        let fit = |name: &str, max_reads: usize| {
+            let out = temp.path().join(name);
+            let mut config = make_config(fastq_path.clone(), out.clone());
+            config.max_reads = max_reads;
+            runner(&config).unwrap();
+            serde_json::to_value(SequencingErrorModel::from_file(&out).unwrap()).unwrap()
+        };
+        assert_eq!(fit("uncapped.json.gz", 0), fit("capped.json.gz", 100));
     }
 
     /// MUST NOT FIRE: ragged read lengths are fine as long as BOTH populations reach the
@@ -2037,19 +2182,42 @@ mod tests {
         assert_positions_match(q, &long_qual, 33);
     }
 
-    /// THE regression for the second review finding on #698: `max_reads` smaller than the
-    /// window the read length was drawn from.
+    /// THE regression for the second review finding on #698: `max_reads` must not let a
+    /// record it excluded set the model's read length. Under the earlier sampling code the
+    /// model advertised 100 bp from records the cap had skipped, and positions 51-100 were
+    /// uniform noise between Q10 and Q40.
     ///
-    /// Known answer: only the ten 50 bp records are fitted, so the model is a 50 bp model.
-    /// Under the sampling code it advertised 100 bp — the length came from records that
-    /// `max_reads` excluded — and positions 51-100 were uniform noise between Q10 and Q40.
+    /// Known answer: 110 records of 50 bp plus one of 100 bp, capped at 10. The sampler is
+    /// seeded, so the record numbers it skips are fixed; the 100 bp record is placed on the
+    /// first of them. Only 50 bp records are fitted, so the model is a 50 bp model.
     #[test]
     fn max_reads_does_not_advertise_positions_it_did_not_fit() {
-        let temp = tempfile::tempdir().unwrap();
-        let fastq_path = temp.path().join("capped.fastq");
+        const TOTAL: usize = 111;
+        let mut sampler = ReadSampler::new(10, TOTAL).unwrap();
+        let kept: Vec<bool> = (0..TOTAL).map(|_| sampler.keep().unwrap()).collect();
+        let skipped = kept
+            .iter()
+            .position(|k| !k)
+            .expect("p = 10/111 skips some record");
+        assert!(
+            kept.iter().any(|&k| k),
+            "the fixture needs at least one fitted record"
+        );
+
         let short_qual = "I".repeat(25) + &"+".repeat(25);
         let long_qual = "I".repeat(50) + &"+".repeat(50);
-        write_two_phase_fastq(&fastq_path, 10, &short_qual, 100, &long_qual);
+        let mut out = String::new();
+        for i in 0..TOTAL {
+            let q = if i == skipped {
+                &long_qual
+            } else {
+                &short_qual
+            };
+            out.push_str(&format!("@r{i}\n{}\n+\n{q}\n", "A".repeat(q.len())));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("capped.fastq");
+        std::fs::write(&fastq_path, out).unwrap();
         let output_path = temp.path().join("model.json.gz");
         let mut config = make_config(fastq_path, output_path.clone());
         config.max_reads = 10;
@@ -2059,7 +2227,7 @@ mod tests {
         let q = model.quality_score_model();
         assert_eq!(
             q.assumed_read_length, 50,
-            "only the ten 50 bp records were fitted, so the model describes 50 positions"
+            "the only 100 bp record was skipped by the cap, so the model describes 50 positions"
         );
         assert_eq!(q.distros_from_one.len(), 49);
         assert_positions_match(q, &short_qual, 33);

@@ -19,7 +19,7 @@ output_file: /path/to/seq_error_model.json.gz
 # optional: set to true to overwrite an existing output file (default: false)
 overwrite_output: false
 
-# optional: maximum number of reads to use for model learning; 0 = unlimited (default: 0)
+# optional: number of reads to fit from, sampled uniformly across the file; 0 = every read (default: 0)
 max_reads: 0
 
 # optional: quality score ASCII offset; 33 for Illumina 1.8+/Sanger, 64 for older Illumina (default: 33)
