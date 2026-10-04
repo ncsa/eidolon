@@ -349,9 +349,6 @@ fn pick_random_snp(
 
 fn check_base(nuc: Nucleotide) -> Nucleotide {
     // For now we'll replace occasional N's with A's.
-    if nuc.is_masked() {
-        return nuc.get_unmasked_base();
-    }
     match nuc {
         Nucleotide::N => Nucleotide::A,
         _ => nuc,
@@ -576,13 +573,6 @@ mod tests {
     #[test]
     fn test_check_base_replaces_n() {
         assert_eq!(check_base(Nucleotide::N), Nucleotide::A);
-    }
-
-    #[test]
-    fn test_check_base_unmasks_masked() {
-        // Masked bases should be replaced with their unmasked equivalent
-        assert_eq!(check_base(Nucleotide::Maskeda), Nucleotide::A);
-        assert_eq!(check_base(Nucleotide::Maskedc), Nucleotide::C);
     }
 
     #[test]

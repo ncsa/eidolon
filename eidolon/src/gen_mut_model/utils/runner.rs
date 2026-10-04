@@ -22,11 +22,7 @@ use crate::gen_mut_model::errors::GenMutationModelError;
 /// counted under a `Masked*` frame is one the SNP side never looks up, which undercounts
 /// occurrences in repeats and inflates their probabilities (#771).
 fn canonical_trinuc(sequence: &[Nucleotide], i: usize) -> (Nucleotide, Nucleotide, Nucleotide) {
-    (
-        sequence[i - 1].get_unmasked_base(),
-        sequence[i].get_unmasked_base(),
-        sequence[i + 1].get_unmasked_base(),
-    )
+    (sequence[i - 1], sequence[i], sequence[i + 1])
 }
 
 pub fn runner(
