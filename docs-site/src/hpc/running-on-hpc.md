@@ -57,17 +57,17 @@ Single-threaded; processes the VCF one chromosome at a time. A full human genome
 
 ### gen-seq-error-model
 
-Single-threaded; streams through the FASTQ. For a full genome FASTQ (~600 M reads), expect 30–60 minutes. For most purposes, training on a representative subset produces a statistically equivalent model in a fraction of the time:
+Single-threaded; streams through the FASTQ. For a full genome FASTQ (~600 M reads), expect 30–60 minutes. `max_reads` caps how many records the fit uses, drawn uniformly from the whole file rather than taken from its start. A FASTQ is written in flowcell order, so its first records all come from one tile of one lane. A capped run still reads every record, once to count them and once to sample, so it shortens the fit but not the pass over the file:
 
 ```yaml
-max_reads: 5000000   # 5 M reads is sufficient; set to 0 for unlimited
+max_reads: 5000000   # a uniform sample of ~5 M records; 0 uses every record
 ```
 
 ```bash
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
-#SBATCH --time=0:30:00   # with max_reads=5M; scale up for unlimited
+#SBATCH --time=1:30:00   # capped or not, every record is read; not yet timed with sampling
 ```
 
 ### gen-frag-length-model
