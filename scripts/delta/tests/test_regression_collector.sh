@@ -23,6 +23,43 @@ GATE="${GATE:-$HERE/../regression_gate.sh}"
 BASELINE="${BASELINE:-$HERE/../baseline_metrics.tsv}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
+# --mutate: break each guarded line in a copy of the file it lives in, and require this
+# suite to fail against the copy. Each row is label@SUITE|ORDER|GATE|BASELINE@from@to
+# (#755). The first rows re-enact d0cd060's drift from either side.
+if [[ "${1:-}" == "--mutate" ]]; then
+    survived=0
+    while IFS='@' read -r label target from to; do
+        [[ -n "$label" ]] || continue
+        case "$target" in
+            SUITE) src="$SUITE" ;; ORDER) src="$ORDER" ;;
+            GATE) src="$GATE" ;;   BASELINE) src="$BASELINE" ;;
+            *) printf '  ERROR    %-52s unknown target %s\n' "$label" "$target"; survived=$((survived+1)); continue ;;
+        esac
+        cp "$src" "$WORK/mutant"
+        FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/' "$WORK/mutant"
+        if cmp -s "$src" "$WORK/mutant"; then
+            printf '  ERROR    %-52s mutation did not apply\n' "$label"; survived=$((survived+1)); continue
+        fi
+        if env "$target=$WORK/mutant" bash "$0" >/dev/null 2>&1; then
+            printf '  SURVIVED %-52s <- nothing caught this\n' "$label"; survived=$((survived+1))
+        else
+            printf '  caught   %s\n' "$label"
+        fi
+    done <<'MUTS'
+collector reads the retired thread label@SUITE@ti="$(get thread_invariant)"@ti="$(get multithread_vs_1thread)"
+collector reads a contig label the harness lacks@SUITE@"$(get contig_name_invariant)"@"$(get contig_order_independent)"
+harness renames a label the collector reads@ORDER@"thread_invariant:"@"threads_invariant:"
+absent label collected as empty@SUITE@                    v=MISSING@                    v=
+absent label passes silently@SUITE@echo "WARNING: '$1:' not found in $f — collector and harness labels have drifted" >&2@true
+emitted metric has no baseline row@SUITE@printf '%s\t%s\n' shard_disjoint @printf '%s\t%s\n' shard_disjointness
+baseline row renamed away@BASELINE@determinism_thread_invariant@determinism_thread_invariance
+gate reads MISSING as a measured FAIL@GATE@    if cv in ("", "MISSING", "NA"):@    if cv in ("NA",):
+gate stops naming label drift@GATE@harness/collector label drift@harness/collector mismatch
+MUTS
+    echo
+    [[ "$survived" -eq 0 ]] && { echo "all mutations caught"; exit 0; } || { echo "$survived survived"; exit 1; }
+fi
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }

@@ -13,6 +13,39 @@ DRAW="${DRAW:-$HERE/../../../tools/draw_gnomad_sv_vcf.sh}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# --mutate: break each guarded line in a copy of the tool and require this suite to fail
+# against the copy (#755). Without bcftools the suite SKIPs with exit 0, which reads here as
+# every mutant surviving: loud, not silent.
+if [[ "${1:-}" == "--mutate" ]]; then
+    survived=0
+    while IFS='@' read -r label from to; do
+        [[ -n "$label" ]] || continue
+        cp "$DRAW" "$WORK/mutant.sh"
+        FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/' "$WORK/mutant.sh"
+        if cmp -s "$DRAW" "$WORK/mutant.sh"; then
+            printf '  ERROR    %-48s mutation did not apply\n' "$label"; survived=$((survived+1)); continue
+        fi
+        if DRAW="$WORK/mutant.sh" bash "$0" >/dev/null 2>&1; then
+            printf '  SURVIVED %-48s <- nothing caught this\n' "$label"; survived=$((survived+1))
+        else
+            printf '  caught   %s\n' "$label"
+        fi
+    done <<'MUTS'
+genotype draw off Hardy-Weinberg@p_het = 2*a*(1-a)@p_het = a*(1-a)
+seed ignored@lcg = (seed % 2147483646) + 1@lcg = 1
+population frequency written as INFO/AF@info = info ";POP_AF=" af@info = info ";AF=" af
+non-PASS sites kept@if (filt != "PASS" && filt != ".")@if (0)
+sites without AF kept@if (af == "." || af + 0 <= 0)@if (0)
+MIN_AF ignored@if (af + 0 < min_af + 0)@if (0)
+MAX_LEN ignored@if (L > max_len + 0)@if (0)
+empty draw exits 0@if (total == 0) {@if (0) {
+output not sorted by position@LC_ALL=C sort -k1,1 -k2,2n@LC_ALL=C sort -k1,1 -k2,2nr
+BND kept by default@TYPES="${TYPES:-DEL,DUP,INS,INV,CNV}"@TYPES="${TYPES:-DEL,DUP,INS,INV,CNV,BND}"
+MUTS
+    echo
+    [[ "$survived" -eq 0 ]] && { echo "all mutations caught"; exit 0; } || { echo "$survived survived"; exit 1; }
+fi
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }
