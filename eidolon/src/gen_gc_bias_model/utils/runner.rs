@@ -265,12 +265,9 @@ fn accumulate_region(
     let first = &sequence[region_start..region_start + window_size];
     let mut gc_count: usize = first
         .iter()
-        .filter(|n| matches!(n.get_unmasked_base(), Nucleotide::G | Nucleotide::C))
+        .filter(|n| matches!(n, Nucleotide::G | Nucleotide::C))
         .count();
-    let mut n_count: usize = first
-        .iter()
-        .filter(|n| n.get_unmasked_base() == Nucleotide::N)
-        .count();
+    let mut n_count: usize = first.iter().filter(|n| **n == Nucleotide::N).count();
 
     let mut cov_sum: u64 = (0..window_size)
         .map(|i| cov.get(region_start + i).copied().unwrap_or(0) as u64)
@@ -293,12 +290,12 @@ fn accumulate_region(
         // Advance both sliding windows by stride steps.
         for j in 0..window_stride {
             // Soft-masked (lowercase) bases count as the base they are (#771).
-            match sequence[w + j].get_unmasked_base() {
+            match sequence[w + j] {
                 Nucleotide::G | Nucleotide::C => gc_count -= 1,
                 Nucleotide::N => n_count -= 1,
                 _ => {}
             }
-            match sequence[w + window_size + j].get_unmasked_base() {
+            match sequence[w + window_size + j] {
                 Nucleotide::G | Nucleotide::C => gc_count += 1,
                 Nucleotide::N => n_count += 1,
                 _ => {}

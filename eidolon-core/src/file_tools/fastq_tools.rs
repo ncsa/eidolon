@@ -106,20 +106,20 @@ fn reference_span(cigar_ops: &[char]) -> usize {
 ///
 /// `N` is unsequenced reference, not a homopolymer, so it never forms or extends a run.
 fn homopolymer_run_at(sequence: &[Nucleotide], index: usize, cap: usize) -> usize {
-    let base = sequence[index].get_unmasked_base();
+    let base = sequence[index];
     if base == N {
         return 0;
     }
     let mut run = 1;
     // Backwards from index, then forwards, stopping at the first differing base.
     for i in (0..index).rev() {
-        if run >= cap || sequence[i].get_unmasked_base() != base {
+        if run >= cap || sequence[i] != base {
             break;
         }
         run += 1;
     }
     for base_at in sequence.iter().skip(index + 1) {
-        if run >= cap || base_at.get_unmasked_base() != base {
+        if run >= cap || *base_at != base {
             break;
         }
         run += 1;
@@ -1145,7 +1145,7 @@ pub fn generate_read_with_alleles(
         // forward-strand reads, which strand-aware callers (e.g. Mutect2) correctly
         // flag as strand bias and filter out.
         let fragment_position = seq_index;
-        let reference_base = sequence[seq_index].get_unmasked_base();
+        let reference_base = sequence[seq_index];
         // Common case writes exactly one base (the reference base, or a single
         // SNP/SNP-error substitution) — kept in the stack array `single`, no
         // heap. Only insertions (multi-base alt / insertion error) set use_ins

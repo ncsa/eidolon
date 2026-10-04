@@ -77,11 +77,7 @@ pub enum Nucleotide {
     G = 2,
     T = 3,
     N = 4,
-    Maskeda = 5,
-    Maskedc = 6,
-    Maskedg = 7,
-    Maskedt = 8,
-    X = 9, // This is purely used to fill out buffers when writing files.
+    X = 5, // This is purely used to fill out buffers when writing files.
 }
 
 impl fmt::Display for Nucleotide {
@@ -98,10 +94,13 @@ impl From<char> for Nucleotide {
             'C' => Self::C,
             'G' => Self::G,
             'T' => Self::T,
-            'a' => Self::Maskeda,
-            'c' => Self::Maskedc,
-            'g' => Self::Maskedg,
-            't' => Self::Maskedt,
+            // A soft-masked (lowercase) base is the same base: the mask marks repeats, and
+            // nothing here models repeats differently. Folding it at parse time means no
+            // later code path can forget to, which three separate defects did (#771, #790).
+            'a' => Self::A,
+            'c' => Self::C,
+            'g' => Self::G,
+            't' => Self::T,
             _ => Self::N,
         }
     }
@@ -114,10 +113,6 @@ impl From<usize> for Nucleotide {
             1 => Self::C,
             2 => Self::G,
             3 => Self::T,
-            5 => Self::Maskeda,
-            6 => Self::Maskedc,
-            7 => Self::Maskedg,
-            8 => Self::Maskedt,
             _ => Self::N,
         }
     }
@@ -130,10 +125,6 @@ impl From<Nucleotide> for usize {
             Nucleotide::C => 1,
             Nucleotide::G => 2,
             Nucleotide::T => 3,
-            Nucleotide::Maskeda => 5,
-            Nucleotide::Maskedc => 6,
-            Nucleotide::Maskedg => 7,
-            Nucleotide::Maskedt => 8,
             _ => 4,
         }
     }
@@ -146,10 +137,6 @@ impl From<Nucleotide> for char {
             Nucleotide::C => 'C',
             Nucleotide::G => 'G',
             Nucleotide::T => 'T',
-            Nucleotide::Maskeda => 'a',
-            Nucleotide::Maskedc => 'c',
-            Nucleotide::Maskedg => 'g',
-            Nucleotide::Maskedt => 't',
             _ => 'N',
         }
     }
@@ -163,39 +150,6 @@ impl Nucleotide {
             Self::C => Self::G,
             Self::G => Self::C,
             Self::T => Self::A,
-            Self::Maskeda => Self::Maskedt,
-            Self::Maskedc => Self::Maskedg,
-            Self::Maskedg => Self::Maskedc,
-            Self::Maskedt => Self::Maskeda,
-            _ => *self,
-        }
-    }
-
-    pub fn get_unmasked_base(&self) -> Self {
-        match self {
-            Self::Maskeda => Nucleotide::A,
-            Self::Maskedc => Nucleotide::C,
-            Self::Maskedg => Nucleotide::G,
-            Self::Maskedt => Nucleotide::T,
-            Self::X => Self::N,
-            _ => *self,
-        }
-    }
-
-    pub fn is_masked(&self) -> bool {
-        matches!(
-            self,
-            Self::Maskeda | Self::Maskedc | Self::Maskedg | Self::Maskedt | Self::X
-        )
-    }
-
-    pub fn get_masked(&self) -> Nucleotide {
-        match self {
-            Self::A => Self::Maskeda,
-            Self::C => Self::Maskedc,
-            Self::G => Self::Maskedg,
-            Self::T => Self::Maskedt,
-            Self::N => Self::X,
             _ => *self,
         }
     }
@@ -276,56 +230,22 @@ mod tests {
             assert_eq!(usize::from(base), slot, "usize::from({base})");
             assert_eq!(Nucleotide::from(slot), base, "Nucleotide::from({slot})");
         }
-        for base in [
-            Nucleotide::N,
-            Nucleotide::Maskeda,
-            Nucleotide::Maskedc,
-            Nucleotide::Maskedg,
-            Nucleotide::Maskedt,
-        ] {
-            assert_eq!(base as usize, usize::from(base), "{base:?}");
+        assert_eq!(Nucleotide::N as usize, usize::from(Nucleotide::N), "N");
+    }
+
+    /// A soft-masked base is parsed as the base it masks. Nothing downstream can see the
+    /// case, so this is the only place it has to be handled (#771, #790).
+    #[test]
+    fn a_lowercase_base_parses_as_the_base_it_masks() {
+        for (lower, upper) in [('a', 'A'), ('c', 'C'), ('g', 'G'), ('t', 'T'), ('n', 'N')] {
+            assert_eq!(Nucleotide::from(lower), Nucleotide::from(upper), "{lower}");
         }
-    }
-
-    #[test]
-    fn test_get_unmasked_base() {
-        assert_eq!(Nucleotide::Maskeda.get_unmasked_base(), Nucleotide::A);
-        assert_eq!(Nucleotide::Maskedc.get_unmasked_base(), Nucleotide::C);
-        assert_eq!(Nucleotide::Maskedg.get_unmasked_base(), Nucleotide::G);
-        assert_eq!(Nucleotide::Maskedt.get_unmasked_base(), Nucleotide::T);
-        assert_eq!(Nucleotide::X.get_unmasked_base(), Nucleotide::N);
-        assert_eq!(Nucleotide::A.get_unmasked_base(), Nucleotide::A);
-    }
-
-    #[test]
-    fn test_is_masked() {
-        assert!(Nucleotide::Maskeda.is_masked());
-        assert!(Nucleotide::Maskedc.is_masked());
-        assert!(Nucleotide::Maskedg.is_masked());
-        assert!(Nucleotide::Maskedt.is_masked());
-        assert!(Nucleotide::X.is_masked());
-        assert!(!Nucleotide::A.is_masked());
-        assert!(!Nucleotide::C.is_masked());
-        assert!(!Nucleotide::G.is_masked());
-        assert!(!Nucleotide::T.is_masked());
-        assert!(!Nucleotide::N.is_masked());
-    }
-
-    #[test]
-    fn test_get_masked() {
-        assert_eq!(Nucleotide::A.get_masked(), Nucleotide::Maskeda);
-        assert_eq!(Nucleotide::C.get_masked(), Nucleotide::Maskedc);
-        assert_eq!(Nucleotide::G.get_masked(), Nucleotide::Maskedg);
-        assert_eq!(Nucleotide::T.get_masked(), Nucleotide::Maskedt);
-        assert_eq!(Nucleotide::N.get_masked(), Nucleotide::X);
     }
 
     #[test]
     fn test_sequence_array_to_string() {
         let seq = vec![Nucleotide::A, Nucleotide::C, Nucleotide::G, Nucleotide::T];
         assert_eq!(sequence_array_to_string(&seq), "ACGT");
-        let masked = vec![Nucleotide::Maskeda, Nucleotide::Maskedc];
-        assert_eq!(sequence_array_to_string(&masked), "ac");
         assert_eq!(sequence_array_to_string(&vec![]), "");
     }
 

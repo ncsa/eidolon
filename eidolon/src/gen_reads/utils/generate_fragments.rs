@@ -178,11 +178,11 @@ fn build_gc_weight_prefix_sum(
     // mask, exactly as `gen-gc-bias-model` counted them when it fitted these weights (#771).
     let mut gc_count: usize = seq[..window]
         .iter()
-        .filter(|n| matches!(n.get_unmasked_base(), Nucleotide::G | Nucleotide::C))
+        .filter(|n| matches!(n, Nucleotide::G | Nucleotide::C))
         .count();
     let mut n_count: usize = seq[..window]
         .iter()
-        .filter(|n| n.get_unmasked_base() == Nucleotide::N)
+        .filter(|n| **n == Nucleotide::N)
         .count();
 
     let weight_at = |gc: usize, n: usize| -> f64 {
@@ -199,8 +199,8 @@ fn build_gc_weight_prefix_sum(
 
     // Slide the window one base at a time, updating counts incrementally.
     for i in 1..n_positions {
-        let outgoing = seq[i - 1].get_unmasked_base();
-        let incoming = seq[i + window - 1].get_unmasked_base();
+        let outgoing = seq[i - 1];
+        let incoming = seq[i + window - 1];
 
         match outgoing {
             Nucleotide::G | Nucleotide::C => gc_count -= 1,
@@ -2039,54 +2039,6 @@ mod tests {
             "medium-span weighted-path depth VMR averaged over {} independent replicates \
              is {avg_vmr:.3} -- underdispersion has not faded by this scale",
             vmrs.len()
-        );
-    }
-
-    /// #771, consumer side. `gen-gc-bias-model` reads a soft-masked `g`/`c` as G/C, so the
-    /// weights it fits are indexed by that GC. gen-reads keeps soft-masked bases in its
-    /// sequence blocks, so the lookup that applies those weights must read them the same
-    /// way, or a masked window is weighted as lower GC than the builder measured it.
-    /// Known answer: a lowercased copy gives the identical prefix sum. The weights rise
-    /// strictly with GC, so any window whose GC count moves changes the sum.
-    #[test]
-    fn gc_weights_are_identical_on_a_soft_masked_sequence() {
-        let upper = make_gc_test_sequence(2_000);
-        let masked: Vec<_> = upper
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                if (i / 50) % 2 == 1 {
-                    n.get_masked()
-                } else {
-                    *n
-                }
-            })
-            .collect();
-        assert!(masked.iter().any(|n| n.is_masked()));
-        assert!(masked.contains(&eidolon_core::structs::nucleotides::Nucleotide::Maskedg));
-        let weights: Vec<f64> = (0..=100).map(|gc| 0.5 + gc as f64 / 100.0).collect();
-        let model = GcBiasModel::from_weights(weights, 100).unwrap();
-
-        let prefix = |seq: Vec<eidolon_core::structs::nucleotides::Nucleotide>| {
-            let block = make_sequence_block(seq);
-            let len = block.sequence.len();
-            build_gc_weight_prefix_sum(&block, 0, len, &model)
-                .unwrap()
-                .unwrap()
-        };
-        let upper_sum = prefix(upper);
-        let masked_sum = prefix(masked);
-        assert_eq!(upper_sum.len(), masked_sum.len());
-        let differing = upper_sum
-            .iter()
-            .zip(&masked_sum)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(
-            differing,
-            0,
-            "{differing} of {} prefix-sum entries differ on the soft-masked copy",
-            upper_sum.len()
         );
     }
 }
