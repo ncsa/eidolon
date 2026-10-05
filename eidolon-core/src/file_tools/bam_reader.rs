@@ -345,6 +345,9 @@ pub type KnownSites = HashMap<String, HashSet<usize>>;
 pub struct TransitionObserver {
     pub counts: [[usize; 4]; 4],
     pub masked: usize,
+    /// Positions the MD tag names as mismatches where SEQ has the reference base, so the
+    /// tag and the read disagree (#767). Left out of `counts`: they are not substitutions.
+    pub md_seq_disagreements: usize,
     mask: Option<KnownSites>,
     contigs: Vec<String>,
 }
@@ -402,7 +405,13 @@ impl RecordObserver for TransitionObserver {
                             let ri: usize = Nucleotide::from(ref_b as char).into();
                             let wi: usize = Nucleotide::from(read_b as char).into();
                             if ri < 4 && wi < 4 {
-                                if sites.is_some_and(|s| s.contains(&ref_pos)) {
+                                if ri == wi {
+                                    // A stale MD tag (reads edited after `samtools calmd`, say).
+                                    // Counted, this was a self-transition, and a row holding
+                                    // only those ended up with no weight once the diagonal was
+                                    // zeroed (#767).
+                                    self.md_seq_disagreements += 1;
+                                } else if sites.is_some_and(|s| s.contains(&ref_pos)) {
                                     self.masked += 1;
                                 } else {
                                     self.counts[ri][wi] += 1;
@@ -791,9 +800,32 @@ fn read_fragment_lengths_sam(path: &PathBuf) -> Result<Vec<usize>, BamReaderErro
 /// lack an MD tag are silently skipped; if no records with MD tags are found
 /// the returned matrix will be all-zeros.
 pub fn read_bam_transitions(path: &PathBuf) -> Result<[[usize; 4]; 4], BamReaderError> {
-    let mut obs = TransitionObserver::default();
+    Ok(read_bam_transition_report(path, None)?.counts)
+}
+
+/// What a mismatch pass over a BAM found: substitution counts, how many mismatches `mask`
+/// left out, and how many MD mismatch positions SEQ contradicts (#767).
+pub struct TransitionReport {
+    pub counts: [[usize; 4]; 4],
+    pub masked: usize,
+    pub md_seq_disagreements: usize,
+}
+
+/// `read_bam_transitions`, optionally masked, reporting everything the pass counted.
+pub fn read_bam_transition_report(
+    path: &PathBuf,
+    mask: Option<KnownSites>,
+) -> Result<TransitionReport, BamReaderError> {
+    let mut obs = match mask {
+        Some(m) => TransitionObserver::with_mask(m),
+        None => TransitionObserver::default(),
+    };
     walk_bam(path, &BamWalkFilter::for_transitions(), &mut [&mut obs])?;
-    Ok(obs.counts)
+    Ok(TransitionReport {
+        counts: obs.counts,
+        masked: obs.masked,
+        md_seq_disagreements: obs.md_seq_disagreements,
+    })
 }
 
 /// As `read_bam_transitions`, leaving out mismatches at `mask`'s positions. Returns the counts
@@ -802,9 +834,8 @@ pub fn read_bam_transitions_masked(
     path: &PathBuf,
     mask: KnownSites,
 ) -> Result<([[usize; 4]; 4], usize), BamReaderError> {
-    let mut obs = TransitionObserver::with_mask(mask);
-    walk_bam(path, &BamWalkFilter::for_transitions(), &mut [&mut obs])?;
-    Ok((obs.counts, obs.masked))
+    let r = read_bam_transition_report(path, Some(mask))?;
+    Ok((r.counts, r.masked))
 }
 
 #[cfg(test)]
