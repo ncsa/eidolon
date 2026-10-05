@@ -959,94 +959,90 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
 
     // Determine transition matrix: TSV > BAM inference > defaults from original Python NEAT
     // (see https://github.com/ncsa/NEAT/blob/main/neat/model_sequencing_error/runner.py)
-    let snp_transition_matrix: Option<TransitionMatrix> = if let Some(path) =
-        &config.transition_matrix_file
-    {
-        info!("Loading SNP transition matrix from TSV: {:?}", path);
-        Some(TransitionMatrix::from_tsv(path)?)
-    } else if let Some(path) = &config.bam_file {
-        info!("Inferring SNP transition matrix from BAM: {:?}", path);
-        let mut md_seq_disagreements = 0usize;
-        let counts = match config.bam_method {
-            BamMethod::Overlap => overlap_counts(path, config)?,
-            BamMethod::Mismatch => {
-                let mask = match &config.known_variants_vcf {
-                    None => None,
-                    Some(vcf) => {
-                        let sites = read_known_sites(vcf)?;
-                        let n_sites: usize = sites.values().map(|s| s.len()).sum();
-                        info!("Masking {n_sites} reference positions from {vcf:?}");
-                        Some(sites)
-                    }
-                };
-                let masking = mask.is_some();
-                let report = read_bam_transition_report(path, mask)?;
-                if masking {
-                    let kept: usize = report.counts.iter().flatten().sum();
-                    let seen = kept + report.masked;
-                    info!(
-                        "Masked {} of {seen} mismatches ({:.2}%) at known variant sites",
-                        report.masked,
-                        if seen > 0 {
-                            100.0 * report.masked as f64 / seen as f64
-                        } else {
-                            0.0
+    let snp_transition_matrix: Option<TransitionMatrix> =
+        if let Some(path) = &config.transition_matrix_file {
+            info!("Loading SNP transition matrix from TSV: {:?}", path);
+            Some(TransitionMatrix::from_tsv(path)?)
+        } else if let Some(path) = &config.bam_file {
+            info!("Inferring SNP transition matrix from BAM: {:?}", path);
+            let counts = match config.bam_method {
+                BamMethod::Overlap => overlap_counts(path, config)?,
+                BamMethod::Mismatch => {
+                    let mask = match &config.known_variants_vcf {
+                        None => None,
+                        Some(vcf) => {
+                            let sites = read_known_sites(vcf)?;
+                            let n_sites: usize = sites.values().map(|s| s.len()).sum();
+                            info!("Masking {n_sites} reference positions from {vcf:?}");
+                            Some(sites)
                         }
-                    );
+                    };
+                    let masking = mask.is_some();
+                    let report = read_bam_transition_report(path, mask)?;
+                    if masking {
+                        let kept: usize = report.counts.iter().flatten().sum();
+                        let seen = kept + report.masked;
+                        info!(
+                            "Masked {} of {seen} mismatches ({:.2}%) at known variant sites",
+                            report.masked,
+                            if seen > 0 {
+                                100.0 * report.masked as f64 / seen as f64
+                            } else {
+                                0.0
+                            }
+                        );
+                    }
+                    if report.md_seq_disagreements > 0 {
+                        // A hard error even when genuine mismatches remain. Only this one symptom
+                        // of a stale tag is detectable; the same tag can also name the wrong
+                        // reference base at a real mismatch, or miss one entirely, and those
+                        // look like ordinary evidence. A count that excluded the visible cases
+                        // would still rest on tags already shown not to describe the reads (#767).
+                        let kept: usize = report.counts.iter().flatten().sum();
+                        return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                            "bam_file {:?} has MD tags that disagree with the reads: at {} \
+                             position(s) MD names a mismatch where the read has the reference \
+                             base ({kept} other mismatch(es) were consistent). The tags are \
+                             stale, for instance written before the reads were edited, so none \
+                             of the substitutions they describe can be trusted. Rewrite them \
+                             with `samtools calmd -b {} reference.fa > fixed.bam`.",
+                            path,
+                            report.md_seq_disagreements,
+                            path.display()
+                        )));
+                    }
+                    as_weights(report.counts)
                 }
-                md_seq_disagreements = report.md_seq_disagreements;
-                if md_seq_disagreements > 0 {
-                    warn!(
-                        "{md_seq_disagreements} position(s) in {path:?} are MD mismatches where \
-                             the read has the reference base: the MD tags disagree with SEQ and \
-                             were left out. `samtools calmd -b` rewrites MD from the reference."
-                    );
-                }
-                as_weights(report.counts)
-            }
-        };
-        // Every row empty means the BAM yielded no evidence at all. The overlap path has
-        // already refused thin evidence and logged its counts; this is the mismatch path's
-        // guard, and a backstop for both.
-        let total: f64 = counts.iter().flatten().sum();
-        if total == 0.0 && md_seq_disagreements > 0 {
-            // Not the missing-MD case below: the tags are there but contradict the reads,
-            // which used to surface as a bare InvalidWeights (#767).
-            return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                "bam_file {:?} yielded no usable mismatches: its MD tags disagree with \
-                     the reads at all {md_seq_disagreements} position(s) they name as \
-                     mismatches, where the read has the reference base. The tags are stale, \
-                     for instance written before the reads were edited. Rewrite them with \
-                     `samtools calmd -b {} reference.fa > fixed.bam`.",
-                path,
-                path.display()
-            )));
-        }
-        if total == 0.0 {
-            // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
-            // fitting the transition matrix -- so a BAM that yields no evidence cannot be
-            // honoured at all. Silently substituting the default produces a model that is
-            // indistinguishable from a trained one downstream. MD is a *predefined* SAM tag
-            // rather than a required one, so this is easy to hit unintentionally.
-            //
-            // Omitting `bam_file:` is how a user asks for the default matrix, so there is
-            // nothing to fall back to here: a config that names a BAM it does not use would
-            // be a lie about provenance.
-            return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
+            };
+            // Every row empty means the BAM yielded no evidence at all. The overlap path has
+            // already refused thin evidence and logged its counts; this is the mismatch path's
+            // guard, and a backstop for both.
+            let total: f64 = counts.iter().flatten().sum();
+            if total == 0.0 {
+                // Hard error, not a warning. `bam_file:` exists for exactly one purpose --
+                // fitting the transition matrix -- so a BAM that yields no evidence cannot be
+                // honoured at all. Silently substituting the default produces a model that is
+                // indistinguishable from a trained one downstream. MD is a *predefined* SAM tag
+                // rather than a required one, so this is easy to hit unintentionally.
+                //
+                // Omitting `bam_file:` is how a user asks for the default matrix, so there is
+                // nothing to fall back to here: a config that names a BAM it does not use would
+                // be a lie about provenance.
+                return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                    "bam_file {:?} yielded no read-vs-reference mismatches, so the SNP \
                      transition matrix cannot be inferred from it. Most likely the BAM has no \
                      MD tags, which are optional in SAM and not written by every aligner. \
                      Either add them with `samtools calmd -b {} reference.fa > with_md.bam`, \
                      or remove `bam_file:` from the config to use the built-in default matrix.",
-                path,
-                path.display()
-            )));
+                    path,
+                    path.display()
+                )));
+            } else {
+                Some(build_transition_matrix_from_weights(counts)?)
+            }
         } else {
-            Some(build_transition_matrix_from_weights(counts)?)
-        }
-    } else {
-        None
-    };
+            None
+        };
 
     let model = SequencingErrorModel::from_raw_data(
         error_rate,
@@ -3115,7 +3111,7 @@ mod tests {
     /// equals the reference base. Counted, that is a self-transition; the diagonal is then
     /// zeroed, and a row holding nothing else was left with no weight at all, which failed
     /// as a bare `InvalidWeights`. Here every MD mismatch is stale (MD says the reference at
-    /// position 1 is A; SEQ has A there), so there is no evidence, and the error must say why.
+    /// position 1 is A; SEQ has A there), and the error must say why.
     #[test]
     fn a_bam_whose_md_disagrees_with_seq_names_the_cause() {
         let temp = tempfile::tempdir().unwrap();
@@ -3131,15 +3127,18 @@ mod tests {
             err.contains("MD") && err.contains("disagree"),
             "the error must name the MD/SEQ disagreement: {err}"
         );
-        assert!(err.contains("5"), "and say how many positions: {err}");
+        assert!(
+            err.contains("at 5 position(s)") && err.contains("0 other mismatch(es)"),
+            "and say how many positions: {err}"
+        );
     }
 
-    /// Stale MD positions are left out, not counted: the genuine A->C mismatches fit the A
-    /// row exactly, and the C row, which only stale positions named, falls back to uniform
-    /// like any row with no evidence. Before the fix the C row's self-count failed the run.
+    /// A BAM with some stale MD positions is refused even though its other mismatches look
+    /// fine. Self-transitions are the only detectable symptom of a stale tag; the same tag
+    /// can mis-state the reference base at a real mismatch, which would be counted as
+    /// ordinary evidence. So the fit must not proceed on the remainder (#767).
     #[test]
-    fn stale_md_positions_are_left_out_of_the_fit() {
-        use eidolon_core::structs::nucleotides::Nucleotide;
+    fn a_bam_with_some_stale_md_is_refused() {
         let temp = tempfile::tempdir().unwrap();
         let fastq = temp.path().join("t.fastq");
         make_test_fastq(&fastq, 20, 4);
@@ -3148,19 +3147,19 @@ mod tests {
         records.extend(vec![(&b"ACGT"[..], Some("1C2")); 3]);
         write_test_bam_records(&bam, &records);
         let output = temp.path().join("m.json.gz");
-        runner(&mismatch_config(fastq, bam, output.clone())).unwrap();
-        let model = SequencingErrorModel::from_file(&output).unwrap();
-        let tm = model.transition_distros();
-        assert_row_cdf_eq(
-            &row_cdf(tm, Nucleotide::A),
-            &[0.0, 1.0, 1.0, 1.0],
-            "A row: 4 A->C",
+        let err = runner(&mismatch_config(fastq, bam, output.clone()))
+            .expect_err("a BAM with stale MD tags must not be fitted")
+            .to_string();
+        assert!(
+            err.contains("disagree") && err.contains("at 3 position(s)"),
+            "the error must name the disagreement and its count: {err}"
         );
-        assert_row_cdf_eq(
-            &row_cdf(tm, Nucleotide::C),
-            &[1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
-            "C row: only stale MD positions, so no evidence",
+        assert!(
+            err.contains("4 other mismatch(es)"),
+            "and say how many consistent mismatches were refused with it: {err}"
         );
+        assert!(err.contains("calmd"), "and how to repair the tags: {err}");
+        assert!(!output.exists(), "no model is written");
     }
 
     #[test]
