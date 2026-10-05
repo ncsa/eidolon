@@ -751,8 +751,8 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
         // transitions alone could not tell that apart from 1 bp, so with 1 bp reads, where
         // there are no transitions at all, the check never fired (#767).
         let mut populations: Vec<(&str, &Vec<Vec<Vec<usize>>>, &[usize], &str)> = Vec::new();
-        // R1's healthy tensor is checked only when there is a second population to be ragged
-        // against. On its own it defines `positions` and cannot fall short of itself.
+        // R1 is checked only alongside a second population. On its own it sets the model's
+        // read length, so it cannot fall short of it.
         if config.fit_quality_degradation {
             populations.push(("healthy", &transition_counts, &seed_counts, DEGRADED_REMEDY));
             populations.push((
@@ -1644,7 +1644,8 @@ mod tests {
             d.read_fraction
         );
         // The two populations share one option set, so the degraded tensor must cover the same
-        // positions as the healthy one. A ragged pair indexes the wrong scores at generation.
+        // positions as the healthy one. If one stopped short, generation would index the wrong
+        // scores.
         assert_eq!(
             d.degraded_distros.len(),
             q.distros_from_one.len(),
@@ -1932,7 +1933,7 @@ mod tests {
     }
 
     /// `max_reads` applies PER MATE (#723). A shared budget spends it all on R1 and fits R2
-    /// from what is left -- nothing -- which the ragged refusal above would turn into an error
+    /// from what is left -- nothing -- which the read-length coverage check would turn into an error
     /// rather than a silent lopsided fit, but the declared semantics are that each mate gets
     /// its own N.
     ///
@@ -2045,7 +2046,7 @@ mod tests {
         assert_eq!(fit("uncapped.json.gz", 0), fit("capped.json.gz", 100));
     }
 
-    /// MUST NOT FIRE: ragged read lengths are fine as long as BOTH populations reach the
+    /// MUST NOT FIRE: mixed read lengths are fine as long as BOTH populations reach the
     /// model's read length. The guard is about a population that cannot cover the model, not
     /// about variable lengths, which every real library has.
     #[test]
