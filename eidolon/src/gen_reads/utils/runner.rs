@@ -3678,8 +3678,8 @@ fn alt_haplotype_window(
 /// Builds a sorted, contiguous list of `(start, end, multiplier)` coverage
 /// segments spanning `[0, block_end)`. Default multiplier is `1.0`; each
 /// symbolic SV multiplies the multiplier in its span (overlapping SVs compose
-/// multiplicatively). SVs without a usable span (no END / SVLEN) or with a
-/// multiplier of `1.0` are skipped silently.
+/// multiplicatively). Breakends and SVs with a multiplier of `1.0` are skipped; an
+/// SV without a usable span (no END / SVLEN) is skipped with a warning.
 fn build_coverage_multipliers(
     sv_variants: &[Variant],
     ploidy: usize,
@@ -3699,6 +3699,13 @@ fn build_coverage_multipliers(
         // Convert the 0-based-stored location back to the VCF's 1-based POS
         // so SvData::span() (which expects 1-based) returns the right count.
         let pos_1based = v.location.saturating_add(1);
+        if sv.sv_type == SvType::Bnd {
+            // A breakend is a point (VCF 4.2 §5.4) with no copy-number change, so it has
+            // no span to modulate. Missing END/SVLEN is expected here, not a defect in the
+            // input, and the warning below is for SVs that should have one (#497).
+            debug!("Breakend at 1-based POS {pos_1based}: a point event, no coverage modulation");
+            continue;
+        }
         let span_bases = match sv.span(pos_1based) {
             Some(n) if n > 0 => n,
             _ => {
