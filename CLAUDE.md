@@ -156,9 +156,11 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   Python is acceptable only where an **external tool forces it** — We will keep existing parsers for truvari and
   SigProfiler are Python packages, but avoid adding more.
 - **Vet what exists** (all validation/prep only, none shipped):
-  `scripts/delta/sbs96_compare.py` is a per-validation measurement helper. It parses
-  SigProfiler's output in SigProfiler's own env, which is the one justification for
-  Python here, and it is **not covered by CI** (#466). `scn_af_compare.py` is gone —
+  `scripts/delta/sbs96_compare.py` is a per-validation measurement helper: stdlib-only, it
+  reads a FASTA and two VCFs and reports the SBS-96 cosine. It needs no external tool, so
+  it is Python only by history. It produced the HCC1395 0.72 → 0.99 figure (#372) and has
+  no current caller; it is kept as is and **not covered by CI** (#466). If it is needed
+  again, add tests then; otherwise it goes when the validation scripts are archived. `scn_af_compare.py` is gone —
   ported to `eidolon compare-af`, which needed no external tool and so should never have
   been Python; the port is pinned by golden fixtures reproducing the Python's output byte
   for byte plus known-answer tests. `tools/{build_pcawg_sv_vcf,normalize_pcawg_sv_model,graft_sv_model}.py` are
