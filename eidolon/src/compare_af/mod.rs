@@ -7,7 +7,8 @@
 //!   * it gets CI coverage for free, which was the whole point of #466; and
 //!   * it needs no external tool — it parses VCFs and does arithmetic — so under this
 //!     repo's standing rule it should not have been Python in the first place.
-//!     `sbs96_compare.py` parses SigProfiler's output and legitimately stays.
+//!     `sbs96_compare.py` is in the same position; it has no current caller and is kept
+//!     untested until it is needed again.
 //!
 //! Output is byte-identical to the Python by design: `run_subclonal_vaf_validation.sh`
 //! parses specific lines out of it to build its PASS/FAIL verdict, and a differential
