@@ -3,8 +3,8 @@
 [![eidolon-tests](https://github.com/ncsa/eidolon/actions/workflows/eidolon-tests.yml/badge.svg?branch=main)](https://github.com/ncsa/eidolon/actions/workflows/eidolon-tests.yml)
 
 > **Formerly `rusty-neat` / `rneat`** — renamed to `eidolon` in v2.0.0. Same tool, same
-> NEAT lineage; the `rneat` command still works as a deprecated alias for one transition
-> release. See `CHANGELOG.md`.
+> NEAT lineage. The deprecated `rneat` alias was removed in v4.0.0; invoke `eidolon`.
+> See `CHANGELOG.md`.
 
 > **Upgrading from 2.0.0 → 3.0.0? The names of emitted output tokens changed.**
 > See [Upgrading from 2.0.0](upgrading/from-2-0-0.md) below — **read it if you have any
