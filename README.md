@@ -4,8 +4,8 @@
 [![DOI](https://zenodo.org/badge/765847780.svg)](https://doi.org/10.5281/zenodo.20100558)
 
 > **Formerly `rusty-neat` / `rneat`** — renamed to `eidolon` in v2.0.0. Same tool, same
-> NEAT lineage; the `rneat` command still works as a deprecated alias for one transition
-> release. See `CHANGELOG.md`.
+> NEAT lineage. The deprecated `rneat` alias was removed in v4.0.0; invoke `eidolon`.
+> See `CHANGELOG.md`.
 
 > **Upgrading from 2.0.0 → 3.0.0? The names of emitted output tokens changed.**
 > See [Upgrading from 2.0.0](docs-site/src/upgrading/from-2-0-0.md) — **read it if you have
