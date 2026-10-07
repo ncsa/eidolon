@@ -25,6 +25,37 @@ fn canonical_trinuc(sequence: &[Nucleotide], i: usize) -> (Nucleotide, Nucleotid
     (sequence[i - 1], sequence[i], sequence[i + 1])
 }
 
+/// Whether `reference` (a VCF REF allele) matches `sequence` from 0-based `loc`. A REF that
+/// runs past the contig end does not match.
+fn ref_matches(sequence: &[Nucleotide], loc: usize, reference: &[Nucleotide]) -> bool {
+    sequence.get(loc..loc + reference.len()) == Some(reference)
+}
+
+/// Whether an indel's REF matches the reference at its 1-based POS.
+fn indel_ref_matches(sequence: &[Nucleotide], variant: &Variant) -> bool {
+    variant.location >= 1 && ref_matches(sequence, variant.location - 1, &variant.reference)
+}
+
+/// A record whose REF disagrees with the reference refuses the fit, as in NEAT2. It stops at
+/// the first one: a misconfigured input fails fast, before the rest of the reference is
+/// read, and the error's `bcftools` command handles a VCF with only a few such records.
+fn ref_mismatch_error(
+    contig: &str,
+    sequence: &[Nucleotide],
+    variant: &Variant,
+) -> GenMutationModelError {
+    let as_text = |bases: &[Nucleotide]| bases.iter().map(|&b| char::from(b)).collect::<String>();
+    let start = variant.location.saturating_sub(1).min(sequence.len());
+    let end = (start + variant.reference.len()).min(sequence.len());
+    let err = GenMutationModelError::RefMismatch {
+        position: format!("{contig}:{}", variant.location),
+        vcf_ref: as_text(&variant.reference),
+        reference: as_text(&sequence[start..end]),
+    };
+    error!("{err}");
+    err
+}
+
 pub fn runner(
     reference: &PathBuf,
     filtered_mutations: HashMap<String, Vec<Variant>>,
@@ -33,9 +64,12 @@ pub fn runner(
 ) -> Result<(), GenMutationModelError> {
     let mut trinuc_count: HashMap<TrinucFrame, usize> = HashMap::new();
     let mut trinuc_transition_count: HashMap<(TrinucFrame, TrinucFrame), usize> = HashMap::new();
+    // SNPs that passed every check and shaped the model. NEAT2 counted a SNP only once it was
+    // usable, and a skipped one must not raise snp_freq or mutation_rate either.
     let mut snp_count = 0;
+    let mut snp_seen = 0;
     let mut snp_edge_skipped = 0;
-    let mut snp_ref_mismatch = 0;
+    let mut reference_contigs: Vec<String> = Vec::new();
     let mut insertion_count: HashMap<usize, usize> = HashMap::new();
     let mut deletion_count: HashMap<usize, usize> = HashMap::new();
     let mut homozygous_count = 0;
@@ -50,6 +84,7 @@ pub fn runner(
 
     for result in FastaStream::open(reference)? {
         let (contig_name, raw) = result?;
+        reference_contigs.push(contig_name.clone());
         // IUPAC codes map to N here intentionally — model-building from real VCF data
         // doesn't need stochastic resolution because variant callers skip ambiguous positions.
         let sequence: Vec<Nucleotide> = raw.chars().map(Nucleotide::from).collect();
@@ -107,7 +142,7 @@ pub fn runner(
             }
             match variant.variant_type {
                 VariantType::SNP => {
-                    snp_count += 1;
+                    snp_seen += 1;
                     // VCF POS is 1-based; skip variants too close to contig edges.
                     if variant.location < 2 {
                         debug!("Skipping edge variant at position {}", variant.location);
@@ -125,12 +160,7 @@ pub fn runner(
                     }
                     let (n0, n1, n2) = canonical_trinuc(&sequence, loc);
                     if n1 != variant.reference[0] {
-                        warn!(
-                            "Reference mismatch at position {}: VCF ref {:?}, FASTA base {:?}; skipping",
-                            variant.location, variant.reference[0], n1
-                        );
-                        snp_ref_mismatch += 1;
-                        continue;
+                        return Err(ref_mismatch_error(&contig_name, &sequence, variant));
                     }
                     let ref_frame = TrinucFrame::from((n0, n1, n2));
                     debug_assert!(
@@ -142,6 +172,12 @@ pub fn runner(
                     *trinuc_transition_count
                         .entry((ref_frame, alt_frame))
                         .or_default() += 1;
+                    snp_count += 1;
+                }
+                VariantType::Insertion | VariantType::Deletion
+                    if !indel_ref_matches(&sequence, variant) =>
+                {
+                    return Err(ref_mismatch_error(&contig_name, &sequence, variant));
                 }
                 VariantType::Insertion => {
                     debug_assert!(
@@ -170,19 +206,31 @@ pub fn runner(
         }
     }
 
-    let snp_skipped = snp_edge_skipped + snp_ref_mismatch;
-    if snp_skipped > 0 {
-        warn!(
-            "{snp_skipped} of {snp_count} SNP(s) could not be used: {snp_ref_mismatch} did not \
-             match the reference base, {snp_edge_skipped} were at a contig edge"
-        );
+    // A BED that names no contig in the reference leaves nothing to count, which surfaced
+    // as an empty trinucleotide table and an "Unknown error".
+    if use_bed && !bed_table.keys().any(|c| reference_contigs.contains(c)) {
+        let mut bed_contigs: Vec<&String> = bed_table.keys().collect();
+        bed_contigs.sort();
+        let err = GenMutationModelError::BedCoversNoReference {
+            bed_contigs: bed_contigs
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            reference_contigs: reference_contigs.join(", "),
+        };
+        error!("{err}");
+        return Err(err);
     }
-    // Without a single usable SNP there is no context information, yet snp_count would
-    // still give the model a SNP fraction, so it would generate SNPs from nothing.
-    if snp_count > 0 && snp_skipped == snp_count {
+
+    if snp_edge_skipped > 0 {
+        warn!("{snp_edge_skipped} of {snp_seen} SNP(s) were at a contig edge and were left out");
+    }
+    // Without a single usable SNP there is no context information, yet a SNP fraction would
+    // still let the model generate SNPs from nothing.
+    if snp_seen > 0 && snp_edge_skipped == snp_seen {
         let err = GenMutationModelError::NoUsableSnps {
-            counted: snp_count,
-            ref_mismatch: snp_ref_mismatch,
+            counted: snp_seen,
             edge: snp_edge_skipped,
         };
         error!("{err}");
@@ -427,96 +475,170 @@ H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
         );
     }
 
+    /// The H1N1_HA sequence, so fixtures can be built from the reference itself.
+    fn h1n1_ha() -> Vec<char> {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let text = std::fs::read_to_string(format!("{manifest_dir}/test_data/references/H1N1.fa"))
+            .unwrap();
+        text.split('>')
+            .find(|rec| rec.starts_with("H1N1_HA"))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .flat_map(|l| l.trim().chars())
+            .collect()
+    }
+
+    /// `n_good` SNPs on H1N1_HA whose REF is the real base, one every third position from
+    /// 1-based POS 30, followed by `extra` records verbatim. Runs the runner on it.
+    fn run_with_good_snps(
+        n_good: usize,
+        extra: &[String],
+    ) -> (
+        Result<(), GenMutationModelError>,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let reference = PathBuf::from(format!("{manifest_dir}/test_data/references/H1N1.fa"));
+        let seq = h1n1_ha();
+        let mut vcf = String::from(
+            "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n",
+        );
+        for i in 0..n_good {
+            let pos = 30 + 3 * i;
+            let r = seq[pos - 1];
+            let alt = if r == 'A' { 'C' } else { 'A' };
+            vcf.push_str(&format!(
+                "H1N1_HA\t{pos}\t.\t{r}\t{alt}\t60\tPASS\t.\tGT\t0/1\n"
+            ));
+        }
+        for line in extra {
+            vcf.push_str(line);
+            vcf.push('\n');
+        }
+        let dir = tempdir().unwrap();
+        let vcf_path = dir.path().join("in.vcf");
+        std::fs::write(&vcf_path, vcf).unwrap();
+        let output = dir.path().join("model.json.gz");
+        let result = runner(
+            &reference,
+            read_vcf(vcf_path).unwrap(),
+            HashMap::new(),
+            &output,
+        );
+        (result, output, dir)
+    }
+
+    /// A SNP at 1-based `pos` on H1N1_HA whose REF is deliberately not the reference base.
+    fn wrong_ref_snp(pos: usize) -> String {
+        let r = h1n1_ha()[pos - 1];
+        let wrong = if r == 'G' { 'T' } else { 'G' };
+        format!("H1N1_HA\t{pos}\t.\t{wrong}\tA\t60\tPASS\t.\tGT\t0/1")
+    }
+
+    // H1N1.fa has 13114 non-N bases (4373 A + 2538 C + 3186 G + 3017 T).
+    const H1N1_NON_N: f64 = 13114.0;
+
+    /// Must not fire: every REF matches, so every SNP is counted.
+    #[test]
+    fn snps_whose_ref_matches_are_all_counted() {
+        let (result, output, _dir) = run_with_good_snps(100, &[]);
+        result.unwrap();
+        let rate = MutationModel::from_file(&output).unwrap().mutation_rate;
+        assert!((rate - 100.0 / H1N1_NON_N).abs() < 1e-15, "rate {rate}");
+    }
+
+    /// A SNP whose REF disagrees with the reference refuses the fit, as in NEAT2, however
+    /// many good records surround it. The error names the record and both bases, and how to
+    /// drop such records deliberately (#819).
     #[test]
     fn test_runner_skips_reference_mismatch_variant() {
-        // When VCF REF doesn't agree with the FASTA base at the same position, the runner
-        // logs a warning and skips that variant. As long as at least one good variant
-        // remains, the model still builds, and the skipped SNP must not shape its contexts.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
-        let out_dir = tempdir().unwrap();
-
-        // First record matches (pos 22 is C, context T C T). Second record's REF=A disagrees
-        // with the FASTA (pos 25 is C, context G C T).
-        let vcf_path = out_dir.path().join("mismatch.vcf");
-        std::fs::write(
-            &vcf_path,
-            "##fileformat=VCFv4.1\n\
-#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
-H1N1_HA\t22\t.\tC\tT\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
-        )
-        .unwrap();
-
-        let mutations = read_vcf(vcf_path).unwrap();
-        let output_file = out_dir.path().join("mismatch_model.json.gz");
-        runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
-
-        let model = MutationModel::from_file(&output_file).unwrap();
-        let weights = model.context_weights().unwrap();
-        let frame = |a: char, b: char, c: char| {
-            TrinucFrame::from((
-                Nucleotide::from(a),
-                Nucleotide::from(b),
-                Nucleotide::from(c),
-            ))
-        };
-        // The only usable SNP is in T C T, so it holds all the context weight. Every other
-        // context that occurs in the reference was observed with zero SNPs; a context absent
-        // from the reference would get the 1e-6 floor, hence the tolerance.
-        let tct = weights[&frame('T', 'C', 'T')];
+        let (result, output, _dir) =
+            run_with_good_snps(100, &[wrong_ref_snp(1000), wrong_ref_snp(1003)]);
+        let err = result
+            .expect_err("a REF mismatch must refuse the fit")
+            .to_string();
+        // It stops at the first mismatch rather than scanning on.
+        assert!(!err.contains("H1N1_HA:1003"), "{err}");
+        let r = h1n1_ha()[999];
+        let wrong = if r == 'G' { 'T' } else { 'G' };
         assert!(
-            (tct - 1.0).abs() < 1e-3,
-            "TCT should carry all the context weight, got {tct}"
+            err.contains(&format!(
+                "H1N1_HA:1000 has REF {wrong}, but the reference has {r}"
+            )),
+            "{err}"
         );
-        // The skipped SNP's context G C T occurs in the reference with no usable SNP.
-        let gct = weights[&frame('G', 'C', 'T')];
-        assert_eq!(
-            gct, 0.0,
-            "the skipped SNP's context GCT must carry no weight"
+        assert!(err.contains("bcftools norm"), "{err}");
+        assert!(!output.exists(), "no model is written");
+    }
+
+    /// An indel's REF is checked the same way.
+    #[test]
+    fn an_indel_whose_ref_disagrees_refuses_the_fit() {
+        // POS 80-83 of H1N1_HA is ACAA; this record claims ACG.
+        let bad_indel = "H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1".to_string();
+        let (result, output, _dir) = run_with_good_snps(100, &[bad_indel]);
+        let err = result
+            .expect_err("an indel REF mismatch must refuse the fit")
+            .to_string();
+        assert!(
+            err.contains("H1N1_HA:80 has REF ACG, but the reference has ACA"),
+            "{err}"
+        );
+        assert!(!output.exists(), "no model is written");
+    }
+
+    /// Must not fire: a SNP at a contig edge has no trinucleotide context, so it is left out,
+    /// and like NEAT2 it is not counted. It is not a REF mismatch and must not refuse the fit.
+    #[test]
+    fn a_snp_at_a_contig_edge_is_left_out_uncounted() {
+        let edge = "H1N1_HA\t1\t.\tA\tG\t60\tPASS\t.\tGT\t0/1".to_string();
+        let (result, output, _dir) = run_with_good_snps(100, &[edge]);
+        result.unwrap();
+        let rate = MutationModel::from_file(&output).unwrap().mutation_rate;
+        assert!(
+            (rate - 100.0 / H1N1_NON_N).abs() < 1e-15,
+            "the edge SNP must not count: {rate} vs 100/13114"
         );
     }
 
-    // The SNPs are counted before they are checked against the reference, so a VCF whose
-    // every SNP mismatches used to give a model that generates SNPs with no context data:
-    // all of them landed in AAA. That must be refused, and nothing written.
+    /// Every SNP at a contig edge leaves no context information at all, so no model.
     #[test]
     fn a_vcf_whose_snps_are_all_unusable_builds_no_model() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
         let out_dir = tempdir().unwrap();
-
-        // Position 22 of H1N1_HA is C and 25 is C; both records claim REF=A. Position 1 is
-        // a contig edge.
-        let vcf_path = out_dir.path().join("all_bad.vcf");
+        // POS 1 and the contig's last base are both edges: neither has a base on each side.
+        let last = h1n1_ha().len();
+        let last_base = h1n1_ha()[last - 1];
+        let vcf_path = out_dir.path().join("all_edge.vcf");
         std::fs::write(
             &vcf_path,
-            "##fileformat=VCFv4.1\n\
+            format!(
+                "##fileformat=VCFv4.1\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
 H1N1_HA\t1\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t22\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
+H1N1_HA\t{last}\t.\t{last_base}\tN\t60\tPASS\t.\tGT\t0/1\n"
+            ),
         )
         .unwrap();
-
         let mutations = read_vcf(vcf_path).unwrap();
-        let output_file = out_dir.path().join("all_bad_model.json.gz");
+        let output_file = out_dir.path().join("all_edge_model.json.gz");
         let result = runner(&reference, mutations, HashMap::new(), &output_file);
         assert!(
             matches!(
                 result,
                 Err(GenMutationModelError::NoUsableSnps {
-                    counted: 3,
-                    ref_mismatch: 2,
-                    edge: 1
+                    counted: 2,
+                    edge: 2
                 })
             ),
-            "expected NoUsableSnps {{ 3, 2, 1 }}, got {result:?}"
+            "expected NoUsableSnps {{ 2, 2 }}, got {result:?}"
         );
-        assert!(!output_file.exists(), "no model file may be written");
+        assert!(!output_file.exists());
     }
 
-    // Must not fire: an indel-only VCF has no SNPs to use, and that is fine.
     #[test]
     fn an_indel_only_vcf_still_builds_a_model() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -527,27 +649,24 @@ H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
             &vcf_path,
             "##fileformat=VCFv4.1\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
-H1N1_HA\t50\t.\tT\tTAG\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1\n",
+H1N1_HA\t50\t.\tC\tCAG\t60\tPASS\t.\tGT\t0/1\n\
+H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
         )
         .unwrap();
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("indels_only_model.json.gz");
         runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
-        assert!(
-            MutationModel::from_file(&output_file)
-                .unwrap()
-                .mutation_rate
-                > 0.0
-        );
+        // Both REFs match H1N1_HA (POS 50 is C, 80-83 ACAA), so both indels count.
+        let rate = MutationModel::from_file(&output_file)
+            .unwrap()
+            .mutation_rate;
+        assert!((rate - 2.0 / 13114.0).abs() < 1e-15, "rate {rate}");
     }
 
+    /// A BED naming no contig in the reference used to fail as "Trinuc counts are empty.
+    /// Unknown error". The error must say what is wrong: the BED and reference contig names.
     #[test]
-    fn test_runner_bed_unknown_contig_succeeds_or_errors_cleanly() {
-        // BED entry references a contig that does not exist in the FASTA. The runner must
-        // not panic; it either succeeds with bed_track_len=0 (which makes mutation_rate
-        // diverge — usually surfaces as a model-construction error) or errors cleanly.
-        // Whatever the exact behavior is today, lock it in.
+    fn a_bed_naming_no_reference_contig_says_so() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
         let vcf_path = PathBuf::from(format!("{}/test_data/vcfs/small_snps.vcf", manifest_dir));
@@ -558,9 +677,14 @@ H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1\n",
         let bed_record = BedRecord::new_bed_record("chrZ_nonexistent".to_string(), 1, 100).unwrap();
         let bed_table = HashMap::from([("chrZ_nonexistent".to_string(), vec![bed_record])]);
 
-        // We don't enforce one outcome here — just that it terminates without panicking.
-        let result = runner(&reference, mutations, bed_table, &output_file);
-        let _ = result; // either Ok or Err is acceptable today
+        let err = runner(&reference, mutations, bed_table, &output_file)
+            .expect_err("a BED covering no reference sequence cannot fit a model")
+            .to_string();
+        assert!(err.contains("covers no sequence in the reference"), "{err}");
+        assert!(
+            err.contains("chrZ_nonexistent") && err.contains("H1N1_HA"),
+            "{err}"
+        );
     }
 
     #[test]

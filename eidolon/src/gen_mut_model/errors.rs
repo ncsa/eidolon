@@ -47,13 +47,29 @@ pub enum GenMutationModelError {
     #[error("Transition matrix error: {0}")]
     TransitionMatrixError(#[from] TransitionMatrixError),
     #[error(
-        "The VCF has {counted} SNP(s) but none could be used: {ref_mismatch} did not match \
-         the reference base and {edge} were at a contig edge. A VCF called against a \
-         different reference build produces this. No model was written."
+        "The VCF has {counted} SNP(s) but none could be used: all {edge} were at a contig \
+         edge. No model was written."
     )]
-    NoUsableSnps {
-        counted: usize,
-        ref_mismatch: usize,
-        edge: usize,
+    NoUsableSnps { counted: usize, edge: usize },
+    #[error(
+        "The VCF record at {position} has REF {vcf_ref}, but the reference has {reference} \
+         there. The VCF and the reference disagree, most likely a different build or a \
+         liftover problem. No model was written. If the VCF does belong to this reference, \
+         drop the mismatching records deliberately and fit on the result: \
+         `bcftools norm -f reference.fa --check-ref x in.vcf.gz -Oz -o checked.vcf.gz`"
+    )]
+    RefMismatch {
+        position: String,
+        vcf_ref: String,
+        reference: String,
+    },
+    #[error(
+        "The BED file covers no sequence in the reference: it names {bed_contigs}, and the \
+         reference has {reference_contigs}. Check the contig names (e.g. `chr1` vs `1`) and \
+         that the BED belongs to this reference. No model was written."
+    )]
+    BedCoversNoReference {
+        bed_contigs: String,
+        reference_contigs: String,
     },
 }
