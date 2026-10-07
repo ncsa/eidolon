@@ -4110,14 +4110,21 @@ mod tests {
         }
     }
 
-    /// Degenerate case: a fragment no longer than the read cannot honour the floor on both
-    /// sides. It must still return a usable offset rather than panic or return 0.
+    /// The shortest fragment a short-read caller passes is the read itself (shorter draws are
+    /// raised to `read_len + 10`). Even there both pieces fit above the `read_len / 4` floor,
+    /// so the floor must hold on both sides, not merely yield an offset of at least 1.
     #[test]
     fn balanced_chimeric_offset_survives_a_fragment_no_longer_than_the_read() {
         let mut rng = NeatRng::new_from_seed(&vec!["degenerate".to_string()]).unwrap();
+        let (frag_len, read_len) = (151usize, 151usize);
+        let floor = read_len / 4;
         for _ in 0..100 {
-            let off = balanced_chimeric_offset(151, 151, &mut rng).unwrap();
-            assert!(off >= 1, "offset must be at least 1, got {off}");
+            let off = balanced_chimeric_offset(frag_len, read_len, &mut rng).unwrap();
+            assert!(
+                off >= floor && frag_len - off >= floor,
+                "offset {off} leaves pieces of {off} and {} bp, below the {floor} bp floor",
+                frag_len - off
+            );
         }
     }
 

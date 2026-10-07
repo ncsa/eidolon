@@ -589,7 +589,10 @@ mod tests {
             fastq.display(),
             output.display()
         ));
-        assert!(RunConfiguration::from(&tmp.path().to_path_buf()).is_ok());
+        let config = RunConfiguration::from(&tmp.path().to_path_buf()).unwrap();
+        assert!(!config.fit_quality_degradation);
+        assert_eq!(config.degradation_tail_window, 0);
+        assert_eq!(config.degradation_tail_cut, 0);
     }
 
     #[test]
