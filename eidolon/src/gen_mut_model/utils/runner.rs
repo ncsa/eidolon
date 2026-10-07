@@ -337,47 +337,107 @@ mod tests {
         );
     }
 
+    /// The fitted indel length distribution for one type, read from the model file `runner`
+    /// writes. `MutationModel` exposes no accessor for its indel model, so this reads the
+    /// written artifact rather than a private field.
+    fn written_indel_dist(path: &PathBuf, which: &str) -> (Vec<u64>, Vec<f64>) {
+        let file = std::fs::File::open(path).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_reader(flate2::read::GzDecoder::new(file)).unwrap();
+        let dist = &value["statistical_models"]["indel_model"][which];
+        let values = dist["values"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no {which}.values in written model"))
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        let weights = dist["weights"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no {which}.weights in written model"))
+            .iter()
+            .map(|w| w.as_f64().unwrap())
+            .collect();
+        (values, weights)
+    }
+
     #[test]
     fn test_runner_with_indels() {
-        // VCF containing an insertion and a deletion alongside SNPs. The runner must accept
-        // non-SNP variant types without erroring and produce a writable model. Catches any
-        // regression that drops the insertion/deletion match arms.
+        // VCF containing one SNP, one insertion and one deletion. The fitted model must carry
+        // each of them in its variant-type weights and its indel lengths, so dropping or
+        // swapping the insertion/deletion match arms changes a value asserted below.
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
         let out_dir = tempdir().unwrap();
 
-        // Position 22 of H1N1_HA is 'C' (after 19 leading Ns: T T C ...). Build a VCF with
-        // a SNP, an insertion, and a deletion at sensible coordinates.
+        // H1N1_HA opens with 19 Ns. Position 22 is C (context T C T); position 50 is C;
+        // positions 80-83 are A C A A. So: a C>T SNP, a 2 bp insertion C>CAG, and a 3 bp
+        // deletion ACAA>A. The two indel lengths differ so that a swap is visible.
         let vcf_path = out_dir.path().join("indels.vcf");
         std::fs::write(
             &vcf_path,
             "##fileformat=VCFv4.1\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
 H1N1_HA\t22\t.\tC\tT\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t50\t.\tT\tTAG\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1\n",
+H1N1_HA\t50\t.\tC\tCAG\t60\tPASS\t.\tGT\t0/1\n\
+H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
         )
         .unwrap();
 
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("indel_model.json.gz");
         runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
-        assert!(output_file.exists());
 
         let model = MutationModel::from_file(&output_file).unwrap();
-        assert!(model.mutation_rate > 0.0);
+
+        // One of each type: SNP, insertion, deletion each 1/3, stored cumulatively.
+        assert_eq!(
+            model.variant_dist.values().unwrap(),
+            vec![
+                VariantType::SNP,
+                VariantType::Insertion,
+                VariantType::Deletion
+            ]
+        );
+        let cumulative = model.variant_dist.weights().unwrap();
+        let expected = [1.0 / 3.0, 2.0 / 3.0, 1.0];
+        for (got, want) in cumulative.iter().zip(expected) {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "variant_dist cumulative weights {cumulative:?}, expected {expected:?}"
+            );
+        }
+
+        // 3 variants over the reference's non-N bases. H1N1.fa has 4373 A + 2538 C +
+        // 3186 G + 3017 T = 13114 (counted with grep, CRLF line endings excluded).
+        let expected_rate = 3.0 / 13114.0;
+        assert!(
+            (model.mutation_rate - expected_rate).abs() < 1e-15,
+            "mutation_rate {}, expected 3/13114 = {expected_rate}",
+            model.mutation_rate
+        );
+
+        // Each type keeps its own observed length.
+        assert_eq!(
+            written_indel_dist(&output_file, "ins_dist"),
+            (vec![2], vec![1.0])
+        );
+        assert_eq!(
+            written_indel_dist(&output_file, "del_dist"),
+            (vec![3], vec![1.0])
+        );
     }
 
     #[test]
     fn test_runner_skips_reference_mismatch_variant() {
         // When VCF REF doesn't agree with the FASTA base at the same position, the runner
         // logs a warning and skips that variant. As long as at least one good variant
-        // remains, the model still builds.
+        // remains, the model still builds, and the skipped SNP must not shape its contexts.
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
         let out_dir = tempdir().unwrap();
 
-        // First record matches (pos 22 is C). Second record's REF=A disagrees with FASTA.
+        // First record matches (pos 22 is C, context T C T). Second record's REF=A disagrees
+        // with the FASTA (pos 25 is C, context G C T).
         let vcf_path = out_dir.path().join("mismatch.vcf");
         std::fs::write(
             &vcf_path,
@@ -391,7 +451,30 @@ H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
         let mutations = read_vcf(vcf_path).unwrap();
         let output_file = out_dir.path().join("mismatch_model.json.gz");
         runner(&reference, mutations, HashMap::new(), &output_file).unwrap();
-        assert!(output_file.exists());
+
+        let model = MutationModel::from_file(&output_file).unwrap();
+        let weights = model.context_weights().unwrap();
+        let frame = |a: char, b: char, c: char| {
+            TrinucFrame::from((
+                Nucleotide::from(a),
+                Nucleotide::from(b),
+                Nucleotide::from(c),
+            ))
+        };
+        // The only usable SNP is in T C T, so it holds all the context weight. Every other
+        // context that occurs in the reference was observed with zero SNPs; a context absent
+        // from the reference would get the 1e-6 floor, hence the tolerance.
+        let tct = weights[&frame('T', 'C', 'T')];
+        assert!(
+            (tct - 1.0).abs() < 1e-3,
+            "TCT should carry all the context weight, got {tct}"
+        );
+        // The skipped SNP's context G C T occurs in the reference with no usable SNP.
+        let gct = weights[&frame('G', 'C', 'T')];
+        assert_eq!(
+            gct, 0.0,
+            "the skipped SNP's context GCT must carry no weight"
+        );
     }
 
     // The SNPs are counted before they are checked against the reference, so a VCF whose

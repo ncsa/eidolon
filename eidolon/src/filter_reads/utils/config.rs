@@ -147,10 +147,69 @@ pub fn create_map_item(
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
+    use super::*;
+
+    /// Write an empty file at `dir/name` and return its path as a String.
+    fn touch(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        fs::write(&path, "").unwrap();
+        path.to_str().unwrap().to_string()
+    }
 
     #[test]
-    fn test_run_configuration() {
-        // TODO: real assertions — stub kept so the test name is reserved.
+    fn create_map_item_inserts_the_key_before_the_extensions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+        for (name, expected) in [
+            ("sample.fastq.gz", "sample_flt.fastq.gz"),
+            ("calls.vcf.gz", "calls_flt.vcf.gz"),
+        ] {
+            let raw = touch(temp_dir.path(), name);
+            let split: Vec<&str> = raw.split(".").collect();
+            let (input, output) = create_map_item(split.clone(), &raw, split.len(), "_flt");
+            assert_eq!(input, PathBuf::from(&raw));
+            assert_eq!(output, PathBuf::from(format!("{dir}/{expected}")));
+        }
+    }
+
+    #[test]
+    fn run_configuration_maps_each_file_with_its_flags_and_default_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+        let bed = touch(temp_dir.path(), "regions.bed");
+        let fastq = touch(temp_dir.path(), "reads.fastq.gz");
+        let vcf = touch(temp_dir.path(), "calls.vcf.gz");
+        let yml = temp_dir.path().join("config.yml");
+        // "." selects the default filter key, "_filter".
+        fs::write(
+            &yml,
+            format!(
+                "bed_file: {bed}\nfiles_to_filter:\n  - {fastq}\n  - {vcf}\n\
+                 filter_key: .\noverwrite_output: false\n"
+            ),
+        )
+        .unwrap();
+
+        let config = RunConfiguration::from(&yml);
+
+        assert_eq!(config.bed_file, PathBuf::from(&bed));
+        assert_eq!(config.file_map.len(), 2);
+        // (output path, is_gzip, is_fastq)
+        assert_eq!(
+            config.file_map[&PathBuf::from(&fastq)],
+            (
+                PathBuf::from(format!("{dir}/reads_filter.fastq.gz")),
+                true,
+                true
+            )
+        );
+        assert_eq!(
+            config.file_map[&PathBuf::from(&vcf)],
+            (
+                PathBuf::from(format!("{dir}/calls_filter.vcf.gz")),
+                true,
+                false
+            )
+        );
     }
 }

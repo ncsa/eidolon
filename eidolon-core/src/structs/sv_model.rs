@@ -3229,7 +3229,11 @@ mod tests {
         // Gaussian approximation handles it cleanly.
         let mut rng = deterministic_rng();
         let n = sample_poisson(121_000.0, &mut rng).expect("must not error at λ=121,000");
-        assert!(n > 0, "λ=121,000 must produce a positive draw");
+        // Within ±5σ of mean. σ = √121000 ≈ 348, so ±1,740 of 121,000.
+        assert!(
+            (n as f64 - 121_000.0).abs() < 1_740.0,
+            "λ=121,000 draw {n} is more than 5σ from mean — algorithm broken?"
+        );
     }
 
     #[test]

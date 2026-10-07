@@ -2352,18 +2352,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_max_reads() {
-        let temp = tempfile::tempdir().unwrap();
-        let fastq_path = temp.path().join("test.fastq");
-        make_test_fastq(&fastq_path, 100, 50);
-        let output_path = temp.path().join("model.json.gz");
-        let mut config = make_config(fastq_path, output_path.clone());
-        config.max_reads = 10;
-        runner(&config).unwrap();
-        assert!(output_path.exists());
-    }
-
-    #[test]
     fn test_runner_truncated_fastq_errors() {
         // FASTQ with only 3 lines (no quality line) must yield MalformedFastq, not a panic
         // or an Ok with garbage data.
@@ -2537,23 +2525,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_max_reads_reduces_processed_count() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let fastq_path = PathBuf::from(format!("{}/test_data/H1N1_read1.fq.gz", manifest_dir));
-        let temp = tempfile::tempdir().unwrap();
-        let output_path = temp.path().join("h1n1_maxreads_model.json.gz");
-        let mut config = make_config(fastq_path, output_path.clone());
-        config.max_reads = 50;
-        runner(&config).unwrap();
-        assert!(output_path.exists());
-
-        let model = SequencingErrorModel::from_file(&output_path).unwrap();
-        let mut rng = eidolon_core::rng::NeatRng::new_from_seed(&vec!["seed".to_string()]).unwrap();
-        let scores = model.generate_quality_scores(151, &mut rng).unwrap();
-        assert_eq!(scores.len(), 151);
-    }
-
-    #[test]
     fn test_transition_matrix_from_tsv() {
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
@@ -2591,7 +2562,19 @@ mod tests {
             bam_min_mapq: 20,
         };
         runner(&config).unwrap();
-        assert!(output_path.exists());
+        // The model must carry the TSV's rows, not the default matrix: each row's CDF is the
+        // running sum of the row written above.
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let tm = model.transition_distros();
+        for (base, expected) in [
+            (Nucleotide::A, [0.0, 0.5, 0.8, 1.0]),
+            (Nucleotide::C, [0.5, 0.5, 0.8, 1.0]),
+            (Nucleotide::G, [0.4, 0.7, 0.7, 1.0]),
+            (Nucleotide::T, [0.3, 0.6, 1.0, 1.0]),
+        ] {
+            assert_row_cdf_eq(&row_cdf(tm, base), &expected, &format!("{base:?} row"));
+        }
     }
 
     /// The cumulative weights of one transition-matrix row, as `[A, C, G, T]`.

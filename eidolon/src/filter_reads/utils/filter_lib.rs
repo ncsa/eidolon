@@ -263,8 +263,35 @@ mod tests {
         file_obj.flush().unwrap();
         let mut outfile = PathBuf::from(temp_dir.path());
         outfile.push("test_data_filtered.txt");
-        prep_files_for_filtering(&temp_file, false, &outfile)
+        let (reader, mut writer) = prep_files_for_filtering(&temp_file, false, &outfile)
             .expect("prep_files_for_filtering should succeed on a real input");
+        // The reader yields the input's lines, newline-stripped.
+        assert_eq!(
+            reader.collect::<Vec<String>>(),
+            vec![
+                "Test data!",
+                "This is only a test",
+                "Please disregard all information within",
+                "the end",
+            ]
+        );
+        // The writer gzips into `outfile`, overwriting it.
+        writer.write_all(b"kept line\n").unwrap();
+        writer.finish().unwrap();
+        let written: Vec<String> = read_gzip_lines(&outfile)
+            .unwrap()
+            .map(|l| l.unwrap())
+            .collect();
+        assert_eq!(written, vec!["kept line"]);
+
+        // A gzipped input is decompressed by the reader.
+        let mut gz_in = PathBuf::from(temp_dir.path());
+        gz_in.push("test_data.txt.gz");
+        let mut gz = BlockGzWriter::new(create_output_file(&gz_in, true).unwrap());
+        gz.write_all(b"first\nsecond\n").unwrap();
+        gz.finish().unwrap();
+        let (reader, _writer) = prep_files_for_filtering(&gz_in, true, &outfile).unwrap();
+        assert_eq!(reader.collect::<Vec<String>>(), vec!["first", "second"]);
     }
 
     #[test]
