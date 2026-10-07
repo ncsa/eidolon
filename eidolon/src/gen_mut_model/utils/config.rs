@@ -182,8 +182,27 @@ mod tests {
     /// value. Those must keep working after the option's removal.
     #[test]
     fn an_empty_transition_matrix_file_key_is_accepted() {
-        assert!(config_with("transition_matrix_file:\n").is_ok());
-        assert!(config_with("transition_matrix_file: .\n").is_ok());
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        for extra in ["transition_matrix_file:\n", "transition_matrix_file: .\n"] {
+            let config = config_with(extra).unwrap();
+            // The rest of the config is parsed as if the key were absent.
+            assert_eq!(
+                config.reference,
+                PathBuf::from(format!("{manifest_dir}/test_data/references/H1N1.fa"))
+            );
+            assert_eq!(config.output_file.file_name().unwrap(), "model.json.gz");
+            assert!(config.overwrite_output);
+            assert!(config.bed_table.is_empty());
+            // small_snps.vcf: three H1N1_HA SNPs at POS 22, 25, 28. The lean reader keeps
+            // POS 1-based; the runner subtracts one before indexing the reference.
+            assert_eq!(config.mutations.len(), 1);
+            let mut locations: Vec<usize> = config.mutations["H1N1_HA"]
+                .iter()
+                .map(|v| v.location)
+                .collect();
+            locations.sort_unstable();
+            assert_eq!(locations, vec![22, 25, 28]);
+        }
     }
 
     /// A value means the user expects the matrix to shape the model. It never did,

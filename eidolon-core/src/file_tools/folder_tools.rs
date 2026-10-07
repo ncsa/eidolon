@@ -31,7 +31,20 @@ mod tests {
     #[test]
     fn test_check_parent() {
         let filename = PathBuf::from("test_data/H1N1.fa");
-        check_parent(&filename, false).unwrap();
+        assert!(PathBuf::from("test_data").is_dir());
+        // An existing parent hands back the same path it was given.
+        let returned = check_parent(&filename, false).unwrap();
+        assert_eq!(returned, &filename);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error creating file log!")]
+    fn test_check_parent_missing_without_create_panics() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing = temp_dir.path().join("absent");
+        let filename = missing.join("test.fa");
+        assert!(!missing.exists());
+        let _ = check_parent(&filename, false);
     }
 
     #[test]

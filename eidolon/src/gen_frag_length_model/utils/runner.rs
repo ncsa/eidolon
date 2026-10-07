@@ -855,23 +855,50 @@ mod tests {
 
     #[test]
     fn test_runner_min_reads_zero_skips_filter() {
-        let temp = tempfile::tempdir().unwrap();
-        let bam_path = temp.path().join("frags.bam");
-        // Every length appears exactly once → min_reads=2 would remove all; min_reads=0 keeps all
-        write_test_frag_bam(
-            &bam_path,
-            &[100, 200, 300, 400, 500, 150, 250, 350, 450, 160],
-        );
-        let output = temp.path().join("model.json.gz");
-        let config = RunConfiguration {
-            input_file: bam_path,
-            output_file: output.clone(),
-            overwrite_output: true,
-            min_reads: 0,
-            distribution: DistributionKind::Normal,
+        // 190..=210 once each, plus one stray at 100,000. Worked by hand: median 200,
+        // MAD 5, so the outlier ceiling is 200 + 10 * 5 = 250 and min_reads > 0 drops the
+        // stray. min_reads = 0 skips trimming entirely and keeps it.
+        let core: Vec<usize> = (190..=210).collect();
+        let mut tlens = core.clone();
+        tlens.push(100_000);
+
+        let fit = |min_reads: usize| {
+            let temp = tempfile::tempdir().unwrap();
+            let bam_path = temp.path().join("frags.bam");
+            write_test_frag_bam(&bam_path, &tlens);
+            let output = temp.path().join("model.json.gz");
+            let config = RunConfiguration {
+                input_file: bam_path,
+                output_file: output.clone(),
+                overwrite_output: true,
+                min_reads,
+                distribution: DistributionKind::Normal,
+            };
+            runner(&config).unwrap();
+            match FragmentLengthModel::discrete_from_file(&output).unwrap() {
+                FragmentLengthModel::Normal { mean, st_dev } => (mean, st_dev),
+                other => panic!("Expected Normal model, got {other:?}"),
+            }
         };
-        runner(&config).unwrap();
-        assert!(output.exists());
+
+        // min_reads = 0: all 22 lengths. mean = (21 * 200 + 100,000) / 22 = 4736.36.
+        let (mean0, sd0) = fit(0);
+        let all_mean = naive_mean(&tlens);
+        assert!((all_mean - 104_200.0 / 22.0).abs() < 1e-9);
+        assert!((mean0 - all_mean).abs() < 1e-6, "mean={mean0}");
+        assert!(
+            (sd0 - naive_std(&tlens, all_mean)).abs() < 1e-6,
+            "st_dev={sd0}"
+        );
+
+        // min_reads = 2: the stray is gone. mean = 200, st_dev = sqrt(2 * 385 / 21).
+        let (mean2, sd2) = fit(2);
+        assert!((mean2 - 200.0).abs() < 1e-6, "mean={mean2}");
+        assert!(
+            (sd2 - (770.0f64 / 21.0).sqrt()).abs() < 1e-6,
+            "st_dev={sd2}"
+        );
+        assert!((naive_std(&core, 200.0) - sd2).abs() < 1e-6);
     }
 
     #[test]
