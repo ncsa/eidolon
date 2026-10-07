@@ -22,12 +22,12 @@ files_to_filter: [
    /my/home/output/bacteria.vcf.gz,
 ]
 ```
-Note the full extension is important, but filter-reads should be able to handle both gzipped and unzipped files, if you decide to unzip them.
+Each file must end in `.fastq`, `.fastq.gz`, `.vcf` or `.vcf.gz`; any other extension is refused. Gzipped and unzipped files are both read.
 
 ```bash
 filter_key: .
 ```
-This is the key appended to the filename, before extensions. For example, if your filename is "miscanthus_r1.fastq.gz", and you set the key as "_only_genes", the output file would be "miscanthus_r1_only_genes.fastq.gz". The default is "_filter".
+This is the key appended to the filename, before extensions. For example, if your filename is "miscanthus_r1.fastq.gz", and you set the key as "_only_genes", the output file would be "miscanthus_r1_only_genes.fastq.gz". The default is "_filter". Output is always gzip-compressed and written next to its input, so an unzipped input gains `.gz`: "miscanthus_r1.fastq" becomes "miscanthus_r1_only_genes.fastq.gz".
 
 ```bash
 overwrite_output: false # optional, default false

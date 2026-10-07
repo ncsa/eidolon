@@ -7,7 +7,7 @@ use log::*;
 use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::string::String;
 
 /// Every top-level key the config parser reads. Anything else is rejected (#496).
@@ -69,31 +69,18 @@ impl RunConfiguration {
         let file_map: HashMap<PathBuf, (PathBuf, bool, bool)> = {
             let mut temp_map = HashMap::new();
             for raw_value in files_to_filter_raw {
-                let mut is_gzip = false;
-                let mut is_fastq = true;
                 let raw_string = raw_value.as_str().unwrap();
-                let split_string: Vec<&str> = raw_string.split(".").collect();
-                let elem_len = split_string.len();
-                let ext1 = split_string[elem_len - 1];
-                if ext1 == "gz" {
-                    is_gzip = true;
-                    let ext2 = split_string[elem_len - 2];
-                    if ext2 == "vcf" {
-                        is_fastq = false;
-                    } else if ext2 == "fastq" {
-                        // Do nothing
-                    } else {
-                        panic!("Unknown File Extension! {:?}", raw_string)
-                    }
-                } else if ext1 == "vcf" {
-                    is_fastq = false;
-                } else if ext1 == "fastq" {
-                    // do nothing
-                } else {
-                    panic!("Unknown File Extension! {:?}", raw_string)
+                let input_path = PathBuf::from(raw_string);
+                let (output_path, is_gzip, is_fastq) = filtered_output(&input_path, filter_key)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Unknown File Extension! {raw_string:?}: expected one of \
+                             .fastq, .fastq.gz, .vcf, .vcf.gz"
+                        )
+                    });
+                if !input_path.is_file() {
+                    panic!("Input file not found! {:?}", input_path)
                 }
-                let (input_path, output_path) =
-                    create_map_item(split_string, raw_string, elem_len, filter_key);
                 if !overwrite_output && output_path.is_file() {
                     panic!("Attempting to overwrite an existing file {:?}", output_path)
                 }
@@ -117,32 +104,37 @@ impl RunConfiguration {
     }
 }
 
-pub fn create_map_item(
-    split_string: Vec<&str>,
-    raw_string: &str,
-    length: usize,
-    filter_key: &str,
-) -> (PathBuf, PathBuf) {
-    let old_element = split_string[length - 3];
-    let new_element = format!("{old_element}{filter_key}");
-    let mut output_name = String::new();
-    // stop one short of the end
-    for i in 0..length - 1 {
-        if i == length - 3 {
-            output_name.push_str(&new_element);
-            output_name.push('.');
-        } else {
-            output_name.push_str(split_string[i]);
-            output_name.push('.');
-        }
-    }
-    // End with the last extension with no traling dot.
-    output_name.push_str(split_string[length - 1]);
-    let temp_path = PathBuf::from(raw_string);
-    if !temp_path.is_file() {
-        panic!("Input file not found! {:?}", temp_path)
-    }
-    (temp_path, PathBuf::from(output_name))
+/// The suffixes filter-reads accepts: `(suffix, is_gzip, is_fastq)`.
+const INPUT_SUFFIXES: [(&str, bool, bool); 4] = [
+    (".fastq.gz", true, true),
+    (".fastq", false, true),
+    (".vcf.gz", true, false),
+    (".vcf", false, false),
+];
+
+/// Where the filtered copy of `input` goes, and whether `input` is gzipped and a FASTQ.
+///
+/// The name is built from the file name alone, so a dot in a directory cannot shift it: the
+/// filter key goes between the stem and the suffix, in the input's directory. The writer
+/// always compresses, so the output always ends in `.gz`, including for plain input:
+/// `reads.fastq` becomes `reads<key>.fastq.gz`. Returns `None` for any other suffix, or for a
+/// name that is nothing but a suffix (#824).
+pub fn filtered_output(input: &Path, filter_key: &str) -> Option<(PathBuf, bool, bool)> {
+    let name = input.file_name()?.to_str()?;
+    let &(suffix, is_gzip, is_fastq) = INPUT_SUFFIXES
+        .iter()
+        .find(|(suffix, _, _)| name.len() > suffix.len() && name.ends_with(suffix))?;
+    let stem = &name[..name.len() - suffix.len()];
+    let out_suffix = if is_gzip {
+        suffix.to_string()
+    } else {
+        format!("{suffix}.gz")
+    };
+    Some((
+        input.with_file_name(format!("{stem}{filter_key}{out_suffix}")),
+        is_gzip,
+        is_fastq,
+    ))
 }
 
 #[cfg(test)]
@@ -157,18 +149,47 @@ mod tests {
     }
 
     #[test]
-    fn create_map_item_inserts_the_key_before_the_extensions() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dir = temp_dir.path().to_str().unwrap();
-        for (name, expected) in [
-            ("sample.fastq.gz", "sample_flt.fastq.gz"),
-            ("calls.vcf.gz", "calls_flt.vcf.gz"),
+    fn filtered_output_inserts_the_key_before_the_suffix() {
+        for (input, expected, is_gzip, is_fastq) in [
+            ("/d/sample.fastq.gz", "/d/sample_flt.fastq.gz", true, true),
+            ("/d/calls.vcf.gz", "/d/calls_flt.vcf.gz", true, false),
+            // Plain input is written compressed, so its output name gains `.gz`.
+            ("/d/sample.fastq", "/d/sample_flt.fastq.gz", false, true),
+            ("/d/calls.vcf", "/d/calls_flt.vcf.gz", false, false),
+            // A dot in a directory, or extra dots in the stem, must not move the key.
+            (
+                "/data/run.1/reads.fastq",
+                "/data/run.1/reads_flt.fastq.gz",
+                false,
+                true,
+            ),
+            (
+                "/d/sample.v2.fastq.gz",
+                "/d/sample.v2_flt.fastq.gz",
+                true,
+                true,
+            ),
+            ("reads.vcf.gz", "reads_flt.vcf.gz", true, false),
         ] {
-            let raw = touch(temp_dir.path(), name);
-            let split: Vec<&str> = raw.split(".").collect();
-            let (input, output) = create_map_item(split.clone(), &raw, split.len(), "_flt");
-            assert_eq!(input, PathBuf::from(&raw));
-            assert_eq!(output, PathBuf::from(format!("{dir}/{expected}")));
+            assert_eq!(
+                filtered_output(Path::new(input), "_flt"),
+                Some((PathBuf::from(expected), is_gzip, is_fastq)),
+                "{input}"
+            );
+        }
+    }
+
+    /// Must not fire: anything but the four suffixes is refused, as is a bare suffix.
+    #[test]
+    fn filtered_output_refuses_other_suffixes() {
+        for input in [
+            "/d/reads.fq.gz",
+            "/d/reads.bam",
+            "/d/reads.fastq.bz2",
+            "/d/.fastq",
+            "/d/vcf",
+        ] {
+            assert_eq!(filtered_output(Path::new(input), "_flt"), None, "{input}");
         }
     }
 
