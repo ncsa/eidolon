@@ -34,7 +34,9 @@ overwrite_output: false
 - Each variant record must have `GT` in the `FORMAT` column; `eidolon` hard-errors if GT is missing
 - `QUAL=.` is accepted and treated as quality score 0
 - Insertion and deletion lengths are each fitted from the VCF. If one type is absent (an insertions-only VCF, say), that type's length distribution is the default one and a warning says so; the type that was observed keeps its fitted lengths. With no indels at all, both use the defaults.
-- A SNP whose `REF` does not match the reference base, or that sits at a contig edge, is skipped with a warning giving the counts. If **every** SNP is skipped, `gen-mut-model` errors out rather than writing a model with no SNP context data. That usually means the VCF was called against a different reference build.
+- Each SNP's and indel's `REF` is compared with the reference at its position. A record that disagrees, or a SNP at a contig edge, is left out of the model entirely (not counted toward the mutation rate or the SNP/indel split), with a warning giving the counts.
+- If more than **1%** of the checked records disagree with the reference, `gen-mut-model` errors out: the VCF and the reference do not belong together, most likely a different build or a liftover problem. The 1% limit is a chosen guard, not a measured rate. It also errors out if **every** SNP is left out, rather than writing a model with no SNP context data.
+- A `bed_file` must name at least one contig in the reference. If none match, the error lists both sets of names; a `chr1` versus `1` mismatch is the usual cause.
 
 Caveats: Only one sample can be read at this point (#412). Currently, high-mutation regions and common variants features from Python NEAT are not yet implemented (#413).
 

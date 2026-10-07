@@ -56,4 +56,23 @@ pub enum GenMutationModelError {
         ref_mismatch: usize,
         edge: usize,
     },
+    #[error(
+        "{mismatched} of {checked} SNP/indel record(s) have a REF that does not match the \
+         reference, more than the {max_percent}% allowed. The VCF and the reference disagree: \
+         most likely a different build or a liftover problem. No model was written."
+    )]
+    RefMismatchRate {
+        mismatched: usize,
+        checked: usize,
+        max_percent: f64,
+    },
+    #[error(
+        "The BED file covers no sequence in the reference: it names {bed_contigs}, and the \
+         reference has {reference_contigs}. Check the contig names (e.g. `chr1` vs `1`) and \
+         that the BED belongs to this reference. No model was written."
+    )]
+    BedCoversNoReference {
+        bed_contigs: String,
+        reference_contigs: String,
+    },
 }
