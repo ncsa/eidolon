@@ -52,16 +52,16 @@ pub enum GenMutationModelError {
     )]
     NoUsableSnps { counted: usize, edge: usize },
     #[error(
-        "{snps} SNP(s) and {indels} indel(s) have a REF that does not match the reference \
-         (first: {examples}). The VCF and the reference disagree, most likely a different \
-         build or a liftover problem. No model was written. If the VCF does belong to this \
-         reference, drop the mismatching records deliberately and fit on the result: \
+        "The VCF record at {position} has REF {vcf_ref}, but the reference has {reference} \
+         there. The VCF and the reference disagree, most likely a different build or a \
+         liftover problem. No model was written. If the VCF does belong to this reference, \
+         drop the mismatching records deliberately and fit on the result: \
          `bcftools norm -f reference.fa --check-ref x in.vcf.gz -Oz -o checked.vcf.gz`"
     )]
     RefMismatch {
-        snps: usize,
-        indels: usize,
-        examples: String,
+        position: String,
+        vcf_ref: String,
+        reference: String,
     },
     #[error(
         "The BED file covers no sequence in the reference: it names {bed_contigs}, and the \

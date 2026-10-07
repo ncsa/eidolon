@@ -25,9 +25,6 @@ fn canonical_trinuc(sequence: &[Nucleotide], i: usize) -> (Nucleotide, Nucleotid
     (sequence[i - 1], sequence[i], sequence[i + 1])
 }
 
-/// How many mismatching records the REF-mismatch error lists by position.
-const REF_MISMATCH_EXAMPLES: usize = 5;
-
 /// Whether `reference` (a VCF REF allele) matches `sequence` from 0-based `loc`. A REF that
 /// runs past the contig end does not match.
 fn ref_matches(sequence: &[Nucleotide], loc: usize, reference: &[Nucleotide]) -> bool {
@@ -39,17 +36,24 @@ fn indel_ref_matches(sequence: &[Nucleotide], variant: &Variant) -> bool {
     variant.location >= 1 && ref_matches(sequence, variant.location - 1, &variant.reference)
 }
 
-/// `contig:POS REF x, reference y`, for the REF-mismatch error.
-fn describe_ref_mismatch(contig: &str, sequence: &[Nucleotide], variant: &Variant) -> String {
+/// A record whose REF disagrees with the reference refuses the fit, as in NEAT2. It stops at
+/// the first one: a misconfigured input fails fast, before the rest of the reference is
+/// read, and the error's `bcftools` command handles a VCF with only a few such records.
+fn ref_mismatch_error(
+    contig: &str,
+    sequence: &[Nucleotide],
+    variant: &Variant,
+) -> GenMutationModelError {
     let as_text = |bases: &[Nucleotide]| bases.iter().map(|&b| char::from(b)).collect::<String>();
     let start = variant.location.saturating_sub(1).min(sequence.len());
     let end = (start + variant.reference.len()).min(sequence.len());
-    format!(
-        "{contig}:{} REF {}, reference {}",
-        variant.location,
-        as_text(&variant.reference),
-        as_text(&sequence[start..end])
-    )
+    let err = GenMutationModelError::RefMismatch {
+        position: format!("{contig}:{}", variant.location),
+        vcf_ref: as_text(&variant.reference),
+        reference: as_text(&sequence[start..end]),
+    };
+    error!("{err}");
+    err
 }
 
 pub fn runner(
@@ -65,11 +69,6 @@ pub fn runner(
     let mut snp_count = 0;
     let mut snp_seen = 0;
     let mut snp_edge_skipped = 0;
-    let mut snp_ref_mismatch = 0;
-    // Records whose REF disagrees with the reference refuse the fit, as in NEAT2; the whole
-    // VCF is scanned first so the error can say how many, and where (#819).
-    let mut indel_ref_mismatch = 0;
-    let mut ref_mismatch_examples: Vec<String> = Vec::new();
     let mut reference_contigs: Vec<String> = Vec::new();
     let mut insertion_count: HashMap<usize, usize> = HashMap::new();
     let mut deletion_count: HashMap<usize, usize> = HashMap::new();
@@ -161,15 +160,7 @@ pub fn runner(
                     }
                     let (n0, n1, n2) = canonical_trinuc(&sequence, loc);
                     if n1 != variant.reference[0] {
-                        snp_ref_mismatch += 1;
-                        if ref_mismatch_examples.len() < REF_MISMATCH_EXAMPLES {
-                            ref_mismatch_examples.push(describe_ref_mismatch(
-                                &contig_name,
-                                &sequence,
-                                variant,
-                            ));
-                        }
-                        continue;
+                        return Err(ref_mismatch_error(&contig_name, &sequence, variant));
                     }
                     let ref_frame = TrinucFrame::from((n0, n1, n2));
                     debug_assert!(
@@ -186,15 +177,7 @@ pub fn runner(
                 VariantType::Insertion | VariantType::Deletion
                     if !indel_ref_matches(&sequence, variant) =>
                 {
-                    indel_ref_mismatch += 1;
-                    if ref_mismatch_examples.len() < REF_MISMATCH_EXAMPLES {
-                        ref_mismatch_examples.push(describe_ref_mismatch(
-                            &contig_name,
-                            &sequence,
-                            variant,
-                        ));
-                    }
-                    continue;
+                    return Err(ref_mismatch_error(&contig_name, &sequence, variant));
                 }
                 VariantType::Insertion => {
                     debug_assert!(
@@ -240,15 +223,6 @@ pub fn runner(
         return Err(err);
     }
 
-    if snp_ref_mismatch + indel_ref_mismatch > 0 {
-        let err = GenMutationModelError::RefMismatch {
-            snps: snp_ref_mismatch,
-            indels: indel_ref_mismatch,
-            examples: ref_mismatch_examples.join("; "),
-        };
-        error!("{err}");
-        return Err(err);
-    }
     if snp_edge_skipped > 0 {
         warn!("{snp_edge_skipped} of {snp_seen} SNP(s) were at a contig edge and were left out");
     }
@@ -576,19 +550,23 @@ H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
     }
 
     /// A SNP whose REF disagrees with the reference refuses the fit, as in NEAT2, however
-    /// many good records surround it. The error names the count and the position, and how to
+    /// many good records surround it. The error names the record and both bases, and how to
     /// drop such records deliberately (#819).
     #[test]
     fn test_runner_skips_reference_mismatch_variant() {
-        let (result, output, _dir) = run_with_good_snps(100, &[wrong_ref_snp(1000)]);
+        let (result, output, _dir) =
+            run_with_good_snps(100, &[wrong_ref_snp(1000), wrong_ref_snp(1003)]);
         let err = result
             .expect_err("a REF mismatch must refuse the fit")
             .to_string();
+        // It stops at the first mismatch rather than scanning on.
+        assert!(!err.contains("H1N1_HA:1003"), "{err}");
         let r = h1n1_ha()[999];
         let wrong = if r == 'G' { 'T' } else { 'G' };
-        assert!(err.contains("1 SNP(s) and 0 indel(s)"), "{err}");
         assert!(
-            err.contains(&format!("H1N1_HA:1000 REF {wrong}, reference {r}")),
+            err.contains(&format!(
+                "H1N1_HA:1000 has REF {wrong}, but the reference has {r}"
+            )),
             "{err}"
         );
         assert!(err.contains("bcftools norm"), "{err}");
@@ -604,8 +582,10 @@ H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
         let err = result
             .expect_err("an indel REF mismatch must refuse the fit")
             .to_string();
-        assert!(err.contains("0 SNP(s) and 1 indel(s)"), "{err}");
-        assert!(err.contains("H1N1_HA:80 REF ACG, reference ACA"), "{err}");
+        assert!(
+            err.contains("H1N1_HA:80 has REF ACG, but the reference has ACA"),
+            "{err}"
+        );
         assert!(!output.exists(), "no model is written");
     }
 

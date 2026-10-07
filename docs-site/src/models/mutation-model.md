@@ -34,7 +34,7 @@ overwrite_output: false
 - Each variant record must have `GT` in the `FORMAT` column; `eidolon` hard-errors if GT is missing
 - `QUAL=.` is accepted and treated as quality score 0
 - Insertion and deletion lengths are each fitted from the VCF. If one type is absent (an insertions-only VCF, say), that type's length distribution is the default one and a warning says so; the type that was observed keeps its fitted lengths. With no indels at all, both use the defaults.
-- Each SNP's and indel's `REF` must match the reference at its position. If any record disagrees, `gen-mut-model` errors out, giving the number of SNPs and indels affected and the first few positions. A mismatch usually means the VCF was called against a different build, or lifted over badly. If the VCF does belong to this reference, drop the mismatching records deliberately and fit on the result:
+- Each SNP's and indel's `REF` must match the reference at its position. At the first record that disagrees, `gen-mut-model` stops with an error naming that record and both bases. A mismatch usually means the VCF was called against a different build, or lifted over badly. If the VCF does belong to this reference, drop the mismatching records deliberately and fit on the result:
   ```
   bcftools norm -f reference.fa --check-ref x in.vcf.gz -Oz -o checked.vcf.gz
   ```
