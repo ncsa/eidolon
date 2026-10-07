@@ -25,11 +25,8 @@ fn canonical_trinuc(sequence: &[Nucleotide], i: usize) -> (Nucleotide, Nucleotid
     (sequence[i - 1], sequence[i], sequence[i + 1])
 }
 
-/// The largest share of checked SNP/indel records whose REF may disagree with the reference
-/// before the fit is refused. A chosen guard, not a measured rate: a VCF called against the
-/// same reference should mismatch almost nowhere, while one from a different build mismatches
-/// at most positions. Below it, mismatched records are dropped with a warning.
-const MAX_REF_MISMATCH_FRACTION: f64 = 0.01;
+/// How many mismatching records the REF-mismatch error lists by position.
+const REF_MISMATCH_EXAMPLES: usize = 5;
 
 /// Whether `reference` (a VCF REF allele) matches `sequence` from 0-based `loc`. A REF that
 /// runs past the contig end does not match.
@@ -37,10 +34,22 @@ fn ref_matches(sequence: &[Nucleotide], loc: usize, reference: &[Nucleotide]) ->
     sequence.get(loc..loc + reference.len()) == Some(reference)
 }
 
-/// Checks an indel's REF against the reference at its 1-based POS, counting it in `checked`.
-fn indel_ref_matches(sequence: &[Nucleotide], variant: &Variant, checked: &mut usize) -> bool {
-    *checked += 1;
+/// Whether an indel's REF matches the reference at its 1-based POS.
+fn indel_ref_matches(sequence: &[Nucleotide], variant: &Variant) -> bool {
     variant.location >= 1 && ref_matches(sequence, variant.location - 1, &variant.reference)
+}
+
+/// `contig:POS REF x, reference y`, for the REF-mismatch error.
+fn describe_ref_mismatch(contig: &str, sequence: &[Nucleotide], variant: &Variant) -> String {
+    let as_text = |bases: &[Nucleotide]| bases.iter().map(|&b| char::from(b)).collect::<String>();
+    let start = variant.location.saturating_sub(1).min(sequence.len());
+    let end = (start + variant.reference.len()).min(sequence.len());
+    format!(
+        "{contig}:{} REF {}, reference {}",
+        variant.location,
+        as_text(&variant.reference),
+        as_text(&sequence[start..end])
+    )
 }
 
 pub fn runner(
@@ -57,10 +66,10 @@ pub fn runner(
     let mut snp_seen = 0;
     let mut snp_edge_skipped = 0;
     let mut snp_ref_mismatch = 0;
-    // Literal SNP/indel records whose REF was compared with the reference, and how many of
-    // those disagreed (#819).
-    let mut ref_checked = 0;
+    // Records whose REF disagrees with the reference refuse the fit, as in NEAT2; the whole
+    // VCF is scanned first so the error can say how many, and where (#819).
     let mut indel_ref_mismatch = 0;
+    let mut ref_mismatch_examples: Vec<String> = Vec::new();
     let mut reference_contigs: Vec<String> = Vec::new();
     let mut insertion_count: HashMap<usize, usize> = HashMap::new();
     let mut deletion_count: HashMap<usize, usize> = HashMap::new();
@@ -151,13 +160,15 @@ pub fn runner(
                         continue;
                     }
                     let (n0, n1, n2) = canonical_trinuc(&sequence, loc);
-                    ref_checked += 1;
                     if n1 != variant.reference[0] {
-                        warn!(
-                            "Reference mismatch at position {}: VCF ref {:?}, FASTA base {:?}; skipping",
-                            variant.location, variant.reference[0], n1
-                        );
                         snp_ref_mismatch += 1;
+                        if ref_mismatch_examples.len() < REF_MISMATCH_EXAMPLES {
+                            ref_mismatch_examples.push(describe_ref_mismatch(
+                                &contig_name,
+                                &sequence,
+                                variant,
+                            ));
+                        }
                         continue;
                     }
                     let ref_frame = TrinucFrame::from((n0, n1, n2));
@@ -173,9 +184,16 @@ pub fn runner(
                     snp_count += 1;
                 }
                 VariantType::Insertion | VariantType::Deletion
-                    if !indel_ref_matches(&sequence, variant, &mut ref_checked) =>
+                    if !indel_ref_matches(&sequence, variant) =>
                 {
                     indel_ref_mismatch += 1;
+                    if ref_mismatch_examples.len() < REF_MISMATCH_EXAMPLES {
+                        ref_mismatch_examples.push(describe_ref_mismatch(
+                            &contig_name,
+                            &sequence,
+                            variant,
+                        ));
+                    }
                     continue;
                 }
                 VariantType::Insertion => {
@@ -222,33 +240,24 @@ pub fn runner(
         return Err(err);
     }
 
-    let snp_skipped = snp_edge_skipped + snp_ref_mismatch;
-    if snp_skipped > 0 {
-        warn!(
-            "{snp_skipped} of {snp_seen} SNP(s) could not be used: {snp_ref_mismatch} did not \
-             match the reference base, {snp_edge_skipped} were at a contig edge"
-        );
-    }
-    if indel_ref_mismatch > 0 {
-        warn!("{indel_ref_mismatch} indel(s) were left out: their REF did not match the reference");
-    }
-    // Without a single usable SNP there is no context information, yet a SNP fraction would
-    // still let the model generate SNPs from nothing.
-    if snp_seen > 0 && snp_skipped == snp_seen {
-        let err = GenMutationModelError::NoUsableSnps {
-            counted: snp_seen,
-            ref_mismatch: snp_ref_mismatch,
-            edge: snp_edge_skipped,
+    if snp_ref_mismatch + indel_ref_mismatch > 0 {
+        let err = GenMutationModelError::RefMismatch {
+            snps: snp_ref_mismatch,
+            indels: indel_ref_mismatch,
+            examples: ref_mismatch_examples.join("; "),
         };
         error!("{err}");
         return Err(err);
     }
-    let ref_mismatch = snp_ref_mismatch + indel_ref_mismatch;
-    if ref_checked > 0 && ref_mismatch as f64 > MAX_REF_MISMATCH_FRACTION * ref_checked as f64 {
-        let err = GenMutationModelError::RefMismatchRate {
-            mismatched: ref_mismatch,
-            checked: ref_checked,
-            max_percent: MAX_REF_MISMATCH_FRACTION * 100.0,
+    if snp_edge_skipped > 0 {
+        warn!("{snp_edge_skipped} of {snp_seen} SNP(s) were at a contig edge and were left out");
+    }
+    // Without a single usable SNP there is no context information, yet a SNP fraction would
+    // still let the model generate SNPs from nothing.
+    if snp_seen > 0 && snp_edge_skipped == snp_seen {
+        let err = GenMutationModelError::NoUsableSnps {
+            counted: snp_seen,
+            edge: snp_edge_skipped,
         };
         error!("{err}");
         return Err(err);
@@ -566,87 +575,90 @@ H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
         assert!((rate - 100.0 / H1N1_NON_N).abs() < 1e-15, "rate {rate}");
     }
 
-    /// A SNP whose REF disagrees with the reference is dropped and counted nowhere. 1 of 101
-    /// is under the 1% limit, so the model builds from the other 100 alone. NEAT2 counted a
-    /// SNP only once it was usable; eidolon counted it first and skipped it after (#819).
+    /// A SNP whose REF disagrees with the reference refuses the fit, as in NEAT2, however
+    /// many good records surround it. The error names the count and the position, and how to
+    /// drop such records deliberately (#819).
     #[test]
     fn test_runner_skips_reference_mismatch_variant() {
         let (result, output, _dir) = run_with_good_snps(100, &[wrong_ref_snp(1000)]);
+        let err = result
+            .expect_err("a REF mismatch must refuse the fit")
+            .to_string();
+        let r = h1n1_ha()[999];
+        let wrong = if r == 'G' { 'T' } else { 'G' };
+        assert!(err.contains("1 SNP(s) and 0 indel(s)"), "{err}");
+        assert!(
+            err.contains(&format!("H1N1_HA:1000 REF {wrong}, reference {r}")),
+            "{err}"
+        );
+        assert!(err.contains("bcftools norm"), "{err}");
+        assert!(!output.exists(), "no model is written");
+    }
+
+    /// An indel's REF is checked the same way.
+    #[test]
+    fn an_indel_whose_ref_disagrees_refuses_the_fit() {
+        // POS 80-83 of H1N1_HA is ACAA; this record claims ACG.
+        let bad_indel = "H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1".to_string();
+        let (result, output, _dir) = run_with_good_snps(100, &[bad_indel]);
+        let err = result
+            .expect_err("an indel REF mismatch must refuse the fit")
+            .to_string();
+        assert!(err.contains("0 SNP(s) and 1 indel(s)"), "{err}");
+        assert!(err.contains("H1N1_HA:80 REF ACG, reference ACA"), "{err}");
+        assert!(!output.exists(), "no model is written");
+    }
+
+    /// Must not fire: a SNP at a contig edge has no trinucleotide context, so it is left out,
+    /// and like NEAT2 it is not counted. It is not a REF mismatch and must not refuse the fit.
+    #[test]
+    fn a_snp_at_a_contig_edge_is_left_out_uncounted() {
+        let edge = "H1N1_HA\t1\t.\tA\tG\t60\tPASS\t.\tGT\t0/1".to_string();
+        let (result, output, _dir) = run_with_good_snps(100, &[edge]);
         result.unwrap();
         let rate = MutationModel::from_file(&output).unwrap().mutation_rate;
         assert!(
             (rate - 100.0 / H1N1_NON_N).abs() < 1e-15,
-            "the mismatched SNP must not count toward mutation_rate: {rate} vs 100/13114"
+            "the edge SNP must not count: {rate} vs 100/13114"
         );
     }
 
-    /// An indel's REF is checked the same way: one with a wrong REF is left out, so the
-    /// model holds only the 100 SNPs and no indel at all.
-    #[test]
-    fn an_indel_whose_ref_disagrees_is_left_out() {
-        // POS 80-83 of H1N1_HA is ACAA; this record claims ACG.
-        let bad_indel = "H1N1_HA\t80\t.\tACG\tA\t60\tPASS\t.\tGT\t0/1".to_string();
-        let (result, output, _dir) = run_with_good_snps(100, &[bad_indel]);
-        result.unwrap();
-        let model = MutationModel::from_file(&output).unwrap();
-        assert!((model.mutation_rate - 100.0 / H1N1_NON_N).abs() < 1e-15);
-        assert_eq!(
-            model.variant_dist.weights().unwrap()[0],
-            1.0,
-            "with the indel left out, every counted variant is a SNP"
-        );
-    }
-
-    /// Above 1% the VCF and reference disagree too often to trust: 2 of 100 is refused,
-    /// naming both counts.
-    #[test]
-    fn a_ref_mismatch_rate_above_one_percent_is_refused() {
-        let (result, output, _dir) =
-            run_with_good_snps(98, &[wrong_ref_snp(1000), wrong_ref_snp(1003)]);
-        let err = result
-            .expect_err("2% mismatched must be refused")
-            .to_string();
-        assert!(err.contains("2 of 100"), "{err}");
-        assert!(!output.exists(), "no model is written");
-    }
-
+    /// Every SNP at a contig edge leaves no context information at all, so no model.
     #[test]
     fn a_vcf_whose_snps_are_all_unusable_builds_no_model() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let reference = PathBuf::from(format!("{}/test_data/references/H1N1.fa", manifest_dir));
         let out_dir = tempdir().unwrap();
-
-        // Position 22 of H1N1_HA is C and 25 is C; both records claim REF=A. Position 1 is
-        // a contig edge.
-        let vcf_path = out_dir.path().join("all_bad.vcf");
+        // POS 1 and the contig's last base are both edges: neither has a base on each side.
+        let last = h1n1_ha().len();
+        let last_base = h1n1_ha()[last - 1];
+        let vcf_path = out_dir.path().join("all_edge.vcf");
         std::fs::write(
             &vcf_path,
-            "##fileformat=VCFv4.1\n\
+            format!(
+                "##fileformat=VCFv4.1\n\
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n\
 H1N1_HA\t1\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t22\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n\
-H1N1_HA\t25\t.\tA\tG\t60\tPASS\t.\tGT\t0/1\n",
+H1N1_HA\t{last}\t.\t{last_base}\tN\t60\tPASS\t.\tGT\t0/1\n"
+            ),
         )
         .unwrap();
-
         let mutations = read_vcf(vcf_path).unwrap();
-        let output_file = out_dir.path().join("all_bad_model.json.gz");
+        let output_file = out_dir.path().join("all_edge_model.json.gz");
         let result = runner(&reference, mutations, HashMap::new(), &output_file);
         assert!(
             matches!(
                 result,
                 Err(GenMutationModelError::NoUsableSnps {
-                    counted: 3,
-                    ref_mismatch: 2,
-                    edge: 1
+                    counted: 2,
+                    edge: 2
                 })
             ),
-            "expected NoUsableSnps {{ 3, 2, 1 }}, got {result:?}"
+            "expected NoUsableSnps {{ 2, 2 }}, got {result:?}"
         );
-        assert!(!output_file.exists(), "no model file may be written");
+        assert!(!output_file.exists());
     }
 
-    // Must not fire: an indel-only VCF has no SNPs to use, and that is fine.
     #[test]
     fn an_indel_only_vcf_still_builds_a_model() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
