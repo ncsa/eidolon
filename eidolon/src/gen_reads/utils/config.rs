@@ -1005,12 +1005,16 @@ mod tests {
         assert_eq!(test_configuration.output_filename, "Hey.hey".to_string());
     }
 
+    // The warning check_and_log_config logs for overwrite_output is not asserted: the crate
+    // has no way to capture log output in a unit test. This checks only that the option
+    // is accepted.
     #[test]
-    fn test_overwrite_warn() {
+    fn test_overwrite_output_is_accepted() {
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
         config.overwrite_output = true;
         RunConfiguration::check_and_log_config(&mut config).unwrap();
+        assert!(config.overwrite_output);
     }
 
     #[test]
@@ -1018,12 +1022,20 @@ mod tests {
         // Verifies that check_and_log_config sets both fastq output paths when paired_ended=true
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
+        config.output_dir = PathBuf::from("/some/out_dir");
+        config.output_filename = "sample".to_string();
         config.paired_ended = true;
         config.fragment_mean = Some(100.0);
         config.fragment_st_dev = Some(10.0);
         RunConfiguration::check_and_log_config(&mut config).unwrap();
-        assert!(config.output_fastq_1.is_some());
-        assert!(config.output_fastq_2.is_some());
+        assert_eq!(
+            config.output_fastq_1,
+            Some(PathBuf::from("/some/out_dir/sample_r1.fastq.gz"))
+        );
+        assert_eq!(
+            config.output_fastq_2,
+            Some(PathBuf::from("/some/out_dir/sample_r2.fastq.gz"))
+        );
     }
 
     #[test]
@@ -1037,9 +1049,17 @@ mod tests {
         config.fragment_model = Some(PathBuf::from(
             "test_data/baseline_models/frag_length.canonical.json.gz",
         ));
+        config.output_dir = PathBuf::from("/some/out_dir");
+        config.output_filename = "sample".to_string();
         RunConfiguration::check_and_log_config(&mut config).unwrap();
-        assert!(config.output_fastq_1.is_some());
-        assert!(config.output_fastq_2.is_some());
+        assert_eq!(
+            config.output_fastq_1,
+            Some(PathBuf::from("/some/out_dir/sample_r1.fastq.gz"))
+        );
+        assert_eq!(
+            config.output_fastq_2,
+            Some(PathBuf::from("/some/out_dir/sample_r2.fastq.gz"))
+        );
     }
 
     #[test]
@@ -1207,11 +1227,19 @@ mod tests {
     fn test_vcf_and_bam_paths() {
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
+        config.output_dir = PathBuf::from("/some/out_dir");
+        config.output_filename = "sample".to_string();
         config.produce_vcf = true;
         config.produce_bam = true;
         RunConfiguration::check_and_log_config(&mut config).unwrap();
-        assert!(config.output_vcf.is_some());
-        assert!(config.output_bam.is_some());
+        assert_eq!(
+            config.output_vcf,
+            Some(PathBuf::from("/some/out_dir/sample.vcf.gz"))
+        );
+        assert_eq!(
+            config.output_bam,
+            Some(PathBuf::from("/some/out_dir/sample.bam"))
+        );
     }
 
     #[test]
