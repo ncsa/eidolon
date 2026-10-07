@@ -91,6 +91,9 @@ probe matcher drops zero-support probes@END { for (i = 1; i <= n; i++) print chr
 all-calls pass still filters (#541)@        filter_args=()@        filter_args=(--passonly)
 only one scoring pass happens (#541)@    TRUVARI_ALL_CALLS=1 run_truvari "$@"@    :
 all-calls overwrites the PASS-only result (#541)@        suffix="_allcalls"@        suffix=""
+query denominator reads missing keys as dropped@lacks TP-comp/FP)" >&2\n        return 0@lacks TP-comp/FP)" >&2\n        return 1
+query denominator result ignored by run_truvari@ || QUERY_FILTERED+=("${label}${suffix}")@ || true
+query denominator counts no non-PASS records@    nonpass=$(bcftools view -H -i 'FILTER!="PASS" && FILTER!="."' "$comp" 2>/dev/null | wc -l)@    nonpass=0
 MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]
@@ -138,7 +141,7 @@ fi
 
 # ── Load the functions under test, verbatim ────────────────────────────────────
 extract() { awk "/^$1\(\)/,/^}\$/" "$PIPELINE"; }
-for fn in truvari_metric selftest_truvari decoy_truvari comp_sample run_truvari run_truvari_both check_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage scaled_replicate_peak_gb reference_bp; do
+for fn in truvari_metric selftest_truvari decoy_truvari comp_sample run_truvari run_truvari_both check_denominator check_query_denominator split_truth_by_type check_binary_provenance prune_bams parse_lfs_quota_kb count_probe_hits report_query_coverage scaled_replicate_peak_gb reference_bp; do
     src="$(extract "$fn")"
     [[ -n "$src" ]] || { echo "FATAL: could not extract $fn from $PIPELINE"; exit 2; }
     eval "$src"
@@ -207,7 +210,8 @@ fp = len(ck - tk)
 recall = tp / len(tk) if tk else None
 prec = tp / len(ck) if ck else None
 json.dump({"recall": recall, "precision": prec,
-           "f1": None, "TP-base": tp, "FN": fn, "FP": fp}, open(outp, "w"))
+           "f1": None, "TP-base": tp, "TP-comp": len(ck & tk), "FN": fn, "FP": fp},
+          open(outp, "w"))
 PYSTUB
             return 0 ;;
     esac
@@ -726,6 +730,43 @@ is "the gap equals exactly one record of four" "0.250000" "$gap"
 echo "  -- and both filters reach the recall report, labelled --"
 has "report carries the PASS-only row" "$(cat "$OUTDIR/scorer_recall.tsv")" "f541_onefilt	PASS-only"
 has "report carries the all-calls row" "$(cat "$OUTDIR/scorer_recall.tsv")" "f541_onefilt	all-calls"
+
+echo "── check_query_denominator: the query side of the denominator (#511) ──"
+# Until this block the function was not extracted, so every run_truvari above called it as
+# an undefined command (rc 127) and pushed each stratum onto QUERY_FILTERED unasserted.
+# Known answers: the query is 4 records; "scored" is TP-comp + FP from summary.json.
+Q_NONPASS="$WORK/q_nonpass.vcf.gz"
+mk_vcf "$Q_NONPASS" LowQual
+zcat "$Q_NONPASS" | awk -F'\t' -v OFS='\t' '!/^#/{$7="LowQual"}1' > "$WORK/q_nonpass.vcf"
+bgzip -f -c "$WORK/q_nonpass.vcf" > "$Q_NONPASS"; bcftools index -f -t "$Q_NONPASS"
+is "fixture: every query record is non-PASS" 4 \
+   "$(bcftools view -H -i 'FILTER!="PASS"' "$Q_NONPASS" 2>/dev/null | wc -l)"
+QD="$WORK/qd"; mkdir -p "$QD"
+
+printf '{"recall": 0.0, "TP-base": 0, "FN": 4}\n' > "$QD/summary.json"
+outp="$(check_query_denominator "$Q_ALLPASS" "$QD" qd_nokeys 2>&1)"; rc=$?
+is  "summary without TP-comp/FP: not flagged as filtered" 0 "$rc"
+has "summary without TP-comp/FP: says UNVERIFIED"         "$outp" "UNVERIFIED"
+
+printf '{"recall": 0.0, "TP-base": 0, "TP-comp": 0, "FN": 4, "FP": 0}\n' > "$QD/summary.json"
+outp="$(check_query_denominator "$Q_NONPASS" "$QD" qd_none 2>&1)"; rc=$?
+is  "no query record scored: flagged"            1 "$rc"
+has "no query record scored: counts all 4"       "$outp" "scored NONE of its 4"
+has "no query record scored: blames --passonly"  "$outp" "--passonly (4 non-PASS)"
+
+printf '{"recall": 0.75, "TP-base": 3, "TP-comp": 3, "FN": 1, "FP": 1}\n' > "$QD/summary.json"
+outp="$(check_query_denominator "$Q_ALLPASS" "$QD" qd_full 2>&1)"; rc=$?
+is    "every query record scored: not flagged (must-not-fire)" 0 "$rc"
+hasnt "every query record scored: no coverage note"            "$outp" "query coverage"
+
+echo "  -- through run_truvari_both: only the pass that scored nothing is flagged --"
+QUERY_FILTERED=()
+STUB_MODE=filter run_truvari_both "$T541" qd_allfilt "$Q_NONPASS" >/dev/null 2>&1
+is "all-non-PASS query: PASS-only pass flagged, all-calls pass not" "qd_allfilt" \
+   "${QUERY_FILTERED[*]:-}"
+QUERY_FILTERED=()
+STUB_MODE=filter run_truvari_both "$T541" qd_allpass "$Q_ALLPASS" >/dev/null 2>&1
+is "all-PASS query: nothing flagged (must-not-fire)" "" "${QUERY_FILTERED[*]:-}"
 
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"

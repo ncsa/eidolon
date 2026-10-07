@@ -1,8 +1,8 @@
 # Pre-release gate: run the tests CI cannot normally reach.
 #
-# WHY THIS EXISTS: six tests in this repo are `#[ignore]`d because they need external
-# tools — bwa-mem2 for the realigned SV gates, samtools/bcftools for the validate
-# differential. `cargo test` skips them, CI reports green, and nobody notices when one
+# WHY THIS EXISTS: some tests in this repo are `#[ignore]`d because they need external
+# tools — bwa-mem2 for the realigned SV gates and the transition-matrix round trip,
+# samtools/bcftools for the golden-BAM NM check and the validate differential. `cargo test` skips them, CI reports green, and nobody notices when one
 # breaks. `gate2_realigned_dup` was red on develop AND main through an entire release
 # before anyone ran it by hand (#582). An ignored test that nothing ever runs is not a
 # test, it is a comment.
@@ -137,7 +137,7 @@ jobs:
         samtools --version | head -1
         bcftools --version | head -1
 
-    # --ignored runs ONLY the ignored tests: the five realigned SV gates and the
-    # validate differential. --no-fail-fast so one failing gate does not conceal the rest.
+    # --ignored runs ONLY the ignored tests: the realigned SV gates, the transition-matrix
+    # round trip, the golden-BAM NM check and the validate differential. --no-fail-fast so one failing gate does not conceal the rest.
     - name: Run the ignored tests (realigned SV gates + validate differential)
       run: cargo test --workspace --no-fail-fast -- --ignored --nocapture
