@@ -540,6 +540,42 @@ H1N1_HA\t80\t.\tACAA\tA\t60\tPASS\t.\tGT\t0/1\n",
     // H1N1.fa has 13114 non-N bases (4373 A + 2538 C + 3186 G + 3017 T).
     const H1N1_NON_N: f64 = 13114.0;
 
+    /// The variant-type shares follow the observed counts, in the order SNP, insertion,
+    /// deletion. Unequal counts (1 SNP, 2 insertions, 1 deletion) make a swapped pair visible,
+    /// which one of each type cannot.
+    #[test]
+    fn variant_shares_follow_the_observed_counts() {
+        let seq = h1n1_ha();
+        let ins = |pos: usize| {
+            let r = seq[pos - 1];
+            format!("H1N1_HA\t{pos}\t.\t{r}\t{r}AG\t60\tPASS\t.\tGT\t0/1")
+        };
+        let del_ref: String = seq[399..402].iter().collect();
+        let del = format!(
+            "H1N1_HA\t400\t.\t{del_ref}\t{}\t60\tPASS\t.\tGT\t0/1",
+            seq[399]
+        );
+        let (result, output, _dir) = run_with_good_snps(1, &[ins(200), ins(300), del]);
+        result.unwrap();
+        let model = MutationModel::from_file(&output).unwrap();
+        assert_eq!(
+            model.variant_dist.values().unwrap(),
+            vec![
+                VariantType::SNP,
+                VariantType::Insertion,
+                VariantType::Deletion
+            ]
+        );
+        // Cumulative: SNP 1/4, insertions 2/4, deletion 1/4.
+        let cumulative = model.variant_dist.weights().unwrap();
+        for (got, want) in cumulative.iter().zip([0.25, 0.75, 1.0]) {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "cumulative weights {cumulative:?}"
+            );
+        }
+    }
+
     /// Must not fire: every REF matches, so every SNP is counted.
     #[test]
     fn snps_whose_ref_matches_are_all_counted() {
