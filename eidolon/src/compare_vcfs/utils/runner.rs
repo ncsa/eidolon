@@ -578,6 +578,24 @@ mod tests {
     }
 
     #[test]
+    fn classify_requires_the_alt_to_match() {
+        // Same position and REF, different ALT: the caller found a variant at the right
+        // place but called the wrong allele. That is a miss and a false call, not a TP.
+        let mut g = HashMap::new();
+        g.insert(
+            "chr1".into(),
+            vec![snp(10, Nucleotide::A, Nucleotide::C, Some("PASS"))],
+        );
+        let mut c = HashMap::new();
+        c.insert(
+            "chr1".into(),
+            vec![snp(10, Nucleotide::A, Nucleotide::T, Some("PASS"))],
+        );
+        let (_per, tot) = aggregate(&classify(&g, &c));
+        assert_eq!((tot.tp, tot.fn_, tot.fp), (0, 1, 1));
+    }
+
+    #[test]
     fn classify_mixed() {
         // golden has (10,A,C) and (20,G,T); called has (10,A,C) and (30,T,A).
         // → 1 TP, 1 FN, 1 FP.
