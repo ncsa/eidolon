@@ -7,9 +7,9 @@
 > NEAT lineage. The deprecated `rneat` alias was removed in v4.0.0; invoke `eidolon`.
 > See `CHANGELOG.md`.
 
-> **Upgrading from 2.0.0 → 3.0.0? The names of emitted output tokens changed.**
-> See [Upgrading from 2.0.0](docs-site/src/upgrading/from-2-0-0.md) — **read it if you have
-> any script that parses eidolon VCFs or FASTQ/BAM read names.**
+> **Upgrading from 3.x → 4.0.0?** Unknown config keys now stop the run, the `rneat` alias is
+> gone, and `gen-mut-model` refuses a VCF that disagrees with its reference. See
+> [Upgrading from 3.x](docs-site/src/upgrading/from-3.md).
 
 `eidolon` is a Rust port of [NEAT](https://github.com/ncsa/neat): it simulates FASTQ that
 looks like it came off a sequencer and carries your data's statistical properties, alongside
@@ -82,6 +82,7 @@ The pages are plain Markdown and readable directly on GitHub. Start at
 | [Cancer simulation how-to](docs/cancer_howto.md) | copy-paste tumor/normal guide |
 | [Model builders](docs-site/src/models/mutation-model.md) | mutation, sequencing error, GC bias, fragment length |
 | [Versioning and the public API](docs-site/src/reference/versioning.md) | what a MAJOR bump protects |
+| [Upgrading from 3.x](docs-site/src/upgrading/from-3.md) | the v4.0.0 compatibility changes |
 | [Upgrading from 2.0.0](docs-site/src/upgrading/from-2-0-0.md) | the v3.0.0 token rename |
 
 ## Citing

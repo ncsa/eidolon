@@ -60,6 +60,7 @@
 
 # Upgrading
 
+- [Upgrading from 3.x](upgrading/from-3.md)
 - [Upgrading from 2.0.0](upgrading/from-2-0-0.md)
 
 ---
