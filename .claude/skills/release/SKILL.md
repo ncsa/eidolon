@@ -15,16 +15,28 @@ procedure exists because v3.2.0 was declared shipped while it was missing its ma
 
 ## Which branch
 
+Everything flows one way: `develop` → `main`. Nothing is merged from `main` back into
+`develop` (decided 2026-10-08, from v4.0.0 on).
+
 | change | branch from | PR targets |
 |---|---|---|
 | normal feature / fix | `develop` | `develop` |
-| release cut | `develop` | `main` |
-| **post-release fix** | **`main`** | **`main`** |
+| release prep (version bump, CHANGELOG) | `develop` | `develop` |
+| the release itself | — | `develop` → `main` |
+| conda sha256 follow-up | `develop` | `develop` |
+| **post-release fix (hotfix)** | **`develop`** | **`develop`, then `develop` → `main` as a release** |
 
-A post-release fix is cut from `main` and carries **only** that fix. Do not merge `develop`
-into `main` to deliver one — that drags in everything else that landed since, and the user
-has said so explicitly. Confirm the scope with `git diff --stat origin/main..HEAD` before
-opening the PR and state the file count in the PR body.
+**A hotfix ships everything on `develop`,** not just the fix: the `develop` → `main` PR carries
+whatever has merged since the last release. That is accepted. It means `develop` has to stay
+releasable, and the hotfix's release notes cover every change it delivers, not only the fix.
+**Version it by what it ships, under `versioning.md`:** a hotfix that carries a new feature
+from `develop` is a MINOR release, and one carrying a breaking change is MAJOR, whatever the fix
+itself would have been.
+Confirm the scope with `git log --first-parent --merges origin/main..origin/develop` and say it
+in the release PR.
+
+The old flow (release branch straight to `main`, then merge `main` back) left `develop` without
+the version bump and broke `Cargo.lock` on the merge-back. Bumping on `develop` removes both.
 
 ## Sequence
 
@@ -69,7 +81,8 @@ opening the PR and state the file count in the PR body.
    Remove with `git rm`, since `.gitignore` does not apply to already-tracked files. Check
    this on the release PR, not after the tag.
 
-3. **Bump the version in both places**, then refresh the lockfile:
+3. **Release prep PR into `develop`.** Branch `release/vX.Y.Z` from `develop`. Bump the version
+   in both places, then refresh the lockfile:
    ```bash
    sed -i "s/^version = '<old>'/version = '<new>'/" Cargo.toml        # [workspace.package]
    sed -i 's/{% set version = "<old>" %}/{% set version = "<new>" %}/' conda-recipe/meta.yaml
@@ -80,9 +93,13 @@ opening the PR and state the file count in the PR body.
    line, `=========`, then `## eidolon vX.Y.Z — <short title>`. Lead with what changed for a
    user. If the binary is unchanged, that is the first sentence.
 
-5. **PR, wait for green, and let the user merge.** Merging is theirs: `--admin` bypasses
-   branch protection and is blocked in this environment anyway. `release-blockers` runs only
-   on `main`-targeted PRs — on a develop PR it reports `SKIPPED`, which is not a pass.
+5. **Two PRs, each green, each merged by the user.** Merging is theirs: `--admin` bypasses
+   branch protection and is blocked in this environment anyway.
+   - The release prep PR (`release/vX.Y.Z` → `develop`).
+   - Then the release: `develop` → `main`, opened once the prep PR is confirmed on
+     `origin/develop`. Its diff should be exactly what `develop` holds; there is nothing to
+     resolve. `release-blockers` runs only on `main`-targeted PRs — on the prep PR it reports
+     `SKIPPED`, which is not a pass, so read it on the release PR.
 
 6. **Tag from `main` after the merge**, never from the branch:
    ```bash
@@ -125,18 +142,13 @@ opening the PR and state the file count in the PR body.
    ```bash
    curl -sL https://github.com/ncsa/eidolon/archive/refs/tags/vX.Y.Z.tar.gz | sha256sum
    ```
-   Put it in `conda-recipe/meta.yaml`, PR to `main`.
+   Put it in `conda-recipe/meta.yaml`, PR to **`develop`**. It reaches `main` with the next
+   release. The tagged commit can never contain its own tarball's hash, so the in-repo recipe
+   always lags by one step; nothing builds from `main`'s copy (Bioconda's recipe is updated
+   separately).
 
-10. **Merge back so `develop` has the bump**, or its next release cut starts from a stale
-   version. **Then run `cargo check --workspace` and commit whatever it does to
-   `Cargo.lock`** — a workspace member that exists only on `develop` inherits the workspace
-   version but is absent from the branch that bumped it, so the merge leaves its lock entry
-   on the old version and `cargo fetch --locked` refuses the result. Verify with the CI
-   command itself before pushing:
-   ```bash
-   cargo check --workspace && cargo fetch --locked
-   git status --short   # a modified Cargo.lock here means it is not committed yet
-   ```
+10. **No merge-back.** `develop` already has the bump, so nothing comes back from `main`.
+    Confirm the release landed with `git merge-base --is-ancestor <develop-sha> origin/main`.
 
 11. **Report** the tag, the asset count, whether the docs site serves, and anything not
     verified. Update the release ticket to match, link it from the release notes, and
