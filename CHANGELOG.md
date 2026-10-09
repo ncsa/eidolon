@@ -1,3 +1,101 @@
+10/8/2026
+=========
+## eidolon v4.0.0 — stricter inputs, and fixes that change output
+
+A major version because three things you may depend on now behave differently: config files
+with keys a subcommand does not read are refused, the `rneat` command is gone, and
+`gen-mut-model` refuses a VCF that disagrees with its reference. Each stops a run that used to
+complete, and each says what to change. **See [Upgrading from 3.x](docs-site/src/upgrading/from-3.md).**
+
+The rest are fixes, several of which change output for the inputs they affect: soft-masked
+references, `input_vcf` deletions next to symbolic SVs, capped sequencing-error fits, and the
+bundled tumor models.
+
+**Output is otherwise unchanged at the same seed.** Checked on H1N1 (uppercase reference, no
+`input_vcf`): v3.5.1 and v4.0.0 write byte-identical FASTQs and truth VCF, and the same BAM
+records apart from the new `NM` tag.
+
+### Compatibility (breaking)
+
+- **Unknown config keys stop the run** (#496). Every top-level key, and the nested `adapters:`,
+  `frag_length:` and `gc_bias:` sections, must be one the subcommand reads. The error names the
+  key, the nearest accepted key, and the full list; for a NEAT config, `gen-reads` names the
+  eidolon equivalent where one exists. An unread key used to be ignored silently:
+  `tumor_mutation_model:` (meant as `tumor_model:`) simulated the tumor with the germline model
+  and reported success. Every rejected key had no effect, so the fix is to remove or rename it.
+  The release shakeout itself had been writing `fragment_length_model:`, which nothing read; it
+  now writes `fragment_model:`.
+- **The `rneat` command is removed** (#710). It was renamed to `eidolon` in v2.0.0 and kept as a
+  deprecated alias. Release binaries never included it; conda installs did. Invoke `eidolon`.
+- **`gen-mut-model` refuses a VCF whose REF disagrees with the reference** (#826). It stops at
+  the first SNP or indel whose REF does not match the reference there, names the record and both
+  bases, and gives the command to drop such records deliberately:
+  `bcftools norm -f reference.fa --check-ref x in.vcf.gz -Oz -o checked.vcf.gz`. NEAT2 stopped
+  the same way for SNPs. eidolon used to warn and skip a mismatched SNP but still count it toward
+  the mutation rate, and never checked indels. A SNP at a contig edge is now also left out of the
+  rate, as in NEAT2. A `bed_file` that names no reference contig now says so, listing both sets
+  of names, instead of failing with "Unknown error".
+
+### Fixed: changes to generated output
+
+- **Soft-masked references simulate exactly like uppercase ones** (#790). Lowercase bases now
+  parse as plain bases. Context-weighted SNP placement used to miss the model in masked
+  sequence, roughly half of a UCSC-style human reference, and fall back to the mean weight; SV
+  REF and breakend anchor bases were written lowercase in the truth VCF.
+- **A literal deletion crossing a symbolic SV's boundary no longer inflates coverage** (#691).
+  When a deletion of 50 bp or more ran past the end of its sub-region, reads were drawn from the
+  deletion to the end of the contig: +48% R1 reads on the ecoli test case. Affects `input_vcf`
+  runs that combine literal deletions with `<DUP>`/`<DEL>`/`<CNV>` records.
+- **The bundled COSMIC tumor models are rebuilt** (#761) with the current builder. Only the
+  per-context SNV placement weights moved, by −7.4% to +12.9% per context, so
+  `gen-cancer-reads` places somatic SNVs slightly differently. All seven were run end to end:
+  each model's simulated spectrum matches its own weights (r ≥ 0.997).
+
+### Fixed: model fitting
+
+- **`max_reads` samples the whole FASTQ** (#721). `gen-seq-error-model` took the first N
+  records, which come from one tile of one lane; it now keeps a uniform, reproducible sample
+  across the file. A capped fit therefore reads the whole file and takes longer, and it gives a
+  different model, one that describes the whole library.
+- **A one-sided indel VCF keeps its fitted lengths** (#766). An insertions-only (or
+  deletions-only) training VCF used to discard both fitted length distributions; now only the
+  unobserved type uses its default, with a warning.
+
+### Added
+
+- **Golden BAM records carry `NM`** (#536), the edit distance to the reference, counted as
+  `samtools calmd` counts it. `samtools stats` and MultiQC used to report a 0 error rate for any
+  simulated BAM.
+
+### Fixed: errors and crashes
+
+- **`filter-reads` accepts plain `.fastq`/`.vcf` and dotted directories** (#824). A plain file
+  panicked with a subtraction overflow, and a dot in a directory name rebuilt the wrong path.
+  Output is always gzip-compressed, so a plain input's output gains `.gz`.
+- **`gen-seq-error-model` names the cause when a BAM's MD tags disagree with its reads** (#767),
+  with a `samtools calmd` fix, instead of failing as a bare `InvalidWeights`. A mate population
+  with no bases is refused by name.
+- **A correct breakend no longer warns about a missing END/SVLEN** (#497). A `<DEL>` or other
+  span-requiring SV without one still does.
+
+### Testing
+
+A test-adequacy audit (#819) made 22 unit tests assert content instead of existence, tested
+`check_query_denominator`, and added mutation checks across the decisions behind quoted
+numbers; two gaps it found are pinned (`compare-vcfs` requires the ALT to match; mutation-model
+variant shares follow observed counts). Four `sv_pipeline.sbatch` functions remain untested
+(#825).
+
+### Not verified for this release
+
+- The `gen-mut-model` REF check (#826) and the `filter-reads` fix (#824) were tested on fixtures,
+  not run on real data.
+- De novo breakends share #497's code path but no test runs them.
+- The rebuilt tumor models' SV components were not exercised end to end (#761 reports they did
+  not change).
+
+Release ticket: #816.
+
 10/1/2026
 =========
 ## eidolon v3.5.1 — release binaries run under their download name
