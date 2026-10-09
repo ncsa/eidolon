@@ -1,6 +1,7 @@
 // This is the run configuration for this particular run, which holds the parameters needed by the
 // various side functions. It is build with a ConfigurationBuilder, which can take either a
 // config yaml file or command line arguments and turn them into the configuration.
+use crate::config_keys::check_keys;
 use crate::gen_mut_model::errors::GenMutationModelError;
 use eidolon_core::{
     file_tools::{bed_reader::read_bed, vcf_tools::read_vcf_lean},
@@ -11,6 +12,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::string::String;
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "bed_file",
+    "output_file",
+    "overwrite_output",
+    "reference",
+    "transition_matrix_file",
+    "vcf_file",
+];
 
 #[derive(Debug, Clone)]
 pub struct RunConfiguration {
@@ -41,6 +52,13 @@ impl RunConfiguration {
         let scrape_config: HashMap<String, Value> =
             serde_yml::from_reader(file).expect("Error reading yaml file!");
         // Fill in the bed_file first, all hinges on that
+        if let Err(msg) = check_keys(
+            scrape_config.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "gen-mut-model",
+        ) {
+            panic!("{msg}")
+        }
         let reference = PathBuf::from(scrape_config["reference"].as_str().unwrap());
         if !reference.is_file() {
             panic!("Invalid reference file {:?}", reference)
@@ -94,34 +112,6 @@ impl RunConfiguration {
     }
 }
 
-pub fn create_map_item(
-    split_string: Vec<&str>,
-    raw_string: &str,
-    length: usize,
-    filter_key: &str,
-) -> (PathBuf, PathBuf) {
-    let old_element = split_string[length - 3];
-    let new_element = format!("{old_element}{filter_key}");
-    let mut output_name = String::new();
-    // stop one short of the end
-    for i in 0..length - 1 {
-        if i == length - 3 {
-            output_name.push_str(&new_element);
-            output_name.push('.');
-        } else {
-            output_name.push_str(split_string[i]);
-            output_name.push('.');
-        }
-    }
-    // End with the last extension with no traling dot.
-    output_name.push_str(split_string[length - 1]);
-    let temp_path = PathBuf::from(raw_string);
-    if !temp_path.is_file() {
-        panic!("Input file not found! {:?}", temp_path)
-    }
-    (temp_path, PathBuf::from(output_name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,8 +154,27 @@ mod tests {
     /// value. Those must keep working after the option's removal.
     #[test]
     fn an_empty_transition_matrix_file_key_is_accepted() {
-        assert!(config_with("transition_matrix_file:\n").is_ok());
-        assert!(config_with("transition_matrix_file: .\n").is_ok());
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        for extra in ["transition_matrix_file:\n", "transition_matrix_file: .\n"] {
+            let config = config_with(extra).unwrap();
+            // The rest of the config is parsed as if the key were absent.
+            assert_eq!(
+                config.reference,
+                PathBuf::from(format!("{manifest_dir}/test_data/references/H1N1.fa"))
+            );
+            assert_eq!(config.output_file.file_name().unwrap(), "model.json.gz");
+            assert!(config.overwrite_output);
+            assert!(config.bed_table.is_empty());
+            // small_snps.vcf: three H1N1_HA SNPs at POS 22, 25, 28. The lean reader keeps
+            // POS 1-based; the runner subtracts one before indexing the reference.
+            assert_eq!(config.mutations.len(), 1);
+            let mut locations: Vec<usize> = config.mutations["H1N1_HA"]
+                .iter()
+                .map(|v| v.location)
+                .collect();
+            locations.sort_unstable();
+            assert_eq!(locations, vec![22, 25, 28]);
+        }
     }
 
     /// A value means the user expects the matrix to shape the model. It never did,

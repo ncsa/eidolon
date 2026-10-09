@@ -1,3 +1,4 @@
+use crate::config_keys::check_keys;
 use crate::gen_frag_length_model::errors::GenFragLengthModelError;
 use crate::gen_frag_length_model::utils::runner::DistributionKind;
 use eidolon_core::file_tools::file_io::check_overwrite;
@@ -5,6 +6,15 @@ use serde_yml::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+
+/// Every top-level key the config parser reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "distribution",
+    "input_file",
+    "min_reads",
+    "output_file",
+    "overwrite_output",
+];
 
 #[derive(Debug, Clone)]
 pub struct RunConfiguration {
@@ -33,6 +43,12 @@ impl RunConfiguration {
         })?;
         let scrape_config: HashMap<String, Value> = serde_yml::from_reader(f)
             .map_err(|e| GenFragLengthModelError::ConfigurationError(e.to_string()))?;
+        check_keys(
+            scrape_config.keys().map(String::as_str),
+            KNOWN_KEYS,
+            "gen-frag-length-model",
+        )
+        .map_err(GenFragLengthModelError::ConfigurationError)?;
 
         let input_file = PathBuf::from(
             scrape_config

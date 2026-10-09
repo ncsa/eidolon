@@ -298,7 +298,9 @@ pub fn run_neat(
             .iter()
             .filter_map(|name| reference.get(name).map(|s| (name.clone(), s.len())))
             .collect();
-        Some(Arc::new(BamContext::new(&contig_lengths)))
+        Some(Arc::new(
+            BamContext::new(&contig_lengths).with_reference(Arc::clone(&reference)),
+        ))
     } else {
         None
     };
@@ -1058,21 +1060,14 @@ fn process_chunk(
                     // exists to get right. The extra width is what lets a fragment
                     // BEGIN inside inserted sequence, which reference coordinates
                     // cannot express at all.
-                    let h = &haplotypes[hap_idx];
-                    let hap_start = h
-                        .map
-                        .reference_base_to_haplotype(sub_start)
-                        .unwrap_or(sub_start);
-                    // sub_end is exclusive, so project the last included base and add
-                    // one; projecting sub_end itself would fall off the contig end.
-                    let hap_end = h
-                        .map
-                        .reference_base_to_haplotype(sub_end.saturating_sub(1))
-                        .map(|p| p + 1)
-                        .unwrap_or_else(|| h.map.haplotype_len());
-                    let hap_span = hap_end.saturating_sub(hap_start);
+                    let (hap_start, hap_span, hap_extension) = alt_haplotype_window(
+                        &haplotypes[hap_idx].map,
+                        sub_start,
+                        sub_end,
+                        materializable_end,
+                    );
                     let alt_frags = generate_fragments(
-                        extension_budget,
+                        hap_extension,
                         hap_span,
                         ctx.config.read_len,
                         hap_start,
@@ -3647,11 +3642,44 @@ fn suppress_junction_double_count(
     Ok(kept)
 }
 
+/// Where an alt haplotype is sampled for reference sub-region `[sub_start, sub_end)`:
+/// `(hap_start, hap_span, extension_budget)` in haplotype coordinates.
+///
+/// Both ends go through the map rather than being shifted by hand: the span grows by every
+/// insertion inside it and shrinks by every deletion. The extension budget is measured on
+/// the haplotype too, from the window's end to `materializable_end` projected the same way,
+/// so a fragment can run into the haplotype that follows but never past its end.
+///
+/// A deletion anchored inside the sub-region can run past `sub_end`. Projecting
+/// `sub_end - 1` then hit a deleted base, and the fallback to `haplotype_len()` sampled the
+/// alt haplotype all the way to the end of the contig (#691).
+fn alt_haplotype_window(
+    map: &InsertionCoordinateMap,
+    sub_start: usize,
+    sub_end: usize,
+    materializable_end: usize,
+) -> (usize, usize, usize) {
+    let hap_len = map.haplotype_len();
+    let hap_start = map
+        .reference_base_to_haplotype(sub_start)
+        .unwrap_or(sub_start)
+        .min(hap_len);
+    let hap_end = map
+        .reference_end_to_haplotype(sub_end)
+        .unwrap_or(hap_len)
+        .max(hap_start);
+    let hap_limit = map
+        .reference_end_to_haplotype(materializable_end)
+        .unwrap_or(hap_len)
+        .max(hap_end);
+    (hap_start, hap_end - hap_start, hap_limit - hap_end)
+}
+
 /// Builds a sorted, contiguous list of `(start, end, multiplier)` coverage
 /// segments spanning `[0, block_end)`. Default multiplier is `1.0`; each
 /// symbolic SV multiplies the multiplier in its span (overlapping SVs compose
-/// multiplicatively). SVs without a usable span (no END / SVLEN) or with a
-/// multiplier of `1.0` are skipped silently.
+/// multiplicatively). Breakends and SVs with a multiplier of `1.0` are skipped; an
+/// SV without a usable span (no END / SVLEN) is skipped with a warning.
 fn build_coverage_multipliers(
     sv_variants: &[Variant],
     ploidy: usize,
@@ -3671,6 +3699,13 @@ fn build_coverage_multipliers(
         // Convert the 0-based-stored location back to the VCF's 1-based POS
         // so SvData::span() (which expects 1-based) returns the right count.
         let pos_1based = v.location.saturating_add(1);
+        if sv.sv_type == SvType::Bnd {
+            // A breakend is a point (VCF 4.2 §5.4) with no copy-number change, so it has
+            // no span to modulate. Missing END/SVLEN is expected here, not a defect in the
+            // input, and the warning below is for SVs that should have one (#497).
+            debug!("Breakend at 1-based POS {pos_1based}: a point event, no coverage modulation");
+            continue;
+        }
         let span_bases = match sv.span(pos_1based) {
             Some(n) if n > 0 => n,
             _ => {
@@ -3908,6 +3943,48 @@ fn intersect_with_bed(
 #[cfg(test)]
 mod tests {
 
+    /// #691 known answer. 10,000 bp reference, sub-region `[2_000, 5_000)`, real sequence to
+    /// the contig end. A 500 bp deletion anchored at 4_799 removes reference
+    /// `[4_800, 5_300)`, straddling `sub_end`. The window must end where the deletion sits
+    /// (haplotype 4_800), and extend over the remaining haplotype, `9_500 - 4_800`.
+    /// Before the fix it ended at `haplotype_len()`, 9_500, with the reference-space budget
+    /// of 5_000 on top: planned fragments could end 5 kb past the molecule.
+    #[test]
+    fn alt_window_stops_where_a_straddling_deletion_sits() {
+        let map = InsertionCoordinateMap::with_deletions(10_000, [], [(4_799, 500)]).unwrap();
+        assert_eq!(map.haplotype_len(), 9_500);
+        let (start, span, ext) = alt_haplotype_window(&map, 2_000, 5_000, 10_000);
+        assert_eq!((start, span, ext), (2_000, 2_800, 4_700));
+        assert!(start + span + ext <= map.haplotype_len());
+    }
+
+    /// MUST NOT FIRE: a deletion wholly inside the sub-region leaves the window as it always
+    /// was: the sub-region shrunk by the deletion, and the reference-space budget unchanged.
+    #[test]
+    fn alt_window_for_a_contained_deletion_is_unchanged() {
+        let map = InsertionCoordinateMap::with_deletions(10_000, [], [(2_999, 500)]).unwrap();
+        let (start, span, ext) = alt_haplotype_window(&map, 2_000, 5_000, 8_000);
+        assert_eq!((start, span, ext), (2_000, 2_500, 3_000));
+    }
+
+    /// The invariant itself: no window plus its budget runs past the haplotype, wherever the
+    /// deletion falls relative to the sub-region's end and the materializable end.
+    #[test]
+    fn alt_window_never_runs_past_the_haplotype() {
+        for anchor in (2_000..9_400).step_by(37) {
+            let map = InsertionCoordinateMap::with_deletions(10_000, [], [(anchor, 500)]).unwrap();
+            for (sub_end, mat_end) in [(5_000, 10_000), (5_000, 5_200), (9_000, 9_600)] {
+                let (start, span, ext) = alt_haplotype_window(&map, 2_000, sub_end, mat_end);
+                assert!(
+                    start + span + ext <= map.haplotype_len(),
+                    "anchor {anchor}, sub_end {sub_end}, materializable_end {mat_end}: \
+                     window {start}+{span}+{ext} past haplotype {}",
+                    map.haplotype_len()
+                );
+            }
+        }
+    }
+
     /// `fragment_tail_pad` continues the last piece in the piece's OWN orientation. Known
     /// answer on `ACGTTGCA` (0-based): a forward piece `[2, 4)` = `GT` continues with
     /// `REF[4..7]` = `TGC`; a reverse-complemented piece `[4, 6)` reads `rc(TG)` = `CA` and
@@ -4033,14 +4110,21 @@ mod tests {
         }
     }
 
-    /// Degenerate case: a fragment no longer than the read cannot honour the floor on both
-    /// sides. It must still return a usable offset rather than panic or return 0.
+    /// The shortest fragment a short-read caller passes is the read itself (shorter draws are
+    /// raised to `read_len + 10`). Even there both pieces fit above the `read_len / 4` floor,
+    /// so the floor must hold on both sides, not merely yield an offset of at least 1.
     #[test]
     fn balanced_chimeric_offset_survives_a_fragment_no_longer_than_the_read() {
         let mut rng = NeatRng::new_from_seed(&vec!["degenerate".to_string()]).unwrap();
+        let (frag_len, read_len) = (151usize, 151usize);
+        let floor = read_len / 4;
         for _ in 0..100 {
-            let off = balanced_chimeric_offset(151, 151, &mut rng).unwrap();
-            assert!(off >= 1, "offset must be at least 1, got {off}");
+            let off = balanced_chimeric_offset(frag_len, read_len, &mut rng).unwrap();
+            assert!(
+                off >= floor && frag_len - off >= floor,
+                "offset {off} leaves pieces of {off} and {} bp, below the {floor} bp floor",
+                frag_len - off
+            );
         }
     }
 

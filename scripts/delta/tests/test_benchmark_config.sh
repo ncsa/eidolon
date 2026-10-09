@@ -15,6 +15,45 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH="${BENCH:-$HERE/../benchmark.sbatch}"
 SUITE="${SUITE:-$HERE/../regression_suite.sh}"
 
+# --mutate: break each guarded line in a copy of the script it lives in, and require this
+# suite to fail against the copy. Each row is label@BENCH|SUITE@from@to (#755).
+if [[ "${1:-}" == "--mutate" ]]; then
+    MWORK="$(mktemp -d)"; trap 'rm -rf "$MWORK"' EXIT
+    survived=0
+    while IFS='@' read -r label target from to; do
+        [[ -n "$label" ]] || continue
+        case "$target" in
+            BENCH) src="$BENCH" ;;
+            SUITE) src="$SUITE" ;;
+            *) printf '  ERROR    %-52s unknown target %s\n' "$label" "$target"; survived=$((survived+1)); continue ;;
+        esac
+        cp "$src" "$MWORK/mutant"
+        FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/' "$MWORK/mutant"
+        if cmp -s "$src" "$MWORK/mutant"; then
+            printf '  ERROR    %-52s mutation did not apply\n' "$label"; survived=$((survived+1)); continue
+        fi
+        if env "$target=$MWORK/mutant" bash "$0" >/dev/null 2>&1; then
+            printf '  SURVIVED %-52s <- nothing caught this\n' "$label"; survived=$((survived+1))
+        else
+            printf '  caught   %s\n' "$label"
+        fi
+    done <<'MUTS'
+REPS ignores the environment@BENCH@REPS="${REPS:-3}"@REPS=3
+GENOMES ignores the environment@BENCH@GENOMES=(${GENOMES:-@GENOMES=(${IGNORED_GENOMES:-
+size reads the symlink, not its target@BENCH@stat -Lc%s@stat -c%s
+size unknown reported as 0@BENCH@2>/dev/null)" || return 0@2>/dev/null)" || { echo 0; return 0; }
+NEAT cap fails open on unknown size@BENCH@if [[ -z "$sz_mb" ]]; then@if false; then
+cap of 0 no longer disables NEAT@BENCH@if (( neat_cap_mb <= 0 )); then@if (( neat_cap_mb < 0 )); then
+NEAT cap never trips@BENCH@if (( sz_mb > neat_cap_mb )); then@if (( sz_mb > neat_cap_mb * 1000 )); then
+TSV size loses its decimal@BENCH@size_mb="$(genome_size_mb "$fasta" '%.1f')"@size_mb="$(genome_size_mb "$fasta")"
+perf arm runs every genome@SUITE@GENOMES="ecoli:$DATA/ecoli.fa chr22:$DATA/chr22.fa" \@REPS=3 \
+perf arm keeps the NEAT comparison@SUITE@NEAT_MAX_GENOME_MB=0 SCALING_THREAD_MODES=1@SCALING_THREAD_MODES=1
+gate collects only ecoli@SUITE@for gg in ecoli chr22; do@for gg in ecoli; do
+MUTS
+    echo
+    [[ "$survived" -eq 0 ]] && { echo "all mutations caught"; exit 0; } || { echo "$survived survived"; exit 1; }
+fi
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL  %s\n     expected: %s\n     actual:   %s\n' "$1" "$2" "$3"; }

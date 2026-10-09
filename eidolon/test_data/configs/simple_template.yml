@@ -10,7 +10,6 @@ fragment_st_dev: .
 
 produce_bam: .
 produce_vcf: .
-produce_fasta: .
 produce_fastq: .
 
 overwrite_output: .

@@ -172,7 +172,7 @@ output_filename: shakeout
 overwrite_output: true
 rng_seed: shakeout v1.7.0
 mutation_model: $WORK/mut_model.json.gz
-fragment_length_model: $WORK/frag_model.json.gz
+fragment_model: $WORK/frag_model.json.gz
 gc_bias_model: $WORK/gc_model.json.gz
 EOF
 /usr/bin/time -v "$RNEAT" gen-reads -c "$WORK/reads.yml" 2> "$WORK/reads.time"

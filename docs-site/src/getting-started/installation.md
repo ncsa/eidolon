@@ -169,4 +169,6 @@ Rust will download any required packages. Compiling Rust code is the slowest par
 ```bash
 ~/eidolon/$ ./target/release/eidolon -c /path/to/filled/in/config.yml
 ```
+
+Every key in a config file must be one the subcommand reads. An unknown key stops the run before it starts, with an error naming the key, the nearest accepted key when one is close, and the full list of accepted keys. That covers a typo (`tumor_mutation_model:` for `tumor_model:`), a key belonging to a different subcommand, and keys from a NEAT config, for which `gen-reads` names the eidolon equivalent where one exists. An unread key used to be ignored, leaving its setting at the default without warning. The templates in `template_config/` list every key each subcommand accepts.
 If you record the output in the logs of Seed string to regenerate these exact results: XXXXXXX, you should be able to use that string as input with rng_seed and reproduce your results.

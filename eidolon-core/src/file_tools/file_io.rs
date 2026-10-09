@@ -167,7 +167,8 @@ mod tests {
         assert!(!path.exists());
         let mut f = create_output_file(&path, false).unwrap();
         f.write_all(b"data").unwrap();
-        assert!(path.exists());
+        drop(f);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "data");
     }
 
     #[test]

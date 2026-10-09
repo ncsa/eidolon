@@ -1606,7 +1606,7 @@ pub fn sample_novel_insertion_bases(
     let mut counts = [0u64; 4];
     for &b in &sequence[start..end] {
         // A soft-masked base is the base it masks (#771); only N is skipped.
-        match b.get_unmasked_base() {
+        match b {
             Nucleotide::A => counts[0] += 1,
             Nucleotide::C => counts[1] += 1,
             Nucleotide::G => counts[2] += 1,
@@ -1694,37 +1694,6 @@ mod tests {
     use super::*;
     use crate::structs::nucleotides::Nucleotide;
     use crate::structs::variants::{AlternateType, SvData, VariantType, parse_bnd_alt};
-
-    // #771: a soft-masked base is the base it masks. The local composition a novel
-    // insertion draws from must be the same whether the window is masked or not;
-    // skipping masked bases falls back to uniform ACGT inside a masked repeat.
-    #[test]
-    fn novel_insertion_composition_is_identical_on_a_soft_masked_window() {
-        // 90% G, 10% A: far from uniform, so a uniform fallback is visible.
-        let upper: Vec<Nucleotide> = (0..500)
-            .map(|i| {
-                if i % 10 == 0 {
-                    Nucleotide::A
-                } else {
-                    Nucleotide::G
-                }
-            })
-            .collect();
-        let masked: Vec<Nucleotide> = upper.iter().map(|n| n.get_masked()).collect();
-        assert!(masked.iter().all(|n| n.is_masked()));
-        let draw = |seq: &[Nucleotide]| {
-            let mut rng = NeatRng::new_from_seed(&vec!["ins-mask".to_string()]).unwrap();
-            sample_novel_insertion_bases(seq, 250, 400, &mut rng).unwrap()
-        };
-        let from_upper = draw(&upper);
-        let from_masked = draw(&masked);
-        let g_share = from_upper.iter().filter(|&&b| b == Nucleotide::G).count() as f64 / 400.0;
-        assert!(
-            g_share > 0.8,
-            "uppercase draw should follow the 90% G window: {g_share}"
-        );
-        assert_eq!(from_masked, from_upper);
-    }
 
     #[test]
     fn default_sv_model_is_not_usable() {
@@ -3260,7 +3229,11 @@ mod tests {
         // Gaussian approximation handles it cleanly.
         let mut rng = deterministic_rng();
         let n = sample_poisson(121_000.0, &mut rng).expect("must not error at λ=121,000");
-        assert!(n > 0, "λ=121,000 must produce a positive draw");
+        // Within ±5σ of mean. σ = √121000 ≈ 348, so ±1,740 of 121,000.
+        assert!(
+            (n as f64 - 121_000.0).abs() < 1_740.0,
+            "λ=121,000 draw {n} is more than 5σ from mean — algorithm broken?"
+        );
     }
 
     #[test]

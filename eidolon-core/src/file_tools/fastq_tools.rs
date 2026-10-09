@@ -106,20 +106,20 @@ fn reference_span(cigar_ops: &[char]) -> usize {
 ///
 /// `N` is unsequenced reference, not a homopolymer, so it never forms or extends a run.
 fn homopolymer_run_at(sequence: &[Nucleotide], index: usize, cap: usize) -> usize {
-    let base = sequence[index].get_unmasked_base();
+    let base = sequence[index];
     if base == N {
         return 0;
     }
     let mut run = 1;
     // Backwards from index, then forwards, stopping at the first differing base.
     for i in (0..index).rev() {
-        if run >= cap || sequence[i].get_unmasked_base() != base {
+        if run >= cap || sequence[i] != base {
             break;
         }
         run += 1;
     }
     for base_at in sequence.iter().skip(index + 1) {
-        if run >= cap || base_at.get_unmasked_base() != base {
+        if run >= cap || *base_at != base {
             break;
         }
         run += 1;
@@ -1145,7 +1145,7 @@ pub fn generate_read_with_alleles(
         // forward-strand reads, which strand-aware callers (e.g. Mutect2) correctly
         // flag as strand bias and filter out.
         let fragment_position = seq_index;
-        let reference_base = sequence[seq_index].get_unmasked_base();
+        let reference_base = sequence[seq_index];
         // Common case writes exactly one base (the reference base, or a single
         // SNP/SNP-error substitution) — kept in the stack array `single`, no
         // heap. Only insertions (multi-base alt / insertion error) set use_ins
@@ -3040,23 +3040,29 @@ mod tests {
         // is incremented inside generate_read when the alt branch fires.)
     }
 
+    /// A read covering a SNP and a 1-bp deletion carries both. Both variants are
+    /// homozygous so neither draws an allele, and every quality is Q60 (error
+    /// probability 1e-6 per base) so a sequencing error cannot perturb the
+    /// expected read under the fixed seed.
     #[test]
     fn test_apply_variants() {
+        //                  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
         let sequence = vec![A, C, G, T, T, A, T, G, A, C, G, T, T, A, T, G];
+        // SNP C>T at 1; deletion TT>T at 3 (anchor T kept, base 4 removed).
         let variant1 =
-            Variant::new(VariantType::SNP, 1, &vec![T], &vec![C], &mut vec![1, 0]).unwrap();
+            Variant::new(VariantType::SNP, 1, &vec![C], &vec![T], &mut vec![1, 1]).unwrap();
         let variant2 = Variant::new(
             VariantType::Deletion,
             3,
             &vec![T, T],
             &vec![T],
-            &mut vec![0, 1],
+            &mut vec![1, 1],
         )
         .unwrap();
         let variant_map = HashMap::from([(1, &variant1), (3, &variant2)]);
         let flagged_positions = vec![1, 3];
         let read_name = "neat_generated__0000000000_0000000008/1".to_string();
-        let qual_scores = vec![33, 25, 37, 28, 15, 33, 33, 37];
+        let qual_scores = vec![60; 8];
         let sequencing_error_model = SequencingErrorModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec![
             "Hello".to_string(),
@@ -3064,7 +3070,7 @@ mod tests {
             "World".to_string(),
         ])
         .unwrap();
-        let result = generate_read(
+        let record = generate_read(
             &sequence,
             // Reference-derived bases only: no haplotype insertion mask, no haplotype
             // deletion.
@@ -3085,8 +3091,23 @@ mod tests {
             0,
             false,
             &mut AdCounter::new(),
+        )
+        .unwrap();
+
+        // Reference bases 0..9 with base 1 substituted (C -> T) and base 4 skipped:
+        // A T G T | A T G A.
+        assert_eq!(record.sequence, "ATGTATGA");
+        assert_eq!(record.sequence.len(), 8);
+        assert_eq!(
+            record.sequence.as_bytes()[1],
+            b'T',
+            "SNP alt base at index 1"
         );
-        assert!(result.is_ok());
+        // Four M (bases 0-3), one D (base 4), four M (bases 5-8).
+        assert_eq!(
+            record.cigar_ops,
+            vec!['M', 'M', 'M', 'M', 'D', 'M', 'M', 'M', 'M']
+        );
     }
 
     // ── incremental BAM flush tests ──────────────────────────────────────────

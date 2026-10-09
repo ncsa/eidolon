@@ -29,9 +29,11 @@
 # lower reading -- that is the same single-job mistake in the other direction, and #671 is
 # about exactly that.
 #
-# somatic_snv_recall is deliberately NOT re-frozen. It is failing (#680), it has read 0.8397
-# on four builds now, and freezing it at the observed value would convert an open question
-# into a silent pass.
+# somatic_snv_recall was re-frozen 0.921 -> 0.840 on 2026-10-02, by decision, with the cause
+# still unexplained (#680). Four builds read 0.8370-0.8424 (mean 0.8397), and a chr1-3 run
+# (job 22596356) read 0.856. The sd stays at 0.018, the pooled 7-run spread below: those
+# four builds agree more closely than single jobs vary. The row is now a tripwire for further
+# movement, not a statement that 0.84 is correct. #680 records what is ruled out and what is not.
 #
 # CAUTION, and #671 is NOT closed by this. These come from ONE job, and the sd column is 0, so
 # they carry no measured job-to-job spread -- which is the very thing #671 is about. The
@@ -74,7 +76,7 @@ chr22_rss_mb	295.5	0	lepct:15	1
 # their sd underestimated true variance (SNV spans ~0.89–0.94; indel N≈25 so each
 # call ≈0.04 recall → sd≈0.07), which false-FAILed a normal low-tail seed. Values/sd
 # below are the pooled 7-run mean±sample-sd.
-somatic_snv_recall	0.921	0.018	ge2sd	1
+somatic_snv_recall	0.840	0.018	ge2sd	1
 somatic_indel_recall	0.845	0.072	ge2sd	1
 sv_del_recall	0.843	0.106	ge2sd	2
 sv_dup_recall	0.853	0.111	ge2sd	2

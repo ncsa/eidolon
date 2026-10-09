@@ -151,8 +151,7 @@ pub fn map_buffer(sequence: &[Nucleotide]) -> Vec<SequenceMap> {
     let mut map: Vec<SequenceMap> = Vec::new();
     let mut region_start = 0;
     let mut region_end = 1;
-    // Soft-masked bases (Maskeda/c/g/t) represent repeat-annotated but valid sequence;
-    // treat them as regular bases for region mapping. Only N and X mark true gaps.
+    // Only N and X mark true gaps. (Soft-masked bases are folded to A/C/G/T at parse time.)
     let mut inside_n_region = matches!(sequence[0], N | X);
 
     if inside_n_region {
@@ -715,18 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_iupac_masked_bases_pass_through() {
+    fn test_resolve_iupac_masked_bases_parse_as_plain_bases() {
+        // Soft-masked bases are not IUPAC ambiguity and are folded to A/C/G/T (#790).
         let mut rng = NeatRng::new_from_seed(&vec!["iupac_mask_test".to_string()]).unwrap();
         let (seq, count) = resolve_iupac_bases("acgt", &mut rng).unwrap();
         assert_eq!(count, 0);
         assert_eq!(
             seq,
-            vec![
-                Nucleotide::Maskeda,
-                Nucleotide::Maskedc,
-                Nucleotide::Maskedg,
-                Nucleotide::Maskedt,
-            ]
+            vec![Nucleotide::A, Nucleotide::C, Nucleotide::G, Nucleotide::T]
         );
     }
 }

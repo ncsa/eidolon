@@ -3,6 +3,7 @@
 // config yaml file or command line arguments and turn them into the configuration.
 use chrono::Utc;
 
+use crate::config_keys::{check_keys, check_keys_with_hints};
 use crate::eidolon_core::file_tools::folder_tools::check_create_dir;
 use crate::gen_reads::errors::GenerateReadsError;
 use crate::gen_reads::utils::subclone;
@@ -204,6 +205,100 @@ impl Default for RunConfiguration {
     }
 }
 
+/// Every top-level key `from_scrape_config` reads. Anything else is rejected (#496).
+pub const KNOWN_KEYS: &[&str] = &[
+    "adapters",
+    "chunk_size",
+    "coverage",
+    "fragment_mean",
+    "fragment_model",
+    "fragment_st_dev",
+    "gc_bias_model",
+    "gc_bias_normalize_coverage",
+    "input_vcf",
+    "keep_short_fragments",
+    "long_reads",
+    "minimum_mutations",
+    "mutation_model",
+    "mutation_rate",
+    "mutation_regions",
+    "num_threads",
+    "output_dir",
+    "output_filename",
+    "output_prefix",
+    "overwrite_output",
+    "paired_ended",
+    "ploidy",
+    "produce_bam",
+    "produce_fastq",
+    "produce_vcf",
+    "quality_score_model",
+    "read_len",
+    "reference",
+    "rng_seed",
+    "sequence_error_model",
+    "sv_max_length_fraction",
+    "sv_rate_scale",
+    "target_bed",
+];
+
+/// Keys from a NEAT 4 config (`NEAT/config_template/template_neat_config.yml`) that
+/// gen-reads does not read, and what to do instead. They are still rejected: a NEAT
+/// config used unchanged would otherwise lose, e.g., its `include_vcf` variants silently.
+const NEAT_KEY_HINTS: &[(&str, &str)] = &[
+    ("include_vcf", "NEAT's name for `input_vcf`"),
+    ("error_model", "NEAT's name for `sequence_error_model`"),
+    ("gc_model", "NEAT's name for `gc_bias_model`"),
+    ("mutation_bed", "NEAT's name for `mutation_regions`"),
+    ("threads", "NEAT's name for `num_threads`"),
+    ("min_mutations", "NEAT's name for `minimum_mutations`"),
+    (
+        "adapter_preset",
+        "set `preset` under an `adapters:` section",
+    ),
+    ("adapter_r1", "set `r1` under an `adapters:` section"),
+    ("adapter_r2", "set `r2` under an `adapters:` section"),
+    (
+        "produce_fasta",
+        "eidolon does not write a FASTA; remove this key",
+    ),
+    (
+        "avg_seq_error",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "rescale_qualities",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "quality_offset",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "discard_bed",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "parallel_block_size",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "n_handling",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "n_max_fraction",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+    (
+        "no_coverage_bias",
+        "a NEAT option eidolon does not support; remove it",
+    ),
+];
+
+/// Every key the `adapters:` section reads.
+const ADAPTER_KEYS: &[&str] = &["enabled", "preset", "r1", "r2"];
+
 impl RunConfiguration {
     pub fn from_yaml_file(yaml_file: &PathBuf) -> Result<RunConfiguration, GenerateReadsError> {
         // Reads an input configuration file from yaml using the serde package. Then sets the
@@ -226,6 +321,21 @@ impl RunConfiguration {
     pub fn from_scrape_config(
         scrape_config: HashMap<String, Value>,
     ) -> Result<RunConfiguration, GenerateReadsError> {
+        check_keys_with_hints(
+            scrape_config.keys().map(String::as_str),
+            KNOWN_KEYS,
+            NEAT_KEY_HINTS,
+            "gen-reads",
+        )
+        .map_err(GenerateReadsError::UnknownConfigKeys)?;
+        if let Some(section) = scrape_config.get("adapters").and_then(Value::as_mapping) {
+            check_keys(
+                section.keys().filter_map(Value::as_str),
+                ADAPTER_KEYS,
+                "gen-reads adapters",
+            )
+            .map_err(GenerateReadsError::UnknownConfigKeys)?;
+        }
         // Fill in the reference first, all hinges on that
         let reference = scrape_config
             .get("reference")
@@ -610,7 +720,11 @@ impl RunConfiguration {
                             }
                         }
                     }
-                    _ => continue,
+                    // Read before the loop.
+                    "reference" => continue,
+                    other => unreachable!(
+                        "`{other}` is in KNOWN_KEYS but has no arm in from_scrape_config"
+                    ),
                 },
             }
         }
@@ -891,12 +1005,16 @@ mod tests {
         assert_eq!(test_configuration.output_filename, "Hey.hey".to_string());
     }
 
+    // The warning check_and_log_config logs for overwrite_output is not asserted: the crate
+    // has no way to capture log output in a unit test. This checks only that the option
+    // is accepted.
     #[test]
-    fn test_overwrite_warn() {
+    fn test_overwrite_output_is_accepted() {
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
         config.overwrite_output = true;
         RunConfiguration::check_and_log_config(&mut config).unwrap();
+        assert!(config.overwrite_output);
     }
 
     #[test]
@@ -904,12 +1022,20 @@ mod tests {
         // Verifies that check_and_log_config sets both fastq output paths when paired_ended=true
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
+        config.output_dir = PathBuf::from("/some/out_dir");
+        config.output_filename = "sample".to_string();
         config.paired_ended = true;
         config.fragment_mean = Some(100.0);
         config.fragment_st_dev = Some(10.0);
         RunConfiguration::check_and_log_config(&mut config).unwrap();
-        assert!(config.output_fastq_1.is_some());
-        assert!(config.output_fastq_2.is_some());
+        assert_eq!(
+            config.output_fastq_1,
+            Some(PathBuf::from("/some/out_dir/sample_r1.fastq.gz"))
+        );
+        assert_eq!(
+            config.output_fastq_2,
+            Some(PathBuf::from("/some/out_dir/sample_r2.fastq.gz"))
+        );
     }
 
     #[test]
@@ -923,9 +1049,17 @@ mod tests {
         config.fragment_model = Some(PathBuf::from(
             "test_data/baseline_models/frag_length.canonical.json.gz",
         ));
+        config.output_dir = PathBuf::from("/some/out_dir");
+        config.output_filename = "sample".to_string();
         RunConfiguration::check_and_log_config(&mut config).unwrap();
-        assert!(config.output_fastq_1.is_some());
-        assert!(config.output_fastq_2.is_some());
+        assert_eq!(
+            config.output_fastq_1,
+            Some(PathBuf::from("/some/out_dir/sample_r1.fastq.gz"))
+        );
+        assert_eq!(
+            config.output_fastq_2,
+            Some(PathBuf::from("/some/out_dir/sample_r2.fastq.gz"))
+        );
     }
 
     #[test]
@@ -1093,11 +1227,19 @@ mod tests {
     fn test_vcf_and_bam_paths() {
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
+        config.output_dir = PathBuf::from("/some/out_dir");
+        config.output_filename = "sample".to_string();
         config.produce_vcf = true;
         config.produce_bam = true;
         RunConfiguration::check_and_log_config(&mut config).unwrap();
-        assert!(config.output_vcf.is_some());
-        assert!(config.output_bam.is_some());
+        assert_eq!(
+            config.output_vcf,
+            Some(PathBuf::from("/some/out_dir/sample.vcf.gz"))
+        );
+        assert_eq!(
+            config.output_bam,
+            Some(PathBuf::from("/some/out_dir/sample.bam"))
+        );
     }
 
     #[test]
@@ -1309,5 +1451,111 @@ mod tests {
         );
         let config = RunConfiguration::from_scrape_config(scrape_config).unwrap();
         assert_eq!(config.rng_seed.as_deref(), Some("42 hello world"));
+    }
+
+    // #496: a key outside KNOWN_KEYS is rejected before anything is read, and every key in
+    // KNOWN_KEYS reaches a real arm (the `unreachable!` would panic otherwise).
+    #[test]
+    fn an_unknown_key_is_rejected_by_name() {
+        let mut scrape_config = HashMap::new();
+        scrape_config.insert(
+            "reference".to_string(),
+            Value::String("test_data/references/H1N1.fa".to_string()),
+        );
+        scrape_config.insert("covrage".to_string(), Value::from(30));
+        match RunConfiguration::from_scrape_config(scrape_config) {
+            Err(GenerateReadsError::UnknownConfigKeys(msg)) => {
+                assert!(
+                    msg.contains("`covrage` (did you mean `coverage`?)"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected UnknownConfigKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_set_to_dot_is_still_rejected() {
+        let mut scrape_config = HashMap::new();
+        scrape_config.insert(
+            "reference".to_string(),
+            Value::String("test_data/references/H1N1.fa".to_string()),
+        );
+        scrape_config.insert("covrage".to_string(), Value::String(".".to_string()));
+        assert!(matches!(
+            RunConfiguration::from_scrape_config(scrape_config),
+            Err(GenerateReadsError::UnknownConfigKeys(_))
+        ));
+    }
+
+    #[test]
+    fn every_known_key_has_an_arm() {
+        let out = tempfile::tempdir().unwrap();
+        for key in KNOWN_KEYS
+            .iter()
+            .filter(|k| **k != "reference" && **k != "output_dir")
+        {
+            let mut scrape_config = HashMap::new();
+            scrape_config.insert(
+                "reference".to_string(),
+                Value::String("test_data/references/H1N1.fa".to_string()),
+            );
+            scrape_config.insert(
+                "output_dir".to_string(),
+                Value::String(out.path().display().to_string()),
+            );
+            // Null is not ".", so it reaches the key's arm. Any Ok/Err is fine; a panic is not.
+            scrape_config.insert(key.to_string(), Value::Null);
+            let result =
+                std::panic::catch_unwind(|| RunConfiguration::from_scrape_config(scrape_config));
+            assert!(
+                result.is_ok(),
+                "`{key}` panicked: it has no arm in from_scrape_config"
+            );
+            if let Ok(Err(GenerateReadsError::UnknownConfigKeys(msg))) = result {
+                panic!("`{key}` is in KNOWN_KEYS but was rejected: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_neat_key_gets_its_eidolon_name() {
+        let mut scrape_config = HashMap::new();
+        scrape_config.insert(
+            "reference".to_string(),
+            Value::String("test_data/references/H1N1.fa".to_string()),
+        );
+        scrape_config.insert(
+            "include_vcf".to_string(),
+            Value::String("x.vcf".to_string()),
+        );
+        match RunConfiguration::from_scrape_config(scrape_config) {
+            Err(GenerateReadsError::UnknownConfigKeys(msg)) => {
+                assert!(
+                    msg.contains("`include_vcf` (NEAT's name for `input_vcf`)"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected UnknownConfigKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_adapters_subkey_is_rejected() {
+        let mut scrape_config = HashMap::new();
+        scrape_config.insert(
+            "reference".to_string(),
+            Value::String("test_data/references/H1N1.fa".to_string()),
+        );
+        let adapters: Value =
+            serde_yml::from_str("enabled: true\npreset: truseq\nr3: ACGT").unwrap();
+        scrape_config.insert("adapters".to_string(), adapters);
+        match RunConfiguration::from_scrape_config(scrape_config) {
+            Err(GenerateReadsError::UnknownConfigKeys(msg)) => {
+                assert!(msg.contains("in gen-reads adapters"), "{msg}");
+                assert!(msg.contains("`r3`"), "{msg}");
+            }
+            other => panic!("expected UnknownConfigKeys, got {other:?}"),
+        }
     }
 }

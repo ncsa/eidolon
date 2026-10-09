@@ -178,11 +178,11 @@ fn build_gc_weight_prefix_sum(
     // mask, exactly as `gen-gc-bias-model` counted them when it fitted these weights (#771).
     let mut gc_count: usize = seq[..window]
         .iter()
-        .filter(|n| matches!(n.get_unmasked_base(), Nucleotide::G | Nucleotide::C))
+        .filter(|n| matches!(n, Nucleotide::G | Nucleotide::C))
         .count();
     let mut n_count: usize = seq[..window]
         .iter()
-        .filter(|n| n.get_unmasked_base() == Nucleotide::N)
+        .filter(|n| **n == Nucleotide::N)
         .count();
 
     let weight_at = |gc: usize, n: usize| -> f64 {
@@ -199,8 +199,8 @@ fn build_gc_weight_prefix_sum(
 
     // Slide the window one base at a time, updating counts incrementally.
     for i in 1..n_positions {
-        let outgoing = seq[i - 1].get_unmasked_base();
-        let incoming = seq[i + window - 1].get_unmasked_base();
+        let outgoing = seq[i - 1];
+        let incoming = seq[i + window - 1];
 
         match outgoing {
             Nucleotide::G | Nucleotide::C => gc_count -= 1,
@@ -1203,7 +1203,12 @@ mod tests {
         )
         .unwrap();
 
-        // Calculate actual depth at each position
+        // Every pool length fits the span, so no draw is discarded: all 500 are placed, each
+        // wholly inside [0, span_length).
+        assert_eq!(fragments.len(), target_count);
+        assert!(fragments.iter().all(|&(_, end)| end <= span_length));
+
+        // Fragment (insert) coverage, not read depth: each fragment covers all of its bases.
         let mut depth = vec![0usize; span_length];
         for (start, end) in fragments {
             for i in start..end {
@@ -1213,10 +1218,13 @@ mod tests {
             }
         }
 
+        // Lengths are drawn uniformly from the pool: mean 450, sd sqrt(12500) ~ 111.8. Mean
+        // depth is 500 * 450 / 10000 = 22.5, with sd 111.8 * sqrt(500) / 10000 ~ 0.25.
+        // The +-1.0 tolerance is 4 sd.
         let avg_depth = depth.iter().sum::<usize>() as f64 / span_length as f64;
-        println!(
-            "Requested coverage: {}, Actual average depth: {}, target_count: {}",
-            coverage, avg_depth, target_count
+        assert!(
+            (avg_depth - 22.5).abs() < 1.0,
+            "average fragment depth {avg_depth}, expected 22.5 +- 1.0"
         );
     }
 
@@ -1247,6 +1255,7 @@ mod tests {
         // Calculate actual depth at each position
         // In paired-ended mode, each fragment (start, end) produces TWO reads of read_length.
         // One at start, one at end-read_length.
+        let n_fragments = fragments.len();
         let mut depth = vec![0usize; span_length];
         for (start, end) in fragments {
             // R1
@@ -1264,10 +1273,16 @@ mod tests {
             }
         }
 
+        // num_frags = ceil(10000 * 10 / (2 * 100)) = 500. A normal(450, 50) length clears
+        // the read_length + 10 floor and fits the 10 kb span, so all 500 are placed, and
+        // each R1/R2 lies wholly inside the span. That is 500 * 2 * 100 = 100000 read
+        // bases over 10000 positions: exactly the configured coverage, with no sampling
+        // noise. The tolerance only absorbs float rounding.
+        assert_eq!(n_fragments, 500);
         let avg_depth = depth.iter().sum::<usize>() as f64 / span_length as f64;
-        println!(
-            "Requested coverage: {}, Actual average depth (paired): {}",
-            coverage, avg_depth
+        assert!(
+            (avg_depth - coverage as f64).abs() < 1e-9,
+            "average paired read depth {avg_depth}, expected {coverage}"
         );
     }
 
@@ -1300,6 +1315,7 @@ mod tests {
         )
         .unwrap();
 
+        let n_fragments = fragments.len();
         let mut depth = vec![0usize; span_length];
         for (start, end) in fragments {
             for i in start..start + read_length {
@@ -1315,10 +1331,16 @@ mod tests {
             }
         }
 
+        // The default GC model weighs every window 1.0, so mean_weight = 1 and normalization
+        // leaves num_frags at ceil(10000 * 10 / (2 * 100)) = 500. Every normal(450, 50)
+        // length fits the span and every start has positive weight, so all 500 are placed
+        // with R1/R2 inside the span: 100000 read bases over 10000 positions, exactly the
+        // configured coverage. The tolerance only absorbs float rounding.
+        assert_eq!(n_fragments, 500);
         let avg_depth = depth.iter().sum::<usize>() as f64 / span_length as f64;
-        println!(
-            "Requested coverage: {}, Actual average depth (weighted uniform): {}",
-            coverage, avg_depth
+        assert!(
+            (avg_depth - coverage as f64).abs() < 1e-9,
+            "average weighted read depth {avg_depth}, expected {coverage}"
         );
     }
 
@@ -2039,54 +2061,6 @@ mod tests {
             "medium-span weighted-path depth VMR averaged over {} independent replicates \
              is {avg_vmr:.3} -- underdispersion has not faded by this scale",
             vmrs.len()
-        );
-    }
-
-    /// #771, consumer side. `gen-gc-bias-model` reads a soft-masked `g`/`c` as G/C, so the
-    /// weights it fits are indexed by that GC. gen-reads keeps soft-masked bases in its
-    /// sequence blocks, so the lookup that applies those weights must read them the same
-    /// way, or a masked window is weighted as lower GC than the builder measured it.
-    /// Known answer: a lowercased copy gives the identical prefix sum. The weights rise
-    /// strictly with GC, so any window whose GC count moves changes the sum.
-    #[test]
-    fn gc_weights_are_identical_on_a_soft_masked_sequence() {
-        let upper = make_gc_test_sequence(2_000);
-        let masked: Vec<_> = upper
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                if (i / 50) % 2 == 1 {
-                    n.get_masked()
-                } else {
-                    *n
-                }
-            })
-            .collect();
-        assert!(masked.iter().any(|n| n.is_masked()));
-        assert!(masked.contains(&eidolon_core::structs::nucleotides::Nucleotide::Maskedg));
-        let weights: Vec<f64> = (0..=100).map(|gc| 0.5 + gc as f64 / 100.0).collect();
-        let model = GcBiasModel::from_weights(weights, 100).unwrap();
-
-        let prefix = |seq: Vec<eidolon_core::structs::nucleotides::Nucleotide>| {
-            let block = make_sequence_block(seq);
-            let len = block.sequence.len();
-            build_gc_weight_prefix_sum(&block, 0, len, &model)
-                .unwrap()
-                .unwrap()
-        };
-        let upper_sum = prefix(upper);
-        let masked_sum = prefix(masked);
-        assert_eq!(upper_sum.len(), masked_sum.len());
-        let differing = upper_sum
-            .iter()
-            .zip(&masked_sum)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(
-            differing,
-            0,
-            "{differing} of {} prefix-sum entries differ on the soft-masked copy",
-            upper_sum.len()
         );
     }
 }

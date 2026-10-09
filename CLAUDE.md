@@ -11,6 +11,12 @@ Hand-written guidance below; the GitNexus block that follows is auto-generated
   PR have missed the merge more than once. Check with
   `git merge-base --is-ancestor <sha> origin/develop`; recover a missed commit with
   `git cherry-pick`.
+- **Close the issue when its PR merges to `develop`.** GitHub auto-closes `Closes #N`
+  only on merge to `main`, so close it by hand once the commits are confirmed on
+  `origin/develop`, with a comment naming the PR and merge SHA. From then on the change
+  is part of `develop`: a further problem gets a **new bug ticket**, not a reopen. Closing
+  is not a claim of verification — the PR's "Not verified" items carry into the release
+  ticket (see the release skill), which is where release-level testing is recorded.
 
 ## Vetting standard (standing requirement)
 "It ran and produced output" is not evidence of correctness, and it is the bar this repo
@@ -48,9 +54,11 @@ Each rule below was earned by a defect that shipped green. Case histories live i
 5. **Chase the evidence past the first plausible story.** `BND recall=0.000` drew three
    confident explanations before the real cause. Each was plausible enough to stop at.
 6. **Say what was NOT verified** — checked by hand rather than CI, on a fixture rather
-   than real data. Current example: `scripts/delta/tests/` covers 2 of
-   `sv_pipeline.sbatch`'s 14 functions; `score_caller` and `check_denominator` produce
-   every recall figure in ACCESS §3.5–3.7 and are untested, as is `sbs96_compare.py` (#466).
+   than real data. Current example (measured 2026-10-06, #819): `scripts/delta/tests/`
+   exercises 25 of `sv_pipeline.sbatch`'s 29 functions, every suite mutation-checked in CI.
+   `score_caller`, which assembles every recall figure in ACCESS §3.5–3.7, is not among them,
+   nor are `build_bnd_spans`, `convert_manta_inversions` and `index_and_align`.
+   `sbs96_compare.py` (#466) is untested by decision.
 
 **The recurring shape**, every quiet failure so far — a harness reporting a metric
 without asserting it measured everything it planted:
@@ -150,9 +158,11 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   Python is acceptable only where an **external tool forces it** — We will keep existing parsers for truvari and
   SigProfiler are Python packages, but avoid adding more.
 - **Vet what exists** (all validation/prep only, none shipped):
-  `scripts/delta/sbs96_compare.py` is a per-validation measurement helper. It parses
-  SigProfiler's output in SigProfiler's own env, which is the one justification for
-  Python here, and it is **not covered by CI** (#466). `scn_af_compare.py` is gone —
+  `scripts/delta/sbs96_compare.py` is a per-validation measurement helper: stdlib-only, it
+  reads a FASTA and two VCFs and reports the SBS-96 cosine. It needs no external tool, so
+  it is Python only by history. It produced the HCC1395 0.72 → 0.99 figure (#372) and has
+  no current caller; it is kept as is and **not covered by CI** (#466). If it is needed
+  again, add tests then; otherwise it goes when the validation scripts are archived. `scn_af_compare.py` is gone —
   ported to `eidolon compare-af`, which needed no external tool and so should never have
   been Python; the port is pinned by golden fixtures reproducing the Python's output byte
   for byte plus known-answer tests. `tools/{build_pcawg_sv_vcf,normalize_pcawg_sv_model,graft_sv_model}.py` are

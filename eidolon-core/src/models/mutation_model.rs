@@ -122,16 +122,16 @@ impl MutationModel {
         // build transition matrices from data for snps and trinucs
         let snp_trinuc_model =
             SnpTrinucModel::from_raw_data(trinuc_frequency, trinuc_transition_frequency)?;
-        // Fall back to the default indel model when no indel data was observed.
-        // The insertion-vs-deletion balance is NOT stored here: it is already
-        // variant_probs[1] and variant_probs[2] (the `variant_dist` weights), which
-        // is what drives generation. This model carries the length distributions only.
+        // Fall back to the default indel model when no indel data was observed. A type
+        // observed on its own keeps its lengths; only the unobserved type takes the
+        // default (#766). The insertion-vs-deletion balance is NOT stored here: it is
+        // already variant_probs[1] and variant_probs[2] (the `variant_dist` weights),
+        // which is what drives generation. This model carries the length distributions only.
         let indel_denom = variant_probs[1] + variant_probs[2];
-        let indel_model = if indel_denom == 0.0 || ins_lengths.is_empty() || del_lengths.is_empty()
-        {
+        let indel_model = if indel_denom == 0.0 {
             IndelModel::default()?
         } else {
-            IndelModel::from_raw_data(ins_lengths, ins_weights, del_lengths, del_weights)?
+            IndelModel::from_observed(ins_lengths, ins_weights, del_lengths, del_weights)?
         };
         let statistical_models = StatisticalModels {
             indel_model,
@@ -349,9 +349,6 @@ fn pick_random_snp(
 
 fn check_base(nuc: Nucleotide) -> Nucleotide {
     // For now we'll replace occasional N's with A's.
-    if nuc.is_masked() {
-        return nuc.get_unmasked_base();
-    }
     match nuc {
         Nucleotide::N => Nucleotide::A,
         _ => nuc,
@@ -579,13 +576,6 @@ mod tests {
     }
 
     #[test]
-    fn test_check_base_unmasks_masked() {
-        // Masked bases should be replaced with their unmasked equivalent
-        assert_eq!(check_base(Nucleotide::Maskeda), Nucleotide::A);
-        assert_eq!(check_base(Nucleotide::Maskedc), Nucleotide::C);
-    }
-
-    #[test]
     fn test_generate_mutation_produces_variant() {
         let model = MutationModel::default().unwrap();
         let mut rng =
@@ -640,6 +630,78 @@ mod tests {
         );
         let model = result.unwrap();
         assert_eq!(model.mutation_rate, 0.001);
+    }
+
+    /// One length distribution out of a model, as (values, cumulative weights), read from
+    /// its serialized form so this module does not need `IndelModel`'s private fields.
+    fn length_dist(model: &MutationModel, which: &str) -> (Vec<usize>, Vec<f64>) {
+        let v = serde_json::to_value(model).unwrap();
+        let d = &v["statistical_models"]["indel_model"][which];
+        (
+            serde_json::from_value(d["values"].clone()).unwrap(),
+            serde_json::from_value(d["weights"].clone()).unwrap(),
+        )
+    }
+
+    fn fit_lengths(ins: (Vec<usize>, Vec<f64>), del: (Vec<usize>, Vec<f64>)) -> MutationModel {
+        MutationModel::from_raw_data(
+            0.001,
+            0.5,
+            vec![0.8, 0.1, 0.1],
+            HashMap::new(),
+            HashMap::new(),
+            ins.0,
+            ins.1,
+            del.0,
+            del.1,
+        )
+        .unwrap()
+    }
+
+    /// #766 KNOWN ANSWER: an insertions-only VCF with lengths {2 x3, 5 x1} keeps that
+    /// distribution, 0.75 / 0.25 (cumulative 0.75, 1.0), and only the unobserved deletions
+    /// fall back to the default. Before the fix, either empty list discarded BOTH.
+    #[test]
+    fn an_insertions_only_fit_keeps_its_insertion_lengths() {
+        let model = fit_lengths((vec![2, 5], vec![3.0, 1.0]), (vec![], vec![]));
+        assert_eq!(
+            length_dist(&model, "ins_dist"),
+            (vec![2, 5], vec![0.75, 1.0])
+        );
+        let default = MutationModel::default().unwrap();
+        assert_eq!(
+            length_dist(&model, "del_dist"),
+            length_dist(&default, "del_dist")
+        );
+    }
+
+    /// The mirror case: deletions observed, insertions not.
+    #[test]
+    fn a_deletions_only_fit_keeps_its_deletion_lengths() {
+        let model = fit_lengths((vec![], vec![]), (vec![1, 3], vec![1.0, 1.0]));
+        assert_eq!(
+            length_dist(&model, "del_dist"),
+            (vec![1, 3], vec![0.5, 1.0])
+        );
+        let default = MutationModel::default().unwrap();
+        assert_eq!(
+            length_dist(&model, "ins_dist"),
+            length_dist(&default, "ins_dist")
+        );
+    }
+
+    /// MUST NOT FIRE: with both types observed, both fitted distributions are kept exactly.
+    #[test]
+    fn a_fit_with_both_indel_types_keeps_both() {
+        let model = fit_lengths((vec![2, 5], vec![3.0, 1.0]), (vec![1, 3], vec![1.0, 1.0]));
+        assert_eq!(
+            length_dist(&model, "ins_dist"),
+            (vec![2, 5], vec![0.75, 1.0])
+        );
+        assert_eq!(
+            length_dist(&model, "del_dist"),
+            (vec![1, 3], vec![0.5, 1.0])
+        );
     }
 
     /// Every model file written before #758's follow-up carries a context-free SNP

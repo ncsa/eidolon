@@ -265,12 +265,9 @@ fn accumulate_region(
     let first = &sequence[region_start..region_start + window_size];
     let mut gc_count: usize = first
         .iter()
-        .filter(|n| matches!(n.get_unmasked_base(), Nucleotide::G | Nucleotide::C))
+        .filter(|n| matches!(n, Nucleotide::G | Nucleotide::C))
         .count();
-    let mut n_count: usize = first
-        .iter()
-        .filter(|n| n.get_unmasked_base() == Nucleotide::N)
-        .count();
+    let mut n_count: usize = first.iter().filter(|n| **n == Nucleotide::N).count();
 
     let mut cov_sum: u64 = (0..window_size)
         .map(|i| cov.get(region_start + i).copied().unwrap_or(0) as u64)
@@ -293,12 +290,12 @@ fn accumulate_region(
         // Advance both sliding windows by stride steps.
         for j in 0..window_stride {
             // Soft-masked (lowercase) bases count as the base they are (#771).
-            match sequence[w + j].get_unmasked_base() {
+            match sequence[w + j] {
                 Nucleotide::G | Nucleotide::C => gc_count -= 1,
                 Nucleotide::N => n_count -= 1,
                 _ => {}
             }
-            match sequence[w + window_size + j].get_unmasked_base() {
+            match sequence[w + window_size + j] {
                 Nucleotide::G | Nucleotide::C => gc_count += 1,
                 Nucleotide::N => n_count += 1,
                 _ => {}
@@ -684,22 +681,21 @@ mod tests {
 
     #[test]
     fn test_all_n_contig_is_skipped() {
-        // chr1 is all-N (skipped); chr2 has real coverage. Runner must not panic
-        // or error on the all-N contig.
-        let fasta = ">chr1\nNNNNNNNNNN\n>chr2\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
-        let ref_file = write_temp(fasta);
+        // chr1 is 200 bp of N -- two full windows, so it clears the contig-length guard
+        // and reaches the N handling -- covered at depth 50. chr2 is 200 bp of ACGT
+        // (two 50%-GC windows) at depth 10. If chr1 contributed, its windows would add
+        // to the window count at depth 50; skipped, the fit sees chr2's two windows only.
+        let fasta = format!(">chr1\n{}\n>chr2\n{}\n", "N".repeat(200), "ACGT".repeat(50));
+        let ref_file = write_temp(&fasta);
 
         let temp = tempfile::tempdir().unwrap();
         let bam_path = temp.path().join("n_skip.bam");
         write_coverage_bam(
             &bam_path,
-            &[(b"chr1", 10), (b"chr2", 104)],
-            &[(0, 0, 10, 10), (1, 0, 104, 10)],
+            &[(b"chr1", 200), (b"chr2", 200)],
+            &[(0, 0, 200, 50), (1, 0, 200, 10)],
         );
-
-        let out = NamedTempFile::new().unwrap();
-        let out_path = out.path().to_path_buf();
-        drop(out);
+        let out_path = temp.path().join("gc.json.gz");
 
         let cfg = write_bam_config(
             &ref_file.path().to_path_buf(),
@@ -710,6 +706,15 @@ mod tests {
             1,
         );
         runner(&cfg.path().to_path_buf()).unwrap();
+
+        let report = std::fs::read_to_string(temp.path().join("gc.json.gz.bins.tsv")).unwrap();
+        let rows: Vec<&str> = report.lines().skip(1).collect();
+        let total_windows: usize = rows
+            .iter()
+            .map(|r| r.split('\t').nth(1).unwrap().parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(total_windows, 2, "only chr2's two windows may be counted");
+        assert_eq!(rows[50], "50\t2\t10.000\t10.000\t1.000000\tfitted");
     }
 
     #[test]

@@ -7,7 +7,7 @@ output_file:
 # OPTIONAL PARAMS
 # overwrite output [optional] - set to "true" to overwrite an existing output file (default: false)
 overwrite_output: false
-# maximum number of reads to process [optional] - set to 0 for unlimited (default: 0)
+# number of reads to fit from [optional] - sampled uniformly across the file, not the first N; 0 for every read (default: 0)
 max_reads: 0
 # quality score ASCII offset [optional] - 33 for Illumina 1.8+/Sanger, 64 for older Illumina (default: 33)
 qual_offset: 33

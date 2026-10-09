@@ -3,11 +3,11 @@ use crate::gen_seq_error_model::{
     utils::config::{BamMethod, RunConfiguration},
 };
 use eidolon_core::file_tools::file_io::is_gzipped_file;
+use eidolon_core::rng::NeatRng;
 use eidolon_core::{
     file_tools::{
         bam_reader::{
-            OVERLAP_BINS, OverlapCounts, read_bam_overlap_transitions, read_bam_transitions,
-            read_bam_transitions_masked,
+            OVERLAP_BINS, OverlapCounts, read_bam_overlap_transitions, read_bam_transition_report,
         },
         file_io::{read_gzip_lines, read_lines},
         vcf_tools::read_known_sites,
@@ -427,11 +427,63 @@ fn accumulate_qual(
     Ok(true)
 }
 
+/// Fixed so a capped fit is reproducible, and shared by both mates so R1 and R2 of the same
+/// length keep the same record numbers.
+const MAX_READS_SAMPLING_SEED: &str = "gen-seq-error-model max_reads (#721)";
+
+/// Which records a `max_reads`-capped fit keeps (#721).
+///
+/// The cap used to keep the FIRST N records. Illumina FASTQs are written in flowcell order,
+/// so that was one corner of one lane: the first 200,000 records of the HG002 library were
+/// all lane 1, tile 1101. Each record is now kept with probability `max_reads / total`, so
+/// the sample is spread across the whole file and holds about `max_reads` records.
+struct ReadSampler {
+    /// `None` keeps every record: no cap, or a cap at or above the file's size.
+    keep_probability: Option<f64>,
+    rng: NeatRng,
+}
+
+impl ReadSampler {
+    fn new(max_reads: usize, total_records: usize) -> Result<Self, GenSeqErrorModelError> {
+        let keep_probability = (max_reads > 0 && total_records > max_reads)
+            .then(|| max_reads as f64 / total_records as f64);
+        let rng = NeatRng::new_from_seed(&vec![MAX_READS_SAMPLING_SEED.to_string()])
+            .map_err(|e| GenSeqErrorModelError::ConfigurationError(e.to_string()))?;
+        Ok(Self {
+            keep_probability,
+            rng,
+        })
+    }
+
+    fn keep(&mut self) -> Result<bool, GenSeqErrorModelError> {
+        match self.keep_probability {
+            None => Ok(true),
+            Some(p) => self
+                .rng
+                .gen_bool(p)
+                .map_err(|e| GenSeqErrorModelError::ConfigurationError(e.to_string())),
+        }
+    }
+}
+
+/// Records in a FASTQ, counted by lines. A first pass for `max_reads`, which needs the total
+/// to sample uniformly; the fitting pass validates every record, so a malformed file is
+/// still reported there.
+fn count_fastq_records(path: &PathBuf) -> Result<usize, GenSeqErrorModelError> {
+    let lines = if is_gzipped_file(path)? {
+        read_gzip_lines(path)?.count()
+    } else {
+        read_lines(path)?.count()
+    };
+    Ok(lines / 4)
+}
+
 /// Read one mate's FASTQ into its own `MateCounts`, pooling the option-set and base counts.
 ///
 /// `max_reads` applies PER MATE rather than across the pair: a shared budget would spend it
 /// all on R1 and fit R2 from whatever was left, which is nothing at the default of 0-means-all
-/// and is silently lopsided otherwise.
+/// and is silently lopsided otherwise. Within a mate it is a uniform sample, not the head of
+/// the file; see `ReadSampler`.
 fn accumulate_one_file(
     path: &PathBuf,
     config: &RunConfiguration,
@@ -447,13 +499,30 @@ fn accumulate_one_file(
         Box::new(read_lines(path)?)
     };
     let qual_offset = config.qual_offset;
-    let mate_start = *reads_processed;
-    'records: loop {
-        if config.max_reads > 0 && (*reads_processed) - mate_start >= config.max_reads {
-            break;
+    let mut sampler = if config.max_reads > 0 {
+        let total = count_fastq_records(path)?;
+        let sampler = ReadSampler::new(config.max_reads, total)?;
+        match sampler.keep_probability {
+            Some(p) => info!(
+                "max_reads {}: sampling {:?} uniformly, keeping each of its {} records with \
+                 probability {:.6}",
+                config.max_reads, path, total, p
+            ),
+            None => info!(
+                "max_reads {} is at least the {} records in {:?}; using every record",
+                config.max_reads, total, path
+            ),
         }
+        sampler
+    } else {
+        ReadSampler::new(0, 0)?
+    };
+    // Every record read, kept or not: line numbers in error messages count from this, while
+    // `m.records_seen` counts only the records the fit used.
+    let mut records_read = 0usize;
+    'records: loop {
         // Line number of this record's header, 1-based, for error messages.
-        let first_line = m.records_seen * 4 + 1;
+        let first_line = records_read * 4 + 1;
 
         // The header is the ONLY line whose absence is a clean end of file. Missing any of the
         // other three means the last record is truncated, which is a corrupt file, not an end.
@@ -467,6 +536,10 @@ fn accumulate_one_file(
         let qual = next_record_line(&mut iter, first_line, first_line + 3)?;
 
         validate_record(&header, &seq, &plus, &qual, first_line)?;
+        records_read += 1;
+        if !sampler.keep()? {
+            continue;
+        }
         m.records_seen += 1;
         m.min_qual_len = m.min_qual_len.min(qual.len());
 
@@ -531,6 +604,12 @@ fn accumulate_one_file(
         )? {
             (*reads_processed) += 1;
         }
+    }
+    if sampler.keep_probability.is_some() {
+        info!(
+            "max_reads {}: fitted {} of {} records in {:?}",
+            config.max_reads, m.records_seen, records_read, path
+        );
     }
     Ok(())
 }
@@ -667,36 +746,49 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
                                             fit_quality_degradation to fit one population per \
                                             mate.";
 
-        let mut populations: Vec<(&str, &Vec<Vec<Vec<usize>>>, &str)> = Vec::new();
-        // R1's healthy tensor is checked only when there is a second population to be ragged
-        // against. On its own it defines `positions` and cannot fall short of itself.
+        // (label, transition counts, seed counts, remedy). The seed is position 1, which the
+        // transition tensor does not hold: a population with no seed covers 0 bp. Counting
+        // transitions alone could not tell that apart from 1 bp, so with 1 bp reads, where
+        // there are no transitions at all, the check never fired (#767).
+        let mut populations: Vec<(&str, &Vec<Vec<Vec<usize>>>, &[usize], &str)> = Vec::new();
+        // R1 is checked only alongside a second population. On its own it sets the model's
+        // read length, so it cannot fall short of it.
         if config.fit_quality_degradation {
-            populations.push(("healthy", &transition_counts, DEGRADED_REMEDY));
-            populations.push(("degraded", &transition_counts_deg, DEGRADED_REMEDY));
+            populations.push(("healthy", &transition_counts, &seed_counts, DEGRADED_REMEDY));
+            populations.push((
+                "degraded",
+                &transition_counts_deg,
+                &seed_counts_deg,
+                DEGRADED_REMEDY,
+            ));
         }
         if let Some(m) = r2.as_ref() {
-            populations.push(("R1", &transition_counts, MATE_REMEDY));
-            populations.push(("R2", &m.transition_counts, MATE_REMEDY));
+            populations.push(("R1", &transition_counts, &seed_counts, MATE_REMEDY));
+            populations.push(("R2", &m.transition_counts, &m.seed_counts, MATE_REMEDY));
             if config.fit_quality_degradation {
                 populations.push((
                     "R2 degraded",
                     &m.transition_counts_deg,
+                    &m.seed_counts_deg,
                     MATE_DEGRADED_REMEDY,
                 ));
             }
         }
-        for (label, counts, remedy) in populations {
-            let trained = trained_positions(counts);
-            if trained < positions {
+        for (label, counts, seeds, remedy) in populations {
+            let covered = if seeds.iter().sum::<usize>() == 0 {
+                0
+            } else {
+                trained_positions(counts) + 1
+            };
+            if covered < read_length {
                 return Err(GenSeqErrorModelError::ConfigurationError(format!(
-                    "the {label} population covers {} bp, but the model covers \
+                    "the {label} population covers {covered} bp, but the model covers \
                      {read_length} bp: positions {} to {read_length} carry no {label} \
                      observation at all. Filling them would give that population a uniform \
                      quality distribution -- fabricated data a reader cannot distinguish \
                      from a fit. Every population must reach the model's read length: \
                      {remedy}",
-                    trained + 1,
-                    trained + 2,
+                    covered + 1,
                 )));
             }
         }
@@ -875,26 +967,52 @@ pub fn runner(config: &RunConfiguration) -> Result<(), GenSeqErrorModelError> {
             info!("Inferring SNP transition matrix from BAM: {:?}", path);
             let counts = match config.bam_method {
                 BamMethod::Overlap => overlap_counts(path, config)?,
-                BamMethod::Mismatch => as_weights(match &config.known_variants_vcf {
-                    None => read_bam_transitions(path)?,
-                    Some(vcf) => {
-                        let sites = read_known_sites(vcf)?;
-                        let n_sites: usize = sites.values().map(|s| s.len()).sum();
-                        info!("Masking {n_sites} reference positions from {vcf:?}");
-                        let (counts, masked) = read_bam_transitions_masked(path, sites)?;
-                        let kept: usize = counts.iter().flatten().sum();
-                        let seen = kept + masked;
+                BamMethod::Mismatch => {
+                    let mask = match &config.known_variants_vcf {
+                        None => None,
+                        Some(vcf) => {
+                            let sites = read_known_sites(vcf)?;
+                            let n_sites: usize = sites.values().map(|s| s.len()).sum();
+                            info!("Masking {n_sites} reference positions from {vcf:?}");
+                            Some(sites)
+                        }
+                    };
+                    let masking = mask.is_some();
+                    let report = read_bam_transition_report(path, mask)?;
+                    if masking {
+                        let kept: usize = report.counts.iter().flatten().sum();
+                        let seen = kept + report.masked;
                         info!(
-                            "Masked {masked} of {seen} mismatches ({:.2}%) at known variant sites",
+                            "Masked {} of {seen} mismatches ({:.2}%) at known variant sites",
+                            report.masked,
                             if seen > 0 {
-                                100.0 * masked as f64 / seen as f64
+                                100.0 * report.masked as f64 / seen as f64
                             } else {
                                 0.0
                             }
                         );
-                        counts
                     }
-                }),
+                    if report.md_seq_disagreements > 0 {
+                        // A hard error even when genuine mismatches remain. Only this one symptom
+                        // of a stale tag is detectable; the same tag can also name the wrong
+                        // reference base at a real mismatch, or miss one entirely, and those
+                        // look like ordinary evidence. A count that excluded the visible cases
+                        // would still rest on tags already shown not to describe the reads (#767).
+                        let kept: usize = report.counts.iter().flatten().sum();
+                        return Err(GenSeqErrorModelError::ConfigurationError(format!(
+                            "bam_file {:?} has MD tags that disagree with the reads: at {} \
+                             position(s) MD names a mismatch where the read has the reference \
+                             base ({kept} other mismatch(es) were consistent). The tags are \
+                             stale, for instance written before the reads were edited, so none \
+                             of the substitutions they describe can be trusted. Rewrite them \
+                             with `samtools calmd -b {} reference.fa > fixed.bam`.",
+                            path,
+                            report.md_seq_disagreements,
+                            path.display()
+                        )));
+                    }
+                    as_weights(report.counts)
+                }
             };
             // Every row empty means the BAM yielded no evidence at all. The overlap path has
             // already refused thin evidence and logged its counts; this is the mismatch path's
@@ -985,31 +1103,6 @@ fn write_test_bam(
     read_bases: &[u8],
     with_md: bool,
 ) {
-    use noodles::bam;
-    use noodles::sam::{
-        self as sam,
-        alignment::{
-            RecordBuf,
-            io::Write as _,
-            record::{
-                Flags,
-                cigar::{Op, op::Kind},
-                data::field::Tag,
-            },
-            record_buf::{Cigar, Sequence, data::field::Value as BufValue},
-        },
-    };
-
-    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
-    let n = read_bases.len();
-    // One contig, every record at position 1, so a known-variants mask can address bases.
-    let header = sam::Header::builder()
-        .add_reference_sequence(
-            b"chr1".to_vec(),
-            Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(1_000).unwrap()),
-        )
-        .build();
-
     // Build MD string: match counts interspersed with ref bases at mismatches
     let md_str: Option<String> = if with_md {
         let mut md = String::new();
@@ -1028,13 +1121,45 @@ fn write_test_bam(
     } else {
         None
     };
+    let records = vec![(read_bases, md_str.as_deref()); n_records];
+    write_test_bam_records(path, &records);
+}
+
+/// A minimal BAM of `(SEQ, MD)` records, each fully aligned at position 1 of `chr1`. The MD
+/// tag is written verbatim rather than derived from a reference, so a test can write one
+/// that disagrees with SEQ (#767). `None` omits the tag.
+#[cfg(test)]
+fn write_test_bam_records(path: &PathBuf, records: &[(&[u8], Option<&str>)]) {
+    use noodles::bam;
+    use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+    use noodles::sam::{
+        self as sam,
+        alignment::{
+            RecordBuf,
+            io::Write as _,
+            record::{
+                Flags,
+                cigar::{Op, op::Kind},
+                data::field::Tag,
+            },
+            record_buf::{Cigar, Sequence, data::field::Value as BufValue},
+        },
+    };
+    let header = sam::Header::builder()
+        .add_reference_sequence(
+            b"chr1".to_vec(),
+            Map::<ReferenceSequence>::new(std::num::NonZero::<usize>::new(1_000).unwrap()),
+        )
+        .build();
 
     let file = std::fs::File::create(path).unwrap();
     let mut writer = bam::io::Writer::new(file);
     writer.write_header(&header).unwrap();
 
-    for _ in 0..n_records {
-        let cigar: Cigar = [Op::new(Kind::Match, n)].into_iter().collect();
+    for &(read_bases, md_str) in records {
+        let cigar: Cigar = [Op::new(Kind::Match, read_bases.len())]
+            .into_iter()
+            .collect();
         let mut record = RecordBuf::default();
         *record.flags_mut() = Flags::empty();
         *record.cigar_mut() = cigar;
@@ -1042,10 +1167,10 @@ fn write_test_bam(
         *record.reference_sequence_id_mut() = Some(0);
         *record.alignment_start_mut() = noodles::core::Position::new(1);
 
-        if let Some(ref md) = md_str {
+        if let Some(md) = md_str {
             record
                 .data_mut()
-                .insert(Tag::MISMATCHED_POSITIONS, BufValue::from(md.as_str()));
+                .insert(Tag::MISMATCHED_POSITIONS, BufValue::from(md));
         }
         writer.write_alignment_record(&header, &record).unwrap();
     }
@@ -1515,7 +1640,8 @@ mod tests {
             d.read_fraction
         );
         // The two populations share one option set, so the degraded tensor must cover the same
-        // positions as the healthy one. A ragged pair indexes the wrong scores at generation.
+        // positions as the healthy one. If one stopped short, generation would index the wrong
+        // scores.
         assert_eq!(
             d.degraded_distros.len(),
             q.distros_from_one.len(),
@@ -1803,22 +1929,21 @@ mod tests {
     }
 
     /// `max_reads` applies PER MATE (#723). A shared budget spends it all on R1 and fits R2
-    /// from what is left -- nothing -- which the ragged refusal above would turn into an error
+    /// from what is left -- nothing -- which the read-length coverage check would turn into an error
     /// rather than a silent lopsided fit, but the declared semantics are that each mate gets
     /// its own N.
     ///
-    /// KNOWN ANSWER, computable from the fixtures: each file's first 10 records carry one
-    /// quality value and its remaining 90 carry another. With a per-mate budget of 10 the
-    /// union option set is exactly {Q20, Q40} -- the two capped-in values -- and Q30/Q10 never
-    /// enter the model. An ignored budget admits all four; a shared budget starves R2.
+    /// KNOWN ANSWER: every R1 record is Q40 and every R2 record Q20, 100 of each, capped at 10
+    /// per mate. Whichever records the sampler keeps, R1 must be fitted all-Q40 and R2 must
+    /// exist and be fitted all-Q20. A shared budget starves R2.
     #[test]
     fn max_reads_applies_to_each_mate() {
         let temp = tempfile::tempdir().unwrap();
         let r1_path = temp.path().join("capped_r1.fastq");
         let r2_path = temp.path().join("capped_r2.fastq");
-        // 'I' = Q40, '?' = Q30, '5' = Q20, '+' = Q10 under Phred+33.
-        write_groups(&r1_path, &[(10, "I".repeat(50)), (90, "?".repeat(50))]);
-        write_groups(&r2_path, &[(10, "5".repeat(50)), (90, "+".repeat(50))]);
+        // 'I' = Q40, '5' = Q20 under Phred+33.
+        write_groups(&r1_path, &[(100, "I".repeat(50))]);
+        write_groups(&r2_path, &[(100, "5".repeat(50))]);
 
         let output_path = temp.path().join("model.json.gz");
         let mut config = make_config(r1_path, output_path.clone());
@@ -1830,28 +1955,94 @@ mod tests {
         let q1 = model.quality_score_model();
         let q2 = model
             .quality_score_model_r2()
-            .expect("R2 must be fitted from its own 10 records, not from R1's leftovers");
-        assert_eq!(
-            q1.quality_score_options,
-            vec![20, 40],
-            "the option set is the union over the two capped mates; Q30 or Q10 here means \
-             `max_reads` did not apply"
-        );
+            .expect("R2 must be fitted from its own sample, not from R1's leftovers");
+        assert_eq!(q1.quality_score_options, vec![20, 40]);
 
         let mut rng = eidolon_core::rng::NeatRng::new_from_seed(&vec!["723".to_string()]).unwrap();
         let s1 = q1.generate_quality_scores(50, &mut rng).unwrap();
         let s2 = q2.generate_quality_scores(50, &mut rng).unwrap();
-        assert!(
-            s1.iter().all(|&s| s == 40),
-            "R1 was capped to its 10 all-Q40 records: {s1:?}"
-        );
-        assert!(
-            s2.iter().all(|&s| s == 20),
-            "R2 was capped to its 10 all-Q20 records: {s2:?}"
+        assert!(s1.iter().all(|&s| s == 40), "R1 is all-Q40: {s1:?}");
+        assert!(s2.iter().all(|&s| s == 20), "R2 is all-Q20: {s2:?}");
+    }
+
+    /// #721 KNOWN ANSWER: the first 500 records are Q40 and the last 500 Q10, as a flowcell
+    /// whose later tiles read worse would be. A cap of 100 must see both halves, so the
+    /// option set is {Q10, Q40}. Taking the head of the file, as the cap did before, fits
+    /// from the Q40 half only and gives {Q40}.
+    #[test]
+    fn a_capped_fit_samples_the_whole_file_not_its_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("two_halves.fastq");
+        write_groups(&fastq_path, &[(500, "I".repeat(50)), (500, "+".repeat(50))]);
+        let output_path = temp.path().join("model.json.gz");
+        let mut config = make_config(fastq_path, output_path.clone());
+        config.max_reads = 100;
+        runner(&config).unwrap();
+
+        let q = SequencingErrorModel::from_file(&output_path).unwrap();
+        assert_eq!(
+            q.quality_score_model().quality_score_options,
+            vec![10, 40],
+            "a capped fit saw only one half of the file: `max_reads` is taking the head (#721)"
         );
     }
 
-    /// MUST NOT FIRE: ragged read lengths are fine as long as BOTH populations reach the
+    /// The sampler keeps about `max_reads` records, spread evenly. KNOWN ANSWER: 1,000 of
+    /// 100,000 is p = 0.01, so the count is Binomial(100000, 0.01): mean 1,000, sigma ~31.5,
+    /// and each tenth of the file expects 100 (sigma ~10). Bounds are +/-5 sigma. A head
+    /// sampler puts all 1,000 in the first tenth.
+    #[test]
+    fn the_sampler_keeps_about_max_reads_spread_across_the_file() {
+        let mut sampler = ReadSampler::new(1_000, 100_000).unwrap();
+        let mut per_tenth = [0usize; 10];
+        for i in 0..100_000 {
+            if sampler.keep().unwrap() {
+                per_tenth[i / 10_000] += 1;
+            }
+        }
+        let kept: usize = per_tenth.iter().sum();
+        assert!(
+            (843..=1_157).contains(&kept),
+            "kept {kept} of 100,000 at p = 0.01"
+        );
+        for (t, &n) in per_tenth.iter().enumerate() {
+            assert!(
+                (50..=150).contains(&n),
+                "tenth {t} kept {n}, expected ~100: {per_tenth:?}"
+            );
+        }
+    }
+
+    /// MUST NOT FIRE: a cap at or above the file's size, or no cap, keeps every record.
+    #[test]
+    fn the_sampler_keeps_everything_when_the_cap_does_not_bind() {
+        for (max_reads, total) in [(0, 500), (500, 500), (1_000, 500)] {
+            let mut sampler = ReadSampler::new(max_reads, total).unwrap();
+            assert!(
+                sampler.keep_probability.is_none(),
+                "max_reads {max_reads}, total {total}"
+            );
+            assert!((0..total).all(|_| sampler.keep().unwrap()));
+        }
+    }
+
+    /// MUST NOT FIRE, end to end: a cap that does not bind writes the same model as no cap.
+    #[test]
+    fn a_cap_above_the_file_size_fits_the_same_model_as_no_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("small.fastq");
+        write_groups(&fastq_path, &[(60, "I".repeat(50)), (40, "+".repeat(50))]);
+        let fit = |name: &str, max_reads: usize| {
+            let out = temp.path().join(name);
+            let mut config = make_config(fastq_path.clone(), out.clone());
+            config.max_reads = max_reads;
+            runner(&config).unwrap();
+            serde_json::to_value(SequencingErrorModel::from_file(&out).unwrap()).unwrap()
+        };
+        assert_eq!(fit("uncapped.json.gz", 0), fit("capped.json.gz", 100));
+    }
+
+    /// MUST NOT FIRE: mixed read lengths are fine as long as BOTH populations reach the
     /// model's read length. The guard is about a population that cannot cover the model, not
     /// about variable lengths, which every real library has.
     #[test]
@@ -2037,19 +2228,42 @@ mod tests {
         assert_positions_match(q, &long_qual, 33);
     }
 
-    /// THE regression for the second review finding on #698: `max_reads` smaller than the
-    /// window the read length was drawn from.
+    /// THE regression for the second review finding on #698: `max_reads` must not let a
+    /// record it excluded set the model's read length. Under the earlier sampling code the
+    /// model advertised 100 bp from records the cap had skipped, and positions 51-100 were
+    /// uniform noise between Q10 and Q40.
     ///
-    /// Known answer: only the ten 50 bp records are fitted, so the model is a 50 bp model.
-    /// Under the sampling code it advertised 100 bp — the length came from records that
-    /// `max_reads` excluded — and positions 51-100 were uniform noise between Q10 and Q40.
+    /// Known answer: 110 records of 50 bp plus one of 100 bp, capped at 10. The sampler is
+    /// seeded, so the record numbers it skips are fixed; the 100 bp record is placed on the
+    /// first of them. Only 50 bp records are fitted, so the model is a 50 bp model.
     #[test]
     fn max_reads_does_not_advertise_positions_it_did_not_fit() {
-        let temp = tempfile::tempdir().unwrap();
-        let fastq_path = temp.path().join("capped.fastq");
+        const TOTAL: usize = 111;
+        let mut sampler = ReadSampler::new(10, TOTAL).unwrap();
+        let kept: Vec<bool> = (0..TOTAL).map(|_| sampler.keep().unwrap()).collect();
+        let skipped = kept
+            .iter()
+            .position(|k| !k)
+            .expect("p = 10/111 skips some record");
+        assert!(
+            kept.iter().any(|&k| k),
+            "the fixture needs at least one fitted record"
+        );
+
         let short_qual = "I".repeat(25) + &"+".repeat(25);
         let long_qual = "I".repeat(50) + &"+".repeat(50);
-        write_two_phase_fastq(&fastq_path, 10, &short_qual, 100, &long_qual);
+        let mut out = String::new();
+        for i in 0..TOTAL {
+            let q = if i == skipped {
+                &long_qual
+            } else {
+                &short_qual
+            };
+            out.push_str(&format!("@r{i}\n{}\n+\n{q}\n", "A".repeat(q.len())));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let fastq_path = temp.path().join("capped.fastq");
+        std::fs::write(&fastq_path, out).unwrap();
         let output_path = temp.path().join("model.json.gz");
         let mut config = make_config(fastq_path, output_path.clone());
         config.max_reads = 10;
@@ -2059,7 +2273,7 @@ mod tests {
         let q = model.quality_score_model();
         assert_eq!(
             q.assumed_read_length, 50,
-            "only the ten 50 bp records were fitted, so the model describes 50 positions"
+            "the only 100 bp record was skipped by the cap, so the model describes 50 positions"
         );
         assert_eq!(q.distros_from_one.len(), 49);
         assert_positions_match(q, &short_qual, 33);
@@ -2135,18 +2349,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scores.len(), 50);
-    }
-
-    #[test]
-    fn test_runner_max_reads() {
-        let temp = tempfile::tempdir().unwrap();
-        let fastq_path = temp.path().join("test.fastq");
-        make_test_fastq(&fastq_path, 100, 50);
-        let output_path = temp.path().join("model.json.gz");
-        let mut config = make_config(fastq_path, output_path.clone());
-        config.max_reads = 10;
-        runner(&config).unwrap();
-        assert!(output_path.exists());
     }
 
     #[test]
@@ -2323,23 +2525,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runner_max_reads_reduces_processed_count() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let fastq_path = PathBuf::from(format!("{}/test_data/H1N1_read1.fq.gz", manifest_dir));
-        let temp = tempfile::tempdir().unwrap();
-        let output_path = temp.path().join("h1n1_maxreads_model.json.gz");
-        let mut config = make_config(fastq_path, output_path.clone());
-        config.max_reads = 50;
-        runner(&config).unwrap();
-        assert!(output_path.exists());
-
-        let model = SequencingErrorModel::from_file(&output_path).unwrap();
-        let mut rng = eidolon_core::rng::NeatRng::new_from_seed(&vec!["seed".to_string()]).unwrap();
-        let scores = model.generate_quality_scores(151, &mut rng).unwrap();
-        assert_eq!(scores.len(), 151);
-    }
-
-    #[test]
     fn test_transition_matrix_from_tsv() {
         let temp = tempfile::tempdir().unwrap();
         let fastq_path = temp.path().join("test.fastq");
@@ -2377,7 +2562,19 @@ mod tests {
             bam_min_mapq: 20,
         };
         runner(&config).unwrap();
-        assert!(output_path.exists());
+        // The model must carry the TSV's rows, not the default matrix: each row's CDF is the
+        // running sum of the row written above.
+        use eidolon_core::structs::nucleotides::Nucleotide;
+        let model = SequencingErrorModel::from_file(&output_path).unwrap();
+        let tm = model.transition_distros();
+        for (base, expected) in [
+            (Nucleotide::A, [0.0, 0.5, 0.8, 1.0]),
+            (Nucleotide::C, [0.5, 0.5, 0.8, 1.0]),
+            (Nucleotide::G, [0.4, 0.7, 0.7, 1.0]),
+            (Nucleotide::T, [0.3, 0.6, 1.0, 1.0]),
+        ] {
+            assert_row_cdf_eq(&row_cdf(tm, base), &expected, &format!("{base:?} row"));
+        }
     }
 
     /// The cumulative weights of one transition-matrix row, as `[A, C, G, T]`.
@@ -2823,6 +3020,131 @@ mod tests {
     /// cause — a perfectly-matching alignment carries no transition evidence either. Included
     /// because the guard keys on the mismatch total, not on tag presence, and a reader could
     /// reasonably assume otherwise from the error text.
+    fn write_fastq(path: &PathBuf, seqs: &[&str]) {
+        let body: String = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("@r{i}\n{s}\n+\n{}\n", "I".repeat(s.len())))
+            .collect();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// #767, path 2. With every read 1 bp the model has no position after the first, so the
+    /// coverage check, which counted only those, could not fire. An R2 file whose records are
+    /// all empty then reached the quality fit with no seed at all and failed as a bare
+    /// `InvalidWeights([0.0])`. It must be refused as a population that covers 0 bp.
+    #[test]
+    fn an_r2_with_no_bases_is_refused_by_name_even_for_1bp_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (r1, r2) = (temp.path().join("r1.fq"), temp.path().join("r2.fq"));
+        write_fastq(&r1, &["A"; 20]);
+        write_fastq(&r2, &[""; 20]);
+        let mut config = make_config(r1, temp.path().join("m.json.gz"));
+        config.fastq_file_r2 = Some(r2);
+        let err = runner(&config)
+            .expect_err("an R2 with no bases cannot be fitted")
+            .to_string();
+        assert!(
+            err.contains("the R2 population covers 0 bp"),
+            "the refusal must name the population and its coverage: {err}"
+        );
+    }
+
+    /// MUST NOT FIRE: a pair of 1 bp files is a 1 bp model for each mate, not an error.
+    #[test]
+    fn a_pair_of_1bp_files_still_fits() {
+        let temp = tempfile::tempdir().unwrap();
+        let (r1, r2) = (temp.path().join("r1.fq"), temp.path().join("r2.fq"));
+        write_fastq(&r1, &["A"; 20]);
+        write_fastq(&r2, &["C"; 20]);
+        let output = temp.path().join("m.json.gz");
+        let mut config = make_config(r1, output.clone());
+        config.fastq_file_r2 = Some(r2);
+        runner(&config).unwrap();
+        let model = SequencingErrorModel::from_file(&output).unwrap();
+        assert_eq!(model.quality_score_model().assumed_read_length, 1);
+        assert!(
+            model.quality_score_model_r2().is_some(),
+            "R2 gets its own model"
+        );
+    }
+
+    fn mismatch_config(fastq: PathBuf, bam: PathBuf, output: PathBuf) -> RunConfiguration {
+        RunConfiguration {
+            fastq_file: fastq,
+            fastq_file_r2: None,
+            output_file: output,
+            overwrite_output: true,
+            max_reads: 0,
+            qual_offset: 33,
+            max_model_read_length: 1000,
+            fit_quality_degradation: false,
+            degradation_tail_window: 50,
+            degradation_tail_cut: 25,
+            binned_quality_bins: None,
+            bam_file: Some(bam),
+            transition_matrix_file: None,
+            known_variants_vcf: None,
+            bam_method: BamMethod::Mismatch,
+            bam_min_mapq: 20,
+        }
+    }
+
+    /// #767, path 1. An MD tag that disagrees with SEQ names a mismatch where the read base
+    /// equals the reference base. Counted, that is a self-transition; the diagonal is then
+    /// zeroed, and a row holding nothing else was left with no weight at all, which failed
+    /// as a bare `InvalidWeights`. Here every MD mismatch is stale (MD says the reference at
+    /// position 1 is A; SEQ has A there), and the error must say why.
+    #[test]
+    fn a_bam_whose_md_disagrees_with_seq_names_the_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq = temp.path().join("t.fastq");
+        make_test_fastq(&fastq, 20, 4);
+        let bam = temp.path().join("stale_md.bam");
+        write_test_bam_records(&bam, &vec![(&b"ACGT"[..], Some("0A3")); 5]);
+        let config = mismatch_config(fastq, bam, temp.path().join("m.json.gz"));
+        let err = runner(&config)
+            .expect_err("stale MD tags are not evidence")
+            .to_string();
+        assert!(
+            err.contains("MD") && err.contains("disagree"),
+            "the error must name the MD/SEQ disagreement: {err}"
+        );
+        assert!(
+            err.contains("at 5 position(s)") && err.contains("0 other mismatch(es)"),
+            "and say how many positions: {err}"
+        );
+    }
+
+    /// A BAM with some stale MD positions is refused even though its other mismatches look
+    /// fine. Self-transitions are the only detectable symptom of a stale tag; the same tag
+    /// can mis-state the reference base at a real mismatch, which would be counted as
+    /// ordinary evidence. So the fit must not proceed on the remainder (#767).
+    #[test]
+    fn a_bam_with_some_stale_md_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let fastq = temp.path().join("t.fastq");
+        make_test_fastq(&fastq, 20, 4);
+        let bam = temp.path().join("mixed_md.bam");
+        let mut records: Vec<(&[u8], Option<&str>)> = vec![(&b"CCGT"[..], Some("0A3")); 4];
+        records.extend(vec![(&b"ACGT"[..], Some("1C2")); 3]);
+        write_test_bam_records(&bam, &records);
+        let output = temp.path().join("m.json.gz");
+        let err = runner(&mismatch_config(fastq, bam, output.clone()))
+            .expect_err("a BAM with stale MD tags must not be fitted")
+            .to_string();
+        assert!(
+            err.contains("disagree") && err.contains("at 3 position(s)"),
+            "the error must name the disagreement and its count: {err}"
+        );
+        assert!(
+            err.contains("4 other mismatch(es)"),
+            "and say how many consistent mismatches were refused with it: {err}"
+        );
+        assert!(err.contains("calmd"), "and how to repair the tags: {err}");
+        assert!(!output.exists(), "no model is written");
+    }
+
     #[test]
     fn test_runner_bam_with_md_but_no_mismatches_is_an_error() {
         let temp = tempfile::tempdir().unwrap();
