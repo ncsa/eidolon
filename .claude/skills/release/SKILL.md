@@ -15,8 +15,8 @@ procedure exists because v3.2.0 was declared shipped while it was missing its ma
 
 ## Which branch
 
-Everything flows one way: `develop` → `main`. Nothing is merged from `main` back into
-`develop` (decided 2026-10-08, from v4.0.0 on).
+Releases flow one way: `develop` → `main`. Nothing is merged from `main` back into `develop`
+(decided 2026-10-08, from v4.0.0 on). Hotfixes are the one exception, below.
 
 | change | branch from | PR targets |
 |---|---|---|
@@ -24,16 +24,26 @@ Everything flows one way: `develop` → `main`. Nothing is merged from `main` ba
 | release prep (version bump, CHANGELOG) | `develop` | `develop` |
 | the release itself | — | `develop` → `main` |
 | conda sha256 follow-up | `develop` | `develop` |
-| **post-release fix (hotfix)** | **`develop`** | **`develop`, then `develop` → `main` as a release** |
+| **post-release fix (hotfix)** | **`main`** | **`main`; then the fix alone into `develop`** |
 
-**A hotfix ships everything on `develop`,** not just the fix: the `develop` → `main` PR carries
-whatever has merged since the last release. That is accepted. It means `develop` has to stay
-releasable, and the hotfix's release notes cover every change it delivers, not only the fix.
-**Version it by what it ships, under `versioning.md`:** a hotfix that carries a new feature
-from `develop` is a MINOR release, and one carrying a breaking change is MAJOR, whatever the fix
-itself would have been.
-Confirm the scope with `git log --first-parent --merges origin/main..origin/develop` and say it
-in the release PR.
+**A hotfix is cut from `main` and carries only that fix**, plus its version bump and CHANGELOG
+entry. Do not route it through `develop`: that would ship everything else that has merged
+since the last release. Confirm the scope with `git diff --stat origin/main..HEAD` before
+opening the PR and state the file count in the PR body.
+
+**Then bring the fix to `develop` in its own PR**, with `git cherry-pick` of the fix commit(s)
+and the CHANGELOG entry, but **not** the version bump: `develop`'s next release prep sets the
+version. Do not merge `main` into `develop`; that reintroduces the merge-back this flow
+removed. Check with `git cherry -v origin/develop <hotfix-branch>`: every fix commit must show
+`-` (an equivalent patch is on `develop`).
+
+**The next release after a hotfix will conflict** on the version line, `Cargo.lock`, and possibly
+the CHANGELOG: `main` and `develop` both changed them from the same base, and a cherry-pick
+shares no history. Resolve it on the release side, not on `develop`: cut `release/vX.Y.Z-merge`
+from `develop`, `git merge origin/main`, keep `develop`'s side of each conflict, run
+`cargo check --workspace && cargo fetch --locked`, and open the `develop` → `main` release PR
+from that branch. Once it merges, `main` contains `develop`'s history and later releases merge
+cleanly again.
 
 The old flow (release branch straight to `main`, then merge `main` back) left `develop` without
 the version bump and broke `Cargo.lock` on the merge-back. Bumping on `develop` removes both.
