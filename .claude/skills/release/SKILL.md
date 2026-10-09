@@ -1,6 +1,6 @@
 ---
 name: release
-description: "Use when cutting an eidolon release or fixing one that shipped wrong — version bumps, tagging, binary assets, the conda sha256 follow-up, and merging back. Examples: \"cut v3.3.0\", \"the macOS binary is missing from the release\", \"do the post-release steps\", \"tag a patch\"."
+description: "Use when cutting an eidolon release or fixing one that shipped wrong — version bumps, tagging, binary assets, the conda sha256 follow-up, and the one-way develop → main flow. Examples: \"cut v3.3.0\", \"the macOS binary is missing from the release\", \"do the post-release steps\", \"tag a patch\"."
 ---
 
 # Releasing eidolon
