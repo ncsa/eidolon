@@ -93,6 +93,12 @@ variant shares follow observed counts). Four `sv_pipeline.sbatch` functions rema
 - De novo breakends share #497's code path but no test runs them.
 - The rebuilt tumor models' SV components were not exercised end to end (#761 reports they did
   not change).
+- Delta-only scripts were checked for unknown config keys by search, not by running them
+  (#496). A Delta script carrying an unread key now fails at job start, naming the key.
+- The straddling-deletion fix (#691) was not rerun on Delta. Known limitation: deleted bases
+  past the sub-region boundary still get reference coverage.
+- Uniform `max_reads` sampling (#721) was not compared against head sampling on HG002, and a
+  capped run was not timed, so the HPC chapter's 1:30:00 estimate is not measured.
 
 Release ticket: #816.
 
