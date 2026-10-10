@@ -184,12 +184,18 @@ if [[ "$ALIGN" -eq 1 ]]; then
     # (the classic 'chr1' vs '1' trap). Warn loudly rather than let mut_model no-op.
     VCF_OK=1
     if [[ -s "$VCF" ]]; then
+        # head and grep -q close their pipes early, so zcat and cut take SIGPIPE (141); under
+        # pipefail that failed the substitution and set -e ended the job silently, after the
+        # BAM was already built (job 22776603). stage_hcc1395.sh hit the same line in job
+        # 19901611 and disables pipefail around both checks; so does this.
+        set +o pipefail
         vcf_ctg=$(zcat "$VCF" | grep -v '^#' | head -1 | cut -f1)
         if ! cut -f1 "$REF.fai" | grep -qxF "$vcf_ctg"; then
             echo "WARNING: truth VCF contig '$vcf_ctg' not found in $REF.fai — gen-mut-model" >&2
             echo "         would see zero variants. Check GRCh38 contig naming (chr-prefix?)." >&2
             VCF_OK=0
         fi
+        set -o pipefail
     else
         echo "WARNING: truth VCF not found at $VCF — run: DATA=hg002 bash scripts/delta/fetch_validation_data.sh" >&2
         VCF_OK=0
