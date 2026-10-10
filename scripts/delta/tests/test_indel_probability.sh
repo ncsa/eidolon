@@ -48,7 +48,8 @@ support is not counted per read@k = c SUBSEP p; mm[k]++@k = c SUBSEP p; mm[k] = 
 aligned bases are not counted@    bases++@    bases += 0
 M1
     run_muts "$PROB" PROB <<'M2'
-mid-support substitutions are counted as errors@else { smid++ }@else { smid++; slo++; sev += sup_s[k] }
+mid-support substitutions are counted as errors@else { smid++; smev += sup_s[k] }@else { smid++; smev += sup_s[k]; sev += sup_s[k] }
+the ambiguous fit leaves out ambiguous substitutions@share_amb = (iev + imev) / (iev + imev + sev + smev)@share_amb = (iev + imev) / (iev + imev + sev)
 indel errors are counted by position, not by read@else if (f < lf) { ilo++; iev += sup_i[k] }@else if (f < lf) { ilo++; iev += 1 }
 substitution errors are counted by position, not by read@else if (f < lf) { slo++; sev += sup_s[k] }@else if (f < lf) { slo++; sev += 1 }
 the curve mean is not weighted by the background@cm += bgn[h] * cw[h]@cm += cw[h]
@@ -152,6 +153,10 @@ eq "observed indel share of errors"    "$(row indel_share "$P")" "0.500000"
 # Every base is a run of 1, so the background mean of the shipped curve is its first entry.
 eq "background mean of the curve"      "$(row curve_bg_mean "$P")" "0.640000"
 eq "indel_probability = share / mean"  "$(row indel_probability "$P")" "0.781250"
+# Ambiguous: pos 28's 3 substitution reads, no indels. 1 / (1 + 0 + 1 + 3) = 0.2, / 0.64.
+eq "ambiguous substitution events"     "$(row sub_ambiguous_events "$P")" "3"
+eq "ambiguous indel events"            "$(row indel_ambiguous_events "$P")" "0"
+eq "fit counting ambiguous as errors"  "$(row indel_probability_with_ambiguous "$P")" "0.312500"
 eq "aligned bases carried through"     "$(row aligned_bases "$P")" "199"
 eq "indel errors per aligned base"     "$(row indel_error_rate "$P")" "0.00502513"
 has "the report names the denominator" "$(cat "$WORK/prob.txt")" "199 aligned bases"
@@ -193,4 +198,4 @@ eq "harness curve parsed"               "$(echo "$harness_curve" | tr ',' '\n' |
 eq "harness default equals the Rust default" "$harness_curve" "$rust_curve"
 
 printf '\n──────── %d passed, %d failed ────────\n' "$PASS" "$FAIL"
-[[ "$FAIL" -eq 0 && "$PASS" -ge 29 ]]
+[[ "$FAIL" -eq 0 && "$PASS" -ge 32 ]]
