@@ -81,6 +81,10 @@ JOIN_WIN="${JOIN_WIN:-25}"        # how far from a clip boundary an indel still 
 MAX_RUN="${MAX_RUN:-10}"          # run lengths above this are pooled into one bin
 HIGH_FRAC="${HIGH_FRAC:-0.25}"    # >= this share of local depth reads as a variant
 LOW_FRAC="${LOW_FRAC:-0.10}"      # <  this share reads as a slippage error
+# The shipped homopolymer context curve, run 1..10 (DEFAULT_INDEL_CONTEXT_CURVE in
+# eidolon-core/src/models/sequencing_error_model.rs; test_indel_probability.sh asserts the
+# two agree). indel_probability is fitted relative to it (#746).
+INDEL_CURVE="${INDEL_CURVE:-0.64,0.76,0.82,1.11,1.58,1.84,5.64,12.16,24.24,39.20}"
 
 for f in "$REAL_BAM" "$REFERENCE" "$REGIONS"; do
     [[ -s "$f" ]] || { echo "ERROR: not found or empty: $f" >&2; exit 1; }
@@ -93,6 +97,7 @@ echo "Reference:  $REFERENCE"
 echo "Regions:    $REGIONS  ($(wc -l < "$REGIONS") loci)"
 echo "Bins:       run length 1..$MAX_RUN (pooled above)"
 echo "Support:    high >= $HIGH_FRAC of depth, low < $LOW_FRAC"
+echo "Curve:      $INDEL_CURVE  (for indel_probability)"
 
 # ── 1. ONE pass over the reads ──────────────────────────────────────────────
 # Cached as (contig, pos, cigar) rather than re-queried. The previous version called
@@ -104,7 +109,7 @@ echo; echo "[1/4] reading the BAM once..."
 while read -r c s e _; do
     [[ -n "${c:-}" ]] || continue
     samtools view -F 0x904 -q 11 "$REAL_BAM" "$c:$((s+1))-$e" \
-      | awk -v OFS='\t' '{ print $3, $4, $6 }' >> "$CACHE"
+      | awk -v OFS='\t' '{ print $3, $4, $6, $10 }' >> "$CACHE"
 done < "$REGIONS"
 NREADS=$(wc -l < "$CACHE")
 [[ "$NREADS" -gt 0 ]] || { echo "ERROR: no reads passed the filter over these regions" >&2; exit 1; }
@@ -118,12 +123,30 @@ NIND=$(wc -l < "$OUTDIR/indels.tsv")
 [[ "$NIND" -gt 0 ]] || { echo "ERROR: no indel operations found -- nothing to measure" >&2; exit 1; }
 echo "      $NIND distinct indel positions"
 
+# ── 2b. mismatches, from the cached SEQ against the reference (#746) ────────
+# The substitution half of indel_probability. One reference segment per region, loaded
+# once; indel_context_subs.awk walks each read's CIGAR against it.
+echo "[2b] extracting mismatches..."
+: > "$OUTDIR/refseq.tsv"
+while read -r c s e _; do
+    [[ -n "${c:-}" ]] || continue
+    printf '%s\t%s\t%s\n' "$c" "$s" \
+        "$(samtools faidx "$REFERENCE" "$c:$((s+1))-$e" | tail -n +2 | tr -d '\n')" \
+        >> "$OUTDIR/refseq.tsv"
+done < "$REGIONS"
+awk -v f_ref="$OUTDIR/refseq.tsv" -v f_bases="$OUTDIR/bases.tsv" \
+    -f "$REPO_ROOT/scripts/delta/indel_context_subs.awk" "$OUTDIR/refseq.tsv" "$CACHE" \
+  | sort -k1,1 -k2,2n > "$OUTDIR/subs.tsv"
+NSUB=$(wc -l < "$OUTDIR/subs.tsv")
+[[ "$NSUB" -gt 0 ]] || { echo "ERROR: no mismatches found -- nothing to measure" >&2; exit 1; }
+echo "      $NSUB distinct mismatch positions over $(cut -f2 "$OUTDIR/bases.tsv") aligned bases"
+
 # ── 3. depth AT THOSE POSITIONS ONLY, from the same cache ───────────────────
-# A depth array over every reference base would be ~4M awk entries; only the indel
-# positions need a denominator.
-echo "[3/4] depth at indel positions..."
-awk -v OFS='\t' '
-    FNR == NR { want[$1 SUBSEP $2] = 1; next }
+# A depth array over every reference base would be ~4M awk entries; only the indel and
+# mismatch positions need a denominator.
+echo "[3/4] depth at indel and mismatch positions..."
+awk -v OFS='\t' -v f_ind="$OUTDIR/indels.tsv" -v f_sub="$OUTDIR/subs.tsv" '
+    FILENAME == f_ind || FILENAME == f_sub { want[$1 SUBSEP $2] = 1; next }
     {
         pos = $2; cig = $3; n = ""
         span = 0
@@ -136,7 +159,7 @@ awk -v OFS='\t' '
         for (p = pos; p < pos + span; p++) if (($1 SUBSEP p) in want) d[$1 SUBSEP p]++
     }
     END { for (k in d) { split(k, a, SUBSEP); print a[1], a[2], d[k] } }' \
-    "$OUTDIR/indels.tsv" "$CACHE" > "$OUTDIR/depth.tsv"
+    "$OUTDIR/indels.tsv" "$OUTDIR/subs.tsv" "$CACHE" > "$OUTDIR/depth.tsv"
 echo "      $(wc -l < "$OUTDIR/depth.tsv") positions with depth"
 
 # ── 4. reference context, one faidx per region, exact background ────────────
@@ -173,6 +196,17 @@ awk -v mx="$MAX_RUN" -v hf="$HIGH_FRAC" -v lf="$LOW_FRAC" \
     "$OUTDIR/indels.tsv" "$OUTDIR/depth.tsv" "$OUTDIR/ctx.tsv" "$OUTDIR/bg.tsv" \
   | tee "$OUTDIR/summary.txt"
 
+# indel_probability (#746): the same support rule over indels AND mismatches. A failure
+# here is a measurement that did not happen, so it stops the job rather than warning.
+awk -v hf="$HIGH_FRAC" -v lf="$LOW_FRAC" -v mx="$MAX_RUN" -v curve="$INDEL_CURVE" \
+    -v f_ind="$OUTDIR/indels.tsv" -v f_sub="$OUTDIR/subs.tsv" -v f_dep="$OUTDIR/depth.tsv" \
+    -v f_bg="$OUTDIR/bg.tsv" -v f_bases="$OUTDIR/bases.tsv" -v f_out="$OUTDIR/indel_probability.tsv" \
+    -f "$REPO_ROOT/scripts/delta/indel_probability.awk" \
+    "$OUTDIR/indels.tsv" "$OUTDIR/subs.tsv" "$OUTDIR/depth.tsv" "$OUTDIR/bg.tsv" \
+    "$OUTDIR/bases.tsv" > "$OUTDIR/indel_probability.txt" || rc=$?
+cat "$OUTDIR/indel_probability.txt" | tee -a "$OUTDIR/summary.txt"
+[[ "${rc:-0}" -eq 0 ]] || { echo "ERROR: indel_probability measurement failed (rc=$rc)" >&2; exit 1; }
+
 if [[ -n "$CANDIDATES" ]]; then
     if [[ -s "$CANDIDATES" ]]; then
         cp -f "$CANDIDATES" "$OUTDIR/candidates.tsv"
@@ -191,4 +225,4 @@ if [[ -n "$CANDIDATES" ]]; then
 fi
 
 rm -f "$CACHE"   # the read cache is large and reproducible; the summary is not
-archive_run "indelctx" "$OUTDIR" "summary.txt" "indels.tsv" || true
+archive_run "indelctx" "$OUTDIR" "summary.txt" "indels.tsv" "indel_probability.tsv" || true
