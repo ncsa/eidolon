@@ -76,6 +76,19 @@ conda_activate() {
 #   elapsed_s alloc_cpus alloc_nodes maxrss_kb core_hours
 # Best-effort: prints zeros when not under SLURM or sacct is unavailable, so the
 # caller can always `read` exactly five fields.
+# _job_log_paths: the absolute StdOut and StdErr paths SLURM recorded for this job, one per
+# line. Fails when there is no job or scontrol cannot answer. When --error is not given both
+# name the same file; copying it twice is harmless.
+_job_log_paths() {
+    [[ -n "${SLURM_JOB_ID:-}" ]] || return 1
+    local info key
+    info="$(scontrol show job -o "$SLURM_JOB_ID" 2>/dev/null)" || return 1
+    [[ -n "$info" ]] || return 1
+    for key in StdOut StdErr; do
+        sed -n "s/.* $key=\([^ ]*\).*/\1/p" <<< "$info"
+    done
+}
+
 _resource_values() {
     local jid="${SLURM_JOB_ID:-}"
     if [[ -z "$jid" ]] || ! command -v sacct >/dev/null 2>&1; then
@@ -130,10 +143,22 @@ archive_run() {
     for f in "$@"; do
         [[ -e "$outdir/$f" ]] && cp -f "$outdir/$f" "$dest/" 2>/dev/null || true
     done
-    # SLURM stdout/err (written to the submit dir as <jobname>_<jobid>.out/.err).
-    local base="${SLURM_JOB_NAME:-job}_${jid}"
-    [[ -f "${base}.out" ]] && cp -f "${base}.out" "$dest/" 2>/dev/null || true
-    [[ -f "${base}.err" ]] && cp -f "${base}.err" "$dest/" 2>/dev/null || true
+    # The job's own log, which is where every script prints its configuration. Ask SLURM where
+    # it is: guessing <jobname>_<jobid>.out in the current directory missed every script that
+    # names its log differently (hg002defaults-%j.log, overlapfit-%j.log, rawpairs-%j.log), and
+    # the miss was silent. The guess remains the fallback when scontrol cannot answer.
+    local base="${SLURM_JOB_NAME:-job}_${jid}" logs p copied=0
+    logs="$(_job_log_paths)" || logs=""
+    [[ -n "$logs" ]] || logs="${base}.out"$'\n'"${base}.err"
+    while IFS= read -r p; do
+        if [[ -n "$p" && -f "$p" ]] && cp -f "$p" "$dest/" 2>/dev/null; then
+            copied=$((copied + 1))
+        fi
+    done <<< "$logs"
+    if [[ "$copied" -eq 0 && -n "${SLURM_JOB_ID:-}" ]]; then
+        echo "[archive] WARNING: job log not found (looked for: ${logs//$'\n'/, });" \
+             "it is NOT archived, and with it the run's printed configuration" >&2
+    fi
 
     local ver git_desc
     ver="$("${EIDOLON_BIN:-eidolon}" --version 2>/dev/null || echo unknown)"
