@@ -103,10 +103,11 @@ YML
 #                <sim_depth>
 #
 # The effective settings of a panel run, as key/value lines archived beside panel.tsv. Every
-# number the panel reports is conditional on these, and the job log that used to be their
-# only record does not survive: job 22583881 could not be reproduced once its log was gone,
-# and a later run differed in real depth, fragment source and adapters without anything on
-# file saying so. The real BAM's size is recorded because a restaged BAM keeps its path.
+# number the panel reports is conditional on these. The job log prints them too, but as
+# prose spread over 48 KB, and it does not record the real BAM's size: the v4.0.0 rerun
+# (22783100) differed from 22583881 in real depth, fragment source and adapters, and the
+# depth difference came from a restaged BAM that kept its path. These lines make two runs
+# comparable with a diff.
 # Everything else is read from the same environment write_sim_config reads.
 write_settings() {
     local out="$1" version="$2" git="$3" real_bam="$4" reference="$5"

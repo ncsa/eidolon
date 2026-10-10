@@ -471,9 +471,9 @@ has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGE
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
 echo "=== write_settings: the run's settings are archived, decided as the config decides ==="
-# Job 22583881's settings lived only in its log; once that was gone the run could not be
-# reproduced, and a later run differed in real depth, fragment source and adapters with
-# nothing on file to say so. These lines are what makes the next comparison possible.
+# Two runs (22583881, 22783100) differed in real depth, fragment source and adapters, and
+# only the metrics showed it: the logs print settings as prose and omit the BAM's size, and
+# the BAM had been restaged under the same path. These lines make runs comparable by diff.
 printf '%012345d' 0 > "$WORK/real.bam"
 (
   unset FRAGMENT_MODEL ADAPTERS GC_BIAS_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
