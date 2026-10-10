@@ -503,6 +503,10 @@ if [[ "$MAX_SIM_DEPTH" -gt 0 && "$REAL_DEPTH" -gt "$MAX_SIM_DEPTH" ]]; then
     SIM_DEPTH="$MAX_SIM_DEPTH"
     DEPTH_CAPPED=1
 fi
+write_settings "$OUTDIR/settings.tsv" \
+    "$("$EIDOLON_BIN" --version 2>/dev/null || echo unknown)" \
+    "$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)" \
+    "$REAL_BAM" "$REFERENCE" "$REAL_DEPTH" "$SIM_DEPTH"
 echo "Probe:      $PROBE"
 echo "Real depth: ${REAL_DEPTH}x"
 if [[ "$DEPTH_CAPPED" -eq 1 ]]; then
@@ -638,4 +642,5 @@ echo "about, and the [min-max] beside each median is how much of it is the locus
 echo "than the data — real dispersion varies several-fold between loci on one chromosome."
 echo "════════════════════════════════════════════════════════════════"
 
-archive_run "realism" "$OUTDIR" "panel.tsv" "real_candidates.tsv" || true
+echo "Settings:   $OUTDIR/settings.tsv"
+archive_run "realism" "$OUTDIR" "panel.tsv" "real_candidates.tsv" "settings.tsv" || true

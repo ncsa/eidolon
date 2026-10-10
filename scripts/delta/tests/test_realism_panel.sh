@@ -56,6 +56,10 @@ model paths are dropped from the config@        [[ -n "$val" ]] && printf '%s: %
 a Normal ceiling is read as unbounded@else ((.Normal.mean + 4 * .Normal.st_dev) | floor) end@else 999999 end
 adapters are emitted as a flat scalar@printf 'adapters:\n  enabled: true\n  preset: %s\n'@printf 'adapters: %s\n' #
 adapters are emitted even when unset@    if [[ -n "${ADAPTERS:-}" ]]; then@    if true; then
+settings always record a Normal fragment@    [[ -n "${FRAGMENT_MODEL:-}" ]] && frag="model ${FRAGMENT_MODEL}"@    true
+settings always record adapters off@printf 'adapters\t%s\n' "${ADAPTERS:-off}"@printf 'adapters\t%s\n' "off"
+settings drop the real BAM's size@    bytes="$(stat -c %s "$real_bam" 2>/dev/null || echo unknown)"@    bytes=unknown
+settings record the real depth as the sim depth@printf 'sim_depth\t%s\n' "$sim_depth"@printf 'sim_depth\t%s\n' "$real_depth"
 CONFIG_MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -466,7 +470,39 @@ has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGE
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=88
+echo "=== write_settings: the run's settings are archived, decided as the config decides ==="
+# Job 22583881's settings lived only in its log; once that was gone the run could not be
+# reproduced, and a later run differed in real depth, fragment source and adapters with
+# nothing on file to say so. These lines are what makes the next comparison possible.
+printf '%012345d' 0 > "$WORK/real.bam"
+(
+  unset FRAGMENT_MODEL ADAPTERS GC_BIAS_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
+  FRAG_MEAN=400 FRAG_SD=90 READ_LEN=250 N_REGIONS=10 REGION_BP=400000 SEED=s \
+    write_settings "$WORK/s_default.tsv" "eidolon 9.9.9+abc" "v9.9.9" "$WORK/real.bam" \
+    /ref.fa 21 15
+)
+st="$(cat "$WORK/s_default.tsv")"
+has "settings carry a header"                    "$st" $'key\tvalue'
+has "settings name the binary"                   "$st" $'eidolon\teidolon 9.9.9+abc'
+has "settings record the real BAM's size"        "$st" $'real_bam_bytes\t12345'
+has "settings record the read length"            "$st" $'read_len\t250'
+has "settings record the real depth"             "$st" $'real_depth\t21'
+has "settings record the sim depth separately"   "$st" $'sim_depth\t15'
+has "no fragment model: the Normal override"     "$st" $'fragment\tNormal(400, 90)'
+has "no adapters: recorded as off"               "$st" $'adapters\toff'
+has "no GC model: recorded as the default"       "$st" $'gc_bias_model\teidolon default'
+(
+  unset GC_BIAS_MODEL SEQ_ERROR_MODEL QUALITY_MODEL MUTATION_MODEL GC_NORMALIZE
+  FRAGMENT_MODEL=/m/f.json.gz ADAPTERS=truseq FRAG_MEAN=400 FRAG_SD=90 \
+    write_settings "$WORK/s_trained.tsv" v g "$WORK/missing.bam" /ref.fa 21 21
+)
+st="$(cat "$WORK/s_trained.tsv")"
+has   "a fragment model is recorded by path"     "$st" $'fragment\tmodel /m/f.json.gz'
+hasnt "and not as the Normal override"           "$st" "Normal("
+has   "an adapter preset is recorded"            "$st" $'adapters\ttruseq'
+has   "a missing BAM's size reads unknown"       "$st" $'real_bam_bytes\tunknown'
+
+MIN_ASSERTIONS=101
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"

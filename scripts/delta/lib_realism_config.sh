@@ -98,3 +98,50 @@ YML
     fi
     return 0
 }
+
+# write_settings <out.tsv> <eidolon_version> <git> <real_bam> <reference> <real_depth> \
+#                <sim_depth>
+#
+# The effective settings of a panel run, as key/value lines archived beside panel.tsv. Every
+# number the panel reports is conditional on these, and the job log that used to be their
+# only record does not survive: job 22583881 could not be reproduced once its log was gone,
+# and a later run differed in real depth, fragment source and adapters without anything on
+# file saying so. The real BAM's size is recorded because a restaged BAM keeps its path.
+# Everything else is read from the same environment write_sim_config reads.
+write_settings() {
+    local out="$1" version="$2" git="$3" real_bam="$4" reference="$5"
+    local real_depth="$6" sim_depth="$7" frag bytes
+    frag="Normal(${FRAG_MEAN:-}, ${FRAG_SD:-})"
+    [[ -n "${FRAGMENT_MODEL:-}" ]] && frag="model ${FRAGMENT_MODEL}"
+    bytes="$(stat -c %s "$real_bam" 2>/dev/null || echo unknown)"
+    {
+        printf 'key\tvalue\n'
+        printf 'eidolon\t%s\n' "$version"
+        printf 'git\t%s\n' "$git"
+        printf 'real_bam\t%s\n' "$real_bam"
+        printf 'real_bam_bytes\t%s\n' "$bytes"
+        printf 'reference\t%s\n' "$reference"
+        printf 'align_reference\t%s\n' "${ALIGN_REFERENCE:-same as reference}"
+        printf 'contig\t%s\n' "${CONTIG:-every contig with reads}"
+        printf 'n_regions\t%s\n' "${N_REGIONS:-}"
+        printf 'region_bp\t%s\n' "${REGION_BP:-}"
+        printf 'seed\t%s\n' "${SEED:-}"
+        printf 'read_len\t%s\n' "${READ_LEN:-}"
+        printf 'match_read_len\t%s\n' "${MATCH_READ_LEN:-}"
+        printf 'read_len_tol\t%s\n' "${READ_LEN_TOL:-}"
+        printf 'real_depth\t%s\n' "$real_depth"
+        printf 'sim_depth\t%s\n' "$sim_depth"
+        printf 'max_sim_depth\t%s\n' "${MAX_SIM_DEPTH:-}"
+        printf 'fragment\t%s\n' "$frag"
+        printf 'gc_bias_model\t%s\n' "${GC_BIAS_MODEL:-eidolon default}"
+        printf 'sequence_error_model\t%s\n' "${SEQ_ERROR_MODEL:-eidolon default}"
+        printf 'quality_score_model\t%s\n' "${QUALITY_MODEL:-eidolon default}"
+        printf 'mutation_model\t%s\n' "${MUTATION_MODEL:-eidolon default}"
+        printf 'gc_normalize\t%s\n' "${GC_NORMALIZE:-eidolon default}"
+        printf 'adapters\t%s\n' "${ADAPTERS:-off}"
+        printf 'min_clip\t%s\n' "${MIN_CLIP:-}"
+        printf 'min_support\t%s\n' "${MIN_SUPPORT:-}"
+        printf 'max_tlen\t%s\n' "${MAX_TLEN:-}"
+        printf 'depth_lag\t%s\n' "${DEPTH_LAG:-}"
+    } > "$out"
+}
