@@ -34,8 +34,8 @@ pub enum GenerateReadsError {
     ApplyVariantsError,
     #[error("Error reading config key: {0} accepts values of {1}")]
     ConfigReadError(String, String),
-    #[error("Error generating configuration!")]
-    ConfigError,
+    #[error("Invalid configuration: {0}")]
+    ConfigError(String),
     #[error("{0}")]
     UnknownConfigKeys(String),
     #[error("Error generating fragments!")]

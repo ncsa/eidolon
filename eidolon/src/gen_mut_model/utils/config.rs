@@ -40,32 +40,38 @@ impl RunConfiguration {
         // parameters based on the inputs. A "." value means to use the default value.
         //
         // Opens file for reading
-        let f = fs::File::open(yml_file);
-        let file = match f {
-            Ok(l) => l,
-            Err(error) => panic!(
-                "Problem reading the config file: {:?}. System error: {}",
-                yml_file, error,
-            ),
-        };
+        let config_err = GenMutationModelError::ConfigurationError;
+        let file = fs::File::open(yml_file).map_err(|error| {
+            config_err(format!("cannot read the config file {yml_file:?}: {error}"))
+        })?;
         // Uses serde_yml to read the file into a HashMap
-        let scrape_config: HashMap<String, Value> =
-            serde_yml::from_reader(file).expect("Error reading yaml file!");
-        // Fill in the bed_file first, all hinges on that
-        if let Err(msg) = check_keys(
+        let scrape_config: HashMap<String, Value> = serde_yml::from_reader(file)
+            .map_err(|error| config_err(format!("{yml_file:?} is not valid YAML: {error}")))?;
+        check_keys(
             scrape_config.keys().map(String::as_str),
             KNOWN_KEYS,
             "gen-mut-model",
-        ) {
-            panic!("{msg}")
-        }
-        let reference = PathBuf::from(scrape_config["reference"].as_str().unwrap());
+        )
+        .map_err(config_err)?;
+        // A required key that is missing, or not a string, is a config error naming the key.
+        let required = |key: &str| -> Result<PathBuf, GenMutationModelError> {
+            scrape_config
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .ok_or_else(|| config_err(format!("missing required key '{key}' (a path)")))
+        };
+        let reference = required("reference")?;
         if !reference.is_file() {
-            panic!("Invalid reference file {:?}", reference)
+            return Err(GenMutationModelError::FileNotFound(format!(
+                "reference {reference:?}"
+            )));
         }
-        let vcf_file = PathBuf::from(scrape_config["vcf_file"].as_str().unwrap());
+        let vcf_file = required("vcf_file")?;
         if !vcf_file.is_file() {
-            panic!("Invalid bed file {:?}", vcf_file)
+            return Err(GenMutationModelError::FileNotFound(format!(
+                "vcf_file {vcf_file:?}"
+            )));
         }
         let bed_file_raw = scrape_config
             .get("bed_file")
@@ -76,14 +82,21 @@ impl RunConfiguration {
         } else {
             let bed_file = PathBuf::from(bed_file_raw);
             if !bed_file.is_file() {
-                panic!("Invalid bed file {:?}", bed_file)
+                return Err(GenMutationModelError::FileNotFound(format!(
+                    "bed_file {bed_file:?}"
+                )));
             }
-            read_bed(&bed_file, false).expect("Error reading bed file!")
+            read_bed(&bed_file, false)?
         };
-        let overwrite_output = scrape_config["overwrite_output"].as_bool().unwrap_or(false);
-        let output_file = PathBuf::from(scrape_config["output_file"].as_str().unwrap());
+        let overwrite_output = scrape_config
+            .get("overwrite_output")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let output_file = required("output_file")?;
         if !overwrite_output && output_file.is_file() {
-            panic!("Attempting to overwrite an existing file {:?}", output_file)
+            return Err(GenMutationModelError::OverwriteFileError(format!(
+                "{output_file:?}; set overwrite_output: true to replace it"
+            )));
         }
         let mutations = read_vcf_lean(vcf_file)?;
 
@@ -95,11 +108,11 @@ impl RunConfiguration {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty() && s.trim() != ".")
         {
-            panic!(
+            return Err(config_err(format!(
                 "transition_matrix_file ({path}) is no longer supported. It never affected \
                  generated variants: SNP alt bases come from the per-trinucleotide-context \
                  model fitted from the VCF. Remove the key to continue (see #758)."
-            )
+            )));
         }
 
         Ok(RunConfiguration {
@@ -180,8 +193,13 @@ mod tests {
     /// A value means the user expects the matrix to shape the model. It never did,
     /// so the run must stop rather than silently ignore it.
     #[test]
-    #[should_panic(expected = "transition_matrix_file (/any/matrix.tsv) is no longer supported")]
     fn a_set_transition_matrix_file_is_refused() {
-        let _ = config_with("transition_matrix_file: /any/matrix.tsv\n");
+        let err = config_with("transition_matrix_file: /any/matrix.tsv\n")
+            .expect_err("a set transition_matrix_file must stop the run")
+            .to_string();
+        assert!(
+            err.contains("transition_matrix_file (/any/matrix.tsv) is no longer supported"),
+            "{err}"
+        );
     }
 }

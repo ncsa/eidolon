@@ -366,6 +366,20 @@ code, and renaming them would ripple through the sbatch and its test suite for n
   reproduce from `input_vcf` vs generate de novo, measured, with the broken cells pinned.
 - `docs/pcawg_sv_measurement.md` — the PCAWG corpus measurements the SV model rests on.
 
+## Errors, not panics (Rust)
+**User input never panics.** A bad config, a missing or existing file, an unknown key or a
+malformed path is the user's mistake, and it returns the subcommand's error type with a
+message that names the key or path. `main` prints that message and exits 1. A panic (exit
+101, "thread 'main' panicked at …") is for a broken invariant only: `unreachable!`, or
+`.expect("required by clap")` on something the parser already guarantees.
+- Do not follow a neighboring `panic!` because it is there. The config loaders carried
+  panics from before the error types existed, and two PRs (#807, #827) extended them for
+  consistency before #NNN converted them.
+- A message carries the key, not just the value: `File not found: .` sent a user hunting;
+  `reference is required and has no default` did not.
+- `tests/config_errors_exit_cleanly.rs` pins this per subcommand: exit 1, the reason on
+  stderr, no "panicked".
+
 ## Testing (Rust)
 - `cargo test` builds a **fresh** binary (`assert_cmd::cargo_bin`) — no staleness worry.
   Integration tests live in `eidolon/tests/` (`mod common;` for shared helpers).

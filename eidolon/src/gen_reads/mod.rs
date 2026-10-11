@@ -12,30 +12,29 @@ pub fn main(config: &PathBuf) -> Result<(), GenerateReadsError> {
     info!("////////////// Welcome to eidolon read generator! \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\");
     // set up the config struct based on whether there was an input config. Input config
     // overrides any other inputs.
-    let config = if !config.display().to_string().is_empty() {
-        info!("Using Configuration file input: {:?}", config);
-        RunConfiguration::from_yaml_file(config)
-            .expect("Error generating run configuration from input yaml")
-    } else {
-        panic!("Failed to supply config file!");
-    };
+    if config.display().to_string().is_empty() {
+        return Err(GenerateReadsError::CliError(
+            "no configuration file was given (-c)".to_string(),
+        ));
+    }
+    info!("Using Configuration file input: {:?}", config);
+    let config = RunConfiguration::from_yaml_file(config)?;
 
     // Check that we are clear to write outputs
     if !config.overwrite_output {
-        if let Some(filename) = &config.output_fastq_1
-            && filename.is_file()
+        for filename in [
+            &config.output_fastq_1,
+            &config.output_fastq_2,
+            &config.output_vcf,
+        ]
+        .into_iter()
+        .flatten()
         {
-            panic!("Attempting to overwrite an existing file: {:?}", filename);
-        }
-        if let Some(filename) = &config.output_fastq_2
-            && filename.is_file()
-        {
-            panic!("Attempting to overwrite an existing file: {:?}", filename);
-        }
-        if let Some(filename) = &config.output_vcf
-            && filename.is_file()
-        {
-            panic!("Attempting to overwrite an existing file: {:?}", filename);
+            if filename.is_file() {
+                return Err(GenerateReadsError::ConfigError(format!(
+                    "output {filename:?} already exists; set overwrite_output: true to replace it"
+                )));
+            }
         }
     }
 
