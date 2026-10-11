@@ -37,7 +37,7 @@ END {
         f = sup_i[k] / d
         if (f >= hf) { ihi++; ivar += sup_i[k] }
         else if (f < lf) { ilo++; iev += sup_i[k] }
-        else { imid++ }
+        else { imid++; imev += sup_i[k] }
     }
     for (k in sup_s) {
         d = dep[k] + 0; if (d <= 0) { snodep++; continue }
@@ -45,7 +45,7 @@ END {
         spool += sup_s[k]
         if (f >= hf) { shi++; svar += sup_s[k] }
         else if (f < lf) { slo++; sev += sup_s[k] }
-        else { smid++ }
+        else { smid++; smev += sup_s[k] }
     }
 
     cm = 0
@@ -59,8 +59,8 @@ END {
     printf "  %-34s %10s %10s %10s %10s\n", "", "error", "ambiguous", "variant", "no depth"
     printf "  %-34s %10d %10d %10d %10d\n", "indel positions", ilo, imid, ihi, inodep
     printf "  %-34s %10d %10d %10d %10d\n", "substitution positions", slo, smid, shi, snodep
-    printf "  %-34s %10d %10s %10d\n", "indel events (reads)", iev, "", ivar
-    printf "  %-34s %10d %10s %10d\n", "substitution events (reads)", sev, "", svar
+    printf "  %-34s %10d %10d %10d\n", "indel events (reads)", iev, imev, ivar
+    printf "  %-34s %10d %10d %10d\n", "substitution events (reads)", sev, smev, svar
     printf "  substitution events in every class: %d (error %d is the part that is not variants)\n", spool, sev
     print ""
     printf "  denominator: %d aligned bases\n", bases
@@ -74,11 +74,17 @@ END {
     }
     share = iev / (iev + sev)
     fit = share / cmean
+    # The ambiguous class, counted as errors too. On HG002 at 21x it was almost all errors at
+    # low local depth, where one or two reads already exceed lf (#746), so the two fits
+    # bracket the measurement rather than either being the answer alone.
+    share_amb = (iev + imev) / (iev + imev + sev + smev)
+    fit_amb = share_amb / cmean
     printf "  indel error events per aligned base:        %.3g\n", iev / bases
     printf "  substitution error events per aligned base: %.3g\n", sev / bases
     printf "  observed indel share of error events:       %.6f\n", share
     printf "  background mean of the shipped curve:       %.6f  (1 on the sample it was fitted from)\n", cmean
     printf "  indel_probability = share / mean:           %.6f\n", fit
+    printf "  ... counting ambiguous positions as errors: %.6f\n", fit_amb
     print ""
     print "SANITY. #746 records an EXPECTATION, not a measurement: indel errors around 1e-6 to"
     print "1e-5 per base (the v3.4.0 CHANGELOG's ~1e-5) and substitutions around 1e-3. A rate far"
@@ -97,4 +103,7 @@ END {
     printf "indel_share\t%.6f\n", share > f_out
     printf "curve_bg_mean\t%.6f\n", cmean > f_out
     printf "indel_probability\t%.6f\n", fit > f_out
+    printf "indel_ambiguous_events\t%d\n", imev > f_out
+    printf "sub_ambiguous_events\t%d\n", smev > f_out
+    printf "indel_probability_with_ambiguous\t%.6f\n", fit_amb > f_out
 }

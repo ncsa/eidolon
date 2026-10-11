@@ -219,8 +219,9 @@ impl SequencingErrorModel {
     ///
     /// The substitution matrix in the file is the mean of two NovaSeq overlap fits (#779),
     /// not HG002's: it was substituted into the file after the quality fit. The remaining
-    /// non-quality fields are the inherited values — `indel_probability` 0.01,
-    /// `insertion_fraction` 0.4 and the shipped indel-context curve.
+    /// non-quality fields are the inherited values, each since measured consistent:
+    /// `indel_probability` 0.01 (0.0092–0.0104 on HG002, #746), `insertion_fraction` 0.4
+    /// (0.387 on HCC1395) and the shipped indel-context curve. See `model_data/README.md`.
     ///
     /// The provenance stamp (`_eidolon`) is ignored rather than checked: this file ships
     /// inside the binary that reads it, so the two cannot disagree.
