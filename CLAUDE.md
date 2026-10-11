@@ -374,7 +374,7 @@ message that names the key or path. `main` prints that message and exits 1. A pa
 `.expect("required by clap")` on something the parser already guarantees.
 - Do not follow a neighboring `panic!` because it is there. The config loaders carried
   panics from before the error types existed, and two PRs (#807, #827) extended them for
-  consistency before #NNN converted them.
+  consistency before #842 converted them.
 - A message carries the key, not just the value: `File not found: .` sent a user hunting;
   `reference is required and has no default` did not.
 - `tests/config_errors_exit_cleanly.rs` pins this per subcommand: exit 1, the reason on
