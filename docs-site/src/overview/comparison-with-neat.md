@@ -27,20 +27,18 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 | Long reads (ONT / PacBio)                  | ❌                             | ⚠️ PacBio-like single-end "given a model" | ⚠️ `long_reads:` fragment mode; no long-read error model yet (#319) |
 | Parallelism                                | Manual job sharding (`--job`)  | Multiprocessing (`--threads`): genome split into ~8 chunks/thread, then stitched | Multithreading (rayon) |
 | Deterministic output                       | Not guaranteed                 | Not guaranteed across thread counts       | ✅ byte-identical for a given seed, across thread counts (`determinism.rs` pins single-threaded and rayon-default) |
-| Speed (single thread, vs NEAT 4.6.1)       | —                              | 1× (baseline)                             | **~10–13× faster** (E. coli 10.4× · yeast 11.2× · chr22 13.3×; measured on v1.19.1) |
-| Peak memory (same runs)                    | —                              | 1× (baseline)                             | **3–7× less**, and flatter (chr22 227 MB vs 1525 MB; v1.19.1, since grown to 295.5 MB)      |
+| Speed (single thread, vs NEAT 4.6.1)       | —                              | 1× (baseline)                             | **~8–12× faster** (E. coli 8.3× · yeast 10.2× · chr22 11.9×; measured on v4.0.0) |
+| Peak memory (same runs)                    | —                              | 1× (baseline)                             | **2–5.5× less** (chr22 277 MB vs 1522 MB; v4.0.0)      |
 | VCF comparison tooling                      | Bundled scripts                | ✅ `compare-vcfs`                          | ✅ `compare-vcfs`                                        |
 | I/O / memory                               | Temp files                     | Temp files                                | Streaming writes, low-memory focus                       |
 | Versioning policy                          | ad hoc                         | ad hoc                                    | SemVer 2.0.0 with a declared public API (as of v3.0.0)   |
 | Distribution                               | GitHub source                  | GitHub / PyPI                             | GitHub + binaries; Bioconda (`conda install -c bioconda eidolon`) |
 
 Speed and memory are single-thread medians (n=3, 10× coverage) on one exclusive
-Delta node against NEAT 4.6.1, measured on v1.19.1; see `docs/access_report_draft.md` §3.2.
-eidolon's chr22 footprint has since grown to 295.5 MB (v3.4.0's quality tensors), and both
-comparisons are being re-measured on the current release (#840). Germline
-fidelity is statistically equivalent between the two tools through an identical
-GATK pipeline (§3.3), which is the intended result for a port. That comparison predates the
-v3.4–v3.5 recalibration and is also being re-run (#840).
+Delta node against NEAT 4.6.1, measured on v4.0.0 (#840); see `docs/access_report_draft.md`
+§3.2. The whole human genome runs single-threaded in 80 minutes at 12.3 GB. Through an
+identical GATK pipeline on chr22 (§3.3), SNP recall is equivalent (0.990 vs 0.989), indel
+recall is higher (0.978 vs 0.969), and eidolon's precision is higher for both.
 
 **On NEAT 4 and structural variants.** NEAT 4.6.1 ships `Inversion`, `Duplication`,
 `Translocation`, `Transposition` and `CopyNumberVariant` classes under
