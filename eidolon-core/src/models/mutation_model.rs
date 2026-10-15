@@ -1,6 +1,5 @@
 //! The mutation model
 use crate::rng::{NeatRng, NeatRngError};
-use flate2::read::GzDecoder;
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -156,9 +155,8 @@ impl MutationModel {
     #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self, MutationModelError> {
         // Creating the default model based on the default for the original NEAT.
-        let reader = GzDecoder::new(DATA_FILE);
-        let mut data: MutationModel =
-            serde_json::from_reader(reader).map_err(MutationModelError::SerdeError)?;
+        let mut data: MutationModel = crate::models::lib::from_gzip_json(DATA_FILE)
+            .map_err(MutationModelError::SerdeError)?;
         // Attach the bundled default SV model in code rather than baking it
         // into `default_mutation_model.json.gz` — keeps the SV defaults
         // auditable in `sv_model_defaults.rs` instead of buried in a
@@ -717,7 +715,8 @@ mod tests {
     fn legacy_model_with_snp_transition_matrix_still_loads() {
         // The NEAT2-derived default eidolon shipped until #752, which predates #763.
         static LEGACY: &[u8] = include_bytes!("test_fixtures/neat2_mutation_model.json.gz");
-        let shipped: serde_json::Value = serde_json::from_reader(GzDecoder::new(LEGACY)).unwrap();
+        let shipped: serde_json::Value =
+            serde_json::from_reader(flate2::read::GzDecoder::new(LEGACY)).unwrap();
         assert!(
             shipped["statistical_models"]
                 .get("transition_matrix")

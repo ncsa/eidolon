@@ -10,7 +10,6 @@ use crate::structs::distributions::{DiscreteDistribution, DistributionErrors};
 use crate::structs::nucleotides::Nucleotide::{A, C, G, N, T};
 use crate::structs::nucleotides::{ALLOWED_NUCS, Nucleotide};
 use crate::structs::transition_matrix::{TransitionMatrix, TransitionMatrixError};
-use flate2::read::GzDecoder;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use log::{debug, info};
@@ -377,9 +376,8 @@ impl SnpTrinucModel {
     pub fn default() -> Result<Self, SnpTrinucError> {
         // This default will read in data from the original NEAT trinuc model to create a more realistic trinuc
         // bias.
-        let reader = GzDecoder::new(DATA_FILE);
         let data: SnpTrinucModel =
-            serde_json::from_reader(reader).map_err(SnpTrinucError::SerdeError)?;
+            crate::models::lib::from_gzip_json(DATA_FILE).map_err(SnpTrinucError::SerdeError)?;
         Ok(data)
     }
 

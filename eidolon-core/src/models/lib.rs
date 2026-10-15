@@ -5,7 +5,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 /// Key under which the provenance stamp is stored in a model file (#708).
@@ -85,6 +85,25 @@ fn stamped<T: Serialize>(model: &T) -> serde_json::Value {
     value
 }
 
+/// Decompress a gzipped JSON document into memory, then parse it.
+///
+/// Every model load goes through here. `serde_json::from_reader` over a `GzDecoder` parses a
+/// byte at a time through `io::Read`, and on the 20.8 MB default sequencing error model that
+/// took ~720 ms against ~70 ms for decompress-then-`from_slice`: most of every `gen-reads`
+/// run's startup (#845). A decompression failure is reported as a serde_json I/O error so
+/// callers keep a single error type.
+pub fn from_gzip_json<T, R>(compressed: R) -> serde_json::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+    R: Read,
+{
+    let mut json = Vec::new();
+    GzDecoder::new(compressed)
+        .read_to_end(&mut json)
+        .map_err(serde_json::Error::io)?;
+    serde_json::from_slice(&json)
+}
+
 /// Read a model, checking its provenance stamp first.
 ///
 /// A file with no stamp was written before stamps existed. That is the documented backward-
@@ -93,11 +112,13 @@ pub fn model_reader<T>(filename: &PathBuf) -> Result<T, std::io::Error>
 where
     T: for<'de> Deserialize<'de>,
 {
-    // This will take any serializable model and write it to file.
-    let filein =
-        File::open(filename).unwrap_or_else(|_| panic!("Error opening file {:?}", filename));
-    let reader = GzDecoder::new(BufReader::new(filein));
-    let mut value: serde_json::Value = serde_json::from_reader(reader)?;
+    let filein = File::open(filename).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot open model file {:?}: {e}", filename),
+        )
+    })?;
+    let mut value: serde_json::Value = from_gzip_json(BufReader::new(filein))?;
     check_provenance(&mut value, filename)?;
     let value: T = serde_json::from_value(value)?;
     Ok(value)
@@ -112,7 +133,7 @@ pub fn model_from_bytes<T>(bytes: &[u8], label: &str) -> Result<T, std::io::Erro
 where
     T: for<'de> Deserialize<'de>,
 {
-    let mut value: serde_json::Value = serde_json::from_reader(GzDecoder::new(bytes))?;
+    let mut value: serde_json::Value = from_gzip_json(bytes)?;
     check_provenance(&mut value, &PathBuf::from(label))?;
     Ok(serde_json::from_value(value)?)
 }
@@ -168,11 +189,15 @@ pub fn model_unzipped_reader<T>(filename: &PathBuf) -> Result<T, std::io::Error>
 where
     T: for<'de> Deserialize<'de>,
 {
-    // This will take any serializable model and write it to file.
-    let filein =
-        File::open(filename).unwrap_or_else(|_| panic!("Error opening file {:?}", filename));
-    let reader = BufReader::new(filein);
-    let value: T = serde_json::from_reader(reader)?;
+    let filein = File::open(filename).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot open model file {:?}: {e}", filename),
+        )
+    })?;
+    let mut json = Vec::new();
+    BufReader::new(filein).read_to_end(&mut json)?;
+    let value: T = serde_json::from_slice(&json)?;
     Ok(value)
 }
 
@@ -340,5 +365,75 @@ mod tests {
         written.as_object_mut().unwrap().remove(PROVENANCE_KEY);
 
         assert_eq!(written, serde_json::to_value(&toy).unwrap());
+    }
+
+    /// The default sequencing error model: 20.8 MB of JSON once decompressed, the file whose
+    /// load time #845 is about. A real shipped blob, so the comparison below covers every field
+    /// shape the defaults actually use.
+    static SEQ_ERROR_DEFAULT: &[u8] =
+        include_bytes!("model_data/default_sequencing_error_model.json.gz");
+
+    /// `from_gzip_json` must produce exactly what the streaming parse it replaces produced.
+    /// The reference parse is the old `serde_json::from_reader(GzDecoder)` path, kept here and
+    /// nowhere else, so a helper that dropped or truncated anything would differ.
+    #[test]
+    fn from_gzip_json_matches_the_streaming_parse_on_the_shipped_default() {
+        let streamed: serde_json::Value =
+            serde_json::from_reader(GzDecoder::new(SEQ_ERROR_DEFAULT)).unwrap();
+        let buffered: serde_json::Value = from_gzip_json(SEQ_ERROR_DEFAULT).unwrap();
+        assert!(
+            streamed["quality_score_model"]["distros_from_one"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "fixture precondition: the default carries its quality tensor"
+        );
+        assert_eq!(buffered, streamed);
+    }
+
+    /// Bad gzip is an error, not a panic, and not an empty model.
+    #[test]
+    fn from_gzip_json_rejects_bytes_that_are_not_gzip() {
+        let r: Result<serde_json::Value, _> = from_gzip_json(&b"{\"not\": \"gzipped\"}"[..]);
+        assert!(r.is_err(), "plain JSON is not a gzip stream: {r:?}");
+    }
+
+    /// A gzip stream cut short must fail rather than parse a prefix.
+    #[test]
+    fn from_gzip_json_rejects_a_truncated_stream() {
+        let cut = &SEQ_ERROR_DEFAULT[..SEQ_ERROR_DEFAULT.len() / 2];
+        let r: Result<serde_json::Value, _> = from_gzip_json(cut);
+        assert!(r.is_err(), "half a gzip stream must not load");
+    }
+
+    /// A stream that decompresses to complete, valid JSON but fails its gzip checksum must be
+    /// refused. This is the one corruption the parse cannot catch on its own, so it is the case
+    /// that shows the decompression error is propagated rather than discarded.
+    #[test]
+    fn from_gzip_json_rejects_a_bad_checksum_on_valid_json() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(br#"{"value": 7}"#).unwrap();
+        let mut gz = encoder.finish().unwrap();
+        let good: serde_json::Value = from_gzip_json(&gz[..]).unwrap();
+        assert_eq!(good, json!({"value": 7}), "fixture precondition: intact stream loads");
+        // The gzip trailer is CRC32 then ISIZE; flip a CRC byte, leave the payload intact.
+        let crc = gz.len() - 8;
+        gz[crc] ^= 0xff;
+        let r: Result<serde_json::Value, _> = from_gzip_json(&gz[..]);
+        assert!(r.is_err(), "a checksum mismatch must not load: {r:?}");
+    }
+
+    /// A missing model file is the user's mistake: an error naming the path, not a panic.
+    #[test]
+    fn model_reader_reports_a_missing_file_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_such_model.json.gz");
+        let r = std::panic::catch_unwind(|| model_reader::<serde_json::Value>(&path));
+        let err = r
+            .expect("a missing model file must not panic")
+            .expect_err("a missing model file must be an error");
+        assert!(
+            err.to_string().contains("no_such_model.json.gz"),
+            "the error must name the file: {err}"
+        );
     }
 }
