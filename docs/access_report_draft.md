@@ -50,8 +50,12 @@ noted.
 | Mean coverage (covered bases) | 29.96× (requested 30×) |
 | Breadth | 0.77 (chr22 N-gaps correctly left uncovered) |
 | Heterozygous allele fraction | 0.486 (clean diploid binomial ~0.5) |
-| Het/hom ratio | **~2.0** (human-realistic; a default-model bug that inflated this to ~95 was found and fixed during this validation — see note) |
-| Ts/Tv | **2.35** (human-realistic) |
+| Het/hom ratio | **1.55** (v4.0.0, job 22801853; ~2.0 in Phase 1 — see note) |
+| Ts/Tv | **2.23** (v4.0.0, job 22801853; 2.35 in Phase 1) |
+
+Determinism, coverage, breadth and allele fraction are Phase 1 measurements (v1.x). Het/hom
+and Ts/Tv were re-measured on v4.0.0 (#840), whose default mutation model is fitted to HG002
+(v3.5.0): `homozygous_frequency` 0.388, and context weights that put chr22 at Ts/Tv 2.23.
 
 Determinism holding byte-for-byte across thread counts is a guarantee NEAT 4 does
 not make.
@@ -74,7 +78,8 @@ corrected default (42,997 variant sites → het/hom 2.00, P(hom) 0.333) and lock
 by a regression test. Because the caller recovers whatever zygosity is
 simulated (truth and query ratios matched throughout), recall, precision and
 Ts/Tv are unaffected by this correction — the fix improves realism of the
-absolute ratio, not the validation conclusions. A population / common-variant
+absolute ratio, not the validation conclusions. Since v3.5.0 the default is 0.388, fitted to
+HG002, which gives het/hom ~1.6. A population / common-variant
 (LD) structured zygosity model (#316) remains a separate, optional realism
 enhancement; it is *not* required for a realistic het/hom ratio.
 
@@ -82,12 +87,28 @@ enhancement; it is *not* required for a realistic het/hom ratio.
 
 | Genome | eidolon wall | NEAT wall | **Speedup** | eidolon RSS | NEAT RSS | **Memory** |
 |---|---|---|---|---|---|---|
-| E. coli (4.5 MB) | 9.27 s | 96.85 s | **10.4×** | 40 MB | 281 MB | **7.0×** |
-| yeast (11 MB) | 20.68 s | 231.1 s | **11.2×** | 53 MB | 168 MB | **3.2×** |
-| chr22 (49 MB) | 60.94 s | 810.3 s | **13.3×** | 227 MB | 1525 MB | **6.7×** |
+| E. coli (4.5 MB) | 12.28 s | 101.47 s | **8.3×** | 104 MB | 193 MB | **1.9×** |
+| yeast (11.7 MB) | 24.03 s | 245.20 s | **10.2×** | 87 MB | 170 MB | **2.0×** |
+| chr22 (49 MB) | 68.20 s | 809.38 s | **11.9×** | 277 MB | 1522 MB | **5.5×** |
+| human GRCh38 (2.999 GB) | 4,787 s | not run | — | 12.3 GB | — | — |
 
-eidolon is **~10–13× faster** than NEAT 4 and uses 3–7× less, flatter memory (both
-tools single-threaded, 10× coverage, n=3 median on one exclusive node).
+v4.0.0, job 22801855 (#840): eidolon is **~8–12× faster** than NEAT 4 and uses 2–5.5× less
+memory (both tools single-threaded, 10× coverage, n=3 median on one exclusive node). The
+whole human genome runs in one single-threaded process in 80 minutes.
+
+Phase 1 (v1.19.1) measured 10.4 / 11.2 / 13.3× and 7.0 / 3.2 / 6.7×. NEAT's wall times are
+within 5% of Phase 1, as are its yeast and chr22 memory (its E. coli RSS read 281 MB then,
+193 MB now). eidolon's are slower and larger, and the difference is a per-run fixed cost rather
+than slower read generation. Measured locally on E. coli, 1 thread, v1.19.1 against v4.0.0
+(2026-10-15, #843): the cost per 1× of coverage is unchanged (0.476 and 0.478 s), while the
+intercept rises from ~0.26 s to ~1.1 s. Most of it is startup: on the 13.5 kb H1N1 reference
+v4.0.0 takes 0.75 s and 36 MB where v1.19.1 takes 0.13 s and 14 MB, and handing v4.0.0 a
+smaller error model brings that to 0.30 s. The shipped sequencing error model, fitted to
+HG002 in v3.4.0, is 20.8 MB of JSON (two quality tables of ~11 MB each), parsed on every
+run. Fixed costs weigh most on small genomes at the 10× used here, so the gap narrows with
+genome size and coverage: at 30× on E. coli v4.0.0 is 6% slower locally. Of the memory
+growth, +22 MB is those quality tables (measured, #670); a further ~40 MB that predates
+them is not yet identified.
 
 **Revision (v1.19.1).** An earlier draft reported ~2.7–2.9×. Those eidolon timings
 were taken while eidolon defaulted to `--log-level trace`, whose per-base debug I/O
@@ -97,6 +118,10 @@ Memory was never affected (logging is CPU/I/O-bound), so the 3–7× memory adva
 is unchanged. Both tools ran at minimal logging — eidolon `warn`, NEAT its default
 `info`, which has no per-read logging and is timing-equivalent to `warn` (verified
 in NEAT's source; #346 makes NEAT `--log-level WARNING` explicit going forward).
+
+**Multicore behavior.** In v4.0.0 (job 22801855) yeast runs 24.0 s at 1 thread, 10.9 s at 4,
+8.6 s at 16 and 7.8 s at 64 (**~3×**, flat beyond 16). That is below the v1.19.1 figures that
+follow (3.9× at 16 threads), and the difference has not been investigated.
 
 **Multicore behavior (v1.19.1).** The same fix also reverses eidolon's apparent
 thread *regression*. On the multi-contig yeast genome, in-process threading now
@@ -115,11 +140,14 @@ Caller recovery of each simulator's truth set through the same GATK pipeline:
 
 | | eidolon SNP | NEAT SNP | eidolon INDEL | NEAT INDEL |
 |---|---|---|---|---|
-| Recall | 0.989 | 0.989 | 0.982 | 0.969 |
-| Precision | 0.9996 | 0.991 | 0.989 | 0.972 |
+| Recall | 0.990 | 0.989 | 0.978 | 0.969 |
+| Precision | 0.9995 | 0.991 | 0.987 | 0.972 |
 
-**Statistically equivalent**, with eidolon marginally cleaner on precision. eidolon
-faithfully reproduces NEAT 4's germline behavior.
+v4.0.0, job 22801853 (#840). NEAT's row is identical to Phase 1; eidolon's moved from
+0.989 / 0.9996 (SNP) and 0.982 / 0.989 (INDEL). Recall is equivalent on SNPs and higher on
+indels, and eidolon is cleaner on precision for both. The truth sets are not the same shape:
+eidolon plants 7,623 indels to NEAT's 2,517 against similar SNP counts, at het/hom 1.55
+where NEAT's truth is almost entirely heterozygous (1,126).
 
 ### 3.4 Cancer end-to-end (chr22, 30×, purity 0.6)
 
@@ -766,16 +794,20 @@ precedes any further BND claims here.
 
 To confirm the chr22 metrics are not overfit to one chromosome, both pipelines were
 re-run on a **chr1–chr3 subset of GRCh38** — ~690 Mb, ~13× chr22, entirely different
-sequence. Every metric held or slightly improved:
+sequence. Every metric held:
 
 | Pipeline | Metric | chr1–3 | chr22 |
 |---|---|---|---|
-| Germline (eidolon) | SNP recall / precision | **0.990 / 0.9997** | 0.989 / 0.9996 |
-| Germline (eidolon) | INDEL recall / precision | **0.988 / 0.990** | 0.982 / 0.989 |
-| Cancer (Mutect2 T/N) | somatic SNV recall / precision | **0.944 / 0.910** | 0.925 / 0.872 |
-| Cancer (Mutect2 T/N) | somatic INDEL recall / precision | **0.908 / 0.885** | 0.900 / 0.844 |
+| Germline (eidolon, v4.0.0) | SNP recall / precision | **0.990 / 0.9995** | 0.990 / 0.9995 |
+| Germline (eidolon, v4.0.0) | INDEL recall / precision | **0.977 / 0.986** | 0.978 / 0.987 |
+| Cancer (Mutect2 T/N, Phase 1) | somatic SNV recall / precision | **0.944 / 0.910** | 0.925 / 0.872 |
+| Cancer (Mutect2 T/N, Phase 1) | somatic INDEL recall / precision | **0.908 / 0.885** | 0.900 / 0.844 |
 
-Germline Ts/Tv held at 2.34 (truth = query). eidolon's fidelity is therefore not an
+The germline rows are v4.0.0 (jobs 22801854 and 22801853, #840: 884,150 SNPs and 129,044
+indels planted on chr1–3); Phase 1 read 0.990 / 0.9997 and 0.988 / 0.990 on chr1–3. The
+cancer rows are Phase 1 and have not been re-run on v4.0.0. Germline Ts/Tv is 2.09 on chr1–3
+and 2.23 on chr22 (truth = query in both); the context model makes Ts/Tv follow sequence
+composition, so the two need not match. eidolon's fidelity is therefore not an
 artifact of chr22 — it holds at 13× the scale on different sequence. Whole-genome
 runs were not pursued (no divergence to investigate); the Mutect2 tumor/normal step
 is the practical scale ceiling (~3.2 h on chr1–3, and ≫48 h projected genome-wide
@@ -937,16 +969,20 @@ themselves cost nothing:
 
 | realism signal | off | on_raw | on_trim |
 |---|---|---|---|
-| fastp adapter reads | 5,913 | 2,425,876 | 2,425,876 |
-| soft-clip fraction | 0.0004 | 0.0804 | 0.0006 (recovered by trim) |
-| mean insert size | 214.6 | 178.5 | 178.5 |
+| fastp adapter reads | 2,834 | 2,442,092 | 2,442,092 |
+| soft-clip fraction | 0.0009 | 0.0809 | 0.0010 (recovered by trim) |
+| mean insert size | 214.4 | 178.5 | 178.5 |
 | mean read length | 151 | 151 | 139 (adapter trimmed) |
 
 | fidelity contrast (Δ = A − B) | isolates | snp_recall | indel_recall |
 |---|---|---|---|
-| `on_trim` − `short_ctrl` | pure adapter effect (same inserts) | +0.0003 | +0.0018 |
-| `on_raw` − `on_trim` | adapter handling (soft-clip vs trim) | −0.0002 | −0.0009 |
-| `short_ctrl` − `off` | short-insert coverage effect (no adapters) | −0.0263 | −0.0334 |
+| `on_trim` − `short_ctrl` | pure adapter effect (same inserts) | −0.0002 | −0.0011 |
+| `on_raw` − `on_trim` | adapter handling (soft-clip vs trim) | −0.0000 | −0.0002 |
+| `short_ctrl` − `off` | short-insert coverage effect (no adapters) | −0.0062 | −0.0081 |
+
+v4.0.0, three replicates per arm (#840). The Phase 1 run read the same conclusions with a
+larger short-insert effect (−0.0263 / −0.0334 recall); the adapter contrasts were within
+noise then as now.
 
 Adding adapter readthrough to short-insert reads costs no fidelity (within replication
 noise), whether the adapters are fastp-trimmed or left for BWA-MEM2 to soft-clip. The only

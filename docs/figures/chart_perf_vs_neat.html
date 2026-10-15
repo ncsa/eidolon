@@ -44,8 +44,8 @@
       <svg id="ram" viewBox="0 0 420 300" role="img" aria-label="peak memory MB"></svg>
     </div>
   </div>
-  <p class="cap"><b>rneat is 10–13× faster and uses 3–7× less, flatter memory</b> than NEAT 4
-  across E. coli (4.5 Mb), yeast (11 Mb) and human chr22 (49 Mb) — single thread, 10×, fixed build (v1.19.1).
+  <p class="cap"><b>eidolon is 8–12× faster and uses 2–5.5× less memory</b> than NEAT 4
+  across E. coli (4.5 Mb), yeast (11.7 Mb) and human chr22 (49 Mb) — single thread, 10×, v4.0.0 (job 22801855, #840).
   Source: ACCESS report §3.2.</p>
 </div>
 <script>
@@ -53,8 +53,8 @@ const NS="http://www.w3.org/2000/svg";
 const el=(t,a)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;};
 const genomes=["E. coli","yeast","chr22"];
 const data={
-  time:{rneat:[9.27,20.68,60.94],neat:[96.85,231.1,810.3],ratio:[10.4,11.2,13.3],unit:"s",log:false,max:850},
-  ram :{rneat:[40,53,227],       neat:[281,168,1525],    ratio:[7.0,3.2,6.7],unit:"MB",log:true, max:2000}
+  time:{rneat:[12.28,24.03,68.20],neat:[101.47,245.20,809.38],ratio:[8.3,10.2,11.9],unit:"s",log:false,max:850},
+  ram :{rneat:[104,87,277],       neat:[193,170,1522],        ratio:[1.9,2.0,5.5],unit:"MB",log:true, max:2000}
 };
 function draw(id,d){
   const svg=document.getElementById(id);

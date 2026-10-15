@@ -41,27 +41,25 @@
     </div>
     <div class="panel">
       <h2>Ts/Tv ratio</h2>
-      <div class="note">query transitions/transversions · biologically plausible band</div>
+      <div class="note">query transitions/transversions · follows sequence composition</div>
       <svg id="tstv" viewBox="0 0 460 300" role="img" aria-label="Ts/Tv per genome"></svg>
     </div>
   </div>
-  <p class="cap"><b>Across E. coli (4.6 Mb), yeast (11.5 Mb), human chr22 (50.8 Mb), C. elegans (100.3 Mb)
-  and rice (389.7 Mb) — an ~85× size range — SNP/indel recall stays ≥0.97 and precision ≥0.99</b>, with no
-  human-specific overtuning. Ts/Tv holds in a tight 2.31–2.43 band throughout. Recall dips only marginally
-  at rice's scale (0.970 vs ~0.985), as expected from its higher repeat content, while precision stays 0.999.
-  Source: ACCESS report §4 (input variety).</p>
+  <p class="cap"><b>Across E. coli (4.6 Mb), yeast (12.2 Mb) and human chr22 (50.8 Mb), SNP recall stays ≥0.97,
+  indel recall ≥0.96 and precision ≥0.98</b> (v4.0.0, #840). Ts/Tv follows sequence composition: the
+  HG002-fitted context model weights CpG transitions, so CpG-rich E. coli reads 3.18 where chr22 reads 2.23.
+  C. elegans and rice were measured on v1.x and not re-run. The yeast FASTA differs from the v1.x run's
+  (12.2 vs 11.5 Mb). Source: ACCESS report §4 (input variety).</p>
 </div>
 <script>
 const NS="http://www.w3.org/2000/svg";
 const el=(t,a)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;};
 const txt=(x,y,s,o={})=>{const e=el("text",{x,y,"font-size":o.size||10,fill:o.fill||"#475569",
   "text-anchor":o.anchor||"middle","font-weight":o.w||400});e.textContent=s;return e;};
-const G=[{n:"E. coli",mb:4.6,sr:0.9847,sp:0.9998,ir:0.9916,ip:1.0000,tstv:2.433},
-         {n:"yeast", mb:11.5,sr:0.9834,sp:0.9998,ir:0.9799,ip:0.9882,tstv:2.378},
-         {n:"chr22", mb:50.8,sr:0.9888,sp:0.9996,ir:0.9822,ip:0.9887,tstv:2.337},
-         {n:"C.eleg",mb:100.3,sr:0.9834,sp:0.9998,ir:0.9796,ip:0.9881,tstv:2.310},
-         {n:"rice",  mb:389.7,sr:0.9700,sp:0.9992,ir:0.9686,ip:0.9868,tstv:2.333}];
-const lx=G.map(g=>Math.log10(g.mb)), lmin=Math.log10(3), lmax=Math.log10(550);
+const G=[{n:"E. coli",mb:4.6,sr:0.9909,sp:0.9993,ir:0.9716,ip:0.9817,tstv:3.183},
+         {n:"yeast", mb:12.2,sr:0.9708,sp:0.9991,ir:0.9608,ip:0.9885,tstv:2.411},
+         {n:"chr22", mb:50.8,sr:0.9897,sp:0.9995,ir:0.9780,ip:0.9873,tstv:2.227}];
+const lx=G.map(g=>Math.log10(g.mb)), lmin=Math.log10(3), lmax=Math.log10(80);
 const Xof=v=>{const L=46,R=16,pw=460-L-R;return L+pw*(Math.log10(v)-lmin)/(lmax-lmin);};
 
 // ---- accuracy panel (y 0.95-1.0) ----
@@ -85,9 +83,9 @@ const Xof=v=>{const L=46,R=16,pw=460-L-R;return L+pw*(Math.log10(v)-lmin)/(lmax-
 // ---- Ts/Tv panel ----
 (function(){
   const svg=document.getElementById("tstv"),W=460,H=300,L=46,R=16,T=14,B=46,pw=W-L-R,ph=H-T-B;
-  const y0=2.0,y1=2.6,Y=v=>T+ph-ph*(v-y0)/(y1-y0);
+  const y0=2.0,y1=3.4,Y=v=>T+ph-ph*(v-y0)/(y1-y0);
   svg.appendChild(el("line",{x1:L,y1:T+ph,x2:W-R,y2:T+ph,stroke:"#cbd5e1"}));
-  [2.0,2.1,2.2,2.3,2.4,2.5,2.6].forEach(v=>{const y=Y(v);
+  [2.0,2.2,2.4,2.6,2.8,3.0,3.2,3.4].forEach(v=>{const y=Y(v);
     svg.appendChild(el("line",{x1:L,y1:y,x2:W-R,y2:y,stroke:"#eef2f7"}));
     svg.appendChild(txt(L-6,y+3,v.toFixed(1),{anchor:"end",fill:"#94a3b8"}));});
   const pts=G.map(g=>`${Xof(g.mb)},${Y(g.tstv)}`).join(" ");
