@@ -98,9 +98,17 @@ whole human genome runs in one single-threaded process in 80 minutes.
 
 Phase 1 (v1.19.1) measured 10.4 / 11.2 / 13.3× and 7.0 / 3.2 / 6.7×. NEAT's wall times are
 within 5% of Phase 1, as are its yeast and chr22 memory (its E. coli RSS read 281 MB then,
-193 MB now). eidolon's are slower and larger. The fixed memory cost is
-accounted for: the shipped default now carries four 249×31 quality tensors where it carried
-one 100×42 (`baseline_metrics.tsv`, v3.4.0 note). The added wall time has not been itemized.
+193 MB now). eidolon's are slower and larger, and the difference is a per-run fixed cost rather
+than slower read generation. Measured locally on E. coli, 1 thread, v1.19.1 against v4.0.0
+(2026-10-15, #843): the cost per 1× of coverage is unchanged (0.476 and 0.478 s), while the
+intercept rises from ~0.26 s to ~1.1 s. Most of it is startup: on the 13.5 kb H1N1 reference
+v4.0.0 takes 0.75 s and 36 MB where v1.19.1 takes 0.13 s and 14 MB, and handing v4.0.0 a
+smaller error model brings that to 0.30 s. The shipped sequencing error model, fitted to
+HG002 in v3.4.0, is 20.8 MB of JSON (two quality tables of ~11 MB each), parsed on every
+run. Fixed costs weigh most on small genomes at the 10× used here, so the gap narrows with
+genome size and coverage: at 30× on E. coli v4.0.0 is 6% slower locally. Of the memory
+growth, +22 MB is those quality tables (measured, #670); a further ~40 MB that predates
+them is not yet identified.
 
 **Revision (v1.19.1).** An earlier draft reported ~2.7–2.9×. Those eidolon timings
 were taken while eidolon defaulted to `--log-level trace`, whose per-base debug I/O
