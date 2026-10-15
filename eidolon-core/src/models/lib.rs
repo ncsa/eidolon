@@ -414,7 +414,11 @@ mod tests {
         encoder.write_all(br#"{"value": 7}"#).unwrap();
         let mut gz = encoder.finish().unwrap();
         let good: serde_json::Value = from_gzip_json(&gz[..]).unwrap();
-        assert_eq!(good, json!({"value": 7}), "fixture precondition: intact stream loads");
+        assert_eq!(
+            good,
+            json!({"value": 7}),
+            "fixture precondition: intact stream loads"
+        );
         // The gzip trailer is CRC32 then ISIZE; flip a CRC byte, leave the payload intact.
         let crc = gz.len() - 8;
         gz[crc] ^= 0xff;
