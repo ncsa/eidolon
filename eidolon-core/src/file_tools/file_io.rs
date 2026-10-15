@@ -53,11 +53,15 @@ pub fn open_safe(filename: &PathBuf) -> Result<BufReader<File>> {
 
 pub fn create_output_file(filename: &PathBuf, overwrite_file: bool) -> Result<File> {
     if filename.is_file() && !overwrite_file {
-        // The file already exists and we're in non overwrite mode
-        panic!(
-            "Attempting to overwrite an existing file: {}",
-            filename.display()
-        )
+        // The file already exists and we're in non overwrite mode: the caller's error, with
+        // the path, rather than a panic.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists; set overwrite_output: true to replace it",
+                filename.display()
+            ),
+        ))
     } else {
         File::create(filename)
     }
@@ -183,12 +187,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Attempting to overwrite an existing file")]
-    fn test_create_output_file_no_overwrite_panics() {
+    fn test_create_output_file_no_overwrite_is_an_error() {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("out.txt");
         std::fs::write(&path, "original").unwrap();
-        create_output_file(&path, false).unwrap();
+        let err = create_output_file(&path, false).expect_err("an existing file is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("out.txt"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original",
+            "left untouched"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 // config yaml file or command line arguments and turn them into the configuration.
 
 use crate::config_keys::check_keys;
+use crate::filter_reads::errors::FilterReadsError;
 use log::*;
 use serde_yml::Value;
 use std::collections::HashMap;
@@ -31,65 +32,73 @@ pub struct RunConfiguration {
 }
 
 impl RunConfiguration {
-    pub fn from(yml_file: &PathBuf) -> Self {
+    pub fn from(yml_file: &PathBuf) -> Result<Self, FilterReadsError> {
         // Reads an input configuration file from yaml using the serde package. Then sets the
         // parameters based on the inputs. A "." value means to use the default value.
-
-        // Opens file for reading
-        let f = fs::File::open(yml_file);
-        let file = match f {
-            Ok(l) => l,
-            Err(error) => panic!(
-                "Problem reading the config file: {:?}. System error: {}",
-                yml_file, error,
-            ),
-        };
+        let config_err = FilterReadsError::ConfigurationError;
+        let file = fs::File::open(yml_file).map_err(|error| {
+            config_err(format!("cannot read the config file {yml_file:?}: {error}"))
+        })?;
         // Uses serde_yml to read the file into a HashMap
-        let scrape_config: HashMap<String, Value> =
-            serde_yml::from_reader(file).expect("Error reading yaml file!");
-        // Fill in the bed_file first, all hinges on that
-        if let Err(msg) = check_keys(
+        let scrape_config: HashMap<String, Value> = serde_yml::from_reader(file)
+            .map_err(|error| config_err(format!("{yml_file:?} is not valid YAML: {error}")))?;
+        check_keys(
             scrape_config.keys().map(String::as_str),
             KNOWN_KEYS,
             "filter-reads",
-        ) {
-            panic!("{msg}")
-        }
-        let bed_file = PathBuf::from(scrape_config["bed_file"].as_str().unwrap());
+        )
+        .map_err(config_err)?;
+        let required_str = |key: &str| -> Result<&str, FilterReadsError> {
+            scrape_config
+                .get(key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| config_err(format!("missing required key '{key}'")))
+        };
+        let bed_file = PathBuf::from(required_str("bed_file")?);
         if !bed_file.is_file() {
-            panic!("Invalid bed file {:?}", bed_file)
+            return Err(FilterReadsError::FileNotFound(format!(
+                "bed_file {bed_file:?}"
+            )));
         }
-        let files_to_filter_raw = scrape_config["files_to_filter"].as_sequence().unwrap();
+        let files_to_filter_raw = scrape_config
+            .get("files_to_filter")
+            .and_then(|v| v.as_sequence())
+            .ok_or_else(|| config_err("missing required key 'files_to_filter' (a list)".into()))?;
         let filter_key: &str = {
-            let temp_key = scrape_config["filter_key"].as_str().unwrap();
+            let temp_key = required_str("filter_key")?;
             if temp_key == "." { "_filter" } else { temp_key }
         };
-        let overwrite_output = scrape_config["overwrite_output"].as_bool().unwrap();
+        let overwrite_output = scrape_config
+            .get("overwrite_output")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| {
+                config_err("missing required key 'overwrite_output' (true/false)".into())
+            })?;
         info!("Overwrite? {overwrite_output}");
-        let file_map: HashMap<PathBuf, (PathBuf, bool, bool)> = {
-            let mut temp_map = HashMap::new();
-            for raw_value in files_to_filter_raw {
-                let raw_string = raw_value.as_str().unwrap();
-                let input_path = PathBuf::from(raw_string);
-                let (output_path, is_gzip, is_fastq) = filtered_output(&input_path, filter_key)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Unknown File Extension! {raw_string:?}: expected one of \
-                             .fastq, .fastq.gz, .vcf, .vcf.gz"
-                        )
-                    });
-                if !input_path.is_file() {
-                    panic!("Input file not found! {:?}", input_path)
-                }
-                if !overwrite_output && output_path.is_file() {
-                    panic!("Attempting to overwrite an existing file {:?}", output_path)
-                }
-                temp_map.insert(input_path, (output_path, is_gzip, is_fastq));
+        let mut file_map: HashMap<PathBuf, (PathBuf, bool, bool)> = HashMap::new();
+        for raw_value in files_to_filter_raw {
+            let raw_string = raw_value.as_str().ok_or_else(|| {
+                config_err(format!("files_to_filter entry {raw_value:?} is not a path"))
+            })?;
+            let input_path = PathBuf::from(raw_string);
+            let (output_path, is_gzip, is_fastq) = filtered_output(&input_path, filter_key)
+                .ok_or_else(|| {
+                    FilterReadsError::MalformedFileName(format!(
+                        "{raw_string:?}: expected one of .fastq, .fastq.gz, .vcf, .vcf.gz"
+                    ))
+                })?;
+            if !input_path.is_file() {
+                return Err(FilterReadsError::FileNotFound(format!("{input_path:?}")));
             }
-            temp_map
-        };
+            if !overwrite_output && output_path.is_file() {
+                return Err(FilterReadsError::OverwriteFileError(format!(
+                    "{output_path:?}; set overwrite_output: true to replace it"
+                )));
+            }
+            file_map.insert(input_path, (output_path, is_gzip, is_fastq));
+        }
 
-        RunConfiguration { bed_file, file_map }
+        Ok(RunConfiguration { bed_file, file_map })
     }
 
     pub fn log(&mut self) {
@@ -211,7 +220,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = RunConfiguration::from(&yml);
+        let config = RunConfiguration::from(&yml).unwrap();
 
         assert_eq!(config.bed_file, PathBuf::from(&bed));
         assert_eq!(config.file_map.len(), 2);
