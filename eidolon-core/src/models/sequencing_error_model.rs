@@ -10,7 +10,6 @@ use crate::{
         transition_matrix::{TransitionMatrix, TransitionMatrixError},
     },
 };
-use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf};
 use thiserror::Error;
@@ -226,8 +225,7 @@ impl SequencingErrorModel {
     /// The provenance stamp (`_eidolon`) is ignored rather than checked: this file ships
     /// inside the binary that reads it, so the two cannot disagree.
     pub fn default() -> Result<Self, SeqModelError> {
-        let reader = GzDecoder::new(DEFAULT_MODEL_FILE);
-        serde_json::from_reader(reader).map_err(SeqModelError::SerdeError)
+        crate::models::lib::from_gzip_json(DEFAULT_MODEL_FILE).map_err(SeqModelError::SerdeError)
     }
 
     pub fn from_file(filename: &PathBuf) -> Result<Self, SeqModelError> {

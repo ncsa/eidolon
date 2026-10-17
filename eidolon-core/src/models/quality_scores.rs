@@ -29,7 +29,6 @@
 //! * In Python, at least, this was slow, although in retrospect it didn't eat up much memory.
 
 use crate::rng::{NeatRng, NeatRngError};
-use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fmt::{Display, Formatter};
@@ -194,9 +193,10 @@ impl QualityScoreModel {
     /// Read through `Value` rather than through `SequencingErrorModel` so this module does not
     /// have to depend on the one that depends on it.
     pub fn default() -> Result<Self, QualityModelError> {
-        let reader = GzDecoder::new(crate::models::sequencing_error_model::DEFAULT_MODEL_FILE);
-        let value: serde_json::Value =
-            serde_json::from_reader(reader).map_err(QualityModelError::SerdeError)?;
+        let value: serde_json::Value = crate::models::lib::from_gzip_json(
+            crate::models::sequencing_error_model::DEFAULT_MODEL_FILE,
+        )
+        .map_err(QualityModelError::SerdeError)?;
         let quality = value.get("quality_score_model").ok_or_else(|| {
             QualityModelError::InvalidConfiguration(
                 "the shipped default sequencing-error model carries no quality_score_model"
