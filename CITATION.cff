@@ -40,8 +40,51 @@ keywords:
   - vcf
   - rust
 license: BSD-3-Clause
-version: 3.1.0
+version: 4.0.0
 identifiers:
   - type: doi
     value: 10.5281/zenodo.20100558
     description: Concept DOI for all versions of eidolon
+references:
+  - type: article
+    title: >-
+      Simulating Next-Generation Sequencing Datasets from
+      Empirical Mutation and Sequencing Models
+    authors:
+      - family-names: Stephens
+        given-names: Z. D.
+      - family-names: Hudson
+        given-names: M. E.
+      - family-names: Mainzer
+        given-names: L. S.
+      - family-names: Taschuk
+        given-names: M.
+      - family-names: Weber
+        given-names: M. R.
+      - family-names: Iyer
+        given-names: R. K.
+    journal: PLOS ONE
+    year: 2016
+    volume: 11
+    issue: "11"
+    doi: 10.1371/journal.pone.0167047
+  - type: article
+    title: >-
+      Enhancing next-generation sequencing simulation:
+      Updates to NEAT
+    authors:
+      - family-names: Allen
+        given-names: J. M.
+      - family-names: Gandhi
+        given-names: K. R.
+      - family-names: Alhazmy
+        given-names: R.
+      - family-names: Wasnik
+        given-names: Y.
+      - family-names: Fliege
+        given-names: C. E.
+    journal: Journal of Open Source Software
+    year: 2026
+    volume: 11
+    issue: "121"
+    doi: 10.21105/joss.09056
