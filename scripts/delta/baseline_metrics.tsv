@@ -94,7 +94,18 @@ chr22_rss_mb	295.5	0	lepct:15	1
 # call ≈0.04 recall → sd≈0.07), which false-FAILed a normal low-tail seed. Values/sd
 # below are the pooled 7-run mean±sample-sd.
 somatic_snv_recall	0.840	0.018	ge2sd	1
-somatic_indel_recall	0.845	0.072	ge2sd	1
+# somatic_indel_recall re-frozen 0.845 -> 0.742 on 2026-10-20 (#847), sd 0.072 -> 0.065.
+# Six runs on build d06b3a0 (chr22, 30x, purity 0.6): 22801852 plus array 22985615 reps 1-5,
+# 121 of 163 planted indels = 0.742 (Wilson 95% CI 0.67-0.80), per-run sd 0.065. The 0.845
+# lies outside that interval, so this is a real shift, not a low draw.
+# The cause is the caller, not eidolon: rep 4 re-run with BAMs kept, then reads counted at
+# each planted indel. Found indels carry 4-13 supporting reads (~9 expected); 8 of the 10
+# missed indels carry as many (7-13, one at 4). Open: one +1 at 3 reads, and one +445 bp
+# insertion that short reads cannot show as an indel. Missed SNVs carry evidence too (8.3
+# reads on average vs 8.7 found). Ruled out at VCF level: germline variants nearby,
+# homopolymer context, and a change in the tumor model's indel lengths (#761 left them
+# identical). Same pattern as #680: more realistic data, harder calling.
+somatic_indel_recall	0.742	0.065	ge2sd	1
 sv_del_recall	0.843	0.106	ge2sd	2
 sv_dup_recall	0.853	0.111	ge2sd	2
 sv_inv_recall	0.916	0.092	ge2sd	2
