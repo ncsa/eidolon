@@ -1,15 +1,7 @@
 # Installing eidolon
 
-Three routes. The first two need no Rust toolchain at all.
-
-## Bioconda
-
-```
-conda install -c bioconda eidolon
-```
-
-A prebuilt binary with dependencies handled. This is the easiest route on a workstation
-and works on a cluster wherever you already have conda.
+Two routes today: a release binary, which needs no Rust toolchain, or building from source. A
+Bioconda package is pending (below).
 
 ## A release binary
 
@@ -44,6 +36,14 @@ From v3.5.1 any name works. A binary named after a subcommand, such as `gen-read
 runs that subcommand directly.
 
 Let us know if one of these does not work on your system.
+
+## Bioconda (not yet available)
+
+A Bioconda package is in review at
+[bioconda-recipes#67420](https://github.com/bioconda/bioconda-recipes/pull/67420). Until it
+is merged, `conda install -c bioconda eidolon` finds nothing. The package Bioconda does carry,
+`rneat`, is this project under its earlier name, frozen at 1.20.1; use a release binary
+instead.
 
 ## Building from source
 
