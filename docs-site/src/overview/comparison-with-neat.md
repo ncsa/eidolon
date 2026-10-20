@@ -32,7 +32,7 @@ line), the current Python 3 NEAT 4.x, and `eidolon`.
 | VCF comparison tooling                      | Bundled scripts                | ✅ `compare-vcfs`                          | ✅ `compare-vcfs`                                        |
 | I/O / memory                               | Temp files                     | Temp files                                | Streaming writes, low-memory focus                       |
 | Versioning policy                          | ad hoc                         | ad hoc                                    | SemVer 2.0.0 with a declared public API (as of v3.0.0)   |
-| Distribution                               | GitHub source                  | GitHub / PyPI                             | GitHub + binaries; Bioconda (`conda install -c bioconda eidolon`) |
+| Distribution                               | GitHub source                  | GitHub / PyPI                             | GitHub + binaries; Bioconda pending ([#67420](https://github.com/bioconda/bioconda-recipes/pull/67420)) |
 
 Speed and memory are single-thread medians (n=3, 10× coverage) on one exclusive
 Delta node against NEAT 4.6.1, measured on v4.0.0 (#840); see `docs/access_report_draft.md`
@@ -78,5 +78,5 @@ when you want:
 - **Reproducibility** — the same seed yields byte-identical FASTQ regardless of
   the thread count.
 - **Easy deployment** — a single self-contained binary with no Python
-  environment to manage, installable via Bioconda
-  (`conda install -c bioconda eidolon`).
+  environment to manage. A Bioconda package is in review
+  ([bioconda-recipes#67420](https://github.com/bioconda/bioconda-recipes/pull/67420)).
