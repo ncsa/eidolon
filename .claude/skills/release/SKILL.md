@@ -92,12 +92,15 @@ the version bump and broke `Cargo.lock` on the merge-back. Bumping on `develop` 
    this on the release PR, not after the tag.
 
 3. **Release prep PR into `develop`.** Branch `release/vX.Y.Z` from `develop`. Bump the version
-   in both places, then refresh the lockfile:
+   in all three places, then refresh the lockfile:
    ```bash
    sed -i "s/^version = '<old>'/version = '<new>'/" Cargo.toml        # [workspace.package]
    sed -i 's/{% set version = "<old>" %}/{% set version = "<new>" %}/' conda-recipe/meta.yaml
+   sed -i 's/^version: <old>$/version: <new>/' CITATION.cff          # "Cite this repository"
    cargo check --workspace -q     # rewrites Cargo.lock; do not hand-edit it
    ```
+   `CITATION.cff` sat at 3.1.0 through v4.0.0 because it was missing from this list. Check all
+   three changed: `git diff --stat` should name each file.
 
 4. **CHANGELOG entry at the top**, matching the existing format exactly — a bare `M/D/YYYY`
    line, `=========`, then `## eidolon vX.Y.Z — <short title>`. Lead with what changed for a
