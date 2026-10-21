@@ -29,12 +29,18 @@ are not quite bugs. See `CHANGELOG.md` for the full release history.
 
 ## Install
 
+Download the binary for your system from the
+[releases page](https://github.com/ncsa/eidolon/releases). It is self-contained, so no Rust
+toolchain or environment is needed. For Linux:
+
 ```bash
-conda install -c bioconda eidolon
+mv eidolon-x86_64-unknown-linux-gnu eidolon && chmod +x eidolon
+./eidolon --version
 ```
 
-A prebuilt binary with dependencies handled, no Rust toolchain required. Release binaries and
-build-from-source instructions are in the docs.
+The other platforms and build-from-source instructions are in the docs. A Bioconda package
+is not available yet; it is in review at
+[bioconda-recipes#67420](https://github.com/bioconda/bioconda-recipes/pull/67420).
 
 ## A minimal run
 

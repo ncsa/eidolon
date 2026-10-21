@@ -548,10 +548,9 @@ pub fn run_neat(
                             combine_temp_fastqs(all_r1, all_r2, filename1, Some(filename2))?;
                         }
                         None => {
-                            error!(
+                            return Err(GenerateReadsError::ConfigError(format!(
                                 "Produce fastq true and paired-ended true, but output_fastq_2 was missing."
-                            );
-                            return Err(GenerateReadsError::ConfigError);
+                            )));
                         }
                     }
                 } else {
@@ -559,8 +558,9 @@ pub fn run_neat(
                 }
             }
             None => {
-                error!("Produce fastq true but output_fastq_1 was missing.");
-                return Err(GenerateReadsError::ConfigError);
+                return Err(GenerateReadsError::ConfigError(format!(
+                    "Produce fastq true but output_fastq_1 was missing."
+                )));
             }
         }
     }

@@ -92,12 +92,15 @@ the version bump and broke `Cargo.lock` on the merge-back. Bumping on `develop` 
    this on the release PR, not after the tag.
 
 3. **Release prep PR into `develop`.** Branch `release/vX.Y.Z` from `develop`. Bump the version
-   in both places, then refresh the lockfile:
+   in all three places, then refresh the lockfile:
    ```bash
    sed -i "s/^version = '<old>'/version = '<new>'/" Cargo.toml        # [workspace.package]
    sed -i 's/{% set version = "<old>" %}/{% set version = "<new>" %}/' conda-recipe/meta.yaml
+   sed -i 's/^version: <old>$/version: <new>/' CITATION.cff          # "Cite this repository"
    cargo check --workspace -q     # rewrites Cargo.lock; do not hand-edit it
    ```
+   `CITATION.cff` sat at 3.1.0 through v4.0.0 because it was missing from this list. Check all
+   three changed: `git diff --stat` should name each file.
 
 4. **CHANGELOG entry at the top**, matching the existing format exactly — a bare `M/D/YYYY`
    line, `=========`, then `## eidolon vX.Y.Z — <short title>`. Lead with what changed for a
@@ -155,13 +158,29 @@ the version bump and broke `Cargo.lock` on the merge-back. Bumping on `develop` 
    Put it in `conda-recipe/meta.yaml`, PR to **`develop`**. It reaches `main` with the next
    release. The tagged commit can never contain its own tarball's hash, so the in-repo recipe
    always lags by one step; nothing builds from `main`'s copy (Bioconda's recipe is updated
-   separately).
+   separately; see the next step).
+
+   **Bioconda: don't let it fall through the cracks.** Updating the in-repo recipe publishes
+   nothing; Bioconda builds from `bioconda/bioconda-recipes`. eidolon went unpublished from
+   v2.0.0 to v4.0.0 because the "Add eidolon" PR (bioconda-recipes#67420) sat unreviewed
+   while every release updated only the in-repo copy, and the docs advertised a
+   `conda install` that found nothing. After each release, look:
+   ```bash
+   curl -s https://api.anaconda.org/package/bioconda/eidolon | grep -o '"latest_version": "[^"]*"'
+   gh pr list -R bioconda/bioconda-recipes --search eidolon --state open
+   ```
+   - **Package published:** Bioconda's autobump bot opens an "Update eidolon to X" PR on its
+     own. Check that it appears and gets merged.
+   - **Package not yet published:** update the open add-recipe PR by hand (version and
+     sha256 in `meta.yaml`, plus any `build.sh` change), and ask for a review if it is idle.
+   Either way, say where Bioconda stands in the report step. This is not a release gate:
+   the release stands without it, but it must not be forgotten.
 
 10. **No merge-back.** `develop` already has the bump, so nothing comes back from `main`.
     Confirm the release landed with `git merge-base --is-ancestor <develop-sha> origin/main`.
 
-11. **Report** the tag, the asset count, whether the docs site serves, and anything not
-    verified. Update the release ticket to match, link it from the release notes, and
+11. **Report** the tag, the asset count, whether the docs site serves, where Bioconda
+    stands, and anything not verified. Update the release ticket to match, link it from the release notes, and
     close it.
 
 ## Gotchas that have actually bitten

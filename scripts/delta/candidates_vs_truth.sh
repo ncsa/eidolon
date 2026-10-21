@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Are the realism panel's real-side candidate breakpoints the DONOR'S OWN variants?
 #
-# WHY. The panel simulates with no variants on purpose (realism_panel.sbatch:528), so every
-# artifact on the simulated side is one the simulator produced by itself. The real side has no
-# such restriction: HG002 differs from GRCh38 at millions of small indels, and every one of
-# them is a place where real reads disagree with the reference and simulated reads cannot.
+# WHY. The panel's simulated genome carries SNPs and small indels drawn by the mutation model
+# at random positions, and no SVs (realism_panel.sbatch, "Simulate at matched depth"). The real
+# side carries the donor's own variants: HG002 differs from GRCh38 at millions of small indels,
+# at positions the simulation does not share, plus SVs the simulation has none of.
 #
 # Job 22243396 classified its 550 real candidates as 3.8% repeat-like, 26.7% junction-like and
 # 69.5% "minority-support, mappable, normal MAPQ" -- which is what a heterozygous small indel

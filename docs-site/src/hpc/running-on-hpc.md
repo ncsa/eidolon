@@ -63,11 +63,13 @@ Single-threaded; streams through the FASTQ. For a full genome FASTQ (~600 M read
 max_reads: 5000000   # a uniform sample of ~5 M records; 0 uses every record
 ```
 
+Measured on Delta with eidolon v4.0.0, one CPU, on a 29 GB gzipped HG002 FASTQ: a 5 M-record cap took 11 minutes and 53 MB; fitting every record took 14 minutes. Most of the time is the pass over the file, which is why the cap saves little.
+
 ```bash
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
-#SBATCH --time=1:30:00   # capped or not, every record is read; not yet timed with sampling
+#SBATCH --time=1:30:00   # capped or not, every record is read
 ```
 
 ### gen-frag-length-model

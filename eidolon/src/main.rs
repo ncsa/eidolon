@@ -66,6 +66,14 @@ pub enum NeatErrors {
     Validate(#[from] ValidateError),
     #[error("{0}")]
     CompareAf(#[from] CompareAfError),
+    // Before any subcommand runs
+    #[error("{subcommand}: configuration file not found: {path:?}")]
+    ConfigFileNotFound { subcommand: String, path: PathBuf },
+    #[error("cannot set up the log file {path:?}: {source}")]
+    LogSetup {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 fn neat_commands() -> [Command; 11] {
@@ -177,7 +185,18 @@ fn neat_commands() -> [Command; 11] {
     ]
 }
 
-fn main() -> Result<(), NeatErrors> {
+/// User input never panics: every failure is a `NeatErrors`, printed by its message (not its
+/// Debug form, which is what returning it from `main` would print) and exiting 1. A panic,
+/// exit 101, is reserved for a broken invariant.
+fn main() {
+    if let Err(err) = run() {
+        error!("{err}");
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), NeatErrors> {
     // parse the arguments from the command line
     let cmd = Command::new(env!("CARGO_CRATE_NAME"))
         .multicall(true)
@@ -288,10 +307,12 @@ fn main() -> Result<(), NeatErrors> {
     };
 
     // Check that the parent dir exists
-    let log_destination =
-        check_parent(&log_dest, true).expect("Log destination parent path doesn't exist");
-    let log_file = create_output_file(log_destination, true)
-        .unwrap_or_else(|_| panic!("Error creating log file: {:?}", log_destination));
+    let log_setup = |source| NeatErrors::LogSetup {
+        path: log_dest.clone(),
+        source,
+    };
+    let log_destination = check_parent(&log_dest, true).map_err(log_setup)?;
+    let log_file = create_output_file(log_destination, true).map_err(log_setup)?;
     // Set up the logger for the run
     CombinedLogger::init(vec![
         TermLogger::new(
@@ -302,7 +323,10 @@ fn main() -> Result<(), NeatErrors> {
         ),
         WriteLogger::new(lev_filter_choice, Config::default(), log_file),
     ])
-    .expect("Error creating log file!");
+    .map_err(|e| NeatErrors::LogSetup {
+        path: log_dest.clone(),
+        source: std::io::Error::other(e),
+    })?;
     info!("////////////// Welcome to eidolon! \\\\\\\\\\\\\\\\\\\\\\\\\\\\");
     let start = time::Instant::now();
     match subcommand {
@@ -316,10 +340,10 @@ fn main() -> Result<(), NeatErrors> {
                     .to_path_buf();
 
                 if !file.is_file() {
-                    return Err(NeatErrors::FilterReadsError(FilterReadsError::CliError(
-                        "Must supply either a configuration file or a reference file to run NEAT!"
-                            .to_string(),
-                    )));
+                    return Err(NeatErrors::ConfigFileNotFound {
+                        subcommand: "gen-reads".to_string(),
+                        path: file,
+                    });
                 }
                 info!("Running gen-reads to generate read data.");
                 let result = gen_reads::main(&file);
@@ -340,10 +364,10 @@ fn main() -> Result<(), NeatErrors> {
                     .to_path_buf();
 
                 if !file.is_file() {
-                    return Err(NeatErrors::FilterReadsError(FilterReadsError::CliError(
-                        "Must supply either a configuration file or a reference file to run NEAT!"
-                            .to_string(),
-                    )));
+                    return Err(NeatErrors::ConfigFileNotFound {
+                        subcommand: "filter-reads".to_string(),
+                        path: file,
+                    });
                 }
                 info!("Running filter-reads to filter eidolon-generated read data.");
                 let result = filter_reads::main(&file);
@@ -364,10 +388,10 @@ fn main() -> Result<(), NeatErrors> {
                     .to_path_buf();
 
                 if !file.is_file() {
-                    return Err(NeatErrors::FilterReadsError(FilterReadsError::CliError(
-                        "Must supply either a configuration file or a reference file to run NEAT!"
-                            .to_string(),
-                    )));
+                    return Err(NeatErrors::ConfigFileNotFound {
+                        subcommand: "gen-mut-model".to_string(),
+                        path: file,
+                    });
                 }
                 info!("Running gen-mut-model to generate a model for use in eidolon.");
                 let result = gen_mut_model::main(&file);

@@ -525,17 +525,21 @@ else
 fi
 
 
-# ── Simulate at matched depth, no variants ───────────────────────────────────
+# ── Simulate at matched depth: germline SNPs and small indels, no SVs ───────
 #
-# sv_rate_scale 0 and no input VCF: every artifact the panel finds on this side is one the
-# simulator produced on its own, which is exactly the background a caller's false-positive
-# filters get calibrated against.
+# The mutation model is left at its default, so the simulated genome carries SNPs and small
+# indels at the model's germline rate, at positions the model draws. They are not the real
+# donor's variants. sv_rate_scale 0 and no input VCF mean no structural variants, so every
+# SV-like artifact on this side (clips, improper pairs, candidate breakpoints) is one the
+# simulator produced on its own. The real reads carry the donor's own variants, SVs
+# included, so part of any gap in those metrics can come from that difference rather than
+# from the simulator.
 SIMDIR="$OUTDIR/sim"
 mkdir -p "$SIMDIR"
 write_sim_config "$SIMDIR/config.yml" "$REFERENCE" "$SIMDIR" "$SEED" "$THREADS" \
                  "$SIM_DEPTH" "$READ_LEN" "$FRAG_MEAN" "$FRAG_SD"
 
-echo "[1/3] simulating ${SIM_DEPTH}x with no variants..."
+echo "[1/3] simulating ${SIM_DEPTH}x (model SNPs and small indels, no SVs)..."
 "$EIDOLON_BIN" gen-reads -c "$SIMDIR/config.yml"
 
 echo "[2/3] aligning the simulated reads..."

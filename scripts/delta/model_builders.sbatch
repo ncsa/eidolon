@@ -72,6 +72,19 @@ module load samtools/1.22-cce19.0.0 2>/dev/null || true
 echo "=== eidolon model-builder stress test: $SLURM_JOB_ID ==="
 echo "eidolon: $("$EIDOLON_BIN" --version 2>/dev/null || echo '??')   git: $(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo '?')"
 echo "ref=$REFERENCE  bam=$INPUT_BAM  fastq=$INPUT_FASTQ  vcf=$INPUT_VCF"
+# An input that is SET but missing stops the job here. Each builder below runs only when its
+# input exists, so a mistyped or purged path used to skip that builder without a word while
+# the job carried on: job 22772429 had INPUT_BAM pointing at a deleted BAM, skipped three
+# builders, and reported only the round-trip failure that followed from it.
+missing=0
+for var in REFERENCE INPUT_BAM INPUT_FASTQ INPUT_VCF; do
+    path="${!var}"
+    if [[ -n "$path" && ! -s "$path" ]]; then
+        echo "ERROR: $var is set but missing or empty: $path" >&2
+        missing=1
+    fi
+done
+[[ "$missing" -eq 0 ]] || exit 1
 [[ -x "$EIDOLON_BIN" ]] || { echo "eidolon binary missing: $EIDOLON_BIN" >&2; exit 1; }
 
 SUMMARY="$OUTDIR/summary.tsv"; : > "$SUMMARY"

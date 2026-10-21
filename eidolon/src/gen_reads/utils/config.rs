@@ -7,7 +7,7 @@ use crate::config_keys::{check_keys, check_keys_with_hints};
 use crate::eidolon_core::file_tools::folder_tools::check_create_dir;
 use crate::gen_reads::errors::GenerateReadsError;
 use crate::gen_reads::utils::subclone;
-use log::{error, info, warn};
+use log::{info, warn};
 use serde_yml::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -305,14 +305,11 @@ impl RunConfiguration {
         // parameters based on the inputs. A "." value means to use the default value.
 
         // Opens file for reading
-        let f = fs::File::open(yaml_file);
-        let file = match f {
-            Ok(l) => l,
-            Err(error) => panic!(
-                "Problem reading the config file: {:?}. System error: {}",
-                yaml_file, error,
-            ),
-        };
+        let file = fs::File::open(yaml_file).map_err(|error| {
+            GenerateReadsError::ConfigError(format!(
+                "cannot read the config file {yaml_file:?}: {error}"
+            ))
+        })?;
         // Uses serde_yml to read the file into a HashMap
         let scrape_config: HashMap<String, Value> = serde_yml::from_reader(file)?;
         Self::from_scrape_config(scrape_config)
@@ -345,8 +342,15 @@ impl RunConfiguration {
         let ref_buf = match ref_str {
             Some(str) => {
                 let path = PathBuf::from(&str);
+                if str.trim() == "." {
+                    // "." means "use the default", and the reference has none.
+                    return Err(GenerateReadsError::ConfigError(
+                        "reference is required and has no default; set it to a FASTA path"
+                            .to_string(),
+                    ));
+                }
                 if !path.is_file() {
-                    return Err(GenerateReadsError::FileNotFound(str.to_owned()));
+                    return Err(GenerateReadsError::FileNotFound(format!("reference {str}")));
                 }
                 path
             }
@@ -492,7 +496,12 @@ impl RunConfiguration {
                         config.output_dir = PathBuf::from(output_path);
                         if !config.output_dir.is_dir() {
                             info!("Creating output directory: {:?}", config.output_dir);
-                            check_create_dir(&config.output_dir);
+                            check_create_dir(&config.output_dir).map_err(|e| {
+                                GenerateReadsError::ConfigError(format!(
+                                    "cannot create output_dir {:?}: {e}",
+                                    config.output_dir
+                                ))
+                            })?;
                         }
                     }
                     // output_prefix is for backward compatability
@@ -518,7 +527,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.quality_score_model = Some(filename);
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "quality_score_model {name}"
+                            )));
                         }
                     }
                     "mutation_model" => {
@@ -532,7 +543,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.mutation_model = Some(filename);
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "mutation_model {name}"
+                            )));
                         }
                     }
                     "fragment_model" => {
@@ -546,7 +559,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.fragment_model = Some(filename);
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "fragment_model {name}"
+                            )));
                         }
                     }
                     "sequence_error_model" => {
@@ -560,7 +575,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.sequence_error_model = Some(filename);
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "sequence_error_model {name}"
+                            )));
                         }
                     }
                     "target_bed" => {
@@ -574,7 +591,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.target_bed = Some(filename);
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "target_bed {name}"
+                            )));
                         }
                     }
                     "mutation_regions" => {
@@ -588,7 +607,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.mutation_regions = Some(filename)
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "mutation_regions {name}"
+                            )));
                         }
                     }
                     "input_vcf" => {
@@ -602,7 +623,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.input_vcf = Some(filename);
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "input_vcf {name}"
+                            )));
                         }
                     }
                     "gc_bias_model" => {
@@ -616,7 +639,9 @@ impl RunConfiguration {
                         if filename.is_file() {
                             config.gc_bias_model = Some(filename)
                         } else {
-                            return Err(GenerateReadsError::FileNotFound(name.to_string()));
+                            return Err(GenerateReadsError::FileNotFound(format!(
+                                "gc_bias_model {name}"
+                            )));
                         }
                     }
                     "gc_bias_normalize_coverage" => {
@@ -712,10 +737,9 @@ impl RunConfiguration {
                                         .to_uppercase();
                                 }
                                 other => {
-                                    error!(
+                                    return Err(GenerateReadsError::ConfigError(format!(
                                         "Unknown adapter preset '{other}'; expected truseq|nextera|custom"
-                                    );
-                                    return Err(GenerateReadsError::ConfigError);
+                                    )));
                                 }
                             }
                         }
@@ -749,11 +773,10 @@ impl RunConfiguration {
         }
         if config.keep_short_fragments {
             if config.long_reads {
-                error!(
+                return Err(GenerateReadsError::ConfigError(format!(
                     "Invalid config: keep_short_fragments=true is redundant/incompatible with \
                      long_reads=true (long-read mode already keeps short fragments). Set one."
-                );
-                return Err(GenerateReadsError::ConfigError);
+                )));
             }
             info!(
                 "\t>keep short fragments: enabled (short inserts kept as genomic reads, no adapter)"
@@ -761,28 +784,25 @@ impl RunConfiguration {
         }
         if config.adapters.enabled {
             if config.long_reads {
-                error!(
+                return Err(GenerateReadsError::ConfigError(format!(
                     "Invalid config: adapters.enabled=true is incompatible with long_reads=true. \
                      Illumina-style 3' adapter readthrough does not occur on long-read platforms. \
                      Set long_reads=false (short-read Illumina) or adapters.enabled=false."
-                );
-                return Err(GenerateReadsError::ConfigError);
+                )));
             }
             let acgt =
                 |s: &str| !s.is_empty() && s.chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T'));
             if config.adapters.r1.is_empty() || config.adapters.r2.is_empty() {
-                error!(
+                return Err(GenerateReadsError::ConfigError(format!(
                     "Invalid config: adapters.enabled=true but an adapter sequence is empty \
                      (preset 'custom' requires non-empty r1 and r2)."
-                );
-                return Err(GenerateReadsError::ConfigError);
+                )));
             }
             if !acgt(&config.adapters.r1) || !acgt(&config.adapters.r2) {
-                error!(
+                return Err(GenerateReadsError::ConfigError(format!(
                     "Invalid config: adapter sequences must contain only A/C/G/T (uppercase); got r1='{}', r2='{}'.",
                     config.adapters.r1, config.adapters.r2
-                );
-                return Err(GenerateReadsError::ConfigError);
+                )));
             }
             info!(
                 "\t>adapters: enabled (R1={}, R2={})",
@@ -801,8 +821,9 @@ impl RunConfiguration {
 
         // No point in running if we aren't producing files
         if !(config.produce_fastq || config.produce_vcf || config.produce_bam) {
-            error!("All file types set to false, no files would be produced.");
-            return Err(GenerateReadsError::ConfigError);
+            return Err(GenerateReadsError::ConfigError(format!(
+                "All file types set to false, no files would be produced."
+            )));
         }
 
         if config.paired_ended {
@@ -815,12 +836,11 @@ impl RunConfiguration {
             let have_mean_sd = config.fragment_mean.is_some() && config.fragment_st_dev.is_some();
             let have_model = config.fragment_model.is_some();
             if !have_mean_sd && !have_model {
-                error!(
+                return Err(GenerateReadsError::ConfigError(format!(
                     "Paired ended is set to true, but no fragment-length source was \
                     provided: set both fragment_mean and fragment_st_dev, or supply a \
                     fragment_model."
-                );
-                return Err(GenerateReadsError::ConfigError);
+                )));
             }
             if have_model && have_mean_sd {
                 warn!(
@@ -1069,7 +1089,7 @@ mod tests {
         config.produce_fastq = false;
         assert!(matches!(
             RunConfiguration::check_and_log_config(&mut config),
-            Err(GenerateReadsError::ConfigError)
+            Err(GenerateReadsError::ConfigError(_))
         ));
     }
 
@@ -1080,7 +1100,7 @@ mod tests {
         config.paired_ended = true;
         assert!(matches!(
             RunConfiguration::check_and_log_config(&mut config),
-            Err(GenerateReadsError::ConfigError)
+            Err(GenerateReadsError::ConfigError(_))
         ));
     }
 
@@ -1092,7 +1112,7 @@ mod tests {
         config.fragment_st_dev = Some(10.0);
         assert!(matches!(
             RunConfiguration::check_and_log_config(&mut config),
-            Err(GenerateReadsError::ConfigError)
+            Err(GenerateReadsError::ConfigError(_))
         ));
     }
 
@@ -1104,7 +1124,7 @@ mod tests {
         config.fragment_mean = Some(100.0);
         assert!(matches!(
             RunConfiguration::check_and_log_config(&mut config),
-            Err(GenerateReadsError::ConfigError)
+            Err(GenerateReadsError::ConfigError(_))
         ));
     }
 
@@ -1120,17 +1140,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_bad_yaml() {
         let yaml = PathBuf::from("test_data/fake_file.yml");
-        RunConfiguration::from_yaml_file(&yaml).unwrap();
+        let err = RunConfiguration::from_yaml_file(&yaml)
+            .expect_err("a missing config file is an error, not a panic")
+            .to_string();
+        assert!(err.contains("cannot read the config file"), "{err}");
+        assert!(err.contains("fake_file.yml"), "{err}");
     }
 
     #[test]
-    #[should_panic]
     fn test_missing_ref() {
         let yaml = PathBuf::from("test_data/configs/simple_template.yml");
-        RunConfiguration::from_yaml_file(&yaml).unwrap();
+        let err = RunConfiguration::from_yaml_file(&yaml)
+            .expect_err("a config with no reference cannot run")
+            .to_string();
+        assert!(err.to_lowercase().contains("reference"), "{err}");
     }
 
     #[test]

@@ -147,8 +147,8 @@ how you find them without an aligner.
 ## Getting it
 
 ```bash
-conda install -c bioconda eidolon        # or cargo build --release
-eidolon --help
+cargo build --release                   # or a release binary; Bioconda pending (#67420)
+./target/release/eidolon --help
 ```
 
 ## Working on it

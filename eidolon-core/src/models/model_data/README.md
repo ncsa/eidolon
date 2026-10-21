@@ -13,7 +13,7 @@ repeatability.
 |---|---|---|
 | `default_fragment_length_model.json.gz` | GIAB HG002 2x250, fitted | yes — see below |
 | `error_rate` | GIAB HG002 2x250, fitted | yes — 0.003774, measured |
-| `indel_probability` | NEAT2 static default | no |
+| `indel_probability` | NEAT2 static default | yes — consistent: 0.0092–0.0104 on HG002 (#746) |
 | `insertion_fraction` | NEAT2 static default | yes — confirmed at 0.387 |
 | indel-error lengths | HCC1395 normal | yes |
 | homopolymer context curve | HCC1395 normal | yes |
@@ -90,8 +90,15 @@ Both were restored to their source values in #660.
 `insertion_fraction` is confirmed by measurement: 668 of 1,726 low-support indels in
 HCC1395 normal are insertions, a fraction of **0.387**.
 
-`indel_probability` has not been measured. On Illumina data the indel error rate is around
-1e-5/base; at Q35 this constant gives ~3.2e-6. Changing it needs its own measurement.
+`indel_probability` keeps its inherited 0.01, which measurement supports (#746). It is the
+share of sequencing-error events that are indels, before the homopolymer curve redistributes
+it, so it was fitted as the observed share of error events divided by the curve's mean over
+the same background. Measured on GIAB HG002 2x250 at 21x over the realism panel's ten 400 kb
+loci on GRCh38 (job 22794642, `indel_context.sbatch`): 3,086 indel and 340,310 substitution
+error events gave **0.0092**; adding the ambiguous-support positions, which are almost all
+errors at low local depth (116 of 29,380 are HG002 v4.2.1 SNVs), gave **0.0104**. A local
+check on NA12878 chr22 gave 0.0094. On that HG002 run the error rates were 3.8e-5 indels and
+4.2e-3 substitutions per aligned base.
 
 ### Substitution matrix (#779)
 

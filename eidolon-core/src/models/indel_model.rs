@@ -15,7 +15,6 @@ use crate::{
         nucleotides::{Nucleotide, allowed_vec},
     },
 };
-use flate2::read::GzDecoder;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf};
@@ -98,9 +97,8 @@ impl IndelModel {
     #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self, IndelModelError> {
         // Default Indel model from the original NEAT, scaled by the lowest value and rounded.
-        let reader = GzDecoder::new(DATA_FILE);
         let data: IndelModel =
-            serde_json::from_reader(reader).map_err(IndelModelError::SerdeError)?;
+            crate::models::lib::from_gzip_json(DATA_FILE).map_err(IndelModelError::SerdeError)?;
         Ok(data)
     }
 
