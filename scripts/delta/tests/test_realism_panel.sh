@@ -56,6 +56,7 @@ model paths are dropped from the config@        [[ -n "$val" ]] && printf '%s: %
 a Normal ceiling is read as unbounded@else ((.Normal.mean + 4 * .Normal.st_dev) | floor) end@else 999999 end
 adapters are emitted as a flat scalar@printf 'adapters:\n  enabled: true\n  preset: %s\n'@printf 'adapters: %s\n' #
 adapters are emitted even when unset@    if [[ -n "${ADAPTERS:-}" ]]; then@    if true; then
+ploidy never reaches the config@                "ploidy:${PLOIDY:-}"; do@                "ploidy:"; do
 CONFIG_MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -318,6 +319,18 @@ has "INPUT_VCF reaches the config" "$(cat "$WORK/c_vcf.yml")" "input_vcf: /v/dra
 has "setting INPUT_VCF leaves sv_rate_scale alone" \
     "$(cat "$WORK/c_vcf.yml")" "sv_rate_scale: 0.0"
 
+echo "=== PLOIDY reaches the config, and is absent when unset (#844) ==="
+# A haploid sample (E. coli) simulated at the default ploidy of 2 would be compared against
+# reads from a genome with half the copies. Unset must leave gen-reads' own default alone.
+write_sim_config "$WORK/c_noploidy.yml" /ref.fa /out seed 8 30 151 400 90
+hasnt "no ploidy key when unset" "$(cat "$WORK/c_noploidy.yml")" "ploidy"
+PLOIDY=1 write_sim_config "$WORK/c_ploidy.yml" /ref.fa /out seed 8 30 151 400 90
+has "PLOIDY reaches the config" "$(cat "$WORK/c_ploidy.yml")" "ploidy: 1"
+
+echo "=== MARGIN is overridable, and keeps its human-sized default ==="
+# A 2 Mb margin each side leaves a 4.6 Mb bacterial chromosome room for one region (#844).
+has "MARGIN defaults to 2 Mb and reads the environment" "$(cat "$PIPELINE")" 'MARGIN="${MARGIN:-2000000}"'
+
 echo "=== SV_RATE_SCALE is overridable, and defaults to off ==="
 # cand_per_mb compares a real genome carrying structural variants against a simulation
 # that plants none. The knob has to exist before that can be tested (#684); it must also
@@ -466,7 +479,7 @@ has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGE
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=88
+MIN_ASSERTIONS=91
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
