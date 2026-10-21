@@ -1,3 +1,54 @@
+10/20/2026
+=========
+## eidolon v4.0.1 — config mistakes report errors, and runs start faster
+
+Two fixes. **Simulation output is unchanged at the same seed**: FASTQs, truth VCF and BAM
+records are byte-identical to v4.0.0 on H1N1 and E. coli.
+
+### Fixed
+
+- **A bad config is reported as an error, not a crash** (#842). A missing or malformed
+  setting, a missing file, an output that already exists, or an unreadable path now stops the
+  run with exit status 1 and a message naming the key or file. These used to panic: exit
+  status 101 and `thread 'main' panicked at …`, sometimes with nothing more than "Error
+  generating configuration!". Examples of the new messages: `reference is required and has no
+  default`, the name of an existing output with the `overwrite_output: true` hint, and a missing
+  config file reported against the subcommand that was asked for (it used to read as a
+  `filter-reads` error for every subcommand). A model file that cannot be opened is also an
+  error naming the file (#846).
+- **Every run starts about 0.6 s sooner** (#845, #846). The default sequencing error model is
+  20.8 MB of JSON once decompressed, and it was parsed through a streaming reader that cost
+  ~720 ms per run. Models are now decompressed into memory and then parsed: startup went from
+  0.72 s to 0.09 s on a small reference. The saving is per run, so it matters most for short
+  runs and many small jobs. Measured on Delta, single thread, 10x: E. coli 12.28 → 10.99 s,
+  yeast 24.03 → 22.94 s, chr22 68.20 → 67.44 s.
+
+### Docs
+
+- **The install instructions no longer promise a Bioconda package** (#849). `conda install -c
+  bioconda eidolon` finds nothing: the recipe is in review at
+  [bioconda-recipes#67420](https://github.com/bioconda/bioconda-recipes/pull/67420). Use a
+  release binary until it is merged.
+- `CITATION.cff` cites both NEAT papers (#850).
+
+### Evidence
+
+- Output identity: v4.0.0-era `develop` and the #846 build write byte-identical FASTQ R1/R2, VCF
+  body and BAM records on H1N1 and on E. coli at 5x.
+- `tests/config_errors_exit_cleanly.rs` requires exit 1, the reason on stderr and no
+  "panicked" for each subcommand's config errors.
+- New model-loading tests compare the new loader against the old streaming parse on the shipped
+  default, and refuse non-gzip input, a truncated stream and a stream that fails its checksum.
+  Each test was checked by mutation.
+
+### Not verified
+
+- Subcommands outside the three config loaders were not audited case by case for user-input
+  panics beyond the shared output-file creation, which is fixed.
+- The Delta timings above come from one run during a possible Delta filesystem incident. Only
+  chr22's replicates agree closely (1% spread); E. coli's first replicate read 15.3 s.
+- The ~40 MB of fixed memory noted in #670 is unchanged and still unexplained.
+
 10/8/2026
 =========
 ## eidolon v4.0.0 — stricter inputs, and fixes that change output
