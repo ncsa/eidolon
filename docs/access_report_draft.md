@@ -110,6 +110,16 @@ genome size and coverage: at 30× on E. coli v4.0.0 is 6% slower locally. Of the
 growth, +22 MB is those quality tables (measured, #670); a further ~40 MB that predates
 them is not yet identified.
 
+**v4.0.1 (#846).** The startup cost turned out to be how the file was read, not its size: the
+model was parsed through a streaming reader (~720 ms) instead of being decompressed first
+(~70 ms). With that fixed, startup on H1N1 is 0.09 s locally, below v1.19.1's 0.13 s, and
+E. coli at 10× is level with v1.19.1 (4.91 against 4.97 s). On Delta (job 22985666, build
+`d06b3a0`) chr22 reads **67.44 s, 12.0× NEAT 4's 809 s**, with replicates within 1%
+(66.83–67.57 s). That run's E. coli and yeast times are not quoted: E. coli's first replicate
+read 15.3 s against 9.5 and 11.0 for the others, during a possible Delta filesystem incident.
+chr22 remains ~10% above v1.19.1's 60.94 s; that gap scales with genome size and is tracked in
+#848. Peak memory is unchanged by the fix.
+
 **Revision (v1.19.1).** An earlier draft reported ~2.7–2.9×. Those eidolon timings
 were taken while eidolon defaulted to `--log-level trace`, whose per-base debug I/O
 dominated its runtime (issue #340); NEAT's figures were unaffected. With the
