@@ -416,7 +416,11 @@ while IFS=$'\t' read -r c l; do printf '              %-10s %s bp\n' "$c" "$l"; 
 # different GC and repeat contexts, which is the spread the baseline is supposed to record.
 REGIONS="$OUTDIR/regions.bed"
 : > "$REGIONS"
-MARGIN=2000000
+# The margin keeps regions off chromosome ends and away from the edges of a human assembly.
+# It is human-sized: on a 4.6 Mb bacterial chromosome a 2 Mb margin each side leaves room
+# for one region, below MIN_REGIONS. N blocks are masked separately (below), so a small
+# genome can set MARGIN low (#844).
+MARGIN="${MARGIN:-2000000}"
 
 # place_regions lives in lib_realism_contig.sh so the distribution arithmetic is tested
 # rather than trusted. It reports contigs too short to host a region instead of dropping
@@ -435,7 +439,7 @@ fi
 PLACE="$(place_regions "$OUTDIR/contigs.tsv" "$N_REGIONS" "$REGION_BP" "$MARGIN" "$REGIONS" "$NMASK")" || exit 1
 N_PLACED="${PLACE%%$'\t'*}"
 N_ELIGIBLE="${PLACE##*$'\t'}"
-echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s)"
+echo "Regions:    $N_PLACED x $REGION_BP bp across $N_ELIGIBLE contig(s), ${MARGIN} bp margins"
 # Rule 4: report the denominator. Asking for 10 and placing 6 is a different measurement,
 # and the median of 6 loci prints just as confidently as the median of 10. place_regions
 # has already named each contig that fell short on stderr; this is the total.

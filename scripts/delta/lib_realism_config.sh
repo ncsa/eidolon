@@ -28,8 +28,10 @@ frag_model_ceiling() {
 #                  <frag_mean> <frag_sd>
 #
 # Optional model paths are read from the environment: GC_BIAS_MODEL, FRAGMENT_MODEL,
-# SEQ_ERROR_MODEL, QUALITY_MODEL, MUTATION_MODEL, GC_NORMALIZE. Unset means "let eidolon
-# use its built-in default", which is a real choice and not the same as a trained model.
+# SEQ_ERROR_MODEL, QUALITY_MODEL, MUTATION_MODEL, GC_NORMALIZE. PLOIDY sets the simulated
+# genome's ploidy (gen-reads defaults to 2); a haploid sample such as E. coli needs 1 (#844).
+# Unset means "let eidolon use its built-in default", which is a real choice and not the
+# same as a trained model.
 #
 # ADAPTERS (unset | truseq | nextera) is the same kind of choice and belongs in the same
 # place. Adapter read-through is a DIRECT source of soft clips -- eidolon's own
@@ -87,7 +89,8 @@ YML
                 "sequence_error_model:${SEQ_ERROR_MODEL:-}" \
                 "quality_score_model:${QUALITY_MODEL:-}" \
                 "mutation_model:${MUTATION_MODEL:-}" \
-                "gc_bias_normalize_coverage:${GC_NORMALIZE:-}"; do
+                "gc_bias_normalize_coverage:${GC_NORMALIZE:-}" \
+                "ploidy:${PLOIDY:-}"; do
         key="${pair%%:*}"; val="${pair#*:}"
         [[ -n "$val" ]] && printf '%s: %s\n' "$key" "$val" >> "$out"
     done

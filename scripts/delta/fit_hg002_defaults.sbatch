@@ -58,6 +58,10 @@ BED="${BED:-$DATA_DIR/HG002_GRCh38_v4.2.1_highconf.bed}"
 REFERENCE="${REFERENCE:-$SCRATCH/neat_data/GRCh38.fa}"
 PAIR_WORK="${PAIR_WORK:-$SCRATCH/hg002_pair}"
 WORK="${WORK:-$SCRATCH/hg002_defaults}"
+# Names the output files (<model>_<LABEL>.json.gz) and the archive directory (<LABEL>_defaults).
+# The same steps fit any sample with a BAM, a VCF, a BED and the reads; set LABEL so another
+# sample's models are not filed as HG002's (#844). The default keeps HG002's names unchanged.
+LABEL="${LABEL:-hg002}"
 EIDOLON="${EIDOLON:-$SCRATCH/cargo-target/eidolon/release/eidolon}"
 # The first #765 commit. The fit needs the binary to contain it.
 REQUIRED_COMMIT="${REQUIRED_COMMIT:-bcfc623}"
@@ -108,35 +112,35 @@ fit() {  # <label> <subcommand> <config> <output>
 # The BED is required, not optional: a benchmark VCF only calls variants inside its confident
 # regions, so dividing by the whole genome would understate the rate.
 printf 'reference: %s\nvcf_file: %s\nbed_file: %s\noutput_file: %s\noverwrite_output: true\n' \
-    "$REFERENCE" "$VCF" "$BED" "$WORK/mut_hg002.json.gz" > "$WORK/mut.yml"
-fit mut gen-mut-model "$WORK/mut.yml" "$WORK/mut_hg002.json.gz"
+    "$REFERENCE" "$VCF" "$BED" "$WORK/mut_${LABEL}.json.gz" > "$WORK/mut.yml"
+fit mut gen-mut-model "$WORK/mut.yml" "$WORK/mut_${LABEL}.json.gz"
 
 # ── 2. fragment length, same method as the model it replaces ────────────────────
 printf 'input_file: %s\noutput_file: %s\noverwrite_output: true\ndistribution: discrete\nmin_reads: 100\n' \
-    "$BAM" "$WORK/frag_hg002.json.gz" > "$WORK/frag.yml"
-fit frag gen-frag-length-model "$WORK/frag.yml" "$WORK/frag_hg002.json.gz"
+    "$BAM" "$WORK/frag_${LABEL}.json.gz" > "$WORK/frag.yml"
+fit frag gen-frag-length-model "$WORK/frag.yml" "$WORK/frag_${LABEL}.json.gz"
 # Known-answer check against the BAM itself, measured with samtools rather than eidolon.
 echo "[frag] validating against the BAM ..."
-bash "$REPO/scripts/delta/validate_frag_model.sh" "$BAM" "$WORK/frag_hg002.json.gz" 2>&1 | tee "$WORK/frag_validate.log"
+bash "$REPO/scripts/delta/validate_frag_model.sh" "$BAM" "$WORK/frag_${LABEL}.json.gz" 2>&1 | tee "$WORK/frag_validate.log"
 echo
 
 # ── 3. GC bias, an optional model; the shipped default stays uniform ────────────
 printf 'reference: %s\nbam_file: %s\nmin_mapq: 0\nbed_file: .\noutput_file: %s\noverwrite_output: true\nwindow_size: 100\nwindow_stride: 100\nmin_windows_per_bin: 10\n' \
-    "$REFERENCE" "$BAM" "$WORK/gc_hg002.json.gz" > "$WORK/gc.yml"
-fit gc gen-gc-bias-model "$WORK/gc.yml" "$WORK/gc_hg002.json.gz"
+    "$REFERENCE" "$BAM" "$WORK/gc_${LABEL}.json.gz" > "$WORK/gc.yml"
+fit gc gen-gc-bias-model "$WORK/gc.yml" "$WORK/gc_${LABEL}.json.gz"
 
 # ── 4. the shipped quality model plus a BAM-fitted substitution matrix ──────────
 # Settings are job 22233888's fit_pair.yml, with bam_file added. The truth VCF masks HG002's
 # own variants, which mismatch the reference in every read carrying them and are not errors;
 # the log reports how many mismatches that removed.
 printf 'fastq_file: %s\nfastq_file_r2: %s\noutput_file: %s\noverwrite_output: true\nmax_reads: 0\nqual_offset: 33\nfit_quality_degradation: true\ndegradation_tail_cut: 25\ndegradation_tail_window: 50\nbam_file: %s\nknown_variants_vcf: %s\n' \
-    "$PAIR_WORK/sub_r1.fastq.gz" "$PAIR_WORK/sub_r2.fastq.gz" "$WORK/seqerr_hg002.json.gz" "$BAM" "$VCF" > "$WORK/seqerr.yml"
-fit seqerr gen-seq-error-model "$WORK/seqerr.yml" "$WORK/seqerr_hg002.json.gz"
+    "$PAIR_WORK/sub_r1.fastq.gz" "$PAIR_WORK/sub_r2.fastq.gz" "$WORK/seqerr_${LABEL}.json.gz" "$BAM" "$VCF" > "$WORK/seqerr.yml"
+fit seqerr gen-seq-error-model "$WORK/seqerr.yml" "$WORK/seqerr_${LABEL}.json.gz"
 echo "[seqerr] must match the shipped model: error_rate 0.003774, degraded R1 11.02%, R2 25.98%"
 sed 's/\x1b\[[0-9;]*m//g' "$WORK/seqerr.log" | grep -E "error_rate|[Dd]egraded population|mismatches|Masking|Overlap fit" || true
 echo
 
-archive_run hg002_defaults "$WORK" \
-    mut_hg002.json.gz frag_hg002.json.gz gc_hg002.json.gz gc_hg002.json.gz.bins.tsv seqerr_hg002.json.gz seqerr_hg002.json.gz.overlap_bins.tsv \
+archive_run "${LABEL}_defaults" "$WORK" \
+    mut_${LABEL}.json.gz frag_${LABEL}.json.gz gc_${LABEL}.json.gz gc_${LABEL}.json.gz.bins.tsv seqerr_${LABEL}.json.gz seqerr_${LABEL}.json.gz.overlap_bins.tsv \
     mut.yml frag.yml gc.yml seqerr.yml mut.log frag.log frag_validate.log gc.log seqerr.log
 echo "DONE."
