@@ -30,6 +30,9 @@ frag_model_ceiling() {
 # Optional model paths are read from the environment: GC_BIAS_MODEL, FRAGMENT_MODEL,
 # SEQ_ERROR_MODEL, QUALITY_MODEL, MUTATION_MODEL, GC_NORMALIZE. PLOIDY sets the simulated
 # genome's ploidy (gen-reads defaults to 2); a haploid sample such as E. coli needs 1 (#844).
+# MUTATION_RATE overrides the mutation model's rate. MUTATION_RATE=0 with INPUT_VCF gives a
+# simulated genome carrying exactly the supplied variants: input_vcf otherwise ADDS to the
+# de novo mutations (#837).
 # Unset means "let eidolon use its built-in default", which is a real choice and not the
 # same as a trained model.
 #
@@ -90,7 +93,8 @@ YML
                 "quality_score_model:${QUALITY_MODEL:-}" \
                 "mutation_model:${MUTATION_MODEL:-}" \
                 "gc_bias_normalize_coverage:${GC_NORMALIZE:-}" \
-                "ploidy:${PLOIDY:-}"; do
+                "ploidy:${PLOIDY:-}" \
+                "mutation_rate:${MUTATION_RATE:-}"; do
         key="${pair%%:*}"; val="${pair#*:}"
         [[ -n "$val" ]] && printf '%s: %s\n' "$key" "$val" >> "$out"
     done
