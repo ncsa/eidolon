@@ -56,7 +56,8 @@ model paths are dropped from the config@        [[ -n "$val" ]] && printf '%s: %
 a Normal ceiling is read as unbounded@else ((.Normal.mean + 4 * .Normal.st_dev) | floor) end@else 999999 end
 adapters are emitted as a flat scalar@printf 'adapters:\n  enabled: true\n  preset: %s\n'@printf 'adapters: %s\n' #
 adapters are emitted even when unset@    if [[ -n "${ADAPTERS:-}" ]]; then@    if true; then
-ploidy never reaches the config@                "ploidy:${PLOIDY:-}"; do@                "ploidy:"; do
+ploidy never reaches the config@                "ploidy:${PLOIDY:-}" \@                "ploidy:" \
+mutation_rate never reaches the config@                "mutation_rate:${MUTATION_RATE:-}"; do@                "mutation_rate:"; do
 CONFIG_MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -327,6 +328,16 @@ hasnt "no ploidy key when unset" "$(cat "$WORK/c_noploidy.yml")" "ploidy"
 PLOIDY=1 write_sim_config "$WORK/c_ploidy.yml" /ref.fa /out seed 8 30 151 400 90
 has "PLOIDY reaches the config" "$(cat "$WORK/c_ploidy.yml")" "ploidy: 1"
 
+echo "=== MUTATION_RATE reaches the config, and is absent when unset (#837) ==="
+# MUTATION_RATE=0 with INPUT_VCF is how the panel simulates the donor's own variants and
+# nothing else. Unset must leave the mutation model's own rate in force.
+write_sim_config "$WORK/c_norate.yml" /ref.fa /out seed 8 30 151 400 90
+hasnt "no mutation_rate key when unset" "$(cat "$WORK/c_norate.yml")" "mutation_rate"
+MUTATION_RATE=0 INPUT_VCF=/v/donor.vcf.gz \
+    write_sim_config "$WORK/c_rate0.yml" /ref.fa /out seed 8 30 151 400 90
+has "MUTATION_RATE=0 reaches the config" "$(cat "$WORK/c_rate0.yml")" "mutation_rate: 0"
+has "alongside the donor VCF" "$(cat "$WORK/c_rate0.yml")" "input_vcf: /v/donor.vcf.gz"
+
 echo "=== MARGIN is overridable, and keeps its human-sized default ==="
 # A 2 Mb margin each side leaves a 4.6 Mb bacterial chromosome room for one region (#844).
 has "MARGIN defaults to 2 Mb and reads the environment" "$(cat "$PIPELINE")" 'MARGIN="${MARGIN:-2000000}"'
@@ -479,7 +490,7 @@ has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGE
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=91
+MIN_ASSERTIONS=94
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"
