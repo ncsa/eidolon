@@ -54,10 +54,10 @@ Each rule below was earned by a defect that shipped green. Case histories live i
 5. **Chase the evidence past the first plausible story.** `BND recall=0.000` drew three
    confident explanations before the real cause. Each was plausible enough to stop at.
 6. **Say what was NOT verified** — checked by hand rather than CI, on a fixture rather
-   than real data. Current example (measured 2026-10-06, #819): `scripts/delta/tests/`
-   exercises 25 of `sv_pipeline.sbatch`'s 29 functions, every suite mutation-checked in CI.
-   `score_caller`, which assembles every recall figure in ACCESS §3.5–3.7, is not among them,
-   nor are `build_bnd_spans`, `convert_manta_inversions` and `index_and_align`.
+   than real data. Current example (measured 2026-10-28, #825): `scripts/delta/tests/` now
+   exercises all 29 of `sv_pipeline.sbatch`'s functions, every suite mutation-checked in CI,
+   but only as functions extracted one at a time. The script's top-level flow between them
+   (what calls what, in which order, with which files) runs only on Delta.
    `sbs96_compare.py` (#466) is untested by decision.
 
 **The recurring shape**, every quiet failure so far — a harness reporting a metric
