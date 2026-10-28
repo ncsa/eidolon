@@ -58,6 +58,8 @@ adapters are emitted as a flat scalar@printf 'adapters:\n  enabled: true\n  pres
 adapters are emitted even when unset@    if [[ -n "${ADAPTERS:-}" ]]; then@    if true; then
 ploidy never reaches the config@                "ploidy:${PLOIDY:-}" \@                "ploidy:" \
 mutation_rate never reaches the config@                "mutation_rate:${MUTATION_RATE:-}"; do@                "mutation_rate:"; do
+the alignment status is never checked@    if [[ "${st[0]}" -ne 0 || "${st[1]}" -ne 0 ]]; then@    if false; then
+the sort status is ignored@ || "${st[1]}" -ne 0 ]]@ ]]
 CONFIG_MUTATIONS
     printf '\n──────── %d mutation(s) survived ────────\n' "$survived"
     [[ "$survived" -eq 0 ]]; exit $?
@@ -260,7 +262,7 @@ echo "=== the alignment reference can differ from the simulation reference ==="
 # gives them nothing to be ambiguous against, so mapq0_pct reads 0 for reasons that have
 # nothing to do with the simulator.
 sep="$(sed -n '/ALIGN_TO=/,+14p' "$PIPELINE")"
-has "the aligner uses ALIGN_TO, not REFERENCE"   "$sep" 'bwa-mem2 mem -t "$THREADS" "$ALIGN_TO"'
+has "the aligner uses ALIGN_TO, not REFERENCE"   "$sep" 'align_sim_reads "$ALIGN_TO"'
 has "and the index is built for the same one"    "$sep" 'index_reference_locked "$ALIGN_TO"'
 has "a missing ALIGN_REFERENCE is fatal"         "$sep" "ALIGN_REFERENCE not found"
 has "defaulting is called out, not silent"       "$sep" "not comparable"
@@ -337,6 +339,34 @@ MUTATION_RATE=0 INPUT_VCF=/v/donor.vcf.gz \
     write_sim_config "$WORK/c_rate0.yml" /ref.fa /out seed 8 30 151 400 90
 has "MUTATION_RATE=0 reaches the config" "$(cat "$WORK/c_rate0.yml")" "mutation_rate: 0"
 has "alongside the donor VCF" "$(cat "$WORK/c_rate0.yml")" "input_vcf: /v/donor.vcf.gz"
+
+echo "=== a failed alignment is named, not silent (job 23251798) ==="
+# Stub aligner and sorter: the failing aligner emits a little output, then the message bwa-mem2
+# printed on job 23251798, and exits 1, as when a FASTQ read fails partway through.
+STUB="$WORK/stub"; mkdir -p "$STUB"
+printf '#!/bin/bash\necho "@SQ partial"\necho "[gzread] Success" >&2\nexit 1\n' > "$STUB/bwa_fail"
+printf '#!/bin/bash\necho "@SQ all"\nexit 0\n' > "$STUB/bwa_ok"
+printf '#!/bin/bash\nout=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat > "$out"\nexit 0\n' > "$STUB/sort_ok"
+printf '#!/bin/bash\ncat > /dev/null\nexit 3\n' > "$STUB/sort_fail"
+chmod +x "$STUB"/*
+rc=0; out=$(BWA_BIN="$STUB/bwa_fail" SAMTOOLS_BIN="$STUB/sort_ok" \
+    align_sim_reads /ref.fa r1 r2 "$WORK/a.bam" "$WORK/a.log" 4 2>&1) || rc=$?
+[[ "$rc" -ne 0 ]] && ok "a failing aligner fails the step" \
+    || bad "a failing aligner fails the step" "non-zero" "$rc"
+has "it names the aligner and its exit status" "$out" "bwa-mem2 exit 1"
+has "it shows the aligner's last log lines" "$out" "[gzread] Success"
+rc=0; out=$(BWA_BIN="$STUB/bwa_ok" SAMTOOLS_BIN="$STUB/sort_fail" \
+    align_sim_reads /ref.fa r1 r2 "$WORK/b.bam" "$WORK/b.log" 4 2>&1) || rc=$?
+[[ "$rc" -ne 0 ]] && ok "a failing sort fails the step" \
+    || bad "a failing sort fails the step" "non-zero" "$rc"
+has "it names the sort's exit status" "$out" "samtools sort exit 3"
+# Must not fire: a clean alignment passes, writes the BAM, and prints no error.
+rc=0; out=$(BWA_BIN="$STUB/bwa_ok" SAMTOOLS_BIN="$STUB/sort_ok" \
+    align_sim_reads /ref.fa r1 r2 "$WORK/c.bam" "$WORK/c.log" 4 2>&1) || rc=$?
+[[ "$rc" -eq 0 ]] && ok "a clean alignment passes" \
+    || bad "a clean alignment passes" "0" "$rc: $out"
+has "and writes its BAM" "$(cat "$WORK/c.bam" 2>/dev/null)" "@SQ all"
+hasnt "and prints no error" "$out" "ERROR"
 
 echo "=== MARGIN is overridable, and keeps its human-sized default ==="
 # A 2 Mb margin each side leaves a 4.6 Mb bacterial chromosome room for one region (#844).
@@ -490,7 +520,7 @@ has "and gives the Delta rebuild command"      "$(cat "$PIPELINE")" "CARGO_TARGE
 # Floor on how many assertions must execute. This file had none, which is how four
 # assertions placed inside a `( ... )` subshell -- where PASS/FAIL increments are
 # discarded -- ran without changing the count. Raise it when adding tests.
-MIN_ASSERTIONS=94
+MIN_ASSERTIONS=102
 TOTAL=$((PASS + FAIL))
 if [[ "$TOTAL" -lt "$MIN_ASSERTIONS" ]]; then
     printf '\n  FAIL  only %d assertions ran, expected at least %d\n' "$TOTAL" "$MIN_ASSERTIONS"

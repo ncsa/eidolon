@@ -561,8 +561,8 @@ else
     echo "        ALIGN_REFERENCE to the reference the real BAM actually used."
 fi
 index_reference_locked "$ALIGN_TO"
-bwa-mem2 mem -t "$THREADS" "$ALIGN_TO" "$SIMDIR/sim_r1.fastq.gz" "$SIMDIR/sim_r2.fastq.gz" \
-  2> "$SIMDIR/bwa.log" | samtools sort -@ 8 -o "$SIMDIR/sim.bam" -
+align_sim_reads "$ALIGN_TO" "$SIMDIR/sim_r1.fastq.gz" "$SIMDIR/sim_r2.fastq.gz" \
+  "$SIMDIR/sim.bam" "$SIMDIR/bwa.log" "$THREADS" || exit 1
 samtools index "$SIMDIR/sim.bam"
 
 # ── Measure both sides, identical settings ───────────────────────────────────
