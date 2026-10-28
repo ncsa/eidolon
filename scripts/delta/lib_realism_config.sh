@@ -105,3 +105,33 @@ YML
     fi
     return 0
 }
+
+# align_sim_reads <reference> <r1> <r2> <out.bam> <bwa.log> <threads>
+#
+# Aligns the simulated reads and refuses to hand on an incomplete BAM. Under `set -euo pipefail`
+# a failed aligner used to end the job with exit 1 and no explanation: on job 23251798 bwa-mem2
+# hit a transient read failure on /scratch after 48 of ~97 read batches, `samtools sort` wrote
+# the half it had received (122,880,000 of 249,098,168 reads), and the job died with nothing in
+# its log but a sort message. Diagnosing it took four round trips. This names the step and
+# shows the aligner's last lines instead.
+#
+# BWA_BIN and SAMTOOLS_BIN exist so tests can substitute a failing aligner.
+align_sim_reads() {
+    local ref="$1" r1="$2" r2="$3" bam="$4" log="$5" threads="$6"
+    local bwa="${BWA_BIN:-bwa-mem2}" samtools="${SAMTOOLS_BIN:-samtools}" st was_e=0
+    [[ $- == *e* ]] && was_e=1
+    set +e
+    "$bwa" mem -t "$threads" "$ref" "$r1" "$r2" 2> "$log" \
+        | "$samtools" sort -@ 8 -o "$bam" -
+    st=("${PIPESTATUS[@]}")
+    [[ "$was_e" -eq 1 ]] && set -e
+    if [[ "${st[0]}" -ne 0 || "${st[1]}" -ne 0 ]]; then
+        echo "ERROR: aligning the simulated reads failed (bwa-mem2 exit ${st[0]}, samtools sort exit ${st[1]})." >&2
+        echo "  $bam is incomplete and will not be measured. Last lines of $log:" >&2
+        tail -5 "$log" | sed 's/^/    /' >&2
+        echo "  '[gzread] Success' there means a read from a FASTQ failed mid-stream; on job" >&2
+        echo "  23251798 the file itself was intact (gzip -t passed), so check the filesystem and rerun." >&2
+        return 1
+    fi
+    return 0
+}
