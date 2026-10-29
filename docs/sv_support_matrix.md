@@ -297,8 +297,11 @@ DELs/DUPs/INVs would be far worse than the bug being worked around), plus an end
 assertion in `multi_sv_integration.rs` that no de novo INS in the truth VCF exceeds
 `read_len - 1`. Removing the call site makes that fail with eleven oversized records.
 
-This is an interim measure. It removes the false-truth problem, not the capability gap: eidolon
-still cannot simulate insertions longer than a read.
+This was an interim measure, and it has since been removed: `a81de378` (2026-08-23, closing
+#516) samples a long insertion on its own mutated copy, so insertions longer than a read now reach
+the reads at full length (the literal-INS rows of the table above). The tests named in this
+paragraph went with the cap. What has not been measured is the upper end: the longest insertion
+checked is 600 bp, while real catalogs such as GIAB HG002 v5.0q carry insertions over 10 kb.
 
 **[#500] A single breakend (`A.`) — FIXED by rejecting it.** VCF 4.2 allows an unresolved
 partner. `parse_bnd_alt` returns no mate, and accepting the record anyway was worse than
