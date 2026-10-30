@@ -4,6 +4,7 @@
 use chrono::Utc;
 
 use crate::config_keys::{check_keys, check_keys_with_hints};
+use crate::eidolon_core::file_tools::fastq_tools::AdapterOverrun;
 use crate::eidolon_core::file_tools::folder_tools::check_create_dir;
 use crate::gen_reads::errors::GenerateReadsError;
 use crate::gen_reads::utils::subclone;
@@ -18,12 +19,14 @@ use std::{env, fs};
 /// reads whose insert is shorter than `read_len` are padded at the 3' end with
 /// adapter sequence (R1 gets `r1`, R2 gets `r2`), matching real Illumina data so
 /// downstream adapter-trim QC stages are actually exercised. Default disabled.
-/// `r1`/`r2` are resolved 5'->3' uppercase-ACGT sequences (from a preset or custom).
+/// `r1`/`r2` are resolved 5'->3' uppercase-ACGT sequences (from a preset or custom):
+/// the whole construct a read runs through. `overrun` fills whatever lies past it (#865).
 #[derive(Debug, Clone)]
 pub struct AdapterConfig {
     pub enabled: bool,
     pub r1: String,
     pub r2: String,
+    pub overrun: AdapterOverrun,
 }
 
 impl Default for AdapterConfig {
@@ -32,7 +35,40 @@ impl Default for AdapterConfig {
             enabled: false,
             r1: String::new(),
             r2: String::new(),
+            overrun: AdapterOverrun::PolyG,
         }
+    }
+}
+
+// Each preset is the whole construct a read runs through after the insert (#865): the
+// adapter stem trimmers search for, then the sample index, then the flow-cell binding
+// sequence -- P7 for read 1, P5 for read 2 -- ending where the molecule ends. Past that
+// there is no template, which `AdapterOverrun` fills. The indexes are fixed placeholders,
+// TruSeq single-index adapter 1 (ATCACG, no i5) and Nextera N701/S501, written as they
+// appear in the read; for read 2 that is the reverse complement of the i5 bases in the
+// oligo (S501 TAGATCGC reads as GCGATCTA). P7/P5 below are the reverse complements of
+// CAAGCAGAAGACGGCATACGAGAT and AATGATACGGCGACCACCGAGATCTACAC. Same sequences as
+// NEAT#345.
+const P7_READTHROUGH: &str = "ATCTCGTATGCCGTCTTCTGCTTG";
+const P5_READTHROUGH: &str = "GTGTAGATCTCGGTGGTCGCCGTATCATT";
+
+/// (read 1, read 2) adapter construct for a named preset; `None` for anything else.
+fn adapter_preset(name: &str) -> Option<(String, String)> {
+    match name {
+        "truseq" => Some((
+            format!(
+                "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC{}{P7_READTHROUGH}",
+                "ATCACG"
+            ),
+            // Single-index universal adapter: with no i5, the stem's final GTGT is also
+            // P5's first four bases, so P5 picks up after it.
+            format!("AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT{}", &P5_READTHROUGH[4..]),
+        )),
+        "nextera" => Some((
+            format!("CTGTCTCTTATACACATCTCCGAGCCCACGAGACTAAGGCGA{P7_READTHROUGH}"),
+            format!("CTGTCTCTTATACACATCTGACGCTGCCGACGAGCGATCTA{P5_READTHROUGH}"),
+        )),
+        _ => None,
     }
 }
 
@@ -297,7 +333,7 @@ const NEAT_KEY_HINTS: &[(&str, &str)] = &[
 ];
 
 /// Every key the `adapters:` section reads.
-const ADAPTER_KEYS: &[&str] = &["enabled", "preset", "r1", "r2"];
+const ADAPTER_KEYS: &[&str] = &["enabled", "overrun", "preset", "r1", "r2"];
 
 impl RunConfiguration {
     pub fn from_yaml_file(yaml_file: &PathBuf) -> Result<RunConfiguration, GenerateReadsError> {
@@ -701,7 +737,8 @@ impl RunConfiguration {
                         })?;
                     }
                     "adapters" => {
-                        // Nested map: { enabled, preset: truseq|nextera|custom, r1, r2 }.
+                        // Nested map: { enabled, preset: truseq|nextera|custom, r1, r2,
+                        // overrun: polyg|random }.
                         let enabled = value
                             .get("enabled")
                             .and_then(|v| v.as_bool())
@@ -714,15 +751,11 @@ impl RunConfiguration {
                                 .unwrap_or("truseq")
                                 .to_lowercase();
                             match preset.as_str() {
-                                "truseq" => {
-                                    config.adapters.r1 =
-                                        "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_string();
-                                    config.adapters.r2 =
-                                        "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT".to_string();
-                                }
-                                "nextera" => {
-                                    config.adapters.r1 = "CTGTCTCTTATACACATCT".to_string();
-                                    config.adapters.r2 = "CTGTCTCTTATACACATCT".to_string();
+                                "truseq" | "nextera" => {
+                                    let (r1, r2) = adapter_preset(&preset)
+                                        .expect("truseq and nextera are presets");
+                                    config.adapters.r1 = r1;
+                                    config.adapters.r2 = r2;
                                 }
                                 "custom" => {
                                     config.adapters.r1 = value
@@ -742,6 +775,18 @@ impl RunConfiguration {
                                     )));
                                 }
                             }
+                            config.adapters.overrun = match value.get("overrun") {
+                                None => AdapterOverrun::PolyG,
+                                Some(v) => match v.as_str().map(str::to_lowercase).as_deref() {
+                                    Some("polyg") => AdapterOverrun::PolyG,
+                                    Some("random") => AdapterOverrun::Random,
+                                    _ => {
+                                        return Err(GenerateReadsError::ConfigError(format!(
+                                            "adapters.overrun must be polyg or random, got {v:?}"
+                                        )));
+                                    }
+                                },
+                            };
                         }
                     }
                     // Read before the loop.
@@ -805,8 +850,8 @@ impl RunConfiguration {
                 )));
             }
             info!(
-                "\t>adapters: enabled (R1={}, R2={})",
-                config.adapters.r1, config.adapters.r2
+                "\t>adapters: enabled (R1={}, R2={}, overrun={:?})",
+                config.adapters.r1, config.adapters.r2, config.adapters.overrun
             );
         }
         if config.overwrite_output {
@@ -1409,8 +1454,77 @@ mod tests {
         let yaml = write_cfg(dir.path(), "adapters:\n  enabled: true\n  preset: truseq\n");
         let cfg = RunConfiguration::from_yaml_file(&yaml).unwrap();
         assert!(cfg.adapters.enabled);
-        assert_eq!(cfg.adapters.r1, "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
-        assert_eq!(cfg.adapters.r2, "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT");
+        // Stem, then index adapter 1, then P7 (read 1); stem, then P5 (read 2).
+        assert_eq!(
+            cfg.adapters.r1,
+            "AGATCGGAAGAGCACACGTCTGAACTCCAGTCACATCACGATCTCGTATGCCGTCTTCTGCTTG"
+        );
+        assert_eq!(
+            cfg.adapters.r2,
+            "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT"
+        );
+        assert_eq!(
+            cfg.adapters.overrun,
+            AdapterOverrun::PolyG,
+            "polyg is the default"
+        );
+    }
+
+    #[test]
+    fn adapter_presets_end_in_the_flow_cell_oligos() {
+        // Independent of the constants above: read 1 runs into the reverse complement of
+        // the P7 oligo, read 2 into that of P5, and each starts with the stem trimmers
+        // search for (#865).
+        let rc = |s: &str| -> String {
+            s.chars()
+                .rev()
+                .map(|c| match c {
+                    'A' => 'T',
+                    'C' => 'G',
+                    'G' => 'C',
+                    _ => 'A',
+                })
+                .collect()
+        };
+        let p7 = rc("CAAGCAGAAGACGGCATACGAGAT");
+        let p5 = rc("AATGATACGGCGACCACCGAGATCTACAC");
+        for (name, stem) in [
+            ("truseq", "AGATCGGAAGAGC"),
+            ("nextera", "CTGTCTCTTATACACATCT"),
+        ] {
+            let (r1, r2) = adapter_preset(name).unwrap();
+            assert!(r1.starts_with(stem) && r2.starts_with(stem), "{name} stem");
+            assert!(r1.ends_with(&p7), "{name} r1 must end in P7: {r1}");
+            assert!(r2.ends_with(&p5), "{name} r2 must end in P5: {r2}");
+        }
+        // Nextera S501 (i5 TAGATCGC) is read in read 2 as its reverse complement.
+        assert!(
+            adapter_preset("nextera")
+                .unwrap()
+                .1
+                .contains(&rc("TAGATCGC"))
+        );
+    }
+
+    #[test]
+    fn adapter_overrun_parses_and_rejects_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = write_cfg(
+            dir.path(),
+            "adapters:\n  enabled: true\n  preset: truseq\n  overrun: random\n",
+        );
+        let cfg = RunConfiguration::from_yaml_file(&yaml).unwrap();
+        assert_eq!(cfg.adapters.overrun, AdapterOverrun::Random);
+        let yaml = write_cfg(
+            dir.path(),
+            "adapters:\n  enabled: true\n  preset: truseq\n  overrun: polyA\n",
+        );
+        match RunConfiguration::from_yaml_file(&yaml) {
+            Err(GenerateReadsError::ConfigError(msg)) => {
+                assert!(msg.contains("adapters.overrun"), "{msg}");
+            }
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1421,8 +1535,14 @@ mod tests {
             "adapters:\n  enabled: true\n  preset: nextera\n",
         );
         let cfg = RunConfiguration::from_yaml_file(&yaml).unwrap();
-        assert_eq!(cfg.adapters.r1, "CTGTCTCTTATACACATCT");
-        assert_eq!(cfg.adapters.r2, "CTGTCTCTTATACACATCT");
+        assert_eq!(
+            cfg.adapters.r1,
+            "CTGTCTCTTATACACATCTCCGAGCCCACGAGACTAAGGCGAATCTCGTATGCCGTCTTCTGCTTG"
+        );
+        assert_eq!(
+            cfg.adapters.r2,
+            "CTGTCTCTTATACACATCTGACGCTGCCGACGAGCGATCTAGTGTAGATCTCGGTGGTCGCCGTATCATT"
+        );
     }
 
     #[test]

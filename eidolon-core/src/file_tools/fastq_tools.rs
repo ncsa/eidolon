@@ -253,6 +253,8 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
     // with adapter sequence: R1 gets r1_adapter, R2 gets r2_adapter.
     r1_adapter: &[Nucleotide],
     r2_adapter: &[Nucleotide],
+    // What follows the end of the adapter construct (#865). Ignored when adapters are off.
+    adapter_overrun: AdapterOverrun,
 ) -> Result<(), FastqToolsError> {
     debug!("writing reads for {}", sequence_block.contig);
     let adapters_on = !r1_adapter.is_empty() || !r2_adapter.is_empty();
@@ -603,6 +605,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
             r1_record = append_adapter_readthrough(
                 r1_record,
                 r1_adapter,
+                adapter_overrun,
                 read_length,
                 quality_score_model,
                 sequencing_error_model,
@@ -712,6 +715,7 @@ pub fn write_block_fastq<B1: Write, B2: Write>(
                         rec = append_adapter_readthrough(
                             rec,
                             r2_adapter,
+                            adapter_overrun,
                             read_length,
                             r2_quality_model(quality_score_model, quality_score_model_r2),
                             sequencing_error_model,
@@ -1461,10 +1465,23 @@ pub fn generate_reverse_mate(
     Ok(reverse_complement_record(record))
 }
 
+/// What a read is filled with once it runs past the end of the whole adapter construct
+/// (#865). Past that point there is no template at all, so nothing is repeated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdapterOverrun {
+    /// G: how two-colour chemistry (NovaSeq, NextSeq, iSeq) calls a cycle with no signal,
+    /// which is the poly-G tail seen in real short-insert data.
+    #[default]
+    PolyG,
+    /// Uniform random bases, closer to four-colour chemistry (MiSeq, HiSeq).
+    Random,
+}
+
 /// Append 3' sequencing-adapter readthrough to a FINAL-oriented read (#125).
 /// When the insert was shorter than `read_length`, the record holds only the
-/// insert bases; this pads it to `read_length` with adapter sequence sourced
-/// cyclically (real reads can read through into — and past — the adapter).
+/// insert bases; this pads it to `read_length` with the adapter construct and,
+/// once that runs out, with `overrun` fill. The adapter is never repeated (#865):
+/// no molecule carries a second copy of it.
 /// Adapter bases:
 ///   - carry the same per-base substitution error as insert bases, so trimmers
 ///     see realistic (not pristine) adapters; insertion/deletion errors are
@@ -1473,11 +1490,15 @@ pub fn generate_reverse_mate(
 ///   - are soft-clipped (`'S'`) in the golden BAM — they are not reference-aligned,
 ///   - carry no variants (adapter is not reference-derived).
 ///
+/// Fill bases take quality scores and are soft-clipped the same way, but take no
+/// substitution error: there is no template base to misread.
+///
 /// Pass the R1 adapter for R1, and the R2 adapter for the post-flip R2 read.
 /// (The end-to-end fastp/cutadapt trim check is an integration step — see #125.)
 fn append_adapter_readthrough(
     mut record: ReadRecord,
     adapter: &[Nucleotide],
+    overrun: AdapterOverrun,
     read_length: usize,
     quality_score_model: &QualityScoreModel,
     sequencing_error_model: &SequencingErrorModel,
@@ -1490,19 +1511,31 @@ fn append_adapter_readthrough(
     let n_adapter = read_length - current;
     let quals = quality_score_model.generate_quality_scores(n_adapter, rng)?;
     for (i, &score) in quals.iter().enumerate() {
-        let mut base = adapter[i % adapter.len()];
-        let prob = sequencing_error_model.convert_score(score)?;
-        if rng.random()? < prob {
-            // Substitution noise only — preserves exact read_length.
-            // `None` for homopolymer context: this is synthetic adapter sequence, not
-            // genome, so a run length measured in it would not mean what the #661 curve
-            // measured. Passing no context keeps this path's behaviour unchanged.
-            if let SequencingErrorType::SnpError(b) =
-                sequencing_error_model.generate_sequencing_error(base, None, rng)?
-            {
-                base = b;
+        let base = match adapter.get(i) {
+            Some(&adapter_base) => {
+                let mut base = adapter_base;
+                let prob = sequencing_error_model.convert_score(score)?;
+                if rng.random()? < prob {
+                    // Substitution noise only — preserves exact read_length.
+                    // `None` for homopolymer context: this is synthetic adapter sequence, not
+                    // genome, so a run length measured in it would not mean what the #661 curve
+                    // measured. Passing no context keeps this path's behavior unchanged.
+                    if let SequencingErrorType::SnpError(b) =
+                        sequencing_error_model.generate_sequencing_error(base, None, rng)?
+                    {
+                        base = b;
+                    }
+                }
+                base
             }
-        }
+            None => match overrun {
+                AdapterOverrun::PolyG => Nucleotide::G,
+                AdapterOverrun::Random => {
+                    [Nucleotide::A, Nucleotide::C, Nucleotide::G, Nucleotide::T]
+                        [((rng.random()? * 4.0) as usize).min(3)]
+                }
+            },
+        };
         record.sequence.push(base.into());
         record.quality_scores.push(score);
         record.cigar_ops.push('S');
@@ -1987,6 +2020,7 @@ mod tests {
         let out = append_adapter_readthrough(
             adapter_rec(&"A".repeat(insert_len), true, false),
             &adapter,
+            AdapterOverrun::PolyG,
             read_length,
             &qm,
             &em,
@@ -2010,6 +2044,93 @@ mod tests {
         );
     }
 
+    /// Pads a 5 bp insert to `read_length` with a 12 bp adapter and returns the tail
+    /// after the insert.
+    fn readthrough_tail(read_length: usize, overrun: AdapterOverrun, seed: &str) -> String {
+        let adapter: Vec<Nucleotide> = "ACACACTTTTTT".chars().map(Nucleotide::from).collect();
+        let qm = QualityScoreModel::default().unwrap();
+        let em = SequencingErrorModel::default().unwrap();
+        let mut rng = NeatRng::new_from_seed(&vec![seed.to_string()]).unwrap();
+        let out = append_adapter_readthrough(
+            adapter_rec("CCCCC", true, false),
+            &adapter,
+            overrun,
+            read_length,
+            &qm,
+            &em,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(out.sequence.len(), read_length);
+        assert!(
+            out.cigar_ops[5..].iter().all(|&c| c == 'S'),
+            "adapter and fill are soft-clipped"
+        );
+        out.sequence[5..].to_string()
+    }
+
+    #[test]
+    fn test_readthrough_past_the_adapter_is_polyg_not_a_second_adapter() {
+        // #865: a 5 bp insert in a 5000 bp read runs through the 12 bp adapter and then
+        // 4983 bases past it. Those must be G, with no substitution errors (no template
+        // base to misread). The old cyclic sourcing repeated the adapter ~415 times.
+        let tail = readthrough_tail(5_000, AdapterOverrun::PolyG, "polyg");
+        let mismatches = tail[..12]
+            .chars()
+            .zip("ACACACTTTTTT".chars())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            mismatches <= 2,
+            "adapter segment should match up to sequencing error: {}",
+            &tail[..12]
+        );
+        let fill = &tail[12..];
+        assert!(
+            fill.chars().all(|c| c == 'G'),
+            "fill must be all G: {} non-G of {}",
+            fill.chars().filter(|&c| c != 'G').count(),
+            fill.len()
+        );
+    }
+
+    #[test]
+    fn test_readthrough_random_fill_is_uniform_and_not_the_adapter() {
+        let tail = readthrough_tail(5_000, AdapterOverrun::Random, "random");
+        let fill = &tail[12..];
+        for base in ['A', 'C', 'G', 'T'] {
+            let frac = fill.chars().filter(|&c| c == base).count() as f64 / fill.len() as f64;
+            // 4983 draws: sigma ~0.006, so 0.22..0.28 is ~5 sigma either side.
+            assert!(
+                (0.22..=0.28).contains(&frac),
+                "{base} fraction {frac:.3} in random fill"
+            );
+        }
+        assert!(
+            !fill.contains("ACACACTTTTTT"),
+            "random fill must not reproduce the adapter"
+        );
+    }
+
+    #[test]
+    fn test_readthrough_ending_inside_the_adapter_has_no_fill() {
+        // Must-not-fire: a tail that ends within the adapter is adapter only, exactly as
+        // before #865 (and the same rng draws, so seeded output is unchanged).
+        let polyg = readthrough_tail(15, AdapterOverrun::PolyG, "inside");
+        let random = readthrough_tail(15, AdapterOverrun::Random, "inside");
+        assert_eq!(polyg.len(), 10);
+        assert_eq!(
+            polyg, random,
+            "overrun mode must not matter before the adapter ends"
+        );
+        let mismatches = polyg
+            .chars()
+            .zip("ACACACTTTT".chars())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(mismatches <= 2, "{polyg}");
+    }
+
     #[test]
     fn test_append_adapter_noop_when_insert_ge_read_length() {
         let read_length = 10usize;
@@ -2019,8 +2140,16 @@ mod tests {
         let mut rng = NeatRng::new_from_seed(&vec!["x".to_string()]).unwrap();
         let rec = adapter_rec("ACGTACGTAC", false, false); // already read_length
         let before = rec.sequence.clone();
-        let out =
-            append_adapter_readthrough(rec, &adapter, read_length, &qm, &em, &mut rng).unwrap();
+        let out = append_adapter_readthrough(
+            rec,
+            &adapter,
+            AdapterOverrun::PolyG,
+            read_length,
+            &qm,
+            &em,
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(
             out.sequence, before,
             "no adapter when insert >= read_length"
@@ -2042,8 +2171,16 @@ mod tests {
         let qm = QualityScoreModel::default().unwrap();
         let em = SequencingErrorModel::default().unwrap();
         let mut rng = NeatRng::new_from_seed(&vec!["r2".to_string()]).unwrap();
-        let out = append_adapter_readthrough(flipped, &r2_adapter, read_length, &qm, &em, &mut rng)
-            .unwrap();
+        let out = append_adapter_readthrough(
+            flipped,
+            &r2_adapter,
+            AdapterOverrun::PolyG,
+            read_length,
+            &qm,
+            &em,
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(out.sequence.len(), read_length);
         let tail = &out.sequence[6..];
         let ac = tail.chars().filter(|c| matches!(c, 'A' | 'C')).count();
@@ -2114,6 +2251,7 @@ mod tests {
             &mut AdCounter::new(),
             &[],
             &[],
+            AdapterOverrun::PolyG,
         )
         .unwrap();
         buf1.finish().unwrap();
@@ -2211,6 +2349,7 @@ mod tests {
             &mut AdCounter::new(),
             &[],
             &[],
+            AdapterOverrun::PolyG,
         )
         .unwrap();
         buf1.finish().unwrap();
@@ -2306,6 +2445,7 @@ mod tests {
             &mut AdCounter::new(),
             &adapter,
             &adapter,
+            AdapterOverrun::PolyG,
         )
         .unwrap();
         buf1.finish().unwrap();
@@ -2404,6 +2544,7 @@ mod tests {
             &mut AdCounter::new(),
             &[], // NO adapter → genomic reads, no padding
             &[],
+            AdapterOverrun::PolyG,
         )
         .unwrap();
         buf1.finish().unwrap();
@@ -3164,6 +3305,7 @@ mod tests {
             &mut AdCounter::new(),
             &[],
             &[],
+            AdapterOverrun::PolyG,
         )
         .unwrap();
     }

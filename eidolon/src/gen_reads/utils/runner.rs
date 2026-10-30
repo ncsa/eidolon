@@ -1233,6 +1233,7 @@ fn process_chunk(
                 &mut ad_counter,
                 &r1_adapter,
                 &r2_adapter,
+                ctx.config.adapters.overrun,
             )?;
             contig_files_r1.push(file_to_write_1);
             contig_files_r2.push(file_to_write_2);
@@ -1260,6 +1261,7 @@ fn process_chunk(
                 &mut ad_counter,
                 &r1_adapter,
                 &r2_adapter,
+                ctx.config.adapters.overrun,
             )?;
             contig_files_r1.push(file_to_write_1);
         }
@@ -1294,6 +1296,7 @@ fn process_chunk(
             &mut ad_counter,
             &r1_adapter,
             &r2_adapter,
+            ctx.config.adapters.overrun,
         )?;
     }
 
