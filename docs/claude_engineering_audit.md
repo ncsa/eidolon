@@ -766,6 +766,39 @@ the SV junction writers (#777), which draw R2's errors after reverse-complementi
 would show the defect before proposing its fix. A test expected to fail that passes is a
 finding, not a nuisance, and the proposed fix belongs in the mutation run.
 
+### 5.9 A library taken at its metadata (2026-10-30, #861)
+
+The telomere comparison (#861) needed real CHM13 Illumina reads, and Claude picked SRR10035390:
+NovaSeq 6000, 2×151, `library_strategy` WGS in ENA, from the T2T consortium's own project. Its
+headline result was posted to the issue the same day as a finding: **"real CHM13 carries 10.6×
+more telomeric reads than the simulation"** (420.0 against 39.7 per million), read as the real
+telomeres being longer than the assembly's.
+
+The control windows put the claim in doubt. Clipping was 0.593 in real data against 0.009
+simulated, **genome-wide**, not just at telomeres. Adapters could not explain that, because the
+fragment model fitted from the same BAM had p05 179 bp. Confident chr21 alignments of the run's
+first 200k pairs then showed **98.8% of R1s carrying a 5′ clip, 88% of them 14–26 bp**, against
+11.5% of R2s. That is a barcoded linked-read layout (16 bp barcode plus spacer). A TruSeq PCR-free
+CHM13 run (SRR2088062) showed 1.6% / 1.4%, and **27.5 telomeric reads per million** in the same
+sample size, near the simulation. The 10× excess was a library artifact. The claim was withdrawn
+in a correction on the issue, and the original comment now opens with it.
+
+Two smaller misreadings came out in the same check:
+- The plan's fallback candidates SRR15395847–53 are CUT&RUN, also labeled WGS.
+- An ENA run can list an unpaired file ahead of its mates, and `stage_raw_pairs.sbatch` took the
+  first two URLs as the pair.
+
+One misstep came in the checking itself. The first local clip test aligned reads to chr21 alone,
+so off-target reads landed partially and clipped: 59% clipping in the PCR-free library too. That
+was caught before it was reported, because about 10% of reads aligned where chr21 holds 1.5% of
+the genome.
+
+**Rule this earns:** `library_strategy` is free text set by the submitter, and "WGS" covers
+linked reads, CUT&RUN and flow-sorted libraries. Before a real library becomes the ground truth,
+check what it physically is. Read-start clip lengths by mate are a cheap check. A library
+artifact large enough to produce the headline difference will usually also show in the control
+windows, so read the controls before the ends.
+
 ---
 
 ## 6. Case study: BND
