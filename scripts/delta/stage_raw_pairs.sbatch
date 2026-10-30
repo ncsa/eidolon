@@ -23,6 +23,12 @@
 #   BAM=$SCRATCH/raw_pairs/<TAG>/<TAG>.bam TAG=<TAG> sbatch --dependency=afterok:<id> scripts/delta/fit_overlap_matrix.sbatch
 # and check the exit state, not just the log:
 #   sacct -j <id> --format=JobID,State,ExitCode,Elapsed
+#
+# LOCAL READS. If $WORK/r1.fastq.gz and r2.fastq.gz already exist, nothing is downloaded and
+# SRR is not needed: this aligns them through the same bwa-mem2 | fixmate | sort | markdup path,
+# which is how simulated reads get compared with real ones on equal terms (#844, #861). N_PAIRS
+# then defaults to the pair count of r1, checked against r2, so it need not be known at submit.
+#   TAG=chm13_sim REFERENCE=... sbatch scripts/delta/stage_raw_pairs.sbatch
 
 #SBATCH --job-name=eidolon-rawpairs
 #SBATCH --partition=cpu
@@ -39,11 +45,11 @@ set -euo pipefail
 REPO="${REPO:-/projects/bhrd/jallen17/eidolon}"
 source "$REPO/scripts/delta/lib_report.sh"
 
-SRR="${SRR:?set SRR to an ENA/SRA run accession}"
 TAG="${TAG:?set TAG to a short library name}"
-N_PAIRS="${N_PAIRS:-40000000}"
 REFERENCE="${REFERENCE:-$SCRATCH/neat_data/GRCh38.fa}"
 WORK="${WORK:-$SCRATCH/raw_pairs/$TAG}"
+LOCAL_READS=0
+[[ -s "$WORK/r1.fastq.gz" && -s "$WORK/r2.fastq.gz" ]] && LOCAL_READS=1
 THREADS="${SLURM_CPUS_PER_TASK:-16}"
 
 module load samtools/1.22-cce19.0.0 2>/dev/null || true
@@ -54,28 +60,42 @@ command -v bwa-mem2 >/dev/null || { echo "FATAL: bwa-mem2 not on PATH" >&2; exit
 [[ -s "$REFERENCE.bwt.2bit.64" ]] || { echo "FATAL: no bwa-mem2 index for $REFERENCE" >&2; exit 1; }
 mkdir -p "$WORK"
 
-# ENA's report gives the FASTQ paths, so the SRR's directory layout need not be derived.
-urls=$(curl -sf "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=$SRR&result=read_run&fields=fastq_ftp" | awk -F'\t' 'NR == 2 { print $2 }')
-IFS=';' read -r u1 u2 <<< "$urls"
-[[ -n "${u1:-}" && -n "${u2:-}" ]] || { echo "FATAL: ENA lists no paired FASTQs for $SRR: '$urls'" >&2; exit 1; }
-echo "=== stage_raw_pairs: $TAG ($SRR), first $N_PAIRS pairs ==="
-echo "r1: $u1"
-echo "r2: $u2"
+if [[ "$LOCAL_READS" -eq 1 ]]; then
+    echo "=== stage_raw_pairs: $TAG, reads already in $WORK ==="
+    if [[ -z "${N_PAIRS:-}" ]]; then
+        n1=$(zcat "$WORK/r1.fastq.gz" | wc -l)
+        n2=$(zcat "$WORK/r2.fastq.gz" | wc -l)
+        [[ "$n1" -eq "$n2" && $((n1 % 4)) -eq 0 && "$n1" -gt 0 ]] \
+            || { echo "FATAL: r1 has $n1 lines and r2 has $n2; not a matched pair of FASTQs" >&2; exit 1; }
+        N_PAIRS=$((n1 / 4))
+    fi
+    echo "pairs: $N_PAIRS"
+else
+    N_PAIRS="${N_PAIRS:-40000000}"
+    SRR="${SRR:?set SRR to an ENA/SRA run accession, or put r1/r2.fastq.gz in $WORK}"
+    # ENA's report gives the FASTQ paths, so the SRR's directory layout need not be derived.
+    urls=$(curl -sf "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=$SRR&result=read_run&fields=fastq_ftp" | awk -F'\t' 'NR == 2 { print $2 }')
+    IFS=';' read -r u1 u2 <<< "$urls"
+    [[ -n "${u1:-}" && -n "${u2:-}" ]] || { echo "FATAL: ENA lists no paired FASTQs for $SRR: '$urls'" >&2; exit 1; }
+    echo "=== stage_raw_pairs: $TAG ($SRR), first $N_PAIRS pairs ==="
+    echo "r1: $u1"
+    echo "r2: $u2"
 
-# `head` closes the pipe early, so curl and zcat take SIGPIPE; pipefail comes off for these
-# pipelines only. The line counts below are what establish the pull finished.
-lines=$((N_PAIRS * 4))
-for m in 1 2; do
-    u="u$m"
-    fq="$WORK/r$m.fastq.gz"
-    [[ -s "$fq" ]] && continue
-    set +o pipefail
-    curl -sf "https://${!u}" | zcat | head -n "$lines" | gzip -1 -c > "$fq.part"
-    set -o pipefail
-    got=$(zcat "$fq.part" | wc -l)
-    [[ "$got" -eq "$lines" ]] || { echo "FATAL: r$m has $got lines, expected $lines" >&2; exit 1; }
-    mv "$fq.part" "$fq"
-done
+    # `head` closes the pipe early, so curl and zcat take SIGPIPE; pipefail comes off for these
+    # pipelines only. The line counts below are what establish the pull finished.
+    lines=$((N_PAIRS * 4))
+    for m in 1 2; do
+        u="u$m"
+        fq="$WORK/r$m.fastq.gz"
+        [[ -s "$fq" ]] && continue
+        set +o pipefail
+        curl -sf "https://${!u}" | zcat | head -n "$lines" | gzip -1 -c > "$fq.part"
+        set -o pipefail
+        got=$(zcat "$fq.part" | wc -l)
+        [[ "$got" -eq "$lines" ]] || { echo "FATAL: r$m has $got lines, expected $lines" >&2; exit 1; }
+        mv "$fq.part" "$fq"
+    done
+fi
 echo "read lengths in r1 (count, bp), most common first:"
 zcat "$WORK/r1.fastq.gz" | awk 'NR % 4 == 2 { print length($0) }' | sort -n | uniq -c | sort -rn | head -5
 
