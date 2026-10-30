@@ -148,10 +148,10 @@ gc_bias_normalize_coverage: true
 # datasets, where size selection is imperfect and a tail of shorter reads is always present.
 #
 # When false (the default, appropriate for Illumina short reads), fragments shorter than
-# read_len are rejected. For Illumina, the correct physical behavior for short fragments
-# is adapter read-through (full-length reads padded with adapter sequence), which is a
-# separate concern outside the scope of this simulator; discarding them is the standard
-# approach used by short-read simulators.
+# read_len are rejected. For Illumina, the physical behavior for short fragments is adapter
+# read-through (full-length reads padded with adapter sequence), which the `adapters` block
+# simulates: adapters: {enabled: true, preset: truseq|nextera|custom, overrun: polyg|random}.
+# See docs-site/src/gen-reads/adapter-readthrough.md.
 #
 # long_reads requires paired_ended: true and a configured fragment_mean / fragment_model.
 # (default: false)

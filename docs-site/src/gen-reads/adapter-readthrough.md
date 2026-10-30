@@ -9,6 +9,7 @@ when the `adapters` block is omitted.
 adapters:
   enabled: true
   preset: truseq        # truseq | nextera | custom
+  overrun: polyg        # polyg | random -- what follows the end of the adapter construct
   # for preset: custom, give explicit 5′→3′ uppercase-ACGT sequences:
   # r1: AGATCGGAAGAGC...
   # r2: AGATCGGAAGAGC...
@@ -24,10 +25,24 @@ readthrough you get is controlled by how many inserts fall below `read_len`** �
 (`fragment_mean` ≫ `read_len`) essentially no reads reach the adapter and enabling this
 changes nothing.
 
+Each preset is the whole construct a read passes through after the insert: the adapter stem,
+then a placeholder sample index, then the P7 (R1) or P5 (R2) flow-cell binding sequence. A read
+longer still has run off the end of the molecule, and `overrun` sets what fills the rest:
+
+- `polyg` (default) — G, which is how two-color instruments (NovaSeq, NextSeq, iSeq) call a
+  cycle with no signal. This is the poly-G tail seen in real short-insert data.
+- `random` — random bases, closer to four-color instruments (MiSeq, HiSeq).
+
+Fill bases take quality scores and are soft-clipped like adapter bases, but take no
+substitution errors, since there is no template base to misread. The adapter is never
+repeated: no real molecule carries a second copy of it (#865).
+
 Presets:
-- `truseq` — Illumina TruSeq (`AGATCGGAAGAGC…`), the most common.
-- `nextera` — Nextera / transposase (`CTGTCTCTTATACACATCT`).
-- `custom` — supply your own `r1` / `r2`.
+- `truseq` — Illumina TruSeq (`AGATCGGAAGAGC…`), the most common. Single-index adapter 1
+  (`ATCACG`).
+- `nextera` — Nextera / transposase Mosaic End (`CTGTCTCTTATACACATCT`), indexes N701/S501.
+- `custom` — supply your own `r1` / `r2`. Give the full sequence each read runs into,
+  including your own index and P5/P7 if you want them; `overrun` fill starts where it ends.
 
 Not compatible with `long_reads: true` (adapter readthrough is a short-read phenomenon).
 
@@ -54,3 +69,5 @@ BWA-MEM2 → GATK HaplotypeCaller vs the golden VCF): adapter readthrough is **d
 noise whether the adapters are fastp-trimmed or left for BWA-MEM2 to soft-clip. An
 adapter-free short-insert control showed the only fidelity difference versus a long-insert
 baseline is the reduced effective coverage of short inserts (mate overlap), not the adapters.
+That benchmark predates #865, when reads past the adapter stem repeated it instead of running
+into the index, P5/P7 and poly-G; it has not been re-run on the current sequence.
