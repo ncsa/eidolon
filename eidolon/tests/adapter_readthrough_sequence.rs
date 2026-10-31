@@ -12,6 +12,10 @@
 //! `AGATCGGAAGAGC` occurs at most once per read; sequencing error can only remove an
 //! occurrence, never add one. **Must not fire:** with `overrun: random` the same reads
 //! must not end in a G run.
+//!
+//! **Fill quality** is what the instrument calls, not a draw from the model (after NEAT#345):
+//! poly-G is a confident G on a dark cluster, so the last 20 scores are the model's top score
+//! (Q40, `I`, for both default mates); random fill is a call on no signal, the floor (Q2, `#`).
 
 mod common;
 
@@ -20,17 +24,23 @@ use std::path::Path;
 
 const STEM: &str = "AGATCGGAAGAGC";
 
-fn read_seqs(path: &Path) -> Vec<String> {
+/// FASTQ line `offset` (1 = sequence, 3 = quality) of every record.
+fn read_lines(path: &Path, offset: usize) -> Vec<String> {
     use std::io::Read;
     let mut s = String::new();
     flate2::read::MultiGzDecoder::new(std::fs::File::open(path).unwrap())
         .read_to_string(&mut s)
         .unwrap();
-    s.lines().skip(1).step_by(4).map(str::to_string).collect()
+    s.lines()
+        .skip(offset)
+        .step_by(4)
+        .map(str::to_string)
+        .collect()
 }
 
-/// R1 and R2 sequences from a short-insert TruSeq run with the given overrun mode.
-fn run(dir: &Path, overrun: &str) -> Vec<String> {
+/// R1 and R2 (sequences, quality lines) from a short-insert TruSeq run with the given
+/// overrun mode.
+fn run(dir: &Path, overrun: &str) -> (Vec<String>, Vec<String>) {
     let cfg = dir.join(format!("{overrun}.yml"));
     std::fs::write(
         &cfg,
@@ -51,15 +61,27 @@ fn run(dir: &Path, overrun: &str) -> Vec<String> {
         .arg(&cfg)
         .assert()
         .success();
-    let mut seqs = read_seqs(&dir.join(format!("{overrun}_r1.fastq.gz")));
-    seqs.extend(read_seqs(&dir.join(format!("{overrun}_r2.fastq.gz"))));
-    seqs
+    let (mut seqs, mut quals) = (Vec::new(), Vec::new());
+    for mate in ["r1", "r2"] {
+        let path = dir.join(format!("{overrun}_{mate}.fastq.gz"));
+        seqs.extend(read_lines(&path, 1));
+        quals.extend(read_lines(&path, 3));
+    }
+    (seqs, quals)
+}
+
+/// Reads whose last 20 quality characters are not all `want`.
+fn tails_not_scored(quals: &[String], want: char) -> usize {
+    quals
+        .iter()
+        .filter(|q| !q[q.len() - 20..].chars().all(|c| c == want))
+        .count()
 }
 
 #[test]
 fn short_insert_reads_run_through_the_adapter_once_then_poly_g() {
     let tmp = tempfile::tempdir().unwrap();
-    let seqs = run(tmp.path(), "polyg");
+    let (seqs, quals) = run(tmp.path(), "polyg");
     assert!(
         seqs.len() > 1000,
         "only {} reads; the test would be weak",
@@ -95,12 +117,14 @@ fn short_insert_reads_run_through_the_adapter_once_then_poly_g() {
             .find(|s| !s.ends_with(&g20))
             .unwrap_or(&String::new())
     );
+    let off = tails_not_scored(&quals, 'I');
+    assert_eq!(off, 0, "{off} reads' poly-G tails are not all Q40 (I)");
 }
 
 #[test]
 fn random_overrun_does_not_end_in_poly_g() {
     let tmp = tempfile::tempdir().unwrap();
-    let seqs = run(tmp.path(), "random");
+    let (seqs, quals) = run(tmp.path(), "random");
     assert!(seqs.len() > 1000, "only {} reads", seqs.len());
     let g20 = "G".repeat(20);
     let polyg = seqs.iter().filter(|s| s.ends_with(&g20)).count();
@@ -110,4 +134,6 @@ fn random_overrun_does_not_end_in_poly_g() {
         repeated, 0,
         "{repeated} reads repeat the stem with overrun: random"
     );
+    let off = tails_not_scored(&quals, '#');
+    assert_eq!(off, 0, "{off} reads' random tails are not all Q2 (#)");
 }
