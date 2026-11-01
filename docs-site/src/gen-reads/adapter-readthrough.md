@@ -30,11 +30,15 @@ then a placeholder sample index, then the P7 (R1) or P5 (R2) flow-cell binding s
 longer still has run off the end of the molecule, and `overrun` sets what fills the rest:
 
 - `polyg` (default) — G, which is how two-color instruments (NovaSeq, NextSeq, iSeq) call a
-  cycle with no signal. This is the poly-G tail seen in real short-insert data.
-- `random` — random bases, closer to four-color instruments (MiSeq, HiSeq).
+  cycle with no signal. This is the poly-G tail seen in real short-insert data. A dark cluster
+  is a confident G call, so these bases carry the quality model's top score (its top bin, for
+  a binned model). That is why trimming on quality alone leaves real poly-G tails in place, and
+  why fastp has a separate poly-G trim.
+- `random` — random bases at the quality model's floor score, closer to four-color instruments
+  (MiSeq, HiSeq).
 
-Fill bases take quality scores and are soft-clipped like adapter bases, but take no
-substitution errors, since there is no template base to misread. The adapter is never
+Fill bases are soft-clipped like adapter bases but take no substitution errors, since there is
+no template base to misread. The adapter is never
 repeated: no real molecule carries a second copy of it (#865).
 
 Presets:

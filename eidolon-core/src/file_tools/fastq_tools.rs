@@ -1490,8 +1490,11 @@ pub enum AdapterOverrun {
 ///   - are soft-clipped (`'S'`) in the golden BAM — they are not reference-aligned,
 ///   - carry no variants (adapter is not reference-derived).
 ///
-/// Fill bases take quality scores and are soft-clipped the same way, but take no
-/// substitution error: there is no template base to misread.
+/// Fill bases are soft-clipped the same way and take no substitution error: there is no
+/// template base to misread. Their quality is what the instrument calls, not a draw from the
+/// model (see `overrun_fill_score`). Scores are still drawn for every tail base first, so the
+/// RNG stream, and with it every read whose tail ends inside the adapter, is the same in
+/// either fill mode.
 ///
 /// Pass the R1 adapter for R1, and the R2 adapter for the post-flip R2 read.
 /// (The end-to-end fastp/cutadapt trim check is an integration step — see #125.)
@@ -1510,7 +1513,13 @@ fn append_adapter_readthrough(
     }
     let n_adapter = read_length - current;
     let quals = quality_score_model.generate_quality_scores(n_adapter, rng)?;
-    for (i, &score) in quals.iter().enumerate() {
+    let fill_score = overrun_fill_score(quality_score_model, overrun);
+    for (i, &drawn) in quals.iter().enumerate() {
+        let score = if i < adapter.len() {
+            drawn
+        } else {
+            fill_score.unwrap_or(drawn)
+        };
         let base = match adapter.get(i) {
             Some(&adapter_base) => {
                 let mut base = adapter_base;
@@ -1541,6 +1550,22 @@ fn append_adapter_readthrough(
         record.cigar_ops.push('S');
     }
     Ok(record)
+}
+
+/// The quality score of a base past the end of the adapter construct (#865, after NEAT#345).
+///
+/// Poly-G is not a low-confidence call: on two-color chemistry a dark cluster is read as a
+/// confident G, which is why quality-only trimming leaves real poly-G tails in place and fastp
+/// carries a separate poly-G trim. So it takes the model's top score. Random fill stands for a
+/// call made on no signal and takes the floor. Both are members of `quality_score_options`, so
+/// a binned model emits its top or bottom bin, a score the instrument can actually produce.
+/// `None` only for a model with no options at all, where the drawn score is kept.
+fn overrun_fill_score(model: &QualityScoreModel, overrun: AdapterOverrun) -> Option<usize> {
+    let options = model.quality_score_options.iter().copied();
+    match overrun {
+        AdapterOverrun::PolyG => options.max(),
+        AdapterOverrun::Random => options.min(),
+    }
 }
 
 pub fn write_read_to_fastq<W: Write>(
@@ -1624,6 +1649,7 @@ mod tests {
     use crate::structs::variants::{Variant, VariantType};
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::collections::HashSet;
     use std::io::Write;
 
     #[derive(Default)]
@@ -2110,6 +2136,87 @@ mod tests {
             !fill.contains("ACACACTTTTTT"),
             "random fill must not reproduce the adapter"
         );
+    }
+
+    #[test]
+    fn test_overrun_fill_quality_is_the_instrument_call_not_a_draw() {
+        // Poly-G is a confident call on a dark cluster: the model's top score. Random fill is a
+        // call on no signal: the floor. Adapter bases before the fill keep their drawn scores.
+        let qm = QualityScoreModel::default().unwrap();
+        let top = *qm.quality_score_options.iter().max().unwrap();
+        let floor = *qm.quality_score_options.iter().min().unwrap();
+        assert!(
+            top > floor,
+            "the default model must have a range for this test to mean anything"
+        );
+        let em = SequencingErrorModel::default().unwrap();
+        let adapter: Vec<Nucleotide> = "ACACACTTTTTTGGAACC".chars().map(Nucleotide::from).collect();
+        for (overrun, want) in [
+            (AdapterOverrun::PolyG, top),
+            (AdapterOverrun::Random, floor),
+        ] {
+            let mut rng = NeatRng::new_from_seed(&vec!["fill quality".to_string()]).unwrap();
+            let out = append_adapter_readthrough(
+                adapter_rec("CCCCC", true, false),
+                &adapter,
+                overrun,
+                500,
+                &qm,
+                &em,
+                &mut rng,
+            )
+            .unwrap();
+            let fill: HashSet<usize> = out.quality_scores[5 + adapter.len()..]
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(fill, HashSet::from([want]), "{overrun:?} fill quality");
+            let adapter_quals: HashSet<usize> = out.quality_scores[5..5 + adapter.len()]
+                .iter()
+                .copied()
+                .collect();
+            assert!(
+                adapter_quals.len() > 1,
+                "adapter bases keep drawn scores: {adapter_quals:?}"
+            );
+        }
+        // Must-not-fire: a tail ending inside the adapter has identical scores in either mode,
+        // because every tail score is drawn before any fill is applied.
+        let tail_quals = |overrun| {
+            let mut rng = NeatRng::new_from_seed(&vec!["inside".to_string()]).unwrap();
+            append_adapter_readthrough(
+                adapter_rec("CCCCC", true, false),
+                &adapter,
+                overrun,
+                15,
+                &qm,
+                &em,
+                &mut rng,
+            )
+            .unwrap()
+            .quality_scores
+        };
+        assert_eq!(
+            tail_quals(AdapterOverrun::PolyG),
+            tail_quals(AdapterOverrun::Random)
+        );
+    }
+
+    #[test]
+    fn test_overrun_fill_quality_uses_a_binned_models_bins() {
+        // A binned instrument only emits its bins, so the fill takes the top or bottom bin.
+        let bins = vec![2usize, 12, 23, 37];
+        let n = bins.len();
+        let qm = QualityScoreModel::from_counts(
+            bins,
+            4,
+            vec![1.0; n],
+            vec![vec![vec![1.0; n]; n]; 3],
+            true,
+        )
+        .unwrap();
+        assert_eq!(overrun_fill_score(&qm, AdapterOverrun::PolyG), Some(37));
+        assert_eq!(overrun_fill_score(&qm, AdapterOverrun::Random), Some(2));
     }
 
     #[test]
