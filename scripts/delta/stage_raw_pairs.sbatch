@@ -8,6 +8,12 @@
 # 0.059% -> 0.014%, where HG002 rises 0.10% -> 0.98%. Its @PG lines stop at bwa, so they
 # cannot say what ran before it. Aligning a run whose reads are untouched removes the question.
 #
+# CHECK WHAT THE LIBRARY IS. ENA's library_strategy is free text, and "WGS" has covered a 10x
+# linked-read library (SRR10035390: a 16-23 bp barcode at the start of ~99% of R1s) and CUT&RUN
+# runs (SRR15395847-53). A barcoded R1 clips 59% of reads genome-wide and changed #861's headline
+# telomere result tenfold. After staging, compare read-start clips by mate (R1 vs R2) before
+# treating the library as standard WGS.
+#
 # CHECK THE READS ARE RAW. An SRA upload can be processed too: SEQC2's own run, SRR7890943,
 # is trimmed (min 35 bp, 36.5% under 151) though its mean length is 150.4. A mean hides this,
 # so the pull prints the length distribution; untrimmed reads are all one length.
@@ -75,7 +81,11 @@ else
     SRR="${SRR:?set SRR to an ENA/SRA run accession, or put r1/r2.fastq.gz in $WORK}"
     # ENA's report gives the FASTQ paths, so the SRR's directory layout need not be derived.
     urls=$(curl -sf "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=$SRR&result=read_run&fields=fastq_ftp" | awk -F'\t' 'NR == 2 { print $2 }')
-    IFS=';' read -r u1 u2 <<< "$urls"
+    # Pick the mates by name. A run can list an unpaired file as well, first:
+    # ERR1341793 lists ERR1341793.fastq.gz;…_1.fastq.gz;…_2.fastq.gz, and taking the first two
+    # would pair the unpaired reads with read 1.
+    u1=$(tr ';' '\n' <<< "$urls" | grep '_1\.fastq\.gz$' || true)
+    u2=$(tr ';' '\n' <<< "$urls" | grep '_2\.fastq\.gz$' || true)
     [[ -n "${u1:-}" && -n "${u2:-}" ]] || { echo "FATAL: ENA lists no paired FASTQs for $SRR: '$urls'" >&2; exit 1; }
     echo "=== stage_raw_pairs: $TAG ($SRR), first $N_PAIRS pairs ==="
     echo "r1: $u1"
