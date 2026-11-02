@@ -42,10 +42,22 @@ fn run_gen_reads_cfg(
     threads: Option<usize>,
     sv_rate_scale: Option<f64>,
 ) {
+    run_gen_reads_full(seed, output_dir, name, threads, sv_rate_scale, None)
+}
+
+fn run_gen_reads_full(
+    seed: &str,
+    output_dir: &std::path::Path,
+    name: &str,
+    threads: Option<usize>,
+    sv_rate_scale: Option<f64>,
+    shuffle_fastq: Option<bool>,
+) {
     let mut config = GenReadsConfig::new(h1n1_reference(), output_dir.to_path_buf(), name);
     config.rng_seed = seed.to_string();
     config.num_threads = threads;
     config.sv_rate_scale = sv_rate_scale;
+    config.shuffle_fastq = shuffle_fastq;
     let yaml = config.write_yaml();
     eidolon()
         .args(["gen-reads", "-c"])
@@ -213,10 +225,21 @@ fn byte_identical_output_with_svs_across_thread_counts() {
 /// them and that section is legitimately not sorted by contig. Only the first section is
 /// asserted here; chimeric block ordering is left unpinned rather than pinned to something
 /// this test would have to guess at.
+///
+/// Since #870 the default output is shuffled, so this pins the `shuffle_fastq: false` path.
+/// That order still matters with the shuffle on: it is the input order the shuffle's
+/// determinism rests on.
 #[test]
 fn ordinary_reads_are_emitted_in_reference_file_order() {
     let (_g, dir) = fresh_workdir();
-    run_gen_reads_cfg("contig order seed", &dir, "order", Some(1), Some(50.0));
+    run_gen_reads_full(
+        "contig order seed",
+        &dir,
+        "order",
+        Some(1),
+        Some(50.0),
+        Some(false),
+    );
     let lines = read_gzip_fastq_lines(&dir.join("order_r1.fastq.gz"));
 
     let reference_order = [

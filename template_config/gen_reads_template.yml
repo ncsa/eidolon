@@ -55,6 +55,12 @@ fragment_st_dev: .
 # At least one of produce_fastq, produce_vcf, or produce_bam must be true.
 produce_fastq: true
 
+# Write the FASTQ(s) in random order, as a sequencer does, rather than genome order. Mates stay
+# in register. Only record order changes: the truth VCF and BAM are identical either way, and the
+# same seed gives the same output at any thread count. Genome order made bwa-mem2 need ~1.8x the
+# memory on a T2T-CHM13 simulation (#870). (default: true)
+shuffle_fastq: true
+
 # Produce a gzipped VCF file recording all inserted variants. (default: false)
 produce_vcf: false
 
