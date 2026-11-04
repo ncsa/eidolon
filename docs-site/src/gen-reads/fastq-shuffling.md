@@ -3,7 +3,9 @@
 real sequencer's FASTQ is in effectively random order. Variant calling does not depend on this,
 since the BAM is coordinate-sorted before calling. Tools that read the FASTQ in batches,
 aligners in particular, do see the difference: a batch can be filled entirely with reads from
-one region, such as a long satellite array. Shuffle before aligning if that matters to you.
+one region, such as a long satellite array. Measured on a 21x simulation of T2T-CHM13 (#870),
+bwa-mem2 peaked at 166 GB on the reads as written and at 90 GB on the same reads shuffled,
+with the same alignments either way. Shuffle before aligning a large genome.
 #870 tracks shuffling in `eidolon` itself.
 
 With `seqkit`, shuffle each mate separately **with the same seed**. seqkit has no paired mode,
