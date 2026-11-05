@@ -1,7 +1,7 @@
 # Parallel Processing
 `eidolon gen-reads` processes contigs in parallel by default using rayon's work-stealing thread pool. Each contig is an independent unit of work — variant generation, fragment sampling, and FASTQ/BAM writing all happen concurrently across contigs — so references with many contigs scale well across cores.
 
-Output is **byte-identical regardless of `num_threads`** (the same seed always produces the same reads in the same order), so you can change the thread count freely without affecting results.
+Output is **byte-identical regardless of `num_threads`** (the same seed always produces the same reads in the same order, shuffled or not; see [FASTQ Shuffling](fastq-shuffling.md)), so you can change the thread count freely without affecting results.
 
 A note on scaling: read generation is largely **memory-bandwidth bound**, so on references dominated by one or a few large chromosomes the wall-time gain from extra cores is limited — the bottleneck is memory throughput, not CPU. An experimental sub-contig **chunk size** knob (below) can split a single chromosome across cores, but it is **disabled by default** because in our benchmarks it did not improve wall time and occasionally regressed it.
 

@@ -6,6 +6,7 @@ pub mod bam_writer;
 pub mod bed_reader;
 pub mod block_gz;
 pub mod fasta_stream;
+pub mod fastq_shuffle;
 pub mod fastq_tools;
 pub mod file_io;
 pub mod folder_tools;

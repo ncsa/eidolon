@@ -151,6 +151,10 @@ pub struct RunConfiguration {
     // set it on its own to get the adapter-free short-insert arm. Default off →
     // short fragments discarded, output byte-identical to before.
     pub keep_short_fragments: bool,
+    // Write the final FASTQs in random order rather than genome order (#870). Default on: a real
+    // sequencer's FASTQ is unordered, and genome order made bwa-mem2 need 166 GB instead of 90 GB
+    // on a 21x CHM13 simulation. Off restores the byte-for-byte concatenation of chunk outputs.
+    pub shuffle_fastq: bool,
     // Scale applied to the SvModel's per-base SV rate at generation time.
     // 0.0 (default) disables de novo SV generation entirely — only SVs
     // from `input_vcf` flow through. Values > 0 enable sampling from
@@ -230,6 +234,7 @@ impl Default for RunConfiguration {
             chunk_size: None,
             long_reads: false,
             keep_short_fragments: false,
+            shuffle_fastq: true,
             sv_rate_scale: 0.0,
             sv_max_length_fraction: 0.25,
             adapters: AdapterConfig::default(),
@@ -273,6 +278,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "reference",
     "rng_seed",
     "sequence_error_model",
+    "shuffle_fastq",
     "sv_max_length_fraction",
     "sv_rate_scale",
     "target_bed",
@@ -720,6 +726,14 @@ impl RunConfiguration {
                             )
                         })?;
                     }
+                    "shuffle_fastq" => {
+                        config.shuffle_fastq = value.as_bool().ok_or_else(|| {
+                            GenerateReadsError::ConfigReadError(
+                                "shuffle_fastq".to_string(),
+                                "boolean".to_string(),
+                            )
+                        })?;
+                    }
                     "sv_rate_scale" => {
                         config.sv_rate_scale = value.as_f64().ok_or_else(|| {
                             GenerateReadsError::ConfigReadError(
@@ -813,6 +827,9 @@ impl RunConfiguration {
             info!("\t>mutation rate: {}", rate)
         }
         info!("\t>paired ended: {}", config.paired_ended);
+        if config.produce_fastq {
+            info!("\t>shuffle FASTQ order: {}", config.shuffle_fastq);
+        }
         if config.long_reads {
             info!("\t>long reads mode: enabled (short fragments produce truncated reads)");
         }
@@ -1043,6 +1060,7 @@ mod tests {
             chunk_size: None,
             long_reads: false,
             keep_short_fragments: false,
+            shuffle_fastq: true,
             sv_rate_scale: 0.0,
             sv_max_length_fraction: 0.25,
             adapters: AdapterConfig::default(),

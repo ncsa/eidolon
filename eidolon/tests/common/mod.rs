@@ -96,6 +96,8 @@ pub struct GenReadsConfig {
     pub mutation_rate: Option<f64>,
     pub mutation_model: Option<PathBuf>,
     pub sv_rate_scale: Option<f64>,
+    /// `None` leaves gen-reads' default, which shuffles the FASTQs (#870).
+    pub shuffle_fastq: Option<bool>,
 }
 
 impl GenReadsConfig {
@@ -121,6 +123,7 @@ impl GenReadsConfig {
             mutation_rate: None,
             mutation_model: None,
             sv_rate_scale: None,
+            shuffle_fastq: None,
         }
     }
 
@@ -169,6 +172,10 @@ impl GenReadsConfig {
             Some(s) => format!("sv_rate_scale: {s}\n"),
             None => String::new(),
         };
+        let shuffle_section = match self.shuffle_fastq {
+            Some(b) => format!("shuffle_fastq: {b}\n"),
+            None => String::new(),
+        };
         write!(
             f,
             "reference: {ref_}\n\
@@ -181,7 +188,7 @@ impl GenReadsConfig {
              output_filename: {name}\n\
              overwrite_output: true\n\
              rng_seed: {seed}\n\
-             {pair}{model}{qmodel}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}",
+             {pair}{model}{qmodel}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}{shuffle}",
             ref_ = self.reference.display(),
             rl = self.read_len,
             cov = self.coverage,
@@ -198,6 +205,7 @@ impl GenReadsConfig {
             chunksz = chunk_size_section,
             ivcf = input_vcf_section,
             mrate = mutation_rate_section,
+            shuffle = shuffle_section,
             mmodel = mutation_model_section,
             svscale = sv_rate_scale_section,
         )

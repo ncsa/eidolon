@@ -17,6 +17,7 @@ use crate::{
             bam_writer::{BamBodyWriter, BamContext, BamRecordStager, concat_temp_bams},
             bed_reader::read_bed,
             fasta_stream::{FastaStream, map_buffer, resolve_iupac_bases},
+            fastq_shuffle::combine_temp_fastqs_shuffled,
             fastq_tools::{
                 HaplotypeContext, PlacedFragment, Strand, combine_temp_fastqs, generate_read,
                 generate_reverse_mate, r2_quality_model, reverse_complement, write_block_fastq,
@@ -83,6 +84,43 @@ struct ContigContext<'a> {
     // run at a fixed seed, single-threaded. Iterate this instead and look the map up.
     contig_order: Arc<Vec<String>>,
 }
+
+/// Writes the final FASTQs from the per-chunk temp files: shuffled by default (#870), or
+/// concatenated in contig order when `shuffle_fastq: false`. The shuffle draws from its own child
+/// of the run's RNG, so it consumes nothing from the streams that generate reads; the truth VCF
+/// and golden BAM are the same either way.
+fn combine_fastqs(
+    config: &RunConfiguration,
+    ctx: &ContigContext<'_>,
+    all_r1: Vec<PathBuf>,
+    all_r2: Vec<PathBuf>,
+    filename1: &PathBuf,
+    filename2: Option<&PathBuf>,
+) -> Result<(), GenerateReadsError> {
+    if !config.shuffle_fastq {
+        combine_temp_fastqs(all_r1, all_r2, filename1, filename2)?;
+        return Ok(());
+    }
+    info!("Shuffling FASTQ order (shuffle_fastq: true)");
+    let mut rng = ctx.base_rng.derive_child(SHUFFLE_RNG_CHILD);
+    let threads = config
+        .num_threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    combine_temp_fastqs_shuffled(
+        all_r1,
+        all_r2,
+        filename1,
+        filename2.map(PathBuf::as_path),
+        &mut rng,
+        ctx.working_dir,
+        threads,
+    )?;
+    Ok(())
+}
+
+/// Child index of the run RNG reserved for the FASTQ shuffle. Contigs use their index and the
+/// chimeric pass uses 999999; this is far from both.
+const SHUFFLE_RNG_CHILD: u64 = 0x5348_5546_464c_4521;
 
 pub fn run_neat(
     config: &RunConfiguration,
@@ -545,7 +583,14 @@ pub fn run_neat(
                     match &config.output_fastq_2 {
                         Some(filename2) => {
                             create_output_file(filename2, config.overwrite_output)?;
-                            combine_temp_fastqs(all_r1, all_r2, filename1, Some(filename2))?;
+                            combine_fastqs(
+                                config,
+                                &ctx,
+                                all_r1,
+                                all_r2,
+                                filename1,
+                                Some(filename2),
+                            )?;
                         }
                         None => {
                             return Err(GenerateReadsError::ConfigError(format!(
@@ -554,7 +599,7 @@ pub fn run_neat(
                         }
                     }
                 } else {
-                    combine_temp_fastqs(all_r1, vec![], filename1, None)?;
+                    combine_fastqs(config, &ctx, all_r1, vec![], filename1, None)?;
                 }
             }
             None => {
