@@ -146,10 +146,20 @@ fn shuffled_output_is_identical_across_thread_counts() {
     run(d, "t1", None, 1);
     run(d, "t4", None, 4);
     for mate in ["r1", "r2"] {
+        let (a, b) = (
+            d.join(format!("t1_{mate}.fastq.gz")),
+            d.join(format!("t4_{mate}.fastq.gz")),
+        );
         assert_eq!(
-            gz_text(&d.join(format!("t1_{mate}.fastq.gz"))),
-            gz_text(&d.join(format!("t4_{mate}.fastq.gz"))),
-            "{mate} differs between 1 and 4 threads"
+            gz_text(&a),
+            gz_text(&b),
+            "{mate} records differ between 1 and 4 threads"
+        );
+        // The files themselves, not just their decompressed text: gzip member boundaries or
+        // headers that varied with thread count would pass the line above.
+        assert!(
+            std::fs::read(&a).unwrap() == std::fs::read(&b).unwrap(),
+            "{mate} gzip bytes differ between 1 and 4 threads"
         );
     }
 }

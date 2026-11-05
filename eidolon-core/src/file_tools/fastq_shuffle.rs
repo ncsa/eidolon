@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::MultiGzDecoder;
-use libdeflater::CompressionLvl;
+use libdeflater::{CompressionLvl, Compressor};
 
 use crate::file_tools::block_gz::BlockGzWriter;
 use crate::file_tools::fastq_tools::FastqToolsError;
@@ -36,9 +36,14 @@ use crate::rng::NeatRng;
 /// Uncompressed bytes per bucket, both mates together. Pass 2 holds this much per thread,
 /// roughly doubled by per-record allocation.
 const BUCKET_TARGET_BYTES: u64 = 256 * 1024 * 1024;
-/// Upper bound on buckets, so the scatter's open files (one per bucket per mate) stay well under
-/// the common 1024 soft limit. Past this, buckets grow instead.
-const MAX_BUCKETS: usize = 256;
+/// Upper bound on buckets. The scatter holds one buffer per bucket per mate, so this bounds that
+/// memory (512 * 2 * `BUCKET_BUFFER_BYTES` = 256 MiB). Past it, buckets grow instead.
+const MAX_BUCKETS: usize = 512;
+/// Scatter buffer per bucket per mate. A full buffer is compressed as one gzip member and
+/// appended to its bucket file, which is then closed again, so the scatter holds at most one
+/// bucket file open at any bucket count. One writer per bucket per mate would need
+/// 2 * MAX_BUCKETS descriptors and failed under `ulimit -n` 256 or 512.
+const BUCKET_BUFFER_BYTES: usize = 256 * 1024;
 /// Gzipped FASTQ expands about 3.5-4.5x; overestimating only adds buckets.
 const EXPANSION_ESTIMATE: u64 = 5;
 /// Pass-2 threads, capped because each holds a whole bucket in memory.
@@ -90,6 +95,68 @@ fn read_record(
 fn open_gz(path: &Path) -> Result<BufReader<MultiGzDecoder<File>>, FastqToolsError> {
     let file = File::open(path).map_err(|e| read_err(path, e))?;
     Ok(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
+}
+
+/// One bucket file being scattered into: records accumulate in `buf` and leave as a gzip member
+/// appended to `path`, so the file is open only while a member is written.
+struct BucketSink {
+    path: PathBuf,
+    buf: Vec<u8>,
+    wrote: bool,
+}
+
+impl BucketSink {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            buf: Vec::new(),
+            wrote: false,
+        }
+    }
+
+    fn push(
+        &mut self,
+        rec: &[u8],
+        c: &mut Compressor,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(), FastqToolsError> {
+        self.buf.extend_from_slice(rec);
+        if self.buf.len() >= BUCKET_BUFFER_BYTES {
+            self.flush(c, scratch)?;
+        }
+        Ok(())
+    }
+
+    /// Appends the buffer as one gzip member. An empty member is written only for a bucket that
+    /// received nothing, so every bucket file is valid gzip.
+    fn flush(&mut self, c: &mut Compressor, scratch: &mut Vec<u8>) -> Result<(), FastqToolsError> {
+        if self.buf.is_empty() && self.wrote {
+            return Ok(());
+        }
+        let bound = c.gzip_compress_bound(self.buf.len());
+        if scratch.len() < bound {
+            scratch.resize(bound, 0);
+        }
+        let n = c
+            .gzip_compress(&self.buf, scratch)
+            .map_err(|e| write_err(&self.path, format!("gzip compression failed: {e:?}")))?;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)
+            .map_err(|e| write_err(&self.path, e))?;
+        f.write_all(&scratch[..n])
+            .map_err(|e| write_err(&self.path, e))?;
+        self.buf.clear();
+        self.wrote = true;
+        Ok(())
+    }
+
+    fn finish(&mut self, c: &mut Compressor, scratch: &mut Vec<u8>) -> Result<(), FastqToolsError> {
+        self.flush(c, scratch)?;
+        self.buf = Vec::new();
+        Ok(())
+    }
 }
 
 /// Pass-2 concurrency: the requested threads, capped at `MAX_SHUFFLE_THREADS` and at however
@@ -164,19 +231,16 @@ fn shuffle_into_buckets(
 
     // ── Pass 1: scatter ───────────────────────────────────────────────────────────────────────
     let mates: Vec<u8> = if paired { vec![1, 2] } else { vec![1] };
-    let mut writers: Vec<Vec<BlockGzWriter<BufWriter<File>>>> = Vec::with_capacity(k);
-    for b in 0..k {
-        let mut per_mate = Vec::with_capacity(mates.len());
-        for &m in &mates {
-            let p = bucket_path(b, m, "bucket");
-            let f = File::create(&p).map_err(|e| write_err(&p, e))?;
-            per_mate.push(BlockGzWriter::with_level(
-                BufWriter::new(f),
-                CompressionLvl::fastest(),
-            ));
-        }
-        writers.push(per_mate);
-    }
+    let mut sinks: Vec<Vec<BucketSink>> = (0..k)
+        .map(|b| {
+            mates
+                .iter()
+                .map(|&m| BucketSink::new(bucket_path(b, m, "bucket")))
+                .collect()
+        })
+        .collect();
+    let mut compressor = Compressor::new(CompressionLvl::fastest());
+    let mut scratch = Vec::new();
     let mut counts = vec![0u64; k];
     let mut bytes = vec![0u64; k];
     let (mut rec1, mut rec2) = (Vec::with_capacity(1024), Vec::with_capacity(1024));
@@ -207,13 +271,9 @@ fn shuffle_into_buckets(
                 break;
             }
             let b = ((rng.random()? * k as f64) as usize).min(k - 1);
-            writers[b][0]
-                .write_all(&rec1)
-                .map_err(|e| write_err(&bucket_path(b, 1, "bucket"), e))?;
+            sinks[b][0].push(&rec1, &mut compressor, &mut scratch)?;
             if paired {
-                writers[b][1]
-                    .write_all(&rec2)
-                    .map_err(|e| write_err(&bucket_path(b, 2, "bucket"), e))?;
+                sinks[b][1].push(&rec2, &mut compressor, &mut scratch)?;
             }
             counts[b] += 1;
             bytes[b] += (rec1.len() + if paired { rec2.len() } else { 0 }) as u64;
@@ -225,12 +285,10 @@ fn shuffle_into_buckets(
             let _ = fs::remove_file(&files_r2[i]);
         }
     }
-    for (b, per_mate) in writers.into_iter().enumerate() {
-        for (j, w) in per_mate.into_iter().enumerate() {
-            w.finish()
-                .map_err(|e| write_err(&bucket_path(b, mates[j], "bucket"), e))?;
-        }
+    for sink in sinks.iter_mut().flatten() {
+        sink.finish(&mut compressor, &mut scratch)?;
     }
+    drop(sinks);
 
     // ── Pass 2: shuffle each bucket ───────────────────────────────────────────────────────────
     let next = AtomicUsize::new(0);
@@ -392,6 +450,19 @@ mod tests {
         (names(&o1), names(&o2))
     }
 
+    /// The output files' raw bytes, for comparing gzip streams rather than their contents.
+    fn raw_k(n: usize, chunks: usize, seed: &str, threads: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (f1, f2) = temp_inputs(dir.path(), n, chunks, true);
+        let (o1, o2) = (
+            dir.path().join("o1.fastq.gz"),
+            dir.path().join("o2.fastq.gz"),
+        );
+        let mut rng = NeatRng::new_from_seed(&vec![seed.to_string()]).unwrap();
+        shuffle_into_buckets(f1, f2, &o1, Some(&o2), &mut rng, dir.path(), threads, k).unwrap();
+        (fs::read(&o1).unwrap(), fs::read(&o2).unwrap())
+    }
+
     fn run(n: usize, chunks: usize, seed: &str, threads: usize) -> (Vec<String>, Vec<String>) {
         run_k(n, chunks, seed, threads, 16)
     }
@@ -441,6 +512,12 @@ mod tests {
         let n = 5_000;
         let a = run(n, 3, "det", 1);
         assert_eq!(a, run(n, 3, "det", 8), "thread count changed the output");
+        // The gzip bytes too: member boundaries or headers that varied with scheduling would
+        // pass the record comparison above.
+        assert!(
+            raw_k(n, 3, "det", 1, 16) == raw_k(n, 3, "det", 8, 16),
+            "thread count changed the gzip bytes"
+        );
         assert_ne!(
             a.0,
             run(n, 3, "det2", 1).0,
@@ -534,6 +611,54 @@ mod tests {
         );
         assert_eq!(shuffle_threads(2, 1), 2, "never more than requested");
         assert_eq!(shuffle_threads(0, 0), 1, "at least one");
+    }
+
+    const FD_CHILD_ENV: &str = "EIDOLON_SHUFFLE_FD_CHILD";
+    /// A file-descriptor limit well under what one writer per bucket per mate would need at the
+    /// cap (2 * MAX_BUCKETS), and well over what the shuffle needs.
+    const FD_LIMIT: usize = 48;
+
+    /// Runs only as the child of `cap_path_runs_under_a_low_file_descriptor_limit`, which sets
+    /// the limit; a no-op otherwise.
+    #[test]
+    fn cap_path_child() {
+        if std::env::var(FD_CHILD_ENV).is_err() {
+            return;
+        }
+        let n = 3_000;
+        let (r1, r2) = run_k(n, 4, "fd", MAX_SHUFFLE_THREADS, MAX_BUCKETS);
+        assert_eq!(r1.len(), n);
+        assert!(
+            r1.iter()
+                .zip(&r2)
+                .all(|(a, b)| a.trim_end_matches("/1") == b.trim_end_matches("/2"))
+        );
+        println!("CAP-PATH-OK {n} pairs through {MAX_BUCKETS} buckets");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cap_path_runs_under_a_low_file_descriptor_limit() {
+        // Paired, at MAX_BUCKETS, under `ulimit -n 48`. The child prints a marker so a filter
+        // that matched nothing cannot pass for a run that succeeded.
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -n {FD_LIMIT} && exec \"$0\" --exact file_tools::fastq_shuffle::tests::cap_path_child --nocapture --test-threads=1"
+            ))
+            .arg(&exe)
+            .env(FD_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            out.status.success() && stdout.contains("CAP-PATH-OK"),
+            "shuffle at {MAX_BUCKETS} buckets failed under ulimit -n {FD_LIMIT}:\n{stdout}\n{stderr}"
+        );
     }
 
     #[test]

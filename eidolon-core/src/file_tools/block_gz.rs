@@ -70,18 +70,11 @@ impl<W: Write> BlockGzWriter<W> {
         // CompressionLvl::default() is libdeflate level 6 — the same ratio
         // target as flate2's Compression::default(), so output size is
         // comparable and only the speed changes.
-        Self::with_level(inner, CompressionLvl::default())
-    }
-
-    /// As [`BlockGzWriter::new`] at a chosen level. Short-lived intermediates (the
-    /// FASTQ shuffle's bucket files) use the fastest level: they are read once and
-    /// deleted, so ratio buys nothing.
-    pub fn with_level(inner: W, level: CompressionLvl) -> Self {
         Self {
             inner,
             buf: Vec::with_capacity(BLOCK_SIZE),
             out: Vec::new(),
-            compressor: Compressor::new(level),
+            compressor: Compressor::new(CompressionLvl::default()),
             finished: false,
             wrote_any: false,
         }
