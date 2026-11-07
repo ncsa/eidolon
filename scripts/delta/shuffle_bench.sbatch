@@ -8,10 +8,16 @@
 # for every task) and runs the three conditions side by side, one of each per round, so each
 # round sees the same filesystem.
 #
-# DESIGN: a 9-task array, %3. Task i runs condition i % 3:
+# History: run 23620433 (2026-11-07) measured an earlier #876 draft, a single scatter log per
+# mate: shuffle-and-write took 66-68 min against v1's 43 min for the whole stage, from ~650k
+# small random reads on Lustre. The branch now uses sequential per-bucket files instead.
+#
+# DESIGN: a 9-task array, %2. Task i runs condition i % 3:
 #   0  off  shuffle_fastq: false, $BIN_DEV   (concatenation)
-#   1  v1   shuffle on,           $BIN_DEV   (#875: a file per bucket per mate)
-#   2  v2   shuffle on,           $BIN_876   (#876: one scatter log per mate)
+#   1  v1   shuffle on,           $BIN_DEV   (#875: a file per bucket per mate, reopened per append)
+#   2  new  shuffle on,           $BIN_876   (the #876 branch under test)
+# %2, not %3: three at once ran out of scratch quota (tasks 4 and 5 of 23620433). v1 writes its
+# bucket files uncompressed (~164 GB of temp at this scale) on top of the output.
 # Each task regenerates the same reads from the same config (CONFIG_DIR/sim.yml, the 21x CHM13
 # simulation), so v1 and v2 must produce byte-identical FASTQs; the md5 column checks that at
 # scale. Outputs are deleted after each task, so disk stays bounded (~300 GB at peak per round).
@@ -33,7 +39,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
 #SBATCH --time=06:00:00
-#SBATCH --array=0-8%3
+#SBATCH --array=0-8%2
 #SBATCH --output=shufbench-%A_%a.log
 
 set -euo pipefail
@@ -51,7 +57,7 @@ THREADS="${SLURM_CPUS_PER_TASK:-16}"
 case $((TASK % 3)) in
     0) cond=off; bin="$BIN_DEV"; shuffle=false ;;
     1) cond=v1;  bin="$BIN_DEV"; shuffle=true ;;
-    2) cond=v2;  bin="$BIN_876"; shuffle=true ;;
+    2) cond=new; bin="$BIN_876"; shuffle=true ;;
     *) echo "FATAL: unreachable condition for task $TASK" >&2; exit 1 ;;
 esac
 for f in "$CONFIG_DIR/sim.yml" "$bin"; do

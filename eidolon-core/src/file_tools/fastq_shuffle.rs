@@ -10,27 +10,32 @@
 //! 1. Scatter. Read the temp files in order and send each record (each pair, when paired) to one
 //!    of `K` buckets chosen at random. Both mates of a pair go to the same bucket, in the same
 //!    position. A bucket's records collect in a buffer; a full buffer is compressed on a worker
-//!    thread and appended to one scatter log per mate, with its place recorded in an in-memory
-//!    index. Each input file is deleted once read, so temp disk stays near one copy.
-//! 2. Shuffle. Load one bucket at a time from its indexed segments, permute it in memory,
-//!    compress it, and write it straight into the output in bucket order.
+//!    thread and appended to that bucket's file, in fill order. Each input file is deleted once
+//!    read, so temp disk stays near one copy.
+//! 2. Shuffle. Read one bucket file at a time, sequentially, permute it in memory, compress it,
+//!    and write it straight into the output in bucket order.
 //!
 //! Bucket assignment and then a uniform permutation within each bucket give a uniform
 //! permutation of the whole file. `K` is chosen so a bucket fits the memory budget.
 //!
-//! **Why one log per mate (#876).** The first version kept a file per bucket per mate and
-//! opened, appended to and closed it for every full buffer: ~650k open/close cycles at genome
-//! scale, which took 2 h 12 m on Delta's Lustre scratch, against 7 min to concatenate. A log
-//! per mate keeps the open files at two and the writes sequential.
+//! **Why this layout (#876), measured at genome scale on Delta (256.6M pairs, Lustre scratch).**
+//! The first version reopened a bucket file for every full buffer (~650k open/close cycles) and
+//! then copied all its output once more: 43 min for the stage, against 7 min to concatenate.
+//! A single log per mate removed the opens but scattered each bucket across the log, so pass 2
+//! did ~650k small random reads: 74 min. Here bucket files stay open while the file-descriptor
+//! limit allows (falling back to reopening, which is slower but correct), pass 2 reads each
+//! bucket sequentially, and the output is written once. Bucket files are compressed at level 1;
+//! both earlier versions asked libdeflate for `fastest()`, which is level 0, stored, and wrote
+//! the temp data uncompressed (~164 GB at that scale).
 //!
-//! **Determinism.** The scatter draws from one RNG, sequentially, and a bucket's segments are
-//! read back in the order they were filled, whatever order the workers appended them in. Each
-//! bucket's permutation draws from its own child RNG, and buckets reach the output in bucket
-//! order. Threads change only timing, so output is byte-identical across thread counts.
+//! **Determinism.** The scatter draws from one RNG, sequentially, and each bucket file receives
+//! its segments in fill order. Each bucket's permutation draws from its own child RNG, and
+//! buckets reach the output in bucket order. Threads change only timing, so output is
+//! byte-identical across thread counts.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -51,8 +56,15 @@ const BUCKET_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Upper bound on buckets. The scatter holds one buffer per bucket per mate, so this bounds that
 /// memory (512 * 2 * `BUCKET_BUFFER_BYTES` = 256 MiB). Past it, buckets grow instead.
 const MAX_BUCKETS: usize = 512;
-/// Scatter buffer per bucket per mate. A full buffer becomes one compressed segment of the log.
+/// Scatter buffer per bucket per mate. A full buffer becomes one compressed segment of the
+/// bucket's file.
 const BUCKET_BUFFER_BYTES: usize = 256 * 1024;
+/// Bucket files are temporary and read once, so the fastest level that compresses at all.
+/// libdeflate's level 0 (`CompressionLvl::fastest()`) stores without compressing.
+const BUCKET_COMPRESSION_LEVEL: i32 = 1;
+/// Descriptors left for everything else (inputs, outputs, the process's own) when deciding
+/// whether bucket files can stay open.
+const FD_RESERVE: u64 = 64;
 /// Gzipped FASTQ expands about 3.5-4.5x; overestimating only adds buckets.
 const EXPANSION_ESTIMATE: u64 = 5;
 /// Pass-2 threads, capped because each holds a whole bucket in memory.
@@ -109,56 +121,100 @@ fn open_gz(path: &Path) -> Result<BufReader<MultiGzDecoder<File>>, FastqToolsErr
     Ok(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
 }
 
-/// One compressed segment of a bucket in a scatter log.
-#[derive(Clone, Copy)]
-struct Segment {
-    /// Order within the bucket: the buffer's fill order, not the order it reached the log.
-    seq: u32,
-    offset: u64,
-    len: u64,
-}
-
-/// The scatter log for one mate: an append-only file shared by every bucket, and where each
-/// bucket's segments landed in it.
-struct ScatterLog {
+/// One bucket's scatter file for one mate. Compression workers finish out of order, but a
+/// bucket's segments must land in fill order, so an append waits for its turn.
+struct BucketFile {
     path: PathBuf,
-    /// The file and its current length.
-    file: Mutex<(File, u64)>,
-    index: Mutex<Vec<Vec<Segment>>>,
+    state: Mutex<BucketState>,
+    turn: Condvar,
 }
 
-impl ScatterLog {
-    fn create(path: PathBuf, k: usize) -> Result<Self, FastqToolsError> {
-        let f = File::create(&path).map_err(|e| write_err(&path, e))?;
-        Ok(Self {
+struct BucketState {
+    next_seq: u32,
+    file: Option<File>,
+    bytes: u64,
+}
+
+impl BucketFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
             path,
-            file: Mutex::new((f, 0)),
-            index: Mutex::new(vec![Vec::new(); k]),
+            state: Mutex::new(BucketState {
+                next_seq: 0,
+                file: None,
+                bytes: 0,
+            }),
+            turn: Condvar::new(),
+        }
+    }
+
+    /// Appends segment `seq` once every earlier segment has landed. With `keep_open` the file stays
+    /// open between appends; otherwise it is opened for each one. Returns early, writing nothing,
+    /// once `abort` is set, so an error elsewhere cannot leave a waiter blocked.
+    fn append(
+        &self,
+        seq: u32,
+        data: &[u8],
+        keep_open: bool,
+        abort: &AtomicBool,
+    ) -> Result<(), FastqToolsError> {
+        let mut st = self.state.lock().unwrap();
+        while st.next_seq != seq && !abort.load(Ordering::SeqCst) {
+            st = self.turn.wait(st).unwrap();
+        }
+        if abort.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let result = (|| -> std::io::Result<()> {
+            if st.file.is_none() {
+                st.file = Some(
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&self.path)?,
+                );
+            }
+            st.file.as_mut().expect("opened above").write_all(data)?;
+            if !keep_open {
+                st.file = None;
+            }
+            Ok(())
+        })();
+        st.next_seq += 1;
+        st.bytes += data.len() as u64;
+        self.turn.notify_all();
+        result.map_err(|e| write_err(&self.path, e))
+    }
+
+    /// Wakes any waiter so it can see `abort`. Taking the lock first means a waiter is either
+    /// already waiting (and is woken) or has yet to check the flag.
+    fn wake(&self) {
+        let _st = self.state.lock().unwrap();
+        self.turn.notify_all();
+    }
+
+    fn close(&self) -> u64 {
+        let mut st = self.state.lock().unwrap();
+        st.file = None;
+        st.bytes
+    }
+}
+
+/// The soft limit on open files. Linux reports it in `/proc/self/limits`; elsewhere, or if it
+/// cannot be read, assume 256, the lowest common default.
+fn open_file_limit() -> u64 {
+    fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|text| {
+            let line = text.lines().find(|l| l.starts_with("Max open files"))?;
+            let soft = line.split_whitespace().nth(3)?;
+            Some(if soft == "unlimited" {
+                u64::MAX
+            } else {
+                soft.parse().ok()?
+            })
         })
-    }
-
-    fn append(&self, bucket: usize, seq: u32, bytes: &[u8]) -> Result<(), FastqToolsError> {
-        let offset = {
-            let mut g = self.file.lock().unwrap();
-            let offset = g.1;
-            g.0.write_all(bytes).map_err(|e| write_err(&self.path, e))?;
-            g.1 += bytes.len() as u64;
-            offset
-        };
-        self.index.lock().unwrap()[bucket].push(Segment {
-            seq,
-            offset,
-            len: bytes.len() as u64,
-        });
-        Ok(())
-    }
-
-    /// A bucket's segments in fill order.
-    fn segments(&self, bucket: usize) -> Vec<Segment> {
-        let mut segs = self.index.lock().unwrap()[bucket].clone();
-        segs.sort_unstable_by_key(|s| s.seq);
-        segs
-    }
+        .unwrap_or(256)
 }
 
 /// Records the first error any thread hits; later ones are dropped.
@@ -207,11 +263,14 @@ pub fn combine_temp_fastqs_shuffled(
         threads,
         bucket_count(compressed),
         BUCKET_BUFFER_BYTES,
+        None,
     )
 }
 
-/// The shuffle with an explicit bucket count, so tests can exercise the multi-bucket path on
-/// inputs small enough that `bucket_count` would choose one.
+/// The shuffle with an explicit bucket count, buffer size and file mode, so tests can exercise
+/// the multi-bucket, multi-segment and reopen paths on inputs small enough that the defaults
+/// would choose one bucket, one segment and open files. `keep_open: None` decides from the
+/// file-descriptor limit.
 #[allow(clippy::too_many_arguments)]
 fn shuffle_into_buckets(
     files_r1: Vec<PathBuf>,
@@ -223,6 +282,7 @@ fn shuffle_into_buckets(
     threads: usize,
     k: usize,
     buffer_bytes: usize,
+    keep_open: Option<bool>,
 ) -> Result<(), FastqToolsError> {
     let paired = out_r2.is_some();
     if paired && files_r1.len() != files_r2.len() {
@@ -233,11 +293,25 @@ fn shuffle_into_buckets(
         )));
     }
     let mates: Vec<u8> = if paired { vec![1, 2] } else { vec![1] };
-    let logs: Vec<ScatterLog> = mates
-        .iter()
-        .map(|m| ScatterLog::create(work_dir.join(format!("shuffle_scatter_r{m}.gz.tmp")), k))
-        .collect::<Result<_, _>>()?;
+    let bucket_dir = work_dir.join("shuffle_buckets");
+    fs::create_dir_all(&bucket_dir).map_err(|e| write_err(&bucket_dir, e))?;
+    let files: Vec<Vec<BucketFile>> = (0..k)
+        .map(|b| {
+            mates
+                .iter()
+                .map(|m| BucketFile::new(bucket_dir.join(format!("bucket_{b:04}_r{m}.gz"))))
+                .collect()
+        })
+        .collect();
+    let keep_open =
+        keep_open.unwrap_or_else(|| (k * mates.len()) as u64 + FD_RESERVE <= open_file_limit());
     let first_error: Mutex<Option<FastqToolsError>> = Mutex::new(None);
+    let abort = AtomicBool::new(false);
+    let fail = |e: FastqToolsError| {
+        keep_first(&first_error, e);
+        abort.store(true, Ordering::SeqCst);
+        files.iter().flatten().for_each(BucketFile::wake);
+    };
 
     // ── Pass 1: scatter ───────────────────────────────────────────────────────────────────────
     let t_scatter = Instant::now();
@@ -249,13 +323,15 @@ fn shuffle_into_buckets(
     let scatter_result: Result<(), FastqToolsError> = std::thread::scope(|s| {
         for _ in 0..scatter_threads {
             s.spawn(|| {
-                let mut c = Compressor::new(CompressionLvl::fastest());
+                let level = CompressionLvl::new(BUCKET_COMPRESSION_LEVEL)
+                    .expect("a valid libdeflate level");
+                let mut c = Compressor::new(level);
                 let mut out = Vec::new();
                 loop {
                     let job = rx.lock().unwrap().recv();
                     let Ok((b, j, seq, buf)) = job else { break };
                     // After an error, keep draining so the reader never blocks on a full channel.
-                    if first_error.lock().unwrap().is_some() {
+                    if abort.load(Ordering::SeqCst) {
                         continue;
                     }
                     let bound = c.gzip_compress_bound(buf.len());
@@ -265,11 +341,11 @@ fn shuffle_into_buckets(
                     let r = c
                         .gzip_compress(&buf, &mut out)
                         .map_err(|e| {
-                            write_err(&logs[j].path, format!("gzip compression failed: {e:?}"))
+                            write_err(&files[b][j].path, format!("gzip compression failed: {e:?}"))
                         })
-                        .and_then(|n| logs[j].append(b, seq, &out[..n]));
+                        .and_then(|n| files[b][j].append(seq, &out[..n], keep_open, &abort));
                     if let Err(e) = r {
-                        keep_first(&first_error, e);
+                        fail(e);
                     }
                 }
             });
@@ -283,8 +359,9 @@ fn shuffle_into_buckets(
             let send = |b: usize, j: usize, buf: Vec<u8>, seqs: &mut Vec<Vec<u32>>| {
                 let seq = seqs[b][j];
                 seqs[b][j] += 1;
-                tx.send((b, j, seq, buf))
-                    .map_err(|_| write_err(&logs[j].path, "scatter compression threads stopped"))
+                tx.send((b, j, seq, buf)).map_err(|_| {
+                    write_err(&files[b][j].path, "scatter compression threads stopped")
+                })
             };
             let (mut rec1, mut rec2) = (Vec::with_capacity(1024), Vec::with_capacity(1024));
             for (i, p1) in files_r1.iter().enumerate() {
@@ -346,17 +423,27 @@ fn shuffle_into_buckets(
         };
         let r = read_all();
         drop(tx);
+        if r.is_err() {
+            // Waiters can only be blocked on segments that will now never arrive.
+            abort.store(true, Ordering::SeqCst);
+            files.iter().flatten().for_each(BucketFile::wake);
+        }
         r
     });
+    let temp_bytes: u64 = files.iter().flatten().map(BucketFile::close).sum();
     scatter_result?;
     if let Some(e) = first_error.lock().unwrap().take() {
         return Err(e);
     }
     let records: u64 = counts.iter().sum();
-    let log_bytes: u64 = logs.iter().map(|l| l.file.lock().unwrap().1).sum();
     info!(
-        "\tshuffle scatter: {records} records into {k} buckets, {:.1} GB compressed, {:.1} s",
-        log_bytes as f64 / 1e9,
+        "\tshuffle scatter: {records} records into {k} buckets ({}), {:.1} GB of bucket files, {:.1} s",
+        if keep_open {
+            "files kept open"
+        } else {
+            "files reopened per append"
+        },
+        temp_bytes as f64 / 1e9,
         t_scatter.elapsed().as_secs_f64()
     );
 
@@ -372,28 +459,22 @@ fn shuffle_into_buckets(
     let base = *rng;
     let (done_tx, done_rx) = mpsc::channel::<(usize, Vec<Vec<u8>>)>();
 
-    let shuffle_bucket =
-        |b: usize, handles: &mut Vec<File>| -> Result<Vec<Vec<u8>>, FastqToolsError> {
-            let mut per_mate: Vec<(Vec<u8>, Vec<usize>)> = Vec::with_capacity(mates.len());
-            for (j, log) in logs.iter().enumerate() {
-                let mut data = Vec::new();
-                let mut compressed = Vec::new();
-                for seg in log.segments(b) {
-                    compressed.resize(seg.len as usize, 0);
-                    handles[j]
-                        .seek(SeekFrom::Start(seg.offset))
-                        .map_err(|e| read_err(&log.path, e))?;
-                    handles[j]
-                        .read_exact(&mut compressed)
-                        .map_err(|e| read_err(&log.path, e))?;
-                    MultiGzDecoder::new(&compressed[..])
-                        .read_to_end(&mut data)
-                        .map_err(|e| read_err(&log.path, e))?;
-                }
-                // Record starts: every fourth newline ends a record.
-                let mut starts = Vec::with_capacity(counts[b] as usize + 1);
-                starts.push(0);
-                let mut lines = 0;
+    let shuffle_bucket = |b: usize| -> Result<Vec<Vec<u8>>, FastqToolsError> {
+        let mut per_mate: Vec<(Vec<u8>, Vec<usize>)> = Vec::with_capacity(mates.len());
+        for bf in &files[b] {
+            let mut data = Vec::new();
+            let mut starts = Vec::with_capacity(counts[b] as usize + 1);
+            starts.push(0);
+            // A bucket that received nothing has no file. Decompress the whole bucket, then find
+            // record boundaries by scanning: every fourth newline ends a record. Much faster than
+            // parsing line by line, and records were already validated on the way in.
+            let mut lines = 0usize;
+            if bf.path.exists() {
+                let f = File::open(&bf.path).map_err(|e| read_err(&bf.path, e))?;
+                MultiGzDecoder::new(BufReader::with_capacity(1 << 20, f))
+                    .read_to_end(&mut data)
+                    .map_err(|e| read_err(&bf.path, e))?;
+                let _ = fs::remove_file(&bf.path);
                 for (i, &c) in data.iter().enumerate() {
                     if c == b'\n' {
                         lines += 1;
@@ -402,34 +483,35 @@ fn shuffle_into_buckets(
                         }
                     }
                 }
-                if starts.len() as u64 - 1 != counts[b] || lines % 4 != 0 {
-                    return Err(read_err(
-                        &log.path,
-                        format!(
-                            "bucket {b} holds {} records, {} were written",
-                            starts.len() - 1,
-                            counts[b]
-                        ),
-                    ));
-                }
-                per_mate.push((data, starts));
             }
-            let mut order: Vec<usize> = (0..counts[b] as usize).collect();
-            base.derive_child(b as u64).shuffle_in_place(&mut order)?;
-            let mut outs = Vec::with_capacity(mates.len());
-            for (data, starts) in &per_mate {
-                let mut gz = Vec::new();
-                let mut w = BlockGzWriter::new(&mut gz);
-                for &i in &order {
-                    w.write_all(&data[starts[i]..starts[i + 1]])
-                        .map_err(|e| FastqToolsError::FastqWriteError(e.to_string()))?;
-                }
-                w.finish()
+            if starts.len() as u64 - 1 != counts[b] || lines % 4 != 0 {
+                return Err(read_err(
+                    &bf.path,
+                    format!(
+                        "bucket {b} holds {} records, {} were written",
+                        starts.len() - 1,
+                        counts[b]
+                    ),
+                ));
+            }
+            per_mate.push((data, starts));
+        }
+        let mut order: Vec<usize> = (0..counts[b] as usize).collect();
+        base.derive_child(b as u64).shuffle_in_place(&mut order)?;
+        let mut outs = Vec::with_capacity(mates.len());
+        for (data, starts) in &per_mate {
+            let mut gz = Vec::new();
+            let mut w = BlockGzWriter::new(&mut gz);
+            for &i in &order {
+                w.write_all(&data[starts[i]..starts[i + 1]])
                     .map_err(|e| FastqToolsError::FastqWriteError(e.to_string()))?;
-                outs.push(gz);
             }
-            Ok(outs)
-        };
+            w.finish()
+                .map_err(|e| FastqToolsError::FastqWriteError(e.to_string()))?;
+            outs.push(gz);
+        }
+        Ok(outs)
+    };
 
     let out_paths: Vec<&Path> = std::iter::once(out_r1).chain(out_r2).collect();
     std::thread::scope(|s| {
@@ -437,18 +519,6 @@ fn shuffle_into_buckets(
             let done_tx = done_tx.clone();
             s.spawn(|| {
                 let done_tx = done_tx;
-                let mut handles = Vec::new();
-                for log in &logs {
-                    match File::open(&log.path) {
-                        Ok(f) => handles.push(f),
-                        Err(e) => {
-                            keep_first(&first_error, read_err(&log.path, e));
-                            failed.store(true, Ordering::SeqCst);
-                            written.1.notify_all();
-                            return;
-                        }
-                    }
-                }
                 loop {
                     let b = next.fetch_add(1, Ordering::SeqCst);
                     if b >= k {
@@ -463,7 +533,7 @@ fn shuffle_into_buckets(
                     if failed.load(Ordering::SeqCst) {
                         break;
                     }
-                    match shuffle_bucket(b, &mut handles) {
+                    match shuffle_bucket(b) {
                         Ok(outs) => {
                             if done_tx.send((b, outs)).is_err() {
                                 break;
@@ -527,9 +597,7 @@ fn shuffle_into_buckets(
             );
         }
     });
-    for log in &logs {
-        let _ = fs::remove_file(&log.path);
-    }
+    let _ = fs::remove_dir(&bucket_dir);
     if let Some(e) = first_error.into_inner().unwrap() {
         return Err(e);
     }
@@ -611,6 +679,7 @@ mod tests {
             threads,
             k,
             BUCKET_BUFFER_BYTES,
+            None,
         )
         .unwrap();
         (names(&o1), names(&o2))
@@ -631,6 +700,19 @@ mod tests {
         k: usize,
         buffer: usize,
     ) -> (Vec<u8>, Vec<u8>) {
+        raw_kbo(n, chunks, seed, threads, k, buffer, None)
+    }
+
+    /// As `raw_kb`, forcing bucket files to stay open (`Some(true)`) or be reopened per append.
+    fn raw_kbo(
+        n: usize,
+        chunks: usize,
+        seed: &str,
+        threads: usize,
+        k: usize,
+        buffer: usize,
+        keep_open: Option<bool>,
+    ) -> (Vec<u8>, Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();
         let (f1, f2) = temp_inputs(dir.path(), n, chunks, true);
         let (o1, o2) = (
@@ -648,6 +730,7 @@ mod tests {
             threads,
             k,
             buffer,
+            keep_open,
         )
         .unwrap();
         (fs::read(&o1).unwrap(), fs::read(&o2).unwrap())
@@ -815,6 +898,12 @@ mod tests {
         if std::env::var(FD_CHILD_ENV).is_err() {
             return;
         }
+        // The limit is detected, so the default chooses to reopen bucket files at this bucket count.
+        assert_eq!(
+            open_file_limit(),
+            FD_LIMIT as u64,
+            "the child should see ulimit -n {FD_LIMIT}"
+        );
         let n = 3_000;
         let (r1, r2) = run_k(n, 4, "fd", MAX_SHUFFLE_THREADS, MAX_BUCKETS);
         assert_eq!(r1.len(), n);
@@ -866,18 +955,42 @@ mod tests {
     }
 
     #[test]
-    fn segments_come_back_in_fill_order_not_append_order() {
+    fn appends_land_in_fill_order_whatever_order_they_arrive() {
+        // Segment 1 arrives first and must wait for segment 0.
         let dir = tempfile::tempdir().unwrap();
-        let log = ScatterLog::create(dir.path().join("log"), 1).unwrap();
-        for seq in [2u32, 0, 1] {
-            log.append(0, seq, &[seq as u8; 3]).unwrap();
-        }
-        let segs = log.segments(0);
-        assert_eq!(segs.iter().map(|s| s.seq).collect::<Vec<_>>(), [0, 1, 2]);
-        assert_eq!(
-            segs.iter().map(|s| s.offset).collect::<Vec<_>>(),
-            [3, 6, 0],
-            "offsets follow append order"
+        let bf = BucketFile::new(dir.path().join("b"));
+        let abort = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| bf.append(1, b"second", true, &abort).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            bf.append(0, b"first-", true, &abort).unwrap();
+        });
+        bf.close();
+        assert_eq!(fs::read(&bf.path).unwrap(), b"first-second");
+    }
+
+    #[test]
+    fn abort_releases_a_waiter_whose_turn_never_comes() {
+        // Segment 0 never arrives (its compression failed); the waiter for 1 must return.
+        let dir = tempfile::tempdir().unwrap();
+        let bf = BucketFile::new(dir.path().join("b"));
+        let abort = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| bf.append(1, b"x", true, &abort));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            abort.store(true, Ordering::SeqCst);
+            bf.wake();
+            assert!(h.join().unwrap().is_ok());
+        });
+        assert!(!bf.path.exists(), "an aborted append must write nothing");
+    }
+
+    #[test]
+    fn kept_open_and_reopened_bucket_files_give_the_same_bytes() {
+        let open = raw_kbo(6_000, 3, "mode", 4, 16, 512, Some(true));
+        assert!(
+            open == raw_kbo(6_000, 3, "mode", 4, 16, 512, Some(false)),
+            "file mode changed the output"
         );
     }
 
