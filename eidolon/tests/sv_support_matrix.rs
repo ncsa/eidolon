@@ -96,7 +96,7 @@ fn run_cell(dir: &Path, name: &str, records: &[&str]) -> PathBuf {
              fragment_mean: 250\nfragment_st_dev: 30\ninput_vcf: {vcf}\n\
              produce_vcf: true\nproduce_fastq: true\nproduce_bam: true\n\
              sv_rate_scale: 0.0\noverwrite_output: true\n\
-             output_dir: {out}\noutput_prefix: o\nrng_seed: matrix {name}\nnum_threads: 1\n",
+             output_dir: {out}\noutput_basename: o\nrng_seed: matrix {name}\nnum_threads: 1\n",
             ref = h1n1_reference().display(),
             vcf = vcf.display(),
             out = out.display(),
@@ -465,7 +465,7 @@ fn fragments_do_not_extend_across_an_assembly_gap() {
              fragment_mean: 250\nfragment_st_dev: 30\n\
              produce_vcf: false\nproduce_fastq: false\nproduce_bam: true\n\
              sv_rate_scale: 0.0\nmutation_rate: 0.0\noverwrite_output: true\n\
-             output_dir: {out}\noutput_prefix: o\nrng_seed: ngap guard\nnum_threads: 1\n",
+             output_dir: {out}\noutput_basename: o\nrng_seed: ngap guard\nnum_threads: 1\n",
             ref = reference.display(),
             out = out.display(),
         ),
@@ -584,7 +584,7 @@ fn depth_modulation_is_accurate_at_realistic_scale() {
                  fragment_mean: 250\nfragment_st_dev: 30\ninput_vcf: {vcf}\n\
                  produce_vcf: false\nproduce_fastq: false\nproduce_bam: true\n\
                  sv_rate_scale: 0.0\noverwrite_output: true\n\
-                 output_dir: {out}\noutput_prefix: o\nrng_seed: realistic {name}\n\
+                 output_dir: {out}\noutput_basename: o\nrng_seed: realistic {name}\n\
                  num_threads: 4\n",
                 ref = reference.display(),
                 vcf = vcf.display(),

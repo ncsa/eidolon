@@ -85,7 +85,7 @@ produce_vcf: false
 produce_bam: false
 overwrite_output: true
 output_dir: $d
-output_prefix: s
+output_basename: s
 rng_seed: ppn $K $i
 num_threads: 1
 YAML

@@ -199,7 +199,7 @@ if [[ -n "$REFERENCE" && -f "$REFERENCE" ]] && grep -q 'PASS' "$SUMMARY"; then
         echo "produce_bam: false"
         echo "overwrite_output: true"
         echo "output_dir: $RT"
-        echo "output_prefix: rt"
+        echo "output_basename: rt"
         echo "rng_seed: eidolon modelbuild roundtrip"
         echo "target_bed: $RT/rt.bed"
         echo "num_threads: 1"

@@ -61,7 +61,7 @@ write_sim_config() {
     cat > "$out" <<YML
 reference: $reference
 output_dir: $outdir
-output_prefix: sim
+output_basename: sim
 rng_seed: "$seed"
 num_threads: $threads
 coverage: $depth

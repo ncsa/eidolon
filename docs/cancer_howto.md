@@ -31,7 +31,7 @@ Smoke test on the bundled H1N1 reference (seconds; proves the build works):
 cat > cancer.yml <<'YAML'
 reference: eidolon/test_data/references/H1N1.fa
 output_dir: ./cancer_out
-output_prefix: smoketest
+output_basename: smoketest
 total_coverage: 30
 purity: 0.6
 read_len: 70
@@ -123,7 +123,7 @@ Assume `eidolon` on `PATH` and a reference at `~/code/data/GRCh38.fa`.
 cat > run.yml <<'YAML'
 reference: ~/code/data/GRCh38.fa
 output_dir: ./out
-output_prefix: tumor70
+output_basename: tumor70
 total_coverage: 60
 purity: 0.7
 read_len: 250
@@ -284,7 +284,7 @@ Fix the germline once and sweep purity/depth by pointing each run at the same
 
 ```bash
 for p in 0.3 0.5 0.8; do
-  sed "s/^purity:.*/purity: $p/; s/^output_prefix:.*/output_prefix: p$p/" run.yml \
+  sed "s/^purity:.*/purity: $p/; s/^output_basename:.*/output_basename: p$p/" run.yml \
     | sed "/^tumor_mutation_rate:/a germline_vcf: ./out/tumor70_normal.vcf.gz" \
     > run_$p.yml
   eidolon gen-cancer-reads -c run_$p.yml

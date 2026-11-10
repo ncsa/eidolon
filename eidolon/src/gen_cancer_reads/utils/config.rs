@@ -20,7 +20,7 @@ use crate::gen_reads::utils::subclone::{Subclone, SubcloneModel};
 pub const KNOWN_KEYS: &[&str] = &[
     "reference",
     "output_dir",
-    "output_prefix",
+    "output_basename",
     "total_coverage",
     "purity",
     "read_len",
@@ -45,7 +45,11 @@ pub const KNOWN_KEYS: &[&str] = &[
 /// Keys removed in v5.0.0 (#879), each an alias of a key that remains. A removed name is
 /// rejected with its replacement rather than read silently under the old name.
 const RENAMED_KEYS: &[(&str, &str)] = &[
-    ("output_filename", "removed in v5.0.0; use `output_prefix`"),
+    (
+        "output_filename",
+        "removed in v5.0.0; use `output_basename`",
+    ),
+    ("output_prefix", "renamed `output_basename` in v5.0.0"),
     (
         "coverage",
         "removed in v5.0.0; use `total_coverage`, the merged depth of both passes",
@@ -62,7 +66,7 @@ const DEFAULT_TUMOR_MUTATION_RATE: f64 = 1e-5;
 pub struct CancerConfig {
     pub reference: PathBuf,
     pub output_dir: PathBuf,
-    pub output_prefix: String,
+    pub output_basename: String,
     pub total_coverage: usize,
     /// Tumor cell fraction in (0, 1). Tumor pass gets `purity * total`, normal
     /// pass the rest.
@@ -107,7 +111,7 @@ impl Default for CancerConfig {
         CancerConfig {
             reference: PathBuf::new(),
             output_dir: PathBuf::from("."),
-            output_prefix: "neat_cancer".to_string(),
+            output_basename: "neat_cancer".to_string(),
             total_coverage: 30,
             purity: 0.5,
             // gen-reads' default, which matches the shipped quality model's fitted length.
@@ -172,15 +176,22 @@ impl CancerConfig {
             match key.as_str() {
                 "reference" => cfg.reference = req_path(value, "reference")?,
                 "output_dir" => cfg.output_dir = req_path(value, "output_dir")?,
-                "output_prefix" => {
-                    cfg.output_prefix = value
+                "output_basename" => {
+                    cfg.output_basename = value
                         .as_str()
                         .ok_or_else(|| {
                             GenCancerReadsError::ConfigError(
-                                "output_prefix must be a string".into(),
+                                "output_basename must be a string".into(),
                             )
                         })?
                         .to_string();
+                    if cfg.output_basename.contains(['/', '\\']) {
+                        return Err(GenCancerReadsError::ConfigError(format!(
+                            "output_basename {:?} contains a path separator; it is a file \
+                             name only, so put the directory in output_dir",
+                            cfg.output_basename
+                        )));
+                    }
                 }
                 "total_coverage" => {
                     cfg.total_coverage = as_usize(value, "total_coverage")?;
@@ -304,7 +315,7 @@ impl CancerConfig {
             mutation_model: self.normal_model.clone(),
             input_vcf: self.germline_vcf.clone(),
             sv_rate_scale: 0.0,
-            output_prefix: format!("{}_normal", self.output_prefix),
+            output_basename: format!("{}_normal", self.output_basename),
             rng_seed: Some(format!("{}-normal", self.rng_seed_root)),
             ..self.shared_run_config()
         };
@@ -336,7 +347,7 @@ impl CancerConfig {
             // (INFO/EIDOLON_VAF = purity × allele_fraction) for direct comparison
             // against a caller's VAF on the merged reads.
             merged_vaf_purity: Some(self.purity),
-            output_prefix: format!("{}_tumor", self.output_prefix),
+            output_basename: format!("{}_tumor", self.output_basename),
             rng_seed: Some(format!("{}-tumor", self.rng_seed_root)),
             ..self.shared_run_config()
         };
@@ -688,8 +699,8 @@ mod tests {
         let tumor = cfg.tumor_pass(PathBuf::from("/tmp/g.vcf.gz")).unwrap();
         assert_eq!(normal.sv_rate_scale, 0.0);
         assert_eq!(tumor.sv_rate_scale, 5.0);
-        assert!(normal.output_prefix.ends_with("_normal"));
-        assert!(tumor.output_prefix.ends_with("_tumor"));
+        assert!(normal.output_basename.ends_with("_normal"));
+        assert!(tumor.output_basename.ends_with("_tumor"));
         assert_eq!(tumor.input_vcf, Some(PathBuf::from("/tmp/g.vcf.gz")));
     }
 

@@ -217,7 +217,7 @@ fn catalog_scale_literal_svs_are_realized_in_the_reads() {
              paired_ended: true\nfragment_mean: 400\nfragment_st_dev: 50\n\
              input_vcf: {}\nmutation_rate: 0\nsv_rate_scale: 0.0\n\
              produce_vcf: true\nproduce_fastq: true\nproduce_bam: true\n\
-             overwrite_output: true\noutput_dir: {}\noutput_prefix: o\n\
+             overwrite_output: true\noutput_dir: {}\noutput_basename: o\n\
              rng_seed: catalog scale svs\nnum_threads: 4\n",
             reference.display(),
             vcf.display(),

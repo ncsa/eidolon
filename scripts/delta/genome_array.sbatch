@@ -111,7 +111,7 @@ produce_vcf: true
 produce_bam: false
 overwrite_output: true
 output_dir: $outdir
-output_prefix: s
+output_basename: s
 rng_seed: $SEED_ROOT $id
 sv_rate_scale: $SV_RATE_SCALE
 target_bed: $bed

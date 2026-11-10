@@ -248,7 +248,7 @@ produce_fastq: true
 produce_vcf: true
 overwrite_output: true
 output_dir: $OUTPUT_DIR
-output_prefix: $prefix_name
+output_basename: $prefix_name
 rng_seed: ${RNG_SEED_ROOT}-${seed_suffix}
 sv_rate_scale: $sv_scale
 EOF

@@ -117,7 +117,7 @@ produce_vcf: true
 produce_bam: $bam
 overwrite_output: true
 output_dir: $dir
-output_prefix: $PREFIX
+output_basename: $PREFIX
 rng_seed: $SEED
 num_threads: $threads
 YAML

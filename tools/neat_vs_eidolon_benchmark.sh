@@ -127,7 +127,7 @@ produce_bam: false
 overwrite_output: true
 rng_seed: benchmark seed forty two
 output_dir: $eidolon_out
-output_prefix: bench
+output_basename: bench
 EOF
     [ "$mode" != "all" ] && echo "num_threads: $nthreads" >> "$eidolon_cfg"
 

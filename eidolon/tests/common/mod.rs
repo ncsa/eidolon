@@ -74,7 +74,7 @@ pub fn write_synthetic_fastq_gz(path: &Path, n_reads: usize, read_length: usize)
 pub struct GenReadsConfig {
     pub reference: PathBuf,
     pub output_dir: PathBuf,
-    pub output_prefix: String,
+    pub output_basename: String,
     pub read_len: usize,
     pub coverage: usize,
     pub paired_ended: bool,
@@ -101,11 +101,11 @@ pub struct GenReadsConfig {
 }
 
 impl GenReadsConfig {
-    pub fn new(reference: PathBuf, output_dir: PathBuf, output_prefix: &str) -> Self {
+    pub fn new(reference: PathBuf, output_dir: PathBuf, output_basename: &str) -> Self {
         Self {
             reference,
             output_dir,
-            output_prefix: output_prefix.to_string(),
+            output_basename: output_basename.to_string(),
             read_len: 50,
             coverage: 2,
             paired_ended: false,
@@ -185,7 +185,7 @@ impl GenReadsConfig {
              produce_bam: {pb}\n\
              produce_vcf: {pv}\n\
              output_dir: {out}\n\
-             output_prefix: {name}\n\
+             output_basename: {name}\n\
              overwrite_output: true\n\
              rng_seed: {seed}\n\
              {pair}{model}{qmodel}{threads}{chunksz}{ivcf}{mrate}{mmodel}{svscale}{shuffle}",
@@ -196,7 +196,7 @@ impl GenReadsConfig {
             pb = self.produce_bam,
             pv = self.produce_vcf,
             out = self.output_dir.display(),
-            name = self.output_prefix,
+            name = self.output_basename,
             seed = self.rng_seed,
             pair = pair_section,
             model = model_section,

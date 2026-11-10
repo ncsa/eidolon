@@ -168,7 +168,7 @@ produce_fastq: true
 produce_bam: true
 produce_vcf: true
 output_dir: $WORK
-output_prefix: shakeout
+output_basename: shakeout
 overwrite_output: true
 rng_seed: shakeout v1.7.0
 mutation_model: $WORK/mut_model.json.gz

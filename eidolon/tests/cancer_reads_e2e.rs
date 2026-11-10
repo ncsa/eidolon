@@ -27,7 +27,7 @@ fn gen_cancer_reads_produces_tagged_fastqs_and_origin_truth() {
         format!(
             "reference: {ref}\n\
              output_dir: {out}\n\
-             output_prefix: ctest\n\
+             output_basename: ctest\n\
              total_coverage: 30\n\
              purity: 0.5\n\
              read_len: 70\n\
@@ -117,7 +117,7 @@ fn subclonal_somatic_variants_span_a_vaf_spectrum() {
         format!(
             "reference: {ref}\n\
              output_dir: {out}\n\
-             output_prefix: sctest\n\
+             output_basename: sctest\n\
              total_coverage: 160\n\
              purity: 0.5\n\
              read_len: 70\n\
@@ -338,7 +338,7 @@ fn reproductive_somatic_vcf_is_replayed_and_tagged_somatic() {
         format!(
             "reference: {ref}\n\
              output_dir: {out}\n\
-             output_prefix: rep\n\
+             output_basename: rep\n\
              total_coverage: 300\n\
              purity: 0.6\n\
              read_len: 70\n\
@@ -455,7 +455,7 @@ fn merged_fastq_read_counts_track_configured_purity() {
         format!(
             "reference: {ref}\n\
              output_dir: {out}\n\
-             output_prefix: purity\n\
+             output_basename: purity\n\
              total_coverage: 30\n\
              purity: 0.75\n\
              read_len: 70\n\

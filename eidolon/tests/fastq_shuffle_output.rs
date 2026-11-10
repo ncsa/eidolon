@@ -36,7 +36,7 @@ fn run(dir: &Path, name: &str, shuffle: Option<bool>, threads: usize) {
             "reference: {ref}\nread_len: 101\ncoverage: 30\npaired_ended: true\n\
              fragment_mean: 300\nfragment_st_dev: 30\n\
              produce_fastq: true\nproduce_vcf: true\nproduce_bam: true\n\
-             overwrite_output: true\noutput_dir: {out}\noutput_prefix: {name}\n\
+             overwrite_output: true\noutput_dir: {out}\noutput_basename: {name}\n\
              rng_seed: fastq shuffle\nnum_threads: {threads}\n{shuffle_line}",
             ref = h1n1_reference().display(),
             out = dir.display(),

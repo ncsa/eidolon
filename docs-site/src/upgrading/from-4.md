@@ -6,15 +6,17 @@ output is written, and the error names the replacement.
 
 | What you see | Cause | What to do |
 |---|---|---|
-| `gen-reads`: `` `output_filename` (removed in v5.0.0; use `output_prefix`) `` | Each key now has one name, shared across subcommands. | Rename `output_filename:` to `output_prefix:`. Same value, same output names. |
-| `gen-cancer-reads`: the same message for `output_filename`, `coverage` or `rng_seed_root` | These were second names for `output_prefix`, `total_coverage` and `rng_seed`. | Use the name the error gives. |
+| `gen-reads`: `` `output_filename` (removed in v5.0.0; use `output_basename`) `` | Each key now has one name, shared across subcommands. | Rename `output_filename:` to `output_basename:`. Same value, same output names. |
+| `gen-cancer-reads`: the same message for `output_filename`, `coverage` or `rng_seed_root` | These were second names for `output_basename`, `total_coverage` and `rng_seed`. | Use the name the error gives. |
 | `filter-reads`: "read name uses the pre-v3.0.0 prefix `RNEAT_generated_`" | Output from v2.0.0 or earlier. 4.x still read it, with a warning. | Rename the reads first (below). |
+| `gen-reads` or `gen-cancer-reads`: `` `output_prefix` (renamed `output_basename` in v5.0.0) `` | `output_prefix` held a file name with no directory, which "prefix" suggests otherwise. | Rename `output_prefix:` to `output_basename:`. A value containing `/` is now refused; put the directory in `output_dir`. |
 | `gen-reads` FASTQs in random order, and about 60% larger | Records are shuffled by default (#870), as a sequencer's are. | Nothing, usually. Set `shuffle_fastq: false` for genome order. |
 
 To update every config under a directory:
 
 ```bash
-grep -rl '^output_filename:' configs/ | xargs sed -i 's/^output_filename:/output_prefix:/'
+grep -rlE '^output_(filename|prefix):' configs/ \
+  | xargs sed -i -E 's/^output_(filename|prefix):/output_basename:/'
 ```
 
 For `gen-cancer-reads` configs, also rename `coverage:` to `total_coverage:` and

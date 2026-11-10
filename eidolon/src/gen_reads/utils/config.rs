@@ -95,7 +95,7 @@ pub struct RunConfiguration {
     // overwrite_output: if true, will overwrite output. If false will error and exit you attempt to
     // overwrite files with the same name.
     // output_dir: The directory, relative or absolute, path to the directory to place output.
-    // output_prefix: The name to use for the output files.
+    // output_basename: The name to use for the output files.
     pub reference: PathBuf,
     pub read_len: usize,
     pub coverage: usize,
@@ -112,7 +112,7 @@ pub struct RunConfiguration {
     pub overwrite_output: bool,
     pub minimum_mutations: usize,
     pub output_dir: PathBuf,
-    pub output_prefix: String,
+    pub output_basename: String,
     pub output_fastq_1: Option<PathBuf>,
     pub output_fastq_2: Option<PathBuf>,
     pub output_vcf: Option<PathBuf>,
@@ -216,7 +216,7 @@ impl Default for RunConfiguration {
             overwrite_output: false,
             minimum_mutations: 0,
             output_dir: env::current_dir().unwrap_or_default(),
-            output_prefix: "neat_out".to_string(),
+            output_basename: "neat_out".to_string(),
             output_fastq_1: None,
             output_fastq_2: None,
             output_vcf: None,
@@ -265,7 +265,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "mutation_regions",
     "num_threads",
     "output_dir",
-    "output_prefix",
+    "output_basename",
     "overwrite_output",
     "paired_ended",
     "ploidy",
@@ -289,7 +289,11 @@ pub const KNOWN_KEYS: &[&str] = &[
 /// used unchanged would otherwise lose, e.g., its `include_vcf` variants silently.
 const KEY_HINTS: &[(&str, &str)] = &[
     // One name per key across subcommands (#879).
-    ("output_filename", "removed in v5.0.0; use `output_prefix`"),
+    (
+        "output_filename",
+        "removed in v5.0.0; use `output_basename`",
+    ),
+    ("output_prefix", "renamed `output_basename` in v5.0.0"),
     ("include_vcf", "NEAT's name for `input_vcf`"),
     ("error_model", "NEAT's name for `sequence_error_model`"),
     ("gc_model", "NEAT's name for `gc_bias_model`"),
@@ -548,16 +552,23 @@ impl RunConfiguration {
                             })?;
                         }
                     }
-                    "output_prefix" => {
-                        config.output_prefix = value
+                    "output_basename" => {
+                        config.output_basename = value
                             .as_str()
                             .ok_or_else(|| {
                                 GenerateReadsError::ConfigReadError(
-                                    "output_prefix".to_string(),
+                                    "output_basename".to_string(),
                                     "String".to_string(),
                                 )
                             })?
                             .to_string();
+                        if config.output_basename.contains(['/', '\\']) {
+                            return Err(GenerateReadsError::ConfigError(format!(
+                                "output_basename {:?} contains a path separator; it is a file \
+                                 name only, so put the directory in output_dir",
+                                config.output_basename
+                            )));
+                        }
                     }
                     "quality_score_model" => {
                         let name = value.as_str().ok_or_else(|| {
@@ -921,30 +932,30 @@ impl RunConfiguration {
             if config.produce_fastq {
                 info!("\t>Producing fastq files:");
                 let mut fastq_1 = config.output_dir.clone();
-                fastq_1.push(format!("{}_r1.fastq.gz", config.output_prefix));
+                fastq_1.push(format!("{}_r1.fastq.gz", config.output_basename));
                 info!("\t\t> {:?}", fastq_1);
                 config.output_fastq_1 = Some(fastq_1);
                 let mut fastq_2 = config.output_dir.clone();
-                fastq_2.push(format!("{}_r2.fastq.gz", config.output_prefix));
+                fastq_2.push(format!("{}_r2.fastq.gz", config.output_basename));
                 info!("\t\t> {:?}", fastq_2);
                 config.output_fastq_2 = Some(fastq_2);
             }
         } else {
             // single-ended
             let mut fastq_1 = config.output_dir.clone();
-            fastq_1.push(format!("{}_r1.fastq.gz", config.output_prefix));
+            fastq_1.push(format!("{}_r1.fastq.gz", config.output_basename));
             info!("\t>Producing fastq file: {:?}", fastq_1);
             config.output_fastq_1 = Some(fastq_1);
         }
         if config.produce_vcf {
             let mut vcf = config.output_dir.clone();
-            vcf.push(format!("{}.vcf.gz", config.output_prefix));
+            vcf.push(format!("{}.vcf.gz", config.output_basename));
             info!("\t>Producing VCF file: {:?}", vcf);
             config.output_vcf = Some(vcf);
         }
         if config.produce_bam {
             let mut bam = config.output_dir.clone();
-            bam.push(format!("{}.bam", config.output_prefix));
+            bam.push(format!("{}.bam", config.output_basename));
             info!("\t>Producing BAM file: {:?}", bam);
             config.output_bam = Some(bam);
         }
@@ -1043,7 +1054,7 @@ mod tests {
             overwrite_output: true,
             minimum_mutations: 0,
             output_dir: PathBuf::from("/my/my"),
-            output_prefix: String::from("Hey.hey"),
+            output_basename: String::from("Hey.hey"),
             output_fastq_1: None,
             output_fastq_2: None,
             output_vcf: None,
@@ -1086,7 +1097,7 @@ mod tests {
         assert_eq!(test_configuration.rng_seed, None);
         assert!(test_configuration.overwrite_output);
         assert_eq!(test_configuration.output_dir, PathBuf::from("/my/my"));
-        assert_eq!(test_configuration.output_prefix, "Hey.hey".to_string());
+        assert_eq!(test_configuration.output_basename, "Hey.hey".to_string());
     }
 
     // The warning check_and_log_config logs for overwrite_output is not asserted: the crate
@@ -1107,7 +1118,7 @@ mod tests {
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
         config.output_dir = PathBuf::from("/some/out_dir");
-        config.output_prefix = "sample".to_string();
+        config.output_basename = "sample".to_string();
         config.paired_ended = true;
         config.fragment_mean = Some(100.0);
         config.fragment_st_dev = Some(10.0);
@@ -1134,7 +1145,7 @@ mod tests {
             "test_data/baseline_models/frag_length.canonical.json.gz",
         ));
         config.output_dir = PathBuf::from("/some/out_dir");
-        config.output_prefix = "sample".to_string();
+        config.output_basename = "sample".to_string();
         RunConfiguration::check_and_log_config(&mut config).unwrap();
         assert_eq!(
             config.output_fastq_1,
@@ -1317,7 +1328,7 @@ mod tests {
         let mut config = RunConfiguration::default();
         config.reference = PathBuf::from("test_data/references/H1N1.fa");
         config.output_dir = PathBuf::from("/some/out_dir");
-        config.output_prefix = "sample".to_string();
+        config.output_basename = "sample".to_string();
         config.produce_vcf = true;
         config.produce_bam = true;
         RunConfiguration::check_and_log_config(&mut config).unwrap();

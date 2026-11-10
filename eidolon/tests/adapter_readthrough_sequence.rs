@@ -48,7 +48,7 @@ fn run(dir: &Path, overrun: &str) -> (Vec<String>, Vec<String>) {
             "reference: {ref}\nread_len: 150\ncoverage: 30\nploidy: 1\npaired_ended: true\n\
              fragment_mean: 40\nfragment_st_dev: 5\n\
              produce_bam: false\nproduce_fastq: true\nproduce_vcf: false\n\
-             overwrite_output: true\noutput_dir: {out}\noutput_prefix: {overrun}\n\
+             overwrite_output: true\noutput_dir: {out}\noutput_basename: {overrun}\n\
              rng_seed: adapter readthrough\nnum_threads: 1\n\
              adapters:\n  enabled: true\n  preset: truseq\n  overrun: {overrun}\n",
             ref = h1n1_reference().display(),

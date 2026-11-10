@@ -14,7 +14,7 @@
 # ── Required ──────────────────────────────────────────────────────────────
 reference: /path/to/reference.fa          # .fa or .fa.gz
 output_dir: /path/to/output
-output_prefix: sample
+output_basename: sample   # file name only, no directory; the directory is output_dir
 
 # ── Coverage / purity ─────────────────────────────────────────────────────
 total_coverage: 30      # combined coverage of the merged output

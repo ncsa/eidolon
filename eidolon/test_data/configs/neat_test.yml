@@ -13,4 +13,4 @@ produce_fastq: false
 
 overwrite_output: true
 output_dir: test_data
-output_prefix: testing
+output_basename: testing

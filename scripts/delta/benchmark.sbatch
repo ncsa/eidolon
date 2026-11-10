@@ -225,7 +225,7 @@ overwrite_output: true
 rng_seed: delta benchmark seed
 num_threads: $nthreads
 output_dir: $out
-output_prefix: bench
+output_basename: bench
 YAML
     run_one "$label" "$fasta" "$nthreads" "eidolon" "$cfg" "$out"
 }

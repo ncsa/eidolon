@@ -14,4 +14,4 @@ produce_fastq: .
 
 overwrite_output: .
 output_dir: .
-output_prefix: .
+output_basename: .
