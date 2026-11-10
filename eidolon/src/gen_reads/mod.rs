@@ -79,7 +79,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 2\n\
              produce_fastq: true\nproduce_bam: true\nproduce_vcf: false\n\
-             output_dir: {out}\noutput_filename: bam_int_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: bam_int_test\noverwrite_output: true\n\
              rng_seed: integration bam test\n{pair}",
             ref = reference.display(),
             out = output_dir.display(),
@@ -227,7 +227,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 0\n\
              produce_fastq: false\nproduce_bam: false\nproduce_vcf: true\n\
-             output_dir: {out}\noutput_filename: mut_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: mut_test\noverwrite_output: true\n\
              mutation_regions: {mut_bed}\n\
              mutation_rate: 0.1\n\
              rng_seed: mut test",
@@ -306,7 +306,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 2\n\
              produce_fastq: true\nproduce_bam: false\nproduce_vcf: false\n\
-             output_dir: {out}\noutput_filename: bed_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: bed_test\noverwrite_output: true\n\
              rng_seed: bed test\ntarget_bed: {bed}\n",
             ref = h1n1_reference().display(),
             out = out.path().display(),
@@ -345,7 +345,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 2\n\
              produce_fastq: true\nproduce_bam: false\nproduce_vcf: false\n\
-             output_dir: {out}\noutput_filename: empty_bed_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: empty_bed_test\noverwrite_output: true\n\
              rng_seed: empty bed test\ntarget_bed: {bed}\n",
             ref = h1n1_reference().display(),
             out = out.path().display(),
@@ -375,7 +375,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 2\n\
              produce_fastq: false\nproduce_bam: true\nproduce_vcf: false\n\
-             output_dir: {out}\noutput_filename: bam_only_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: bam_only_test\noverwrite_output: true\n\
              rng_seed: bam only test\npaired_ended: false\n",
             ref = h1n1_reference().display(),
             out = out.path().display(),
@@ -619,7 +619,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 10\n\
              produce_fastq: true\nproduce_bam: true\nproduce_vcf: false\n\
-             output_dir: {out}\noutput_filename: vcf_bam_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: vcf_bam_test\noverwrite_output: true\n\
              rng_seed: vcf bam test\ninput_vcf: {vcf}\n",
             ref = h1n1_reference().display(),
             out = out.path().display(),
@@ -712,7 +712,7 @@ mod tests {
         write!(yaml,
             "reference: {ref}\nread_len: 50\ncoverage: 2\n\
              produce_fastq: true\nproduce_bam: false\nproduce_vcf: true\n\
-             output_dir: {out}\noutput_filename: vcf_input_test\noverwrite_output: true\n\
+             output_dir: {out}\noutput_prefix: vcf_input_test\noverwrite_output: true\n\
              rng_seed: vcf input test\ninput_vcf: {vcf}\n",
             ref = h1n1_reference().display(),
             out = out.path().display(),

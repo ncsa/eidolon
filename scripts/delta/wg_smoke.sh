@@ -68,7 +68,7 @@ produce_vcf: true
 produce_bam: false
 overwrite_output: true
 output_dir: $OUTDIR
-output_filename: smoke
+output_prefix: smoke
 rng_seed: eidolon smoke $CTG
 sv_rate_scale: $SV_RATE_SCALE
 target_bed: $BED

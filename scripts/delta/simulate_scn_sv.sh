@@ -74,7 +74,7 @@ produce_vcf: true
 produce_bam: false
 overwrite_output: true
 output_dir: $OUTDIR
-output_filename: scn_svsim
+output_prefix: scn_svsim
 rng_seed: scn sv render check
 num_threads: $THREADS
 mutation_model: $MUT

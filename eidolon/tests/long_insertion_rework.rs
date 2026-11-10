@@ -98,7 +98,7 @@ fn run(dir: &Path, name: &str, records: &[String], extra_cfg: &str) -> Cell {
              fragment_mean: 250\nfragment_st_dev: 30\ninput_vcf: {vcf}\n\
              produce_vcf: true\nproduce_fastq: true\nproduce_bam: true\n\
              sv_rate_scale: 0.0\noverwrite_output: true\n\
-             output_dir: {out}\noutput_filename: o\nrng_seed: i516 {name}\nnum_threads: 1\n{extra_cfg}",
+             output_dir: {out}\noutput_prefix: o\nrng_seed: i516 {name}\nnum_threads: 1\n{extra_cfg}",
             ref = h1n1_reference().display(),
             vcf = vcf.display(),
             out = out.display(),

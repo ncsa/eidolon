@@ -161,7 +161,7 @@ fn built_seq_error_model_drives_output_quality() {
             "reference: {ref}\nread_len: {rl}\ncoverage: 20\npaired_ended: false\n\
              sequence_error_model: {model}\nproduce_fastq: true\nproduce_bam: false\n\
              produce_vcf: false\noverwrite_output: true\noutput_dir: {out}\n\
-             output_filename: rt\nrng_seed: seqerr fidelity\nnum_threads: 1\n",
+             output_prefix: rt\nrng_seed: seqerr fidelity\nnum_threads: 1\n",
             ref = h1n1_reference().display(),
             rl = read_len,
             model = model.display(),
@@ -296,7 +296,7 @@ fn simulate_variant_count(tmp: &Path, tag: &str, model: &Path) -> usize {
             "reference: {ref}\nread_len: 100\ncoverage: 5\npaired_ended: false\nploidy: 1\n\
              mutation_model: {model}\nproduce_vcf: true\nproduce_fastq: false\n\
              produce_bam: false\noverwrite_output: true\noutput_dir: {out}\n\
-             output_filename: rt_{tag}\nrng_seed: mut fidelity {tag}\nnum_threads: 1\n",
+             output_prefix: rt_{tag}\nrng_seed: mut fidelity {tag}\nnum_threads: 1\n",
             ref = h1n1_reference().display(),
             model = model.display(),
             out = tmp.display(),
@@ -535,7 +535,7 @@ fn built_gc_bias_model_depletes_disfavored_gc_in_output() {
             "reference: {ref}\nread_len: {rl}\ncoverage: 20\npaired_ended: false\n\
              gc_bias_model: {model}\nproduce_fastq: true\nproduce_bam: false\n\
              produce_vcf: false\noverwrite_output: true\noutput_dir: {out}\n\
-             output_filename: rt\nrng_seed: gc fidelity\nnum_threads: 1\n",
+             output_prefix: rt\nrng_seed: gc fidelity\nnum_threads: 1\n",
             ref = reference.display(),
             rl = read_len,
             model = model.display(),
@@ -601,7 +601,7 @@ fn built_seq_error_model_reproduces_the_positional_quality_profile() {
             "reference: {ref}\nread_len: {rl}\ncoverage: 20\npaired_ended: false\n\
              sequence_error_model: {model}\nproduce_fastq: true\nproduce_bam: false\n\
              produce_vcf: false\noverwrite_output: true\noutput_dir: {out}\n\
-             output_filename: grad\nrng_seed: seqerr gradient\nnum_threads: 1\n",
+             output_prefix: grad\nrng_seed: seqerr gradient\nnum_threads: 1\n",
             ref = h1n1_reference().display(),
             rl = read_len,
             model = model.display(),
@@ -719,7 +719,7 @@ fn simulate_over_polya(tmp: &Path, tag: &str, tsv: Option<&Path>) -> (usize, usi
             "reference: {ref}\nread_len: {rl}\ncoverage: 30\npaired_ended: false\n\
              sequence_error_model: {model}\nmutation_rate: 0.0\nproduce_fastq: true\n\
              produce_bam: false\nproduce_vcf: false\noverwrite_output: true\n\
-             output_dir: {out}\noutput_filename: {tag}\nrng_seed: transition fidelity\n\
+             output_dir: {out}\noutput_prefix: {tag}\nrng_seed: transition fidelity\n\
              num_threads: 1\n",
             ref = reference.display(),
             rl = read_len,

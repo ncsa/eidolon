@@ -46,7 +46,7 @@ fn every_mapped_record_carries_the_nm_samtools_calmd_computes() {
     std::fs::write(
         &yaml,
         format!(
-            "reference: {}\noutput_dir: {}\noutput_filename: nm\nread_len: 100\n\
+            "reference: {}\noutput_dir: {}\noutput_prefix: nm\nread_len: 100\n\
              coverage: 20\npaired_ended: true\nfragment_mean: 150\nfragment_st_dev: 50\n\
              produce_fastq: true\nproduce_bam: true\nrng_seed: \"golden bam nm\"\n\
              sv_rate_scale: 30.0\nadapters:\n  enabled: true\n  preset: truseq\n",

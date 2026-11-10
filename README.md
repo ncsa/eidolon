@@ -51,7 +51,7 @@ read_len: 250
 coverage: 10
 ploidy: 2
 output_dir: /path/to/output
-output_filename: my_run
+output_prefix: my_run
 produce_fastq: true
 produce_bam: true
 produce_vcf: true

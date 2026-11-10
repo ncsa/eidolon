@@ -77,7 +77,7 @@ produce_vcf: true
 produce_bam: false
 overwrite_output: true
 output_dir: /scratch/$USER/run1
-output_filename: sample
+output_prefix: sample
 rng_seed: my run 1
 num_threads: 1
 ```

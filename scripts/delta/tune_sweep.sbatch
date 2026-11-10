@@ -105,7 +105,7 @@ overwrite_output: true
 rng_seed: tune sweep
 num_threads: $nt
 output_dir: $run_dir
-output_filename: b
+output_prefix: b
 YAML
     local pre=(); [[ "$use_numa" == "1" && "$HAVE_NUMACTL" == "1" ]] && pre=(numactl --interleave=all)
     local envp=();   [[ -n "$preload" ]] && envp=(env "LD_PRELOAD=$preload")

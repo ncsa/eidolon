@@ -134,3 +134,65 @@ fn filter_reads_an_unknown_key_names_it() {
     let (code, err) = run(&work, "filter-reads", &cfg);
     assert_clean_error(code, &err, "filter_keyy");
 }
+
+/// v5.0.0 keeps one name per key (#879). A removed name stops the run and names its
+/// replacement, rather than being read under the old name or rejected without a hint.
+#[test]
+fn gen_reads_output_filename_is_refused_naming_output_prefix() {
+    let (_tmp, work) = fresh_workdir();
+    let cfg = format!(
+        "reference: {}\noutput_dir: {}\noutput_filename: x\nread_len: 50\ncoverage: 1\n",
+        h1n1_reference().display(),
+        work.display()
+    );
+    let (code, err) = run(&work, "gen-reads", &cfg);
+    assert_clean_error(
+        code,
+        &err,
+        "`output_filename` (removed in v5.0.0; use `output_prefix`)",
+    );
+}
+
+#[test]
+fn gen_cancer_reads_removed_keys_are_refused_naming_their_replacements() {
+    for (removed, replacement) in [
+        ("output_filename", "output_prefix"),
+        ("coverage", "total_coverage"),
+        ("rng_seed_root", "rng_seed"),
+    ] {
+        let (_tmp, work) = fresh_workdir();
+        let cfg = format!(
+            "reference: {}\noutput_dir: {}\npurity: 0.5\n{removed}: x\n",
+            h1n1_reference().display(),
+            work.display()
+        );
+        let (code, err) = run(&work, "gen-cancer-reads", &cfg);
+        assert_clean_error(
+            code,
+            &err,
+            &format!("`{removed}` (removed in v5.0.0; use `{replacement}`"),
+        );
+    }
+}
+
+/// filter-reads no longer reads the pre-v3.0.0 `RNEAT_generated_` prefix (#879). Such a read
+/// is an error naming the prefix, never an ordinary line: dropping it silently would leave an
+/// empty filtered FASTQ at exit 0.
+#[test]
+fn filter_reads_a_pre_v3_read_name_is_refused() {
+    let (_tmp, work) = fresh_workdir();
+    std::fs::write(work.join("regions.bed"), "chr1\t0\t2000\n").unwrap();
+    std::fs::write(
+        work.join("reads.fastq"),
+        "@RNEAT_generated_chr1_0000001000_0000002000_0000000000000000/1\nACGT\n+\nIIII\n",
+    )
+    .unwrap();
+    let cfg = format!(
+        "bed_file: {d}/regions.bed\nfiles_to_filter:\n  - {d}/reads.fastq\nfilter_key: .\n\
+         overwrite_output: true\n",
+        d = work.display()
+    );
+    let (code, err) = run(&work, "filter-reads", &cfg);
+    assert_clean_error(code, &err, "RNEAT_generated_");
+    assert_clean_error(code, &err, "EIDOLON_generated_");
+}

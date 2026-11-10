@@ -130,7 +130,7 @@ produce_vcf: true
 produce_bam: false
 overwrite_output: true
 output_dir: $OUTDIR
-output_filename: scn_af
+output_prefix: scn_af
 rng_seed: scn af replay
 num_threads: $THREADS
 mutation_model: $MUT

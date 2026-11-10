@@ -263,7 +263,7 @@ fn built_fragment_model_drives_output_insert_size() {
         &format!(
             "reference: {ref}\nread_len: 75\ncoverage: 30\nploidy: 1\npaired_ended: true\n\
              fragment_model: {model}\nproduce_bam: true\nproduce_fastq: false\nproduce_vcf: false\n\
-             overwrite_output: true\noutput_dir: {out}\noutput_filename: rt\n\
+             overwrite_output: true\noutput_dir: {out}\noutput_prefix: rt\n\
              rng_seed: frag fidelity\nnum_threads: 1\n",
             ref = h1n1_reference().display(),
             model = model.display(),
@@ -360,7 +360,7 @@ fn a_built_discrete_model_carries_the_right_tail_all_the_way_to_the_reads() {
         &format!(
             "reference: {reference}\nread_len: 75\ncoverage: 6\nploidy: 1\npaired_ended: true\n\
              fragment_model: {model}\nproduce_bam: true\nproduce_fastq: false\nproduce_vcf: false\n\
-             overwrite_output: true\noutput_dir: {out}\noutput_filename: rt\n\
+             overwrite_output: true\noutput_dir: {out}\noutput_prefix: rt\n\
              rng_seed: frag shape fidelity\nnum_threads: 2\n",
             reference = ecoli_reference().display(),
             model = built[0].1.display(),

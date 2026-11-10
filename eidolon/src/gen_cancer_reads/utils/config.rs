@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use log::warn;
 use serde_yml::Value;
 
-use crate::config_keys::check_keys;
+use crate::config_keys::check_keys_with_hints;
 use crate::gen_cancer_reads::errors::GenCancerReadsError;
 use crate::gen_reads::utils::config::RunConfiguration;
 use crate::gen_reads::utils::subclone::{Subclone, SubcloneModel};
@@ -21,9 +21,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "reference",
     "output_dir",
     "output_prefix",
-    "output_filename",
     "total_coverage",
-    "coverage",
     "purity",
     "read_len",
     "paired_ended",
@@ -31,7 +29,6 @@ pub const KNOWN_KEYS: &[&str] = &[
     "fragment_st_dev",
     "fragment_model",
     "rng_seed",
-    "rng_seed_root",
     "normal_model",
     "tumor_model",
     "normal_mutation_rate",
@@ -43,6 +40,17 @@ pub const KNOWN_KEYS: &[&str] = &[
     "sv_rate_scale",
     "keep_per_pass",
     "overwrite_output",
+];
+
+/// Keys removed in v5.0.0 (#879), each an alias of a key that remains. A removed name is
+/// rejected with its replacement rather than read silently under the old name.
+const RENAMED_KEYS: &[(&str, &str)] = &[
+    ("output_filename", "removed in v5.0.0; use `output_prefix`"),
+    (
+        "coverage",
+        "removed in v5.0.0; use `total_coverage`, the merged depth of both passes",
+    ),
+    ("rng_seed_root", "removed in v5.0.0; use `rng_seed`"),
 ];
 
 /// Default tumor-pass somatic SNP/indel rate (typical solid tumor; see #235).
@@ -133,9 +141,10 @@ impl CancerConfig {
     }
 
     fn from_scrape(scrape: HashMap<String, Value>) -> Result<CancerConfig, GenCancerReadsError> {
-        check_keys(
+        check_keys_with_hints(
             scrape.keys().map(String::as_str),
             KNOWN_KEYS,
+            RENAMED_KEYS,
             "gen-cancer-reads",
         )
         .map_err(GenCancerReadsError::ConfigError)?;
@@ -163,7 +172,7 @@ impl CancerConfig {
             match key.as_str() {
                 "reference" => cfg.reference = req_path(value, "reference")?,
                 "output_dir" => cfg.output_dir = req_path(value, "output_dir")?,
-                "output_prefix" | "output_filename" => {
+                "output_prefix" => {
                     cfg.output_prefix = value
                         .as_str()
                         .ok_or_else(|| {
@@ -173,7 +182,7 @@ impl CancerConfig {
                         })?
                         .to_string();
                 }
-                "total_coverage" | "coverage" => {
+                "total_coverage" => {
                     cfg.total_coverage = as_usize(value, "total_coverage")?;
                 }
                 "purity" => cfg.purity = as_f64(value, "purity")?,
@@ -182,7 +191,7 @@ impl CancerConfig {
                 "fragment_mean" => cfg.fragment_mean = Some(as_f64(value, "fragment_mean")?),
                 "fragment_st_dev" => cfg.fragment_st_dev = Some(as_f64(value, "fragment_st_dev")?),
                 "fragment_model" => cfg.fragment_model = Some(req_path(value, "fragment_model")?),
-                "rng_seed" | "rng_seed_root" => {
+                "rng_seed" => {
                     cfg.rng_seed_root = value
                         .as_str()
                         .map(str::to_string)
@@ -295,7 +304,7 @@ impl CancerConfig {
             mutation_model: self.normal_model.clone(),
             input_vcf: self.germline_vcf.clone(),
             sv_rate_scale: 0.0,
-            output_filename: format!("{}_normal", self.output_prefix),
+            output_prefix: format!("{}_normal", self.output_prefix),
             rng_seed: Some(format!("{}-normal", self.rng_seed_root)),
             ..self.shared_run_config()
         };
@@ -327,7 +336,7 @@ impl CancerConfig {
             // (INFO/EIDOLON_VAF = purity × allele_fraction) for direct comparison
             // against a caller's VAF on the merged reads.
             merged_vaf_purity: Some(self.purity),
-            output_filename: format!("{}_tumor", self.output_prefix),
+            output_prefix: format!("{}_tumor", self.output_prefix),
             rng_seed: Some(format!("{}-tumor", self.rng_seed_root)),
             ..self.shared_run_config()
         };
@@ -679,8 +688,8 @@ mod tests {
         let tumor = cfg.tumor_pass(PathBuf::from("/tmp/g.vcf.gz")).unwrap();
         assert_eq!(normal.sv_rate_scale, 0.0);
         assert_eq!(tumor.sv_rate_scale, 5.0);
-        assert!(normal.output_filename.ends_with("_normal"));
-        assert!(tumor.output_filename.ends_with("_tumor"));
+        assert!(normal.output_prefix.ends_with("_normal"));
+        assert!(tumor.output_prefix.ends_with("_tumor"));
         assert_eq!(tumor.input_vcf, Some(PathBuf::from("/tmp/g.vcf.gz")));
     }
 

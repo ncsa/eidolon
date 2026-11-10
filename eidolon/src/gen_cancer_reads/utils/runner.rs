@@ -21,7 +21,7 @@ pub fn run_cancer(cfg: &CancerConfig) -> Result<(), GenCancerReadsError> {
     let normal = cfg.normal_pass()?;
     info!(
         ">> Pass 1 (normal): {normal_cov}x coverage → {}",
-        normal.output_filename
+        normal.output_prefix
     );
     let mut rng_n = NeatRng::new_from_seed(&normal.seed_vec)
         .map_err(|e| GenCancerReadsError::Rng(format!("{e:?}")))?;
@@ -49,11 +49,11 @@ pub fn run_cancer(cfg: &CancerConfig) -> Result<(), GenCancerReadsError> {
     match cfg.tumor_mutation_rate {
         Some(r) => info!(
             ">> Pass 2 (tumor): {tumor_cov}x coverage, somatic rate {r} → {}",
-            tumor.output_filename
+            tumor.output_prefix
         ),
         None => info!(
             ">> Pass 2 (tumor): {tumor_cov}x coverage, model-fitted rate → {}",
-            tumor.output_filename
+            tumor.output_prefix
         ),
     }
     let mut rng_t = NeatRng::new_from_seed(&tumor.seed_vec)
