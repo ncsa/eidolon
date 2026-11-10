@@ -34,6 +34,11 @@ Measured on T2T-CHM13 chr21 at 20x (about 3M pairs, 8 threads), against `shuffle
 - **gzipped FASTQs about 60% larger.** Reads in genome order overlap their neighbors, which gzip
   exploits; shuffled reads, like a real sequencer's, compress less well.
 
+At genome scale (the whole of T2T-CHM13 at 21x, 256.6M pairs, 64 threads, temp directory on Lustre
+scratch on NCSA Delta, three runs each), writing the final FASTQs took 864–884 s with the shuffle
+against 393–406 s without it, and the whole run 26 min against 18 min. The bucket files peaked at
+59 GB, about the size of the shuffled output.
+
 **Shuffling output from older versions, or from `shuffle_fastq: false`.** With `seqkit`, shuffle
 each mate separately **with the same seed**. seqkit has no paired mode, but its permutation
 depends only on the seed and the number of records, and R1 and R2 have the same count:
