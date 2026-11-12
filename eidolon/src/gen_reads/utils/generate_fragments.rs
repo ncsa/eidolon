@@ -14,6 +14,25 @@ use eidolon_core::structs::nucleotides::Nucleotide;
 use eidolon_core::structs::sequence_block::SequenceBlock;
 use log::*;
 
+/// Fragments to place for `len` bases at `coverage`: `ceil(len x coverage / denom)`, times
+/// `budget_scale`. At a scale of exactly 1.0 this is the integer formula untouched, so a run with
+/// no `target_bed` is bit-identical to before #578; otherwise the product is done in floating
+/// point, so `coverage: 1` scaled by 2.5 is 2.5 and not a rounded 2 or 3.
+pub(crate) fn fragment_budget(
+    len: usize,
+    coverage: usize,
+    denom: usize,
+    budget_scale: f64,
+) -> usize {
+    if budget_scale == 1.0 {
+        return len.saturating_mul(coverage).div_ceil(denom);
+    }
+    if !budget_scale.is_finite() || budget_scale <= 0.0 {
+        return 0;
+    }
+    ((len as f64 * coverage as f64 / denom as f64) * budget_scale).ceil() as usize
+}
+
 pub fn generate_fragments(
     // How far past `sequence_length` (local, region-relative) real sequence
     // continues: 0 means `sequence_length` IS the true end of what can be
@@ -40,6 +59,9 @@ pub fn generate_fragments(
     // control emits them as insert-length genomic reads, in write_block_fastq (#125).
     keep_short: bool,
     fragment_model: &FragmentLengthModel,
+    // Multiplies the fragment budget (1.0 = no change). A `target_bed` run passes 1 / (the
+    // on-target fraction of its read bases) so `coverage` means on-target depth (#578).
+    budget_scale: f64,
     rng: &mut NeatRng,
 ) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
     // Takes:
@@ -61,7 +83,10 @@ pub fn generate_fragments(
     } else {
         read_length
     };
-    if sequence_length <= min_region {
+    // Real sequence past the region's far edge counts: a fragment owned by a narrow target starts
+    // inside it and runs on, so only a region that cannot hold a read even with that room is
+    // empty. At a true terminus (extension_budget 0) this is the old test.
+    if sequence_length.saturating_add(extension_budget) <= min_region {
         debug!("Sequence length was too short, maybe because of a small bed region.");
         return Ok(Vec::new());
     }
@@ -75,7 +100,7 @@ pub fn generate_fragments(
     } else {
         read_length
     };
-    let num_frags = sequence_length.saturating_mul(coverage).div_ceil(denom);
+    let num_frags = fragment_budget(sequence_length, coverage, denom, budget_scale);
     if paired_ended {
         // For paired-end reads the physical fragment length (insert size) determines spacing.
         // Keep sampling until num_frags valid fragments are collected so that the pool has
@@ -278,13 +303,16 @@ pub fn generate_weighted_fragments(
     long_reads: bool,
     // keep short fragments (readthrough or the adapter-free control); see generate_fragments.
     keep_short: bool,
+    // See `generate_fragments`: multiplies the fragment budget, 1.0 = no change.
+    budget_scale: f64,
     rng: &mut NeatRng,
 ) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
     const MAX_COVERAGE_MULTIPLIER: usize = 100;
 
     let region_len = region_end.saturating_sub(region_start);
     let min_region = if long_reads { 0 } else { read_length };
-    if region_len <= min_region {
+    // See generate_fragments: room past the far edge lets a narrow region own fragments.
+    if region_len.saturating_add(extension_budget) <= min_region {
         debug!("Region too short for weighted fragment generation.");
         return Ok(Vec::new());
     }
@@ -316,7 +344,7 @@ pub fn generate_weighted_fragments(
     } else {
         read_length
     };
-    let num_frags_base = region_len.saturating_mul(coverage).div_ceil(denom);
+    let num_frags_base = fragment_budget(region_len, coverage, denom, budget_scale);
     let num_frags = if normalize {
         let inflated = (num_frags_base as f64 / mean_weight).round() as usize;
         let cap = num_frags_base.saturating_mul(MAX_COVERAGE_MULTIPLIER);
@@ -529,6 +557,72 @@ mod tests {
     use eidolon_core::structs::nucleotides::Nucleotide::{A, C, G, T};
     use eidolon_core::structs::sequence_block::{RegionType, SequenceBlock, SequenceMap};
 
+    /// MUST NOT FIRE: at a scale of exactly 1.0 the budget is the old integer formula for every
+    /// input, so a run without a `target_bed` places the same fragments it always did.
+    #[test]
+    fn unit_scale_is_the_integer_budget() {
+        for len in [1usize, 99, 100, 178, 4_999, 2_280, 1_000_003] {
+            for coverage in [0usize, 1, 3, 30, 60] {
+                for denom in [100usize, 150, 200, 300] {
+                    assert_eq!(
+                        fragment_budget(len, coverage, denom, 1.0),
+                        len.saturating_mul(coverage).div_ceil(denom),
+                        "len {len} coverage {coverage} denom {denom}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Known answer: 1000 bp at coverage 1 with 200 bp per fragment is 5 fragments; scaled by
+    /// 2.5 it is 12.5, rounded up to 13. Coverage is an integer, so a scale folded into it would
+    /// have turned 2.5 into 2 or 3 and been wrong by up to 20%.
+    #[test]
+    fn a_fractional_scale_is_applied_to_the_budget_not_to_the_integer_coverage() {
+        assert_eq!(fragment_budget(1_000, 1, 200, 1.0), 5);
+        assert_eq!(fragment_budget(1_000, 1, 200, 2.5), 13);
+        assert_eq!(fragment_budget(1_000, 1, 200, 2.4), 12);
+    }
+
+    #[test]
+    fn a_nonsense_scale_places_nothing() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(fragment_budget(1_000, 30, 200, bad), 0, "scale {bad}");
+        }
+    }
+
+    /// A target narrower than a read still owns fragments when sequence continues past it: its
+    /// fragments start inside it and run on. An exome has many such targets (63% of one public
+    /// IDT design's chr22 targets are 150 bp or less), and refusing them left them with spill
+    /// from neighbors only. 126 bp x coverage 30 over 2 x 150 bp reads is 12.6, so 13 fragments.
+    #[test]
+    fn a_region_narrower_than_a_read_still_owns_fragments_when_sequence_continues() {
+        let mut rng = make_rng();
+        let model = FragmentLengthModel::new_normal(300.0, 20.0).unwrap();
+        let frags = generate_fragments(
+            10_000, 126, 150, 5_000, 30, true, false, false, &model, 1.0, &mut rng,
+        )
+        .unwrap();
+        assert_eq!(frags.len(), 13);
+        for (s, e) in &frags {
+            assert!((5_000..5_126).contains(s), "start {s} outside the region");
+            assert!(*e - *s >= 160, "fragment shorter than a read pair");
+        }
+    }
+
+    /// MUST NOT FIRE: with no sequence past the region (a true terminus) a region no longer than
+    /// a read still places nothing, as before.
+    #[test]
+    fn a_region_narrower_than_a_read_at_a_terminus_places_nothing() {
+        let mut rng = make_rng();
+        let model = FragmentLengthModel::new_normal(300.0, 20.0).unwrap();
+        let frags = generate_fragments(
+            0, 126, 150, 5_000, 30, true, false, false, &model, 1.0, &mut rng,
+        )
+        .unwrap();
+        assert!(frags.is_empty());
+    }
+
     fn make_rng() -> NeatRng {
         NeatRng::new_from_seed(&vec!["gc-bias-test".to_string()]).unwrap()
     }
@@ -629,6 +723,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -659,6 +754,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -681,6 +777,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
+            1.0,
             &mut rng2,
         )
         .unwrap();
@@ -710,6 +807,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -750,6 +848,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -785,6 +884,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -818,6 +918,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -848,6 +949,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -879,6 +981,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -919,6 +1022,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng1,
         )
         .unwrap();
@@ -937,6 +1041,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng2,
         )
         .unwrap();
@@ -969,6 +1074,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -987,6 +1093,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1027,6 +1134,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1070,6 +1178,7 @@ mod tests {
             false,
             false,
             false, // keep_short (off in these fragment-placement tests)
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1248,6 +1357,7 @@ mod tests {
             false, // long_reads
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1311,6 +1421,7 @@ mod tests {
             true,  // paired_ended
             false, // long_reads
             false, // keep_short
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1374,6 +1485,7 @@ mod tests {
             true,  // paired_ended
             false, // long_reads
             false, // keep_short
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1748,6 +1860,7 @@ mod tests {
             true, // paired_ended
             false,
             false,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1792,6 +1905,7 @@ mod tests {
             true,
             false,
             false,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1828,6 +1942,7 @@ mod tests {
             true,
             false,
             false,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -1978,6 +2093,7 @@ mod tests {
             true,
             false,
             false,
+            1.0,
             &mut rng,
         )
         .unwrap();
@@ -2023,6 +2139,7 @@ mod tests {
                 true,
                 false,
                 false,
+                1.0,
                 &mut rng,
             )
             .unwrap();

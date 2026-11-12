@@ -48,6 +48,9 @@ use crate::{
             generate_fragments::{generate_fragments, generate_weighted_fragments},
             generate_variants::generate_variants,
             subclone::SubcloneModel,
+            target_depth::{
+                ContigTargets, OwnedRegion, SpillParams, TARGET_DEPTH_STREAM, on_target_fraction,
+            },
         },
     },
 };
@@ -83,6 +86,9 @@ struct ContigContext<'a> {
     // generation iterated `mutated_maps` directly and produced a different read set every
     // run at a fixed seed, single-threaded. Iterate this instead and look the map up.
     contig_order: Arc<Vec<String>>,
+    /// Multiplies every fragment budget: 1 / (on-target fraction of read bases) on a
+    /// `target_bed` run, so `coverage` means on-target depth (#578); exactly 1.0 otherwise.
+    budget_scale: f64,
 }
 
 /// Writes the final FASTQs from the per-chunk temp files: shuffled by default (#870), or
@@ -414,7 +420,7 @@ pub fn run_neat(
     }
     let shared_mutated_maps = Arc::new(all_mutated_maps);
 
-    let ctx = ContigContext {
+    let mut ctx = ContigContext {
         config,
         target_bed: &target_bed,
         mutation_regions: &mutation_regions,
@@ -430,6 +436,7 @@ pub fn run_neat(
         reference,
         mutated_maps: shared_mutated_maps,
         contig_order: Arc::new(contig_order_in_file.clone()),
+        budget_scale: 1.0,
     };
 
     let mut mutated_maps: HashMap<String, Vec<MutatedMap>> = HashMap::new();
@@ -452,6 +459,7 @@ pub fn run_neat(
         Some(n) => info!("\t>Sub-contig chunking: enabled, chunk size {} bp", n),
     }
     let seq_cache = SeqBlockCache::new(&ctx.reference, &contig_order_in_file);
+    ctx.budget_scale = target_budget_scale(&ctx, &seq_cache, &contig_order_in_file)?;
     let chunk_work: Vec<ChunkWork> = contig_order_in_file
         .iter()
         .enumerate()
@@ -1121,6 +1129,7 @@ fn process_chunk(
                         ctx.config.long_reads,
                         keep_short,
                         ctx.fragment_length_model,
+                        ctx.budget_scale,
                         &mut rng,
                     )?;
                     block_frags.extend(alt_frags.into_iter().map(|(s, e)| PlacedFragment {
@@ -1145,6 +1154,7 @@ fn process_chunk(
                         ctx.config.long_reads,
                         keep_short,
                         ctx.fragment_length_model,
+                        ctx.budget_scale,
                         &mut rng,
                     )?
                 } else {
@@ -1161,6 +1171,7 @@ fn process_chunk(
                         ctx.config.paired_ended,
                         ctx.config.long_reads,
                         keep_short,
+                        ctx.budget_scale,
                         &mut rng,
                     )?
                 };
@@ -3956,6 +3967,89 @@ fn scale_coverage(base: usize, multiplier: f64) -> usize {
         return 0;
     }
     (base as f64 * multiplier).round() as usize
+}
+
+/// The fragment-budget multiplier that makes `coverage` mean on-target depth on a `target_bed`
+/// run (#578): 1 / (the fraction of read bases that land on target), estimated from the BED
+/// geometry and the fragment model by [`on_target_fraction`]. Exactly 1.0 without a BED.
+///
+/// The owned regions are built with the same calls `process_chunk` uses (non-N regions
+/// intersected with the BED), so the estimate sees the geometry placement sees. They are not
+/// clipped to chunks: a chunk boundary is crossed freely, so output does not depend on chunking
+/// and neither does this.
+fn target_budget_scale(
+    ctx: &ContigContext<'_>,
+    cache: &SeqBlockCache<'_>,
+    contig_order: &[String],
+) -> Result<f64, GenerateReadsError> {
+    let Some(bed) = ctx.target_bed else {
+        return Ok(1.0);
+    };
+    let names: Vec<&String> = contig_order
+        .iter()
+        .filter(|n| bed.contains_key(*n) && ctx.reference.contains_key(*n))
+        .collect();
+    let contigs: Vec<ContigTargets> = names
+        .par_iter()
+        .map(|name| {
+            let block = cache.get(name);
+            let raw = block.get_non_n_regions();
+            let bounds: Vec<(usize, usize)> = raw.iter().map(|r| (r.start, r.end)).collect();
+            let owned_maps = intersect_with_bed(&raw, &bed[*name], 0);
+            let owned: Vec<OwnedRegion> = owned_maps
+                .iter()
+                .map(|r| {
+                    let materializable_end = bounds
+                        .iter()
+                        .find(|&&(ns, ne)| r.start >= ns && r.start < ne)
+                        .map(|&(_, ne)| ne)
+                        .unwrap_or(block.ref_end);
+                    OwnedRegion {
+                        start: r.start,
+                        end: r.end,
+                        extension: materializable_end.saturating_sub(r.end),
+                    }
+                })
+                .collect();
+            let mut spans: Vec<(usize, usize)> = owned.iter().map(|o| (o.start, o.end)).collect();
+            spans.sort_unstable();
+            let mut on_target: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+            for (s, e) in spans {
+                match on_target.last_mut() {
+                    Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                    _ => on_target.push((s, e)),
+                }
+            }
+            ContigTargets { owned, on_target }
+        })
+        .collect();
+
+    let params = SpillParams {
+        read_len: ctx.config.read_len,
+        paired_ended: ctx.config.paired_ended,
+        keep_short: ctx.config.adapters.enabled || ctx.config.keep_short_fragments,
+        long_reads: ctx.config.long_reads,
+    };
+    let mut rng = ctx.base_rng.derive_child(TARGET_DEPTH_STREAM);
+    let Some(fraction) = on_target_fraction(&contigs, params, ctx.fragment_length_model, &mut rng)?
+    else {
+        return Ok(1.0);
+    };
+    if fraction <= 0.0 {
+        return Err(GenerateReadsError::CliError(
+            "target_bed: no read base is estimated to land on target, so `coverage` cannot be \
+             met; check the BED against the reference"
+                .to_string(),
+        ));
+    }
+    let scale = 1.0 / fraction;
+    info!(
+        "target_bed: {:.1}% of read bases are expected on target, so the fragment budget is \
+         scaled {:.3}x for `coverage` to mean on-target depth",
+        fraction * 100.0,
+        scale
+    );
+    Ok(scale)
 }
 
 /// Intersects a set of non-N regions (block-local coordinates) with BED records
