@@ -63,7 +63,7 @@ fn run(dir: &Path, name: &str, adapters: bool) -> Vec<(usize, usize)> {
         "reference: {ref}\nread_len: 100\ncoverage: 20\nploidy: 1\npaired_ended: true\n\
          fragment_mean: 60\nfragment_st_dev: 5\n\
          produce_bam: true\nproduce_fastq: false\nproduce_vcf: false\n\
-         overwrite_output: true\noutput_dir: {out}\noutput_filename: {name}\n\
+         overwrite_output: true\noutput_dir: {out}\noutput_basename: {name}\n\
          rng_seed: adapter cigar\nnum_threads: 1\n{ad}",
         ref = h1n1_reference().display(),
         out = dir.display(),

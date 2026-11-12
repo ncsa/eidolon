@@ -125,7 +125,7 @@ fn native_gen_cancer_reads_matches_cancer_simulate_sh() {
         format!(
             "reference: {ref}\n\
              output_dir: {out}\n\
-             output_prefix: sample\n\
+             output_basename: sample\n\
              total_coverage: {TOTAL_COV}\n\
              purity: {PURITY}\n\
              read_len: {READ_LEN}\n\

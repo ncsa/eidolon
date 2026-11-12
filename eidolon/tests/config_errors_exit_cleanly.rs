@@ -57,7 +57,7 @@ fn gen_reads_a_config_check_failure_names_its_reason() {
 fn gen_reads_an_existing_output_is_refused_without_a_panic() {
     let (_tmp, work) = fresh_workdir();
     let cfg = format!(
-        "reference: {}\noutput_dir: {}\noutput_prefix: x\nread_len: 50\ncoverage: 1\n\
+        "reference: {}\noutput_dir: {}\noutput_basename: x\nread_len: 50\ncoverage: 1\n\
          produce_fastq: true\noverwrite_output: false\n",
         h1n1_reference().display(),
         work.display()
@@ -133,4 +133,114 @@ fn filter_reads_an_unknown_key_names_it() {
     );
     let (code, err) = run(&work, "filter-reads", &cfg);
     assert_clean_error(code, &err, "filter_keyy");
+}
+
+/// v5.0.0 keeps one name per key (#879). A removed name stops the run and names its
+/// replacement, rather than being read under the old name or rejected without a hint.
+#[test]
+fn gen_reads_output_filename_is_refused_naming_output_basename() {
+    let (_tmp, work) = fresh_workdir();
+    let cfg = format!(
+        "reference: {}\noutput_dir: {}\noutput_filename: x\nread_len: 50\ncoverage: 1\n",
+        h1n1_reference().display(),
+        work.display()
+    );
+    let (code, err) = run(&work, "gen-reads", &cfg);
+    assert_clean_error(
+        code,
+        &err,
+        "`output_filename` (removed in v5.0.0; use `output_basename`)",
+    );
+}
+
+#[test]
+fn gen_cancer_reads_removed_keys_are_refused_naming_their_replacements() {
+    for (removed, replacement) in [
+        ("output_filename", "output_basename"),
+        ("coverage", "total_coverage"),
+        ("rng_seed_root", "rng_seed"),
+    ] {
+        let (_tmp, work) = fresh_workdir();
+        let cfg = format!(
+            "reference: {}\noutput_dir: {}\npurity: 0.5\n{removed}: x\n",
+            h1n1_reference().display(),
+            work.display()
+        );
+        let (code, err) = run(&work, "gen-cancer-reads", &cfg);
+        assert_clean_error(
+            code,
+            &err,
+            &format!("`{removed}` (removed in v5.0.0; use `{replacement}`"),
+        );
+    }
+}
+
+/// `output_prefix` was renamed `output_basename` in v5.0.0; the old name must say so.
+#[test]
+fn output_prefix_is_refused_naming_output_basename() {
+    for sub in ["gen-reads", "gen-cancer-reads"] {
+        let (_tmp, work) = fresh_workdir();
+        let cfg = format!(
+            "reference: {}\noutput_dir: {}\n{extra}output_prefix: x\n",
+            h1n1_reference().display(),
+            work.display(),
+            extra = if sub == "gen-cancer-reads" {
+                "purity: 0.5\n"
+            } else {
+                ""
+            }
+        );
+        let (code, err) = run(&work, sub, &cfg);
+        assert_clean_error(
+            code,
+            &err,
+            "`output_prefix` (renamed `output_basename` in v5.0.0)",
+        );
+    }
+}
+
+/// `output_basename` is a file name: a path separator would silently replace `output_dir`
+/// (absolute) or fail with a bare I/O error (relative subdirectory).
+#[test]
+fn output_basename_with_a_path_separator_is_refused() {
+    for sub in ["gen-reads", "gen-cancer-reads"] {
+        for bad in ["sub/run", "/abs/run", "a\\\\b"] {
+            let (_tmp, work) = fresh_workdir();
+            let cfg = format!(
+                "reference: {}\noutput_dir: {}\n{extra}output_basename: \"{bad}\"\n",
+                h1n1_reference().display(),
+                work.display(),
+                extra = if sub == "gen-cancer-reads" {
+                    "purity: 0.5\n"
+                } else {
+                    ""
+                }
+            );
+            let (code, err) = run(&work, sub, &cfg);
+            assert_clean_error(code, &err, "contains a path separator");
+            assert!(err.contains("output_dir"), "{sub} {bad}: {err}");
+        }
+    }
+}
+
+/// filter-reads no longer reads the pre-v3.0.0 `RNEAT_generated_` prefix (#879). Such a read
+/// is an error naming the prefix, never an ordinary line: dropping it silently would leave an
+/// empty filtered FASTQ at exit 0.
+#[test]
+fn filter_reads_a_pre_v3_read_name_is_refused() {
+    let (_tmp, work) = fresh_workdir();
+    std::fs::write(work.join("regions.bed"), "chr1\t0\t2000\n").unwrap();
+    std::fs::write(
+        work.join("reads.fastq"),
+        "@RNEAT_generated_chr1_0000001000_0000002000_0000000000000000/1\nACGT\n+\nIIII\n",
+    )
+    .unwrap();
+    let cfg = format!(
+        "bed_file: {d}/regions.bed\nfiles_to_filter:\n  - {d}/reads.fastq\nfilter_key: .\n\
+         overwrite_output: true\n",
+        d = work.display()
+    );
+    let (code, err) = run(&work, "filter-reads", &cfg);
+    assert_clean_error(code, &err, "RNEAT_generated_");
+    assert_clean_error(code, &err, "EIDOLON_generated_");
 }

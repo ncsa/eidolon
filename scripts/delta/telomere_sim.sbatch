@@ -109,7 +109,7 @@ produce_bam: false
 produce_vcf: false
 overwrite_output: true
 output_dir: $WORK
-output_filename: sim
+output_basename: sim
 rng_seed: chm13 telomere 861
 num_threads: $THREADS
 EOF

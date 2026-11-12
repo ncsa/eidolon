@@ -21,7 +21,7 @@ pub fn run_cancer(cfg: &CancerConfig) -> Result<(), GenCancerReadsError> {
     let normal = cfg.normal_pass()?;
     info!(
         ">> Pass 1 (normal): {normal_cov}x coverage → {}",
-        normal.output_filename
+        normal.output_basename
     );
     let mut rng_n = NeatRng::new_from_seed(&normal.seed_vec)
         .map_err(|e| GenCancerReadsError::Rng(format!("{e:?}")))?;
@@ -49,11 +49,11 @@ pub fn run_cancer(cfg: &CancerConfig) -> Result<(), GenCancerReadsError> {
     match cfg.tumor_mutation_rate {
         Some(r) => info!(
             ">> Pass 2 (tumor): {tumor_cov}x coverage, somatic rate {r} → {}",
-            tumor.output_filename
+            tumor.output_basename
         ),
         None => info!(
             ">> Pass 2 (tumor): {tumor_cov}x coverage, model-fitted rate → {}",
-            tumor.output_filename
+            tumor.output_basename
         ),
     }
     let mut rng_t = NeatRng::new_from_seed(&tumor.seed_vec)
@@ -67,7 +67,7 @@ pub fn run_cancer(cfg: &CancerConfig) -> Result<(), GenCancerReadsError> {
     merge_fastqs(cfg, &normal, &tumor)?;
     let truth = cfg
         .output_dir
-        .join(format!("{}_merged_truth.vcf.gz", cfg.output_prefix));
+        .join(format!("{}_merged_truth.vcf.gz", cfg.output_basename));
     let normal_vcf = normal.output_vcf.clone().expect("normal golden vcf path");
     let tumor_vcf = tumor.output_vcf.clone().expect("tumor golden vcf path");
     vcf_merge::merge_goldens(&normal_vcf, &tumor_vcf, &truth)?;
@@ -95,7 +95,7 @@ fn merge_fastqs(
     let t_r1 = need(&tumor.output_fastq_1, "tumor R1")?;
     let merged_r1 = cfg
         .output_dir
-        .join(format!("{}_merged_r1.fastq.gz", cfg.output_prefix));
+        .join(format!("{}_merged_r1.fastq.gz", cfg.output_basename));
     fastq_merge::tag_and_concat(&[(&n_r1, "N"), (&t_r1, "T")], &merged_r1)?;
     info!(">> Wrote merged R1: {merged_r1:?}");
 
@@ -104,7 +104,7 @@ fn merge_fastqs(
         let t_r2 = need(&tumor.output_fastq_2, "tumor R2")?;
         let merged_r2 = cfg
             .output_dir
-            .join(format!("{}_merged_r2.fastq.gz", cfg.output_prefix));
+            .join(format!("{}_merged_r2.fastq.gz", cfg.output_basename));
         fastq_merge::tag_and_concat(&[(&n_r2, "N"), (&t_r2, "T")], &merged_r2)?;
         info!(">> Wrote merged R2: {merged_r2:?}");
     }
@@ -138,7 +138,7 @@ fn print_summary(cfg: &CancerConfig, truth: &Path) {
     );
     info!(
         "  merged FASTQ:  {}_merged_r1.fastq.gz{}",
-        cfg.output_prefix,
+        cfg.output_basename,
         if cfg.paired_ended { " (+ _r2)" } else { "" }
     );
     info!("  merged truth:  {truth:?} (INFO/EIDOLON_ORIGIN = germline | somatic | shared)");

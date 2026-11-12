@@ -95,7 +95,7 @@ run_eidolon() {
         echo "produce_bam: false"
         echo "overwrite_output: true"
         echo "output_dir: $wd"
-        echo "output_filename: sample"
+        echo "output_basename: sample"
         echo "rng_seed: $seed"
         echo "sv_rate_scale: 0"
         [[ -n "$bed" ]] && echo "target_bed: $bed"

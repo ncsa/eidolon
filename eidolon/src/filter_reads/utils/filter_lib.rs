@@ -7,13 +7,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Lines, Write};
 use std::path::PathBuf;
-use std::sync::Once;
 use thiserror::Error;
-
-/// Guards the one-time pre-v3.0.0 read-name-prefix warning in
-/// `parse_fastq_record_name` — it is called once per FASTQ record, and a per-read
-/// warning on a multi-million-read file would be worse than silence.
-static LEGACY_PREFIX_WARNED: Once = Once::new();
 
 use eidolon_core::file_tools::file_io::{create_output_file, read_gzip_lines, read_lines};
 /// The purpose of this module is to filter a eidolon-generated fastq and vcf file, so that they only show regions
@@ -29,6 +23,8 @@ enum FilterLibError {
     InvalidReadName,
     #[error("Line parsing was not understood: {0}")]
     MalformedLine(String),
+    #[error("pre-v3.0.0 read name: {0}")]
+    RetiredPrefix(String),
 }
 
 impl Iterator for ReaderType {
@@ -85,49 +81,31 @@ fn parse_fastq_record_name(line: &str) -> Result<(String, usize, usize), FilterL
     // for why it's necessary). Parser takes the last three underscore-separated
     // tokens as (start, end, uniq) and ignores uniq.
     const PREFIX: &str = "@EIDOLON_generated_";
-    // v2.0.0 and earlier emitted "@RNEAT_generated_" (v3.0.0 renamed the output
-    // tokens). Accept both: FASTQs are far too large to be worth rewriting just to
-    // change a 19-byte prefix, so legacy output stays filterable. Note the two
-    // prefixes differ in length (19 vs 17), hence the matched-prefix slice below.
-    const LEGACY_PREFIX: &str = "@RNEAT_generated_";
-    let prefix = if line.starts_with(PREFIX) {
-        PREFIX
-    } else if line.starts_with(LEGACY_PREFIX) {
-        // Warn once. Accepting the old prefix silently is the only remaining path where
-        // a user's pre-v3.0.0 data flows through v3.0.0 with no signal that the output
-        // format changed — and a user's own `grep '^@RNEAT_generated_'` over the same
-        // file returns zero rows with exit 0. This is the cheapest place to make that
-        // discoverable, so say it out loud (once, not per read).
-        LEGACY_PREFIX_WARNED.call_once(|| {
-            warn!(
-                "input uses the pre-v3.0.0 read-name prefix \"{}\" (v3.0.0 renamed it to \
-                 \"{}\"). Accepting it for compatibility. Note eidolon does NOT rewrite \
-                 read names — any of your own scripts matching the old prefix will \
-                 silently match nothing. See the \"Upgrading from 2.0.0\" section in the \
-                 README.",
-                LEGACY_PREFIX.trim_start_matches('@'),
-                PREFIX.trim_start_matches('@'),
-            );
-        });
-        LEGACY_PREFIX
-    } else {
-        // A line that *embeds* a known prefix without starting with one is a read
-        // name we can't parse: that's a loud MalformedLine. Anything else is
-        // InvalidReadName, which filter_fastq treats as an ordinary data line.
-        // (Note both prefixes include the leading '@', so the "@N_"/"@T_" tagged
-        // names in a merged cancer FASTQ do NOT land here — they are InvalidReadName
-        // and get dropped. Pre-existing behaviour; no harness runs filter-reads on
-        // a merged FASTQ, so it's untouched here.)
-        return if line.contains(PREFIX) || line.contains(LEGACY_PREFIX) {
+    // v2.0.0 and earlier wrote "@RNEAT_generated_". Through v4 it was still read, with a
+    // warning; v5.0.0 refuses it (#879). It must stay an error, never an ordinary line:
+    // filter_fastq writes ordinary lines through or drops them, so an unrecognized prefix
+    // would leave an empty filtered FASTQ at exit 0.
+    const RETIRED_PREFIX: &str = "@RNEAT_generated_";
+    if line.starts_with(RETIRED_PREFIX) {
+        return Err(FilterLibError::RetiredPrefix(line.to_string()));
+    }
+    if !line.starts_with(PREFIX) {
+        // A line that *embeds* the prefix without starting with it is a read name we
+        // can't parse: that's a loud MalformedLine. Anything else is InvalidReadName,
+        // which filter_fastq treats as an ordinary data line. (The prefix includes the
+        // leading '@', so the "@N_"/"@T_" tagged names in a merged cancer FASTQ do NOT
+        // land here — they are InvalidReadName and get dropped. Pre-existing behavior;
+        // no harness runs filter-reads on a merged FASTQ, so it's untouched here.)
+        return if line.contains(PREFIX) {
             Err(FilterLibError::MalformedLine(line.to_string()))
         } else {
             Err(FilterLibError::InvalidReadName)
         };
-    };
-    // Slice off the matched prefix and the "/N" strand suffix (2 chars). Use
-    // prefix.len() rather than a magic number so a future prefix rename can't
-    // silently shift the offset.
-    let trimmed = &line[prefix.len()..line.len() - 2];
+    }
+    // Slice off the prefix and the "/N" strand suffix (2 chars). Use PREFIX.len()
+    // rather than a magic number so a future prefix rename can't silently shift the
+    // offset.
+    let trimmed = &line[PREFIX.len()..line.len() - 2];
     let split_line: Vec<&str> = trimmed.split('_').collect();
     let length = split_line.len();
     if length < 4 {
@@ -171,6 +149,15 @@ pub fn filter_fastq(
                             return Err(FilterReadsError::FastqFilterError(format!(
                                 "Filter error with line: {}",
                                 line
+                            )));
+                        }
+                        FilterLibError::RetiredPrefix(line) => {
+                            return Err(FilterReadsError::FastqFilterError(format!(
+                                "read name uses the pre-v3.0.0 prefix \"RNEAT_generated_\", \
+                                 which v5.0.0 no longer reads: {line}. Rename it to \
+                                 \"EIDOLON_generated_\" first, e.g. `zcat in.fastq.gz | sed \
+                                 's/^@RNEAT_generated_/@EIDOLON_generated_/' | gzip > \
+                                 out.fastq.gz` (see \"Upgrading from 2.0.0\")."
                             )));
                         }
                         FilterLibError::InvalidReadName => {
@@ -310,16 +297,15 @@ mod tests {
     /// clear MalformedLine error rather than silently parsing the contig as
     /// the wrong thing or panicking. This protects users who feed old eidolon
     /// output through a new filter_reads — they'll see a real error.
-    /// v2.0.0-era `@RNEAT_generated_` read names must still parse — FASTQs are too
-    /// large to rewrite just for a prefix rename. The two prefixes differ in length
-    /// (17 vs 19), so this also pins that the slice uses the *matched* prefix.
+    /// The pre-v3.0.0 `@RNEAT_generated_` prefix is refused as its own error (#879), not
+    /// parsed and not passed through as an ordinary line.
     #[test]
-    fn test_parse_record_name_accepts_pre_rename_prefix() {
-        let old = "@RNEAT_generated_chrom_1_0000001000_0000002000_000000000000002a/1".to_string();
-        assert_eq!(
-            parse_fastq_record_name(&old).unwrap(),
-            ("chrom_1".to_string(), 1000, 2000),
-        );
+    fn test_parse_record_name_refuses_pre_rename_prefix() {
+        let old = "@RNEAT_generated_chrom_1_0000001000_0000002000_000000000000002a/1";
+        assert!(matches!(
+            parse_fastq_record_name(old),
+            Err(FilterLibError::RetiredPrefix(_))
+        ));
     }
 
     #[test]

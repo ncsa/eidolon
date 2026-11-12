@@ -111,7 +111,7 @@ fn indel_rate(dir: &Path, name: &str, seq: &[u8]) -> (f64, usize, usize) {
         "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 1\npaired_ended: false\n\
          mutation_rate: 0.0\n\
          produce_bam: true\nproduce_fastq: false\nproduce_vcf: false\n\
-         overwrite_output: true\noutput_dir: {out}\noutput_filename: {name}\n\
+         overwrite_output: true\noutput_dir: {out}\noutput_basename: {name}\n\
          rng_seed: indel context fidelity\nnum_threads: 1\n",
         ref = reference.display(),
         out = dir.display(),
@@ -366,7 +366,7 @@ fn indel_rate_with_model(dir: &Path, name: &str, seq: &[u8], model: &Path) -> (f
             "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 1\npaired_ended: false\n\
              mutation_rate: 0.0\nsequence_error_model: {model}\n\
              produce_bam: true\nproduce_fastq: false\nproduce_vcf: false\n\
-             overwrite_output: true\noutput_dir: {out}\noutput_filename: {name}\n\
+             overwrite_output: true\noutput_dir: {out}\noutput_basename: {name}\n\
              rng_seed: indel context fidelity\nnum_threads: 1\n",
             ref = reference.display(),
             model = model.display(),
@@ -456,7 +456,7 @@ fn indel_errors_land_in_the_homopolymers_not_merely_at_the_right_overall_rate() 
             "reference: {ref}\nread_len: 100\ncoverage: 60\nploidy: 1\npaired_ended: false\n\
              mutation_rate: 0.0\n\
              produce_bam: true\nproduce_fastq: false\nproduce_vcf: false\n\
-             overwrite_output: true\noutput_dir: {out}\noutput_filename: posmix\n\
+             overwrite_output: true\noutput_dir: {out}\noutput_basename: posmix\n\
              rng_seed: indel context position\nnum_threads: 1\n",
             ref = reference.display(),
             out = tmp.path().display(),

@@ -71,8 +71,8 @@ mkdir -p "$work" "$tmp"
 echo "=== shuffle_bench task $TASK: $cond on $(hostname) ==="
 echo "binary: $("$bin" --version)"
 # The same config, its outputs redirected, shuffle set explicitly either way.
-grep -v -E '^(output_dir|output_filename|num_threads|shuffle_fastq):' "$CONFIG_DIR/sim.yml" > "$work/c.yml"
-printf 'output_dir: %s\noutput_filename: o\nnum_threads: %s\nshuffle_fastq: %s\n' \
+grep -v -E '^(output_dir|output_filename|output_basename|num_threads|shuffle_fastq):' "$CONFIG_DIR/sim.yml" > "$work/c.yml"
+printf 'output_dir: %s\noutput_basename: o\nnum_threads: %s\nshuffle_fastq: %s\n' \
     "$work" "$THREADS" "$shuffle" >> "$work/c.yml"
 
 rc=0

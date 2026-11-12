@@ -126,7 +126,7 @@ done
 # ── 3. generate from each ───────────────────────────────────────────────────────
 for mode in plain degraded; do
     cfg="$WORK/gen_$mode.yml"
-    printf 'reference: %s\noutput_dir: %s\noutput_filename: gen_%s\noverwrite_output: true\nread_len: %s\ncoverage: %s\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\npaired_ended: false\nrng_seed: qualdeg\nsequence_error_model: %s\n' \
+    printf 'reference: %s\noutput_dir: %s\noutput_basename: gen_%s\noverwrite_output: true\nread_len: %s\ncoverage: %s\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\npaired_ended: false\nrng_seed: qualdeg\nsequence_error_model: %s\n' \
         "$REFERENCE" "$WORK" "$mode" "$READ_LEN" "$COVERAGE" "$WORK/model_$mode.json.gz" > "$cfg"
     echo "[3/5] generating from $mode ..."
     "$EIDOLON" gen-reads -c "$cfg" >/dev/null 2>&1

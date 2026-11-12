@@ -118,7 +118,7 @@ fn simulate_vcf_ploidy(dir: &Path, tag: &str, model: &Path, ploidy: usize) -> Pa
             "reference: {r}\nread_len: 100\ncoverage: 5\npaired_ended: false\nploidy: {p}\n\
              mutation_model: {m}\nproduce_vcf: true\nproduce_fastq: false\n\
              produce_bam: false\noverwrite_output: true\noutput_dir: {o}\n\
-             output_filename: bgi_{tag}\nrng_seed: baseline germline {tag}\nnum_threads: 1\n",
+             output_basename: bgi_{tag}\nrng_seed: baseline germline {tag}\nnum_threads: 1\n",
             r = h1n1_reference().display(),
             m = model.display(),
             o = dir.display(),

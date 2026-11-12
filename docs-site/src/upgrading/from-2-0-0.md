@@ -30,9 +30,9 @@ that carries only one of the two. Convert the file instead.
 ## Read names — NOT converted, and this is the part that can bite you
 
 Read names are **not** rewritten, in either FASTQ or BAM. Rewriting files that are
-routinely hundreds of GB to change ~19 bytes per record isn't a reasonable ask, so
-instead `eidolon filter-reads` accepts **both** prefixes natively — legacy FASTQs keep
-working with no conversion step, and it warns once when it sees an old prefix.
+routinely hundreds of GB to change ~19 bytes per record isn't a reasonable ask. Through v4.x,
+`eidolon filter-reads` read both prefixes and warned once on the old one. **From v5.0.0 it
+refuses the old prefix** with an error; rename the reads with the `sed` line below first.
 
 **Nothing protects your own scripts.** A `grep '^@RNEAT_generated_'`, `awk` field split,
 or regex over read names will match **zero records and exit 0** against v3.0.0 output —

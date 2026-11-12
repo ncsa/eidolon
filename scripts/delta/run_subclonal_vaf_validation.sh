@@ -127,7 +127,7 @@ YML="$OUTDIR/cancer.yml"
 {
   echo "reference: $REF"
   echo "output_dir: $OUTDIR"
-  echo "output_prefix: subvaf"
+  echo "output_basename: subvaf"
   echo "total_coverage: $COV"
   echo "purity: $PURITY"
   echo "read_len: 151"

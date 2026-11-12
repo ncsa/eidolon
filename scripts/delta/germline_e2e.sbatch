@@ -203,7 +203,7 @@ produce_vcf: true
 produce_bam: false
 overwrite_output: true
 output_dir: $wd
-output_filename: sample
+output_basename: sample
 rng_seed: $SEED
 sv_rate_scale: 0
 num_threads: $THREADS

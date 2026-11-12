@@ -87,7 +87,7 @@ produce_vcf: false
 produce_bam: false
 overwrite_output: true
 output_dir: $d
-output_filename: s
+output_basename: s
 rng_seed: threadscale $T $rep
 num_threads: $T
 YAML

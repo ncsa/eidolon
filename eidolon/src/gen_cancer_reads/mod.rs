@@ -19,8 +19,8 @@ pub fn main(config: &PathBuf) -> Result<(), GenCancerReadsError> {
 
     if !cfg.overwrite_output {
         for name in [
-            format!("{}_merged_r1.fastq.gz", cfg.output_prefix),
-            format!("{}_merged_truth.vcf.gz", cfg.output_prefix),
+            format!("{}_merged_r1.fastq.gz", cfg.output_basename),
+            format!("{}_merged_truth.vcf.gz", cfg.output_basename),
         ] {
             let p = cfg.output_dir.join(&name);
             if p.is_file() {

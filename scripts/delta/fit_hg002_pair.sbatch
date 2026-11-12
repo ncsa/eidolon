@@ -126,7 +126,7 @@ if "quality_score_model_r2" not in m:
              "       duplicate. REBUILD (see the header) and resubmit.")
 print("      ok: model carries a separate R2 population")
 PY
-printf 'reference: %s\noutput_dir: %s\noutput_filename: pre\noverwrite_output: true\nread_len: %s\ncoverage: 1\npaired_ended: true\nfragment_mean: %s.0\nfragment_st_dev: 60.0\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\nmutation_rate: 0.0\nrng_seed: preflight\nsequence_error_model: %s\n' \
+printf 'reference: %s\noutput_dir: %s\noutput_basename: pre\noverwrite_output: true\nread_len: %s\ncoverage: 1\npaired_ended: true\nfragment_mean: %s.0\nfragment_st_dev: 60.0\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\nmutation_rate: 0.0\nrng_seed: preflight\nsequence_error_model: %s\n' \
     "$REFERENCE" "$PRE" "$READ_LEN" "$FRAGMENT_MEAN" "$PRE/model.json.gz" > "$PRE/gen.yml"
 "$EIDOLON" gen-reads -c "$PRE/gen.yml" > "$PRE/gen.log" 2>&1
 python3 - "$PRE/pre_r2.fastq.gz" <<'PY' || exit 1
@@ -218,7 +218,7 @@ echo
 
 # ── 4. generate paired reads from each model ────────────────────────────────────
 generate() {  # <tag> <model>
-    printf 'reference: %s\noutput_dir: %s\noutput_filename: gen_%s\noverwrite_output: true\nread_len: %s\ncoverage: %s\npaired_ended: true\nfragment_mean: %s.0\nfragment_st_dev: 60.0\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\nmutation_rate: 0.0\nrng_seed: hg002pair\nsequence_error_model: %s\n' \
+    printf 'reference: %s\noutput_dir: %s\noutput_basename: gen_%s\noverwrite_output: true\nread_len: %s\ncoverage: %s\npaired_ended: true\nfragment_mean: %s.0\nfragment_st_dev: 60.0\nproduce_fastq: true\nproduce_bam: false\nproduce_vcf: false\nmutation_rate: 0.0\nrng_seed: hg002pair\nsequence_error_model: %s\n' \
         "$REFERENCE" "$WORK" "$1" "$READ_LEN" "$COVERAGE" "$FRAGMENT_MEAN" "$2" > "$WORK/gen_$1.yml"
     "$EIDOLON" gen-reads -c "$WORK/gen_$1.yml" > "$WORK/gen_$1.log" 2>&1
 }

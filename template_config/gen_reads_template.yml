@@ -77,7 +77,7 @@ output_dir: .
 
 # Stem name applied to all output files.
 # e.g., "my_run" produces my_run_r1.fastq.gz, my_run.vcf.gz, my_run.bam (default: "neat_out")
-output_filename: neat_out
+output_basename: neat_out   # file name only, no directory; the directory is output_dir
 
 # Set to true to overwrite existing output files. false will error on collision. (default: false)
 overwrite_output: false

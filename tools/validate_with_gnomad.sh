@@ -241,7 +241,7 @@ paired_ended: false
 mutation_model: $TRAINED_MODEL
 sv_rate_scale: 1.0
 output_dir: $(pwd)/reads_out
-output_filename: validation
+output_basename: validation
 produce_fastq: true
 produce_vcf: true
 overwrite_output: true
