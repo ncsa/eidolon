@@ -114,6 +114,9 @@ fragment_model: .
 # exome runs on large genomes, where post-hoc filtering with `filter-reads` would
 # otherwise process the entire genome first.
 #
+# With a BED, `coverage` is the mean depth over the target bases (v5.0.0): the fragment budget
+# is scaled up to cover the reads that spill past a target's edge.
+#
 # Coordinates must use the same contig names as the reference FASTA.
 # Omit (or set to .) to generate reads over the full reference. (default: none)
 target_bed: .
