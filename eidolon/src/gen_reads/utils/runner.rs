@@ -932,6 +932,11 @@ fn process_chunk(
             for (sub_start, sub_end, mult) in
                 split_region_by_multipliers(region_start, region_end, &coverage_multipliers)
             {
+                // A target region that owns fragments even when narrower than a read (#881). Only a
+                // whole target qualifies: a piece an SV event carved out of one is covered by its
+                // neighbors' reads, and a budget of its own over-delivers there.
+                let allow_narrow =
+                    ctx.target_bed.is_some() && (sub_start, sub_end) == (region_start, region_end);
                 let scaled = scale_coverage(ctx.config.coverage, mult);
                 if scaled == 0 {
                     continue;
@@ -1130,6 +1135,7 @@ fn process_chunk(
                         keep_short,
                         ctx.fragment_length_model,
                         ctx.budget_scale,
+                        allow_narrow,
                         &mut rng,
                     )?;
                     block_frags.extend(alt_frags.into_iter().map(|(s, e)| PlacedFragment {
@@ -1155,6 +1161,7 @@ fn process_chunk(
                         keep_short,
                         ctx.fragment_length_model,
                         ctx.budget_scale,
+                        allow_narrow,
                         &mut rng,
                     )?
                 } else {
@@ -1172,6 +1179,7 @@ fn process_chunk(
                         ctx.config.long_reads,
                         keep_short,
                         ctx.budget_scale,
+                        allow_narrow,
                         &mut rng,
                     )?
                 };
