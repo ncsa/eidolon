@@ -33,6 +33,26 @@ pub(crate) fn fragment_budget(
     ((len as f64 * coverage as f64 / denom as f64) * budget_scale).ceil() as usize
 }
 
+/// Whether a region owns no fragments because it is too short to hold a read.
+///
+/// With `allow_narrow`, real sequence past the far edge counts: a fragment owned by a narrow
+/// target starts inside it and runs on. Without it the region's own width alone decides, as it
+/// always did. Only target-BED regions pass `true`; the short segments an SV event carves out of
+/// a contig are already covered by their neighbors' reads, and giving them a budget of their own
+/// over-delivers depth by about 8% in a 100 bp gap between two deletions (#881).
+pub(crate) fn narrow_region_is_empty(
+    width: usize,
+    extension_budget: usize,
+    min_region: usize,
+    allow_narrow: bool,
+) -> bool {
+    if allow_narrow {
+        width.saturating_add(extension_budget) <= min_region
+    } else {
+        width <= min_region
+    }
+}
+
 pub fn generate_fragments(
     // How far past `sequence_length` (local, region-relative) real sequence
     // continues: 0 means `sequence_length` IS the true end of what can be
@@ -62,6 +82,7 @@ pub fn generate_fragments(
     // Multiplies the fragment budget (1.0 = no change). A `target_bed` run passes 1 / (the
     // on-target fraction of its read bases) so `coverage` means on-target depth (#578).
     budget_scale: f64,
+    allow_narrow: bool,
     rng: &mut NeatRng,
 ) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
     // Takes:
@@ -86,7 +107,7 @@ pub fn generate_fragments(
     // Real sequence past the region's far edge counts: a fragment owned by a narrow target starts
     // inside it and runs on, so only a region that cannot hold a read even with that room is
     // empty. At a true terminus (extension_budget 0) this is the old test.
-    if sequence_length.saturating_add(extension_budget) <= min_region {
+    if narrow_region_is_empty(sequence_length, extension_budget, min_region, allow_narrow) {
         debug!("Sequence length was too short, maybe because of a small bed region.");
         return Ok(Vec::new());
     }
@@ -305,6 +326,7 @@ pub fn generate_weighted_fragments(
     keep_short: bool,
     // See `generate_fragments`: multiplies the fragment budget, 1.0 = no change.
     budget_scale: f64,
+    allow_narrow: bool,
     rng: &mut NeatRng,
 ) -> Result<Vec<(usize, usize)>, GenerateReadsError> {
     const MAX_COVERAGE_MULTIPLIER: usize = 100;
@@ -312,7 +334,7 @@ pub fn generate_weighted_fragments(
     let region_len = region_end.saturating_sub(region_start);
     let min_region = if long_reads { 0 } else { read_length };
     // See generate_fragments: room past the far edge lets a narrow region own fragments.
-    if region_len.saturating_add(extension_budget) <= min_region {
+    if narrow_region_is_empty(region_len, extension_budget, min_region, allow_narrow) {
         debug!("Region too short for weighted fragment generation.");
         return Ok(Vec::new());
     }
@@ -600,7 +622,7 @@ mod tests {
         let mut rng = make_rng();
         let model = FragmentLengthModel::new_normal(300.0, 20.0).unwrap();
         let frags = generate_fragments(
-            10_000, 126, 150, 5_000, 30, true, false, false, &model, 1.0, &mut rng,
+            10_000, 126, 150, 5_000, 30, true, false, false, &model, 1.0, true, &mut rng,
         )
         .unwrap();
         assert_eq!(frags.len(), 13);
@@ -617,10 +639,29 @@ mod tests {
         let mut rng = make_rng();
         let model = FragmentLengthModel::new_normal(300.0, 20.0).unwrap();
         let frags = generate_fragments(
-            0, 126, 150, 5_000, 30, true, false, false, &model, 1.0, &mut rng,
+            0, 126, 150, 5_000, 30, true, false, false, &model, 1.0, true, &mut rng,
         )
         .unwrap();
         assert!(frags.is_empty());
+    }
+
+    /// MUST NOT FIRE: a piece an SV event carved out of a contig does not get the narrow-region
+    /// rule. The same 126 bp region with sequence beyond it places nothing without
+    /// `allow_narrow`, which is the behavior before #881 and what keeps a 60 bp gap between two
+    /// deletions at the depth its neighbors supply.
+    #[test]
+    fn a_narrow_region_without_allow_narrow_places_nothing() {
+        let mut rng = make_rng();
+        let model = FragmentLengthModel::new_normal(300.0, 20.0).unwrap();
+        let frags = generate_fragments(
+            10_000, 126, 150, 5_000, 30, true, false, false, &model, 1.0, false, &mut rng,
+        )
+        .unwrap();
+        assert!(frags.is_empty());
+        assert!(narrow_region_is_empty(126, 10_000, 150, false));
+        assert!(!narrow_region_is_empty(126, 10_000, 150, true));
+        assert!(narrow_region_is_empty(126, 0, 150, true));
+        assert!(!narrow_region_is_empty(151, 0, 150, false));
     }
 
     fn make_rng() -> NeatRng {
@@ -724,6 +765,7 @@ mod tests {
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -755,6 +797,7 @@ mod tests {
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -778,6 +821,7 @@ mod tests {
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
             1.0,
+            false,
             &mut rng2,
         )
         .unwrap();
@@ -808,6 +852,7 @@ mod tests {
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -849,6 +894,7 @@ mod tests {
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -885,6 +931,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -919,6 +966,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -950,6 +998,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -982,6 +1031,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1023,6 +1073,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng1,
         )
         .unwrap();
@@ -1042,6 +1093,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng2,
         )
         .unwrap();
@@ -1075,6 +1127,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1094,6 +1147,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1135,6 +1189,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1179,6 +1234,7 @@ mod tests {
             false,
             false, // keep_short (off in these fragment-placement tests)
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1358,6 +1414,7 @@ mod tests {
             false, // keep_short (off in these fragment-placement tests)
             &fragment_model,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1422,6 +1479,7 @@ mod tests {
             false, // long_reads
             false, // keep_short
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1486,6 +1544,7 @@ mod tests {
             false, // long_reads
             false, // keep_short
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1861,6 +1920,7 @@ mod tests {
             false,
             false,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1906,6 +1966,7 @@ mod tests {
             false,
             false,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -1943,6 +2004,7 @@ mod tests {
             false,
             false,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -2094,6 +2156,7 @@ mod tests {
             false,
             false,
             1.0,
+            false,
             &mut rng,
         )
         .unwrap();
@@ -2140,6 +2203,7 @@ mod tests {
                 false,
                 false,
                 1.0,
+                false,
                 &mut rng,
             )
             .unwrap();
