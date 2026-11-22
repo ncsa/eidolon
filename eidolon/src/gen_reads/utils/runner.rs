@@ -48,6 +48,7 @@ use crate::{
             generate_fragments::{generate_fragments, generate_weighted_fragments},
             generate_variants::generate_variants,
             subclone::SubcloneModel,
+            tandem_dup::{self, DupFragment},
         },
     },
 };
@@ -1168,6 +1169,60 @@ fn process_chunk(
                     block_frags.extend(frags.into_iter().map(PlacedFragment::from));
                 }
             }
+
+            // The extra copy of every tandem duplication starting in this region (#884). A
+            // fragment that ends inside the span is an ordinary reference fragment; one that
+            // runs past its end crosses the junction and is the chimeric pass's. Starts are
+            // owned by the region that contains them, like every other fragment.
+            for dup in &sv_variants {
+                let Some(sv) = dup.alternate.as_symbolic() else {
+                    continue;
+                };
+                if sv.sv_type != SvType::Dup {
+                    continue;
+                }
+                let span_start = dup.location + 1;
+                let Some(span_end) = sv
+                    .end
+                    .or_else(|| sv.span(dup.location).map(|n| dup.location + n - 1))
+                else {
+                    continue;
+                };
+                if span_start >= region_end || span_end <= region_start {
+                    continue;
+                }
+                let Some(excess) = dup_excess(
+                    dup,
+                    sv,
+                    ctx.config.ploidy,
+                    ctx.config.subclone_model.is_some(),
+                ) else {
+                    continue;
+                };
+                let mut dup_draws = dup_rng(&ctx.base_rng, &contig_name, span_start, span_end);
+                let extra = tandem_dup::sample_extra_copy(
+                    span_start,
+                    span_end,
+                    excess,
+                    ctx.config.coverage,
+                    ctx.config.read_len,
+                    ctx.config.paired_ended,
+                    ctx.config.long_reads,
+                    keep_short,
+                    ctx.fragment_length_model,
+                    &mut dup_draws,
+                )?;
+                block_frags.extend(
+                    extra
+                        .into_iter()
+                        .filter(|f| {
+                            !f.crosses_junction(span_end)
+                                && f.start >= region_start
+                                && f.start < region_end
+                        })
+                        .map(|f| PlacedFragment::from((f.start, f.start + f.frag_len))),
+                );
+            }
         }
         block_frags
     };
@@ -2102,43 +2157,37 @@ fn process_chimeric_variants(
                     continue;
                 }
 
-                let mult = sv_effective_fraction(
+                // The extra copy's fragments, drawn once for both passes (`tandem_dup`): the ones
+                // that end inside the span are ordinary reads and belong to the regular pass.
+                // Here only those that run past END, into the tandem junction.
+                let Some(excess) = dup_excess(
                     sv_rec,
+                    sv,
                     ctx.config.ploidy,
                     ctx.config.subclone_model.is_some(),
-                );
-
-                let num_frags = scale_coverage(ctx.config.coverage, mult);
-                if num_frags == 0 {
+                ) else {
                     continue;
-                }
+                };
+                let span_start = sv_rec.location + 1;
+                let mut dup_draws = dup_rng(&ctx.base_rng, contig_name, span_start, end);
+                let keep_short = ctx.config.adapters.enabled || ctx.config.keep_short_fragments;
+                let frags = tandem_dup::sample_extra_copy(
+                    span_start,
+                    end,
+                    excess,
+                    ctx.config.coverage,
+                    ctx.config.read_len,
+                    ctx.config.paired_ended,
+                    ctx.config.long_reads,
+                    keep_short,
+                    ctx.fragment_length_model,
+                    &mut dup_draws,
+                )?;
 
-                for frag_idx in 0..num_frags {
-                    let se_pad = if ctx.config.paired_ended { 0 } else { 32 };
-                    let frag_len = if ctx.config.paired_ended {
-                        let mut attempts = 0;
-                        let mut f = 0;
-                        while attempts < 100 {
-                            let rand_val = rng.random().map_err(GenerateReadsError::from)?;
-                            f = ctx
-                                .fragment_length_model
-                                .generate_fragment(rand_val)
-                                .map_err(GenerateReadsError::from)?
-                                as usize;
-                            if ctx.config.long_reads || f >= ctx.config.read_len + 10 {
-                                break;
-                            }
-                            attempts += 1;
-                        }
-                        if f < ctx.config.read_len && !ctx.config.long_reads {
-                            f = ctx.config.read_len + 10;
-                        }
-                        f
-                    } else {
-                        ctx.config.read_len + se_pad
-                    };
-
-                    let offset = balanced_chimeric_offset(frag_len, ctx.config.read_len, &mut rng)?;
+                for (frag_idx, frag) in frags.iter().filter(|f| f.crosses_junction(end)).enumerate()
+                {
+                    let DupFragment { frag_len, .. } = *frag;
+                    let offset = frag.junction_offset(end);
 
                     let result = generate_dup_pair(
                         ctx,
@@ -2769,12 +2818,10 @@ fn generate_dup_pair(
 /// START of the duplicated region (REF[location..location+len2]) —
 /// representing the first bases of the new tandem copy.
 ///
-/// For small DUPs (span smaller than len1 or len2) the pieces are
-/// capped by the contig boundaries only; the resulting stitched
-/// fragment may then look like the unbroken reference (if the windows
-/// extend into surrounding context on both sides), in which case BWA
-/// aligns it normally and the read contributes no SV signal. That's
-/// acceptable — tiny DUPs are below most callers' resolution anyway.
+/// The right piece is not capped at the span: after the junction the molecule is the second copy
+/// followed by the flank, so a fragment longer than the span legitimately reads on into reference
+/// past END. A span shorter than the left piece reaches back into the sequence before POS,
+/// which is the same molecule seen from further left.
 fn get_dup_pieces(
     contig: &str,
     location: usize, // 0-based POS (first base of dup region)
@@ -3764,28 +3811,22 @@ fn build_coverage_multipliers(
                 continue;
             }
         };
-        let base_mult =
-            match coverage_multiplier_for(sv.sv_type, sv.copy_number, &v.genotype, ploidy) {
-                Some(m) => m,
-                None => {
-                    warn!(
-                        "CNV at 1-based POS {} has no INFO/CN — cannot determine copy number; \
+        // A tandem duplication is not a depth multiplier. Its extra copy is sampled as fragments
+        // that start in the span and follow the new junction (`tandem_dup`), so raising the start
+        // density here as well would count it twice and push reads into the flank (#884).
+        if sv.sv_type == SvType::Dup {
+            continue;
+        }
+        let mult = match sv_modulation_multiplier(v, sv, ploidy, use_subclone) {
+            Some(m) => m,
+            None => {
+                warn!(
+                    "CNV at 1-based POS {} has no INFO/CN — cannot determine copy number; \
                      skipping coverage modulation",
-                        pos_1based
-                    );
-                    continue;
-                }
-            };
-        let mult = if use_subclone {
-            let dosage = sv_dosage_fraction(v, ploidy);
-            let ccf = if dosage > 0.0 {
-                (v.allele_fraction.unwrap_or(dosage) / dosage).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            1.0 + (base_mult - 1.0) * ccf
-        } else {
-            base_mult
+                    pos_1based
+                );
+                continue;
+            }
         };
         if (mult - 1.0).abs() < f64::EPSILON {
             continue;
@@ -3799,6 +3840,52 @@ fn build_coverage_multipliers(
     }
     segments
 }
+
+/// The depth multiplier a symbolic SV declares: `CN / ploidy` or the genotype's, composed with the
+/// subclone's cellular fraction when one is in use. `None` for a `<CNV>` with no copy number.
+fn sv_modulation_multiplier(
+    v: &Variant,
+    sv: &SvData,
+    ploidy: usize,
+    use_subclone: bool,
+) -> Option<f64> {
+    let base_mult = coverage_multiplier_for(sv.sv_type, sv.copy_number, &v.genotype, ploidy)?;
+    Some(if use_subclone {
+        let dosage = sv_dosage_fraction(v, ploidy);
+        let ccf = if dosage > 0.0 {
+            (v.allele_fraction.unwrap_or(dosage) / dosage).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        1.0 + (base_mult - 1.0) * ccf
+    } else {
+        base_mult
+    })
+}
+
+/// How many copies of a duplicated span a symbolic `<DUP>` adds to the molecules sampled, as a
+/// fraction of the baseline (0.5 heterozygous on a diploid, 1.0 homozygous). `None` when it adds
+/// none.
+fn dup_excess(v: &Variant, sv: &SvData, ploidy: usize, use_subclone: bool) -> Option<f64> {
+    tandem_dup::excess_fraction(sv_modulation_multiplier(v, sv, ploidy, use_subclone)?)
+}
+
+/// A child RNG for one duplication, keyed by where it is. The regular pass and the chimeric pass
+/// both draw the duplication's extra-copy fragments and must draw the same ones.
+fn dup_rng(base: &NeatRng, contig: &str, span_start: usize, span_end: usize) -> NeatRng {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in contig
+        .bytes()
+        .chain(span_start.to_le_bytes())
+        .chain(span_end.to_le_bytes())
+    {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    base.derive_child(h ^ DUP_STREAM)
+}
+
+/// Stream key for [`dup_rng`], kept apart from the per-contig and per-chunk derivations.
+const DUP_STREAM: u64 = 0x0d09_0000_0000_0884;
 
 /// Returns the 0-based half-open coordinate range over which a symbolic SV
 /// modulates coverage, given the variant's 0-based stored `location` (= VCF
@@ -4914,21 +5001,51 @@ mod tests {
         assert_eq!(segs, vec![(0, 101, 1.0), (101, 200, 0.0), (200, 500, 1.0)]);
     }
 
+    /// A duplication is not a depth multiplier (#884): its extra copy is sampled as fragments, so a
+    /// multiplier here as well would count it twice. The extra copy it adds is 0.5 of the baseline
+    /// heterozygous and 1.0 homozygous on a diploid.
     #[test]
-    fn test_build_coverage_multipliers_het_dup_inflates_span() {
-        // <DUP> heterozygous on diploid → multiplier 1.5.
-        let svs = vec![sv_variant_with_span(
+    fn a_duplication_adds_an_extra_copy_and_no_depth_multiplier() {
+        for (genotype, excess) in [(Genotype::Heterozygous, 0.5), (Genotype::Homozygous, 1.0)] {
+            let svs = vec![sv_variant_with_span(
+                50,
+                149,
+                SvType::Dup,
+                genotype.clone(),
+                None,
+            )];
+            let segs = build_coverage_multipliers(&svs, 2, 300, false);
+            assert_eq!(segs, vec![(0, 300, 1.0)], "{genotype:?}: still modulated");
+            let sv = svs[0].alternate.as_symbolic().unwrap();
+            assert_eq!(dup_excess(&svs[0], sv, 2, false), Some(excess));
+        }
+        // A copy number of 4 on a diploid is a multiplier of 2.0, so an excess of 1.0; of 6, an
+        // excess of 2.0.
+        for (cn, excess) in [(4, 1.0), (6, 2.0)] {
+            let svs = vec![sv_variant_with_span(
+                50,
+                149,
+                SvType::Dup,
+                Genotype::Heterozygous,
+                Some(cn),
+            )];
+            let sv = svs[0].alternate.as_symbolic().unwrap();
+            assert_eq!(dup_excess(&svs[0], sv, 2, false), Some(excess), "CN {cn}");
+        }
+        // Must not fire: a deletion is still a multiplier and adds no copy.
+        let del = vec![sv_variant_with_span(
             50,
             149,
-            SvType::Dup,
+            SvType::Del,
             Genotype::Heterozygous,
             None,
         )];
-        // POS = 51 (1-based); span = 149 - 51 + 1 = 99. The anchor at POS is not
-        // duplicated, so the affected range is [51, 50 + 99) = [51, 149).
-        // Was [50, 149) — one base early.
-        let segs = build_coverage_multipliers(&svs, 2, 300, false);
-        assert_eq!(segs, vec![(0, 51, 1.0), (51, 149, 1.5), (149, 300, 1.0)]);
+        assert_eq!(
+            build_coverage_multipliers(&del, 2, 300, false),
+            vec![(0, 51, 1.0), (51, 149, 0.5), (149, 300, 1.0)]
+        );
+        let sv = del[0].alternate.as_symbolic().unwrap();
+        assert_eq!(dup_excess(&del[0], sv, 2, false), None);
     }
 
     #[test]

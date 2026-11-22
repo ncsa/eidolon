@@ -677,6 +677,26 @@ fn junction_pairs_survive_r2_deletion_errors() {
     for e in &events {
         *expected.entry(e.class).or_default() += if e.class == Class::Inv { 8 } else { 4 };
     }
+    // A duplication's junction fragments are the ones its extra copy places across the junction
+    // (#884), so their number depends on the fragment lengths drawn and is not `coverage` per
+    // event. Those draws do not depend on sequencing errors, so the same run with no errors
+    // gives the count that must survive them.
+    let (_base_dir, base_work) = fresh_workdir();
+    let base_events = simulate(&base_work, 0.0, 0.0);
+    let base_dups = read_gzip_fastq_lines(&base_work.join("frame_r1.fastq.gz"))
+        .chunks(4)
+        .filter(|rec| {
+            let name = rec[0].trim_start_matches('@');
+            base_events
+                .iter()
+                .any(|e| e.class == Class::Dup && name.starts_with(&e.qname_prefix))
+        })
+        .count();
+    assert!(
+        base_dups > 0,
+        "the baseline run placed no duplication junction pairs, so there is nothing to compare"
+    );
+    expected.insert(Class::Dup, base_dups);
     for (mate, file) in [(1, "frame_r1.fastq.gz"), (2, "frame_r2.fastq.gz")] {
         let lines = read_gzip_fastq_lines(&work.join(file));
         let mut got: HashMap<Class, usize> = HashMap::new();
