@@ -16,6 +16,12 @@
 //! into the flank, and the junction reads came on top of them: depth past the end of a
 //! 500 bp duplication read 1.2 to 1.4 times a no-variant control.
 //!
+//! A span shorter than a fragment has a second population. A fragment that starts *before* it and
+//! runs through it continues into the second copy as well, so on a carrier it too is a junction
+//! read. The reference sampling draws it as an ordinary fragment that carries on into the flank,
+//! so the regular pass gives it up ([`is_diverted`]) and [`sample_flank_crossers`] draws it as a
+//! junction read. A span longer than every fragment has none, and nothing is diverted.
+//!
 //! The excess may exceed 1.0 (a copy number of 4 or more on a diploid): each additional copy
 //! contributes one more population with the same geometry.
 
@@ -103,6 +109,86 @@ pub fn sample_extra_copy(
         out.push(DupFragment { start, frag_len });
     }
     Ok(out)
+}
+
+/// How far before the span a fragment can start and still be drawn as a flank crosser. Longer
+/// than any fragment a run draws, so the window does not truncate the distribution.
+pub const FLANK_WINDOW: usize = 2_000;
+
+/// The share of the molecules that carry the duplication, for the fragments that start before it.
+/// Heterozygous on a diploid is 0.5, homozygous and above is 1.0.
+pub fn carrier_share(excess: f64) -> f64 {
+    excess.clamp(0.0, 1.0)
+}
+
+/// A duplication whose flank crossers are diverted, in reference coordinates `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DupSpan {
+    pub start: usize,
+    pub end: usize,
+    pub share: f64,
+}
+
+/// Fragments that start before the span and run through it. On a molecule carrying the
+/// duplication they continue into the second copy, so they cross the junction exactly like the
+/// ones that start inside it. Only a span shorter than a fragment has any: a fragment that starts
+/// before `span_start` crosses `span_end` only if it is longer than the span.
+///
+/// `share` is the carrier share (see [`carrier_share`]). The count is the carriers' fragment
+/// density times the window, drawn the same way as [`sample_extra_copy`] and filtered to the ones
+/// that reach the end.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_flank_crossers(
+    span_start: usize,
+    span_end: usize,
+    share: f64,
+    coverage: usize,
+    read_length: usize,
+    paired_ended: bool,
+    long_reads: bool,
+    keep_short: bool,
+    model: &FragmentLengthModel,
+    rng: &mut NeatRng,
+) -> Result<Vec<DupFragment>, GenerateReadsError> {
+    if span_end <= span_start || !share.is_finite() || share <= 0.0 || coverage == 0 {
+        return Ok(Vec::new());
+    }
+    let window = FLANK_WINDOW.min(span_start);
+    let candidates = sample_extra_copy(
+        span_start - window,
+        span_start,
+        share,
+        coverage,
+        read_length,
+        paired_ended,
+        long_reads,
+        keep_short,
+        model,
+        rng,
+    )?;
+    Ok(candidates
+        .into_iter()
+        .filter(|f| f.crosses_junction(span_end))
+        .collect())
+}
+
+/// Whether a baseline fragment `[start, end)` is one the duplication takes over. It starts before
+/// the span and ends after it, so on a carrier it continues into the second copy instead of into
+/// the flank. Diverted fragments are replaced by [`sample_flank_crossers`]; keeping both would
+/// count them twice. Drawn with probability `share`; no draw when it is 1.
+pub fn is_diverted(
+    start: usize,
+    end: usize,
+    spans: &[DupSpan],
+    rng: &mut NeatRng,
+) -> Result<bool, GenerateReadsError> {
+    for d in spans {
+        let crosses = start < d.start && end > d.end;
+        if crosses && (d.share >= 1.0 || rng.random()? < d.share) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -289,5 +375,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b);
+    }
+
+    /// A span of 100 bp under 250 bp fragments: fragments that start before it and reach past it.
+    /// Each fragment length has `length - span` such starts per base of density.
+    #[test]
+    fn flank_crossers_start_before_the_span_and_reach_past_it() {
+        let frags = sample_flank_crossers(
+            5_000,
+            5_100,
+            1.0,
+            1_000,
+            100,
+            true,
+            false,
+            false,
+            &model(250.0),
+            &mut rng("flank"),
+        )
+        .unwrap();
+        // density 1000 / 200 per base, (250 - 100) starts per fragment length.
+        let expected = 1_000.0 / 200.0 * 150.0;
+        let n = frags.len() as f64;
+        assert!((n / expected - 1.0).abs() < 0.10, "{n} vs {expected}");
+        for f in &frags {
+            assert!(f.start < 5_000 && f.crosses_junction(5_100), "{f:?}");
+            let off = f.junction_offset(5_100);
+            assert!(off > 100 && off < f.frag_len, "offset {off}");
+        }
+    }
+
+    /// Does not fire: a span longer than every fragment cannot be started before and crossed.
+    #[test]
+    fn a_span_longer_than_a_fragment_has_no_flank_crossers() {
+        let frags = sample_flank_crossers(
+            5_000,
+            6_000,
+            1.0,
+            1_000,
+            100,
+            true,
+            false,
+            false,
+            &model(250.0),
+            &mut rng("long"),
+        )
+        .unwrap();
+        assert!(frags.is_empty());
+    }
+
+    #[test]
+    fn the_carrier_share_is_the_excess_capped_at_one() {
+        assert_eq!(carrier_share(0.5), 0.5);
+        assert_eq!(carrier_share(1.0), 1.0);
+        assert_eq!(carrier_share(2.0), 1.0);
+        assert_eq!(carrier_share(-1.0), 0.0);
+    }
+
+    /// The decision, at every edge: only a fragment that starts before the span AND ends after it.
+    #[test]
+    fn only_a_fragment_that_starts_before_and_ends_after_the_span_is_diverted() {
+        let spans = [DupSpan {
+            start: 1_000,
+            end: 1_100,
+            share: 1.0,
+        }];
+        let mut r = rng("div");
+        let mut d = |s, e| is_diverted(s, e, &spans, &mut r).unwrap();
+        assert!(d(999, 1_101), "one base each side");
+        assert!(!d(1_000, 1_300), "starts inside the span");
+        assert!(!d(900, 1_100), "ends at the end, has not crossed");
+        assert!(!d(900, 1_000), "stops before the span");
+        assert!(!d(1_200, 1_500), "past the span");
+        assert!(!d(0, 50));
+    }
+
+    #[test]
+    fn a_diverted_fragment_is_drawn_with_the_carrier_share() {
+        let spans = [DupSpan {
+            start: 1_000,
+            end: 1_100,
+            share: 0.5,
+        }];
+        let mut r = rng("coin");
+        let n = (0..10_000)
+            .filter(|_| is_diverted(900, 1_200, &spans, &mut r).unwrap())
+            .count();
+        assert!((4_700..=5_300).contains(&n), "{n} of 10000");
+        // A fragment that cannot be diverted draws nothing, so the stream is untouched.
+        let mut a = rng("same");
+        let mut b = rng("same");
+        assert!(!is_diverted(0, 50, &spans, &mut a).unwrap());
+        assert_eq!(a.random().unwrap(), b.random().unwrap());
     }
 }

@@ -1247,6 +1247,13 @@ fn process_chunk(
         &mut rng,
     )?;
 
+    let dup_spans = dup_spans(
+        &mutated_map.sv_records,
+        ctx.config.ploidy,
+        ctx.config.subclone_model.is_some(),
+    );
+    let block_fragments = divert_dup_crossers(block_fragments, &dup_spans, &mut rng)?;
+
     let mut contig_files_r1: Vec<PathBuf> = Vec::new();
     let mut contig_files_r2: Vec<PathBuf> = Vec::new();
 
@@ -2184,9 +2191,28 @@ fn process_chimeric_variants(
                     &mut dup_draws,
                 )?;
 
-                for (frag_idx, frag) in frags.iter().filter(|f| f.crosses_junction(end)).enumerate()
-                {
-                    let DupFragment { frag_len, .. } = *frag;
+                // Fragments that start before the span and run through it are the same junction
+                // reads on a carrier, and the regular pass gives up the matching ones
+                // (`divert_dup_crossers`). Only a span shorter than a fragment has any.
+                let flank = tandem_dup::sample_flank_crossers(
+                    span_start,
+                    end,
+                    tandem_dup::carrier_share(excess),
+                    ctx.config.coverage,
+                    ctx.config.read_len,
+                    ctx.config.paired_ended,
+                    ctx.config.long_reads,
+                    keep_short,
+                    ctx.fragment_length_model,
+                    &mut dup_draws,
+                )?;
+                let crossers = frags
+                    .iter()
+                    .copied()
+                    .filter(|f| f.crosses_junction(end))
+                    .chain(flank);
+                for (frag_idx, frag) in crossers.enumerate() {
+                    let DupFragment { frag_len, .. } = frag;
                     let offset = frag.junction_offset(end);
 
                     let result = generate_dup_pair(
@@ -3868,6 +3894,53 @@ fn sv_modulation_multiplier(
 /// none.
 fn dup_excess(v: &Variant, sv: &SvData, ploidy: usize, use_subclone: bool) -> Option<f64> {
     tandem_dup::excess_fraction(sv_modulation_multiplier(v, sv, ploidy, use_subclone)?)
+}
+
+/// Every duplication with a span and a dosage, for diverting the fragments that cross it.
+fn dup_spans(
+    sv_records: &[Variant],
+    ploidy: usize,
+    use_subclone: bool,
+) -> Vec<tandem_dup::DupSpan> {
+    sv_records
+        .iter()
+        .filter_map(|v| {
+            let sv = v.alternate.as_symbolic()?;
+            if sv.sv_type != SvType::Dup {
+                return None;
+            }
+            let end = sv
+                .end
+                .or_else(|| sv.span(v.location).map(|n| v.location + n - 1))?;
+            let excess = dup_excess(v, sv, ploidy, use_subclone)?;
+            Some(tandem_dup::DupSpan {
+                start: v.location + 1,
+                end,
+                share: tandem_dup::carrier_share(excess),
+            })
+        })
+        .collect()
+}
+
+/// Gives up the regular fragments that start before a duplication and run through it. On a
+/// carrier they continue into the second copy, and the chimeric pass draws them there; left in,
+/// they would also cover the flank, which reads 1.1 times a control after a 100 bp duplication.
+/// No draw, and the input untouched, when there are no duplications.
+fn divert_dup_crossers(
+    fragments: Vec<PlacedFragment>,
+    spans: &[tandem_dup::DupSpan],
+    rng: &mut NeatRng,
+) -> Result<Vec<PlacedFragment>, GenerateReadsError> {
+    if spans.is_empty() {
+        return Ok(fragments);
+    }
+    let mut kept = Vec::with_capacity(fragments.len());
+    for placed in fragments {
+        if !tandem_dup::is_diverted(placed.start, placed.end, spans, rng)? {
+            kept.push(placed);
+        }
+    }
+    Ok(kept)
 }
 
 /// A child RNG for one duplication, keyed by where it is. The regular pass and the chimeric pass

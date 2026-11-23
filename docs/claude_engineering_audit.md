@@ -831,6 +831,20 @@ that end before END are ordinary reads and the rest are the junction reads, from
 they cannot disagree (`tandem_dup.rs`). Realigned with bwa-mem2 the profile is flat at
 1.45 to 1.52 inside and 1.00 outside on both sides.
 
+**The same shape, one size down.** The first version of that fix passed a known-answer test on
+the golden BAM from 100 bp up, and was correct for any event longer than a fragment. Validating
+it at the sizes it claimed, realigned, found it was not correct below that: a 100 bp
+heterozygous duplication read 1.18 to 1.26 inside the span and 1.10 to 1.14 over the 300 bp past
+its end, and carried a third of the junction reads of a 500 bp one (10 fragments per event
+against 35). A fragment that starts *before* a span shorter than a fragment and runs through it
+continues into the second copy; the reference sampling drew it as a reference fragment that
+carried on into the flank, and nothing drew the junction read. The golden BAM test had agreed
+with the model because the golden BAM places mate 2 of such a read over the second piece only,
+so it could not see where the bases go. The fix gives up those regular fragments and draws them
+as junction reads (`tandem_dup::is_diverted`, `sample_flank_crossers`); the realigned gate
+`gate2_realigned_dup_depth.rs` pins the small sizes and the golden-BAM test pins the junction
+count for every size. For events longer than a fragment nothing changes.
+
 **The rule.** A depth feature is validated across its boundaries as well as inside them, against
 a no-variant control, at the smallest size it claims to support. "Vanishes at realistic scale"
 is a claim about size and has to be measured at that size.
