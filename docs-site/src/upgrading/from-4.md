@@ -1,7 +1,8 @@
 # Upgrading from 4.x
 
-v5.0.0 removes duplicate config-key names and the pre-v3.0.0 read-name prefix, and changes
-the order of `gen-reads` FASTQ records by default. A removed name stops the run before any
+v5.0.0 removes duplicate config-key names and the pre-v3.0.0 read-name prefix, changes
+the order of `gen-reads` FASTQ records by default, and makes `coverage` mean on-target depth
+when a `target_bed` is set. A removed name stops the run before any
 output is written, and the error names the replacement.
 
 | What you see | Cause | What to do |
@@ -10,6 +11,7 @@ output is written, and the error names the replacement.
 | `gen-cancer-reads`: the same message for `output_filename`, `coverage` or `rng_seed_root` | These were second names for `output_basename`, `total_coverage` and `rng_seed`. | Use the name the error gives. |
 | `filter-reads`: "read name uses the pre-v3.0.0 prefix `RNEAT_generated_`" | Output from v2.0.0 or earlier. 4.x still read it, with a warning. | Rename the reads first (below). |
 | `gen-reads` or `gen-cancer-reads`: `` `output_prefix` (renamed `output_basename` in v5.0.0) `` | `output_prefix` held a file name with no directory, which "prefix" suggests otherwise. | Rename `output_prefix:` to `output_basename:`. A value containing `/` is now refused; put the directory in `output_dir`. |
+| `gen-reads` with `target_bed`: on-target depth is now your `coverage` | `coverage` used to set a fragment budget, so on-target depth came in below it (24.5× for a requested 60× on one exome-shaped BED). Targets no longer than a read also owned no fragments. | Nothing, usually. Divide your old `coverage` request by the on-target fraction to undo a compensating increase. See [Targeted generation](../gen-reads/targeted-generation.md). |
 | `gen-reads` FASTQs in random order, and about 60% larger | Records are shuffled by default (#870), as a sequencer's are. | Nothing, usually. Set `shuffle_fastq: false` for genome order. |
 
 To update every config under a directory:
