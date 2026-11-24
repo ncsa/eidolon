@@ -32,9 +32,11 @@ A base counts as on-target if *any* target covers it, so targets that touch or s
 
 **The mean is corrected, not each target.** A narrow target captures fewer on-target bases per fragment than a wide one, so depth still varies with target width: in the chr22 run, targets of 150 bp or less (63% of the targets, 32% of the target bases) averaged 13.8×, and wider ones 37.8×.
 
+**Not corrected for GC bias (#887).** The estimate is geometry only. With a non-uniform `gc_bias_model` the placement weights fragment starts by GC, so `coverage` is no longer the mean on-target depth, and the run logs a warning. On the chr22 exome run above with one generated non-uniform model, `coverage: 30` gave 47.2× with `gc_bias_normalize_coverage` on (the default) and 37.2× with it off. The default model is uniform and is unaffected.
+
 **Targets narrower than a read.** Before v5.0.0 a target no longer than `read_len` owned no fragments and was covered only by spill from its neighbors (1.1× against a requested 30× for those targets on the chr22 run). They now own fragments like any other target.
 
 - **Do not read a 100%-on-target simulation as "better".** eidolon before v3.1.x confined every fragment inside its target, which yields 100% on-target and is physically impossible for targets narrower than the fragment length. It also under-delivered the fragment budget itself and collapsed the realized fragment-length distribution near target edges.
 - To reproduce a pre-v5.0.0 run's fragment count, multiply its `coverage` by the on-target fraction from the log line.
 
-**Not verified:** one real exome design on one chromosome; N-gap-adjacent targets (the estimate treats only contig ends as termini); other fragment-length models than a normal.
+**Not verified:** a GC-biased run (see above); one real exome design on one chromosome; N-gap-adjacent targets (the estimate treats only contig ends as termini); other fragment-length models than a normal.

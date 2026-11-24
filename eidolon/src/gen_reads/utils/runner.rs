@@ -4220,6 +4220,13 @@ fn target_budget_scale(
         fraction * 100.0,
         scale
     );
+    if !ctx.gc_bias_model.is_uniform() {
+        warn!(
+            "target_bed: the fragment budget is not corrected for GC bias. A non-uniform \
+             gc_bias_model weights fragment starts by GC, so `coverage` will not equal the mean \
+             on-target depth; GC-rich targets read deeper than requested (#887)"
+        );
+    }
     Ok(scale)
 }
 
