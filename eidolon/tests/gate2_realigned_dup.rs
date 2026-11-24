@@ -22,28 +22,16 @@
 //! breakpoint — detectable by a depth caller and invisible to Manta or Delly, which is
 //! consistent with what array 21072620 reported.
 //!
-//! ## Measured excess over the declared dosage — evidence for #499
+//! ## Depth over the declared dosage (#499, #884)
 //!
-//! A homozygous DUP without `CN` gets `coverage_multiplier_for` = **2.0**, but the realigned
-//! depth over this 300 bp event reads **2.55x** its flank. Mutating the multiplier gives a clean
-//! dose-response:
-//!
-//! | multiplier | depth inside | flank | ratio |
-//! |---|---|---|---|
-//! | 2.0 (shipped) | 168.60 | 66.05 | 2.553 |
-//! | 1.0 | 99.14 | 65.25 | 1.519 |
-//! | 0.5 | 69.08 | 65.55 | 1.054 |
-//!
-//! That is `ratio ~= multiplier + 0.53` — a constant offset independent of the multiplier, and
-//! ~44 everted pairs plus 64 clipped reads is about the right number of extra reads to account
-//! for it. The junction reads appear to be emitted *in addition to* the coverage-multiplied
-//! regular reads, rather than being part of them. Being a fixed number of reads, the excess
-//! scales inversely with event length, which predicts the ~8% seen on #499's 1200 bp event
-//! against the 27% seen here on 300 bp.
-//!
-//! **This gate deliberately does not assert the excess away.** It asserts the signature is
-//! present; the dosage question belongs to #499 and to the Phase 1 size sweep, which this
-//! measurement now gives a mechanism to test.
+//! Before #884 a homozygous DUP without `CN` realigned to **2.55x** its flank on this 300 bp
+//! event against a declared 2.0. The junction reads were emitted in addition to a raised start
+//! density whose fragments ran on into the flank. A duplication's extra copy is now sampled as
+//! fragments that start in the span and follow the new junction, so the two cannot disagree; see
+//! `tandem_dup.rs`. The same event now reads about 1.85x. That is a small-window figure on a
+//! 300 bp event (the sigma of a window that size is about 13%), so **this gate still does not
+//! assert it**: it asserts the signature is present. The depth profile across both edges, against
+//! a no-variant control, is `dup_depth_profile.rs`.
 //!
 //! Requires bwa-mem2; `#[ignore]`d so CI never reaches it. See `common/gate2.rs`.
 //!

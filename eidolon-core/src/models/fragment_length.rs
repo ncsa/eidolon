@@ -136,6 +136,30 @@ impl FragmentLengthModel {
         }
     }
 
+    /// The longest fragment this model draws in practice: the largest value with weight for a
+    /// `Discrete` model, and the mean plus eight standard deviations for `Normal` (a tail the
+    /// model reaches about once in 10^15 draws). Deterministic, no RNG draw.
+    pub fn max_length(&self) -> Result<usize, FragmentModelError> {
+        match self {
+            FragmentLengthModel::Normal { mean, st_dev } => {
+                Ok((mean + 8.0 * st_dev).max(0.0).ceil() as usize)
+            }
+            FragmentLengthModel::Discrete { distribution } => {
+                let values = distribution.values()?;
+                let weights = distribution.weights()?;
+                values
+                    .iter()
+                    .zip(weights.iter())
+                    .filter(|&(_, &w)| w > 0.0)
+                    .map(|(&v, _)| v)
+                    .max()
+                    .ok_or(FragmentModelError::FragModelError(
+                        "Discrete fragment model has no value with weight",
+                    ))
+            }
+        }
+    }
+
     pub fn normal_params(&self) -> Result<(f64, f64), FragmentModelError> {
         // This returns the parameters used to initiate the model
         match self {
@@ -476,5 +500,17 @@ mod tests {
         let model2 = FragmentLengthModel::discrete_from_file(&temp_file).unwrap();
         assert_eq!(model.is_discrete(), model2.is_discrete());
         temp_dir.close().unwrap();
+    }
+
+    #[test]
+    fn max_length_is_the_longest_fragment_the_model_draws() {
+        let discrete =
+            FragmentLengthModel::new_discrete(vec![200, 30_000, 900], vec![1.0, 0.1, 0.0]).unwrap();
+        // 900 has no weight, so it is not the longest; 30_000 is.
+        assert_eq!(discrete.max_length().unwrap(), 30_000);
+        let zero = FragmentLengthModel::new_discrete(vec![30_000, 200], vec![0.0, 1.0]).unwrap();
+        assert_eq!(zero.max_length().unwrap(), 200);
+        let normal = FragmentLengthModel::new_normal(350.0, 35.0).unwrap();
+        assert_eq!(normal.max_length().unwrap(), 630);
     }
 }
