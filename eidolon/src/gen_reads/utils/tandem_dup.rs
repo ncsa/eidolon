@@ -63,12 +63,17 @@ pub fn excess_fraction(multiplier: f64) -> Option<f64> {
 ///
 /// `denom` is `2 x read_length` paired and `read_length` single-ended, as in
 /// `generate_fragments`, so the excess is in the same units as the baseline's budget.
+///
+/// `budget_scale` is the factor the baseline fragment budget carries (1.0 without a `target_bed`,
+/// `1 / on-target share` with one, #578). The extra copy is scaled by the same factor so that it
+/// stays `excess` times the depth the baseline gives those bases, not `excess` times the request.
 #[allow(clippy::too_many_arguments)]
 pub fn sample_extra_copy(
     span_start: usize,
     span_end: usize,
     excess: f64,
     coverage: usize,
+    budget_scale: f64,
     read_length: usize,
     paired_ended: bool,
     long_reads: bool,
@@ -77,7 +82,13 @@ pub fn sample_extra_copy(
     rng: &mut NeatRng,
 ) -> Result<Vec<DupFragment>, GenerateReadsError> {
     let width = span_end.saturating_sub(span_start);
-    if width == 0 || !excess.is_finite() || excess <= 0.0 || coverage == 0 {
+    if width == 0
+        || !excess.is_finite()
+        || excess <= 0.0
+        || coverage == 0
+        || !budget_scale.is_finite()
+        || budget_scale <= 0.0
+    {
         return Ok(Vec::new());
     }
     let denom = if paired_ended {
@@ -85,7 +96,8 @@ pub fn sample_extra_copy(
     } else {
         read_length.max(1)
     };
-    let count = (excess * width as f64 * coverage as f64 / denom as f64).round() as usize;
+    let count =
+        (excess * width as f64 * coverage as f64 / denom as f64 * budget_scale).round() as usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let frag_len = if paired_ended {
@@ -139,6 +151,7 @@ pub fn sample_flank_crossers(
     span_end: usize,
     share: f64,
     coverage: usize,
+    budget_scale: f64,
     read_length: usize,
     paired_ended: bool,
     long_reads: bool,
@@ -159,6 +172,7 @@ pub fn sample_flank_crossers(
         span_start,
         share,
         coverage,
+        budget_scale,
         read_length,
         paired_ended,
         long_reads,
@@ -211,6 +225,7 @@ mod tests {
             6_000,
             0.5,
             60,
+            1.0,
             100,
             true,
             false,
@@ -227,6 +242,7 @@ mod tests {
             6_000,
             1.0,
             60,
+            1.0,
             100,
             false,
             false,
@@ -250,6 +266,7 @@ mod tests {
             1_000,
             2.0,
             1_000,
+            1.0,
             100,
             true,
             false,
@@ -311,6 +328,7 @@ mod tests {
             100,
             1.0,
             60,
+            1.0,
             100,
             true,
             false,
@@ -329,13 +347,13 @@ mod tests {
         let mut r = rng("none");
         for (excess, cov, a, b) in [(0.0, 60, 0, 100), (-0.5, 60, 0, 100), (0.5, 0, 0, 100)] {
             assert!(
-                sample_extra_copy(a, b, excess, cov, 100, true, false, false, &m, &mut r)
+                sample_extra_copy(a, b, excess, cov, 1.0, 100, true, false, false, &m, &mut r)
                     .unwrap()
                     .is_empty()
             );
         }
         assert!(
-            sample_extra_copy(7, 7, 0.5, 60, 100, true, false, false, &m, &mut r)
+            sample_extra_copy(7, 7, 0.5, 60, 1.0, 100, true, false, false, &m, &mut r)
                 .unwrap()
                 .is_empty()
         );
@@ -353,6 +371,7 @@ mod tests {
             800,
             0.5,
             30,
+            1.0,
             100,
             true,
             false,
@@ -366,6 +385,7 @@ mod tests {
             800,
             0.5,
             30,
+            1.0,
             100,
             true,
             false,
@@ -386,6 +406,7 @@ mod tests {
             5_100,
             1.0,
             1_000,
+            1.0,
             100,
             true,
             false,
@@ -413,6 +434,7 @@ mod tests {
             6_000,
             1.0,
             1_000,
+            1.0,
             100,
             true,
             false,
@@ -481,6 +503,7 @@ mod tests {
             20_100,
             0.5,
             60,
+            1.0,
             150,
             true,
             true,
@@ -502,6 +525,7 @@ mod tests {
             20_100,
             0.5,
             60,
+            1.0,
             150,
             true,
             false,
@@ -511,5 +535,32 @@ mod tests {
         )
         .unwrap();
         assert!(short.iter().all(|f| f.start + 360 > 20_000));
+    }
+
+    /// The extra copy follows the baseline's budget scale (#578): 150 fragments at 1.0, 300 at
+    /// 2.0, and none for a scale that is not a positive number.
+    #[test]
+    fn the_extra_copy_count_follows_the_budget_scale() {
+        let draw = |scale: f64| {
+            sample_extra_copy(
+                5_000,
+                6_000,
+                0.5,
+                60,
+                scale,
+                100,
+                true,
+                false,
+                false,
+                &model(250.0),
+                &mut rng("scale"),
+            )
+            .unwrap()
+            .len()
+        };
+        assert_eq!(draw(1.0), 150);
+        assert_eq!(draw(2.0), 300);
+        assert_eq!(draw(0.0), 0);
+        assert_eq!(draw(f64::NAN), 0);
     }
 }

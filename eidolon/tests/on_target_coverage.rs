@@ -232,3 +232,53 @@ fn sv_depth_modulation_inside_a_target_is_unchanged() {
         inside / flank
     );
 }
+
+/// MUST HOLD with a budget scale above 1 (#884 x #578). The baseline fragments of every target
+/// are scaled by 1 / (share of read bases on target); a duplication's extra copy has to be scaled
+/// by the same factor, or it adds `excess x 30` to a baseline of `scale x 30` and the event reads
+/// `1 + 0.5 / scale` instead of 1.5. The event is an 8 kb het duplication inside a 20 kb target;
+/// in the second run 200 isolated 180 bp targets pull the scale above 1.5. Each ratio is event
+/// over the same bases of a run without the duplication, and the two must agree.
+#[test]
+fn a_duplication_inside_a_target_keeps_its_ratio_when_the_budget_is_scaled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (anchor, svlen) = (106_000usize, 8_000usize);
+    let end = anchor + svlen;
+    let record = format!(
+        "{CONTIG}\t{anchor}\tv\tA\t<DUP>\t60\tPASS\tSVTYPE=DUP;END={end};SVLEN={svlen}\tGT\t0/1"
+    );
+    let wide = (100_000usize, 120_000usize);
+    let mut scaled = vec![wide];
+    scaled.extend((0..200).map(|i| (400_000 + i * 2_500, 400_000 + i * 2_500 + 180)));
+    let ratio = |name: &str, targets: &[(usize, usize)]| {
+        let with = depth_track(&run(
+            tmp.path(),
+            &format!("{name}_dup"),
+            targets,
+            std::slice::from_ref(&record),
+        ));
+        let control = depth_track(&run(tmp.path(), &format!("{name}_ctrl"), targets, &[]));
+        let (a, b) = (anchor + 1_000, end - 1_000);
+        let baseline = mean_over(&control, a, b);
+        let event = mean_over(&with, a, b);
+        eprintln!(
+            "[on-target] {name}: baseline {baseline:.2}x, with the duplication {event:.2}x, ratio {:.3}",
+            event / baseline
+        );
+        (baseline, event / baseline)
+    };
+    let (base_one, ratio_one) = ratio("unscaled", &[wide]);
+    let (base_scaled, ratio_scaled) = ratio("scaled", &scaled);
+    assert!(
+        base_scaled > 1.3 * base_one,
+        "baseline {base_scaled:.1}x against {base_one:.1}x: the scale did not apply, so this does not test it"
+    );
+    assert!(
+        (ratio_one - 1.5).abs() < 0.10,
+        "unscaled ratio {ratio_one:.3}, declared 1.5"
+    );
+    assert!(
+        (ratio_scaled - ratio_one).abs() < 0.06,
+        "ratio {ratio_scaled:.3} with a scaled budget against {ratio_one:.3} without"
+    );
+}
