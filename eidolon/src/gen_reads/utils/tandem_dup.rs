@@ -111,10 +111,6 @@ pub fn sample_extra_copy(
     Ok(out)
 }
 
-/// How far before the span a fragment can start and still be drawn as a flank crosser. Longer
-/// than any fragment a run draws, so the window does not truncate the distribution.
-pub const FLANK_WINDOW: usize = 2_000;
-
 /// The share of the molecules that carry the duplication, for the fragments that start before it.
 /// Heterozygous on a diploid is 0.5, homozygous and above is 1.0.
 pub fn carrier_share(excess: f64) -> f64 {
@@ -153,7 +149,11 @@ pub fn sample_flank_crossers(
     if span_end <= span_start || !share.is_finite() || share <= 0.0 || coverage == 0 {
         return Ok(Vec::new());
     }
-    let window = FLANK_WINDOW.min(span_start);
+    // How far before the span a fragment can start and still reach it: the longest fragment the
+    // model draws (or one read, single-ended). The regular pass diverts every baseline fragment
+    // that crosses, wherever it starts, so the window must not be shorter than that.
+    let reach = model.max_length()?.max(read_length);
+    let window = reach.min(span_start);
     let candidates = sample_extra_copy(
         span_start - window,
         span_start,
@@ -467,5 +467,49 @@ mod tests {
         let mut b = rng("same");
         assert!(!is_diverted(0, 50, &spans, &mut a).unwrap());
         assert_eq!(a.random().unwrap(), b.random().unwrap());
+    }
+
+    /// A long-read model (every fragment 5 kb) over a 100 bp span. Fragments crossing the span
+    /// start anywhere in the 4.9 kb before it, and the regular pass diverts all of them, so the
+    /// replacements must come from the whole reach and not from a fixed window:
+    /// share x coverage x 4900 / denom = 0.5 x 60 x 4900 / 300 = 490 (#885 review).
+    #[test]
+    fn flank_crossers_cover_the_whole_reach_of_a_long_fragment_model() {
+        let long = FragmentLengthModel::new_discrete(vec![5_000], vec![1.0]).unwrap();
+        let got = sample_flank_crossers(
+            20_000,
+            20_100,
+            0.5,
+            60,
+            150,
+            true,
+            true,
+            false,
+            &long,
+            &mut rng("long"),
+        )
+        .unwrap();
+        assert!(
+            (got.len() as f64 - 490.0).abs() < 490.0 * 0.05,
+            "{} crossers, want about 490",
+            got.len()
+        );
+        let far = got.iter().filter(|f| f.start < 20_000 - 2_000).count();
+        assert!(far > 200, "only {far} start more than 2 kb before the span");
+        // Must not fire: a short-fragment model still draws only what can reach the span.
+        let short = sample_flank_crossers(
+            20_000,
+            20_100,
+            0.5,
+            60,
+            150,
+            true,
+            false,
+            false,
+            &model(350.0),
+            &mut rng("short"),
+        )
+        .unwrap();
+        assert!(short.iter().all(|f| f.start + 360 > 20_000));
     }
 }

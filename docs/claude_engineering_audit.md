@@ -844,6 +844,10 @@ so it could not see where the bases go. The fix gives up those regular fragments
 as junction reads (`tandem_dup::is_diverted`, `sample_flank_crossers`); the realigned gate
 `gate2_realigned_dup_depth.rs` pins the small sizes and the golden-BAM test pins the junction
 count for every size. For events longer than a fragment nothing changes.
+Review then found the replacement window was a fixed 2 kb while the diversion had no such
+limit, so a long-read model (fragments in the tens of kb) lost the junction reads of every
+diverted fragment that started further out. The window is now the longest fragment the model
+draws (`FragmentLengthModel::max_length`), pinned by a known-answer count on 5 kb fragments.
 
 **The rule.** A depth feature is validated across its boundaries as well as inside them, against
 a no-variant control, at the smallest size it claims to support. "Vanishes at realistic scale"
