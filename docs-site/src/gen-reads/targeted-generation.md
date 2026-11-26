@@ -34,6 +34,8 @@ A base counts as on-target if *any* target covers it, so targets that touch or s
 
 **Not corrected for GC bias (#887).** The estimate is geometry only. With a non-uniform `gc_bias_model` the placement weights fragment starts by GC, so `coverage` is no longer the mean on-target depth, and the run logs a warning. On the chr22 exome run above with one generated non-uniform model, `coverage: 30` gave 47.2× with `gc_bias_normalize_coverage` on (the default) and 37.2× with it off. The default model is uniform and is unaffected.
 
+**SV junction reads are scaled with the rest.** A structural variant's junction fragments (DEL, INV, BND, `<CNV>`) take the same budget scale as the baseline, so an event's junction support stays in proportion to the local depth (#889). Measured as junction-read counts against a scale-1 run of the same events: 90 → 150 at scale 1.657 for DEL, BND and `<CNV>` loss, 180 → 300 for INV (synthetic reference, 100 bp reads; ratios 1.67, in line with the scale). Not measured with a caller.
+
 **Targets narrower than a read.** Before v5.0.0 a target no longer than `read_len` owned no fragments and was covered only by spill from its neighbors (1.1× against a requested 30× for those targets on the chr22 run). They now own fragments like any other target.
 
 - **Do not read a 100%-on-target simulation as "better".** eidolon before v3.1.x confined every fragment inside its target, which yields 100% on-target and is physically impossible for targets narrower than the fragment length. It also under-delivered the fragment budget itself and collapsed the realized fragment-length distribution near target edges.
