@@ -1862,7 +1862,8 @@ fn process_chimeric_variants(
                     ctx.config.subclone_model.is_some(),
                 );
 
-                let num_frags = scale_coverage(ctx.config.coverage, mult);
+                let num_frags =
+                    scale_junction_coverage(ctx.config.coverage, mult, ctx.budget_scale);
                 if num_frags == 0 {
                     continue;
                 }
@@ -1956,7 +1957,8 @@ fn process_chimeric_variants(
                     ctx.config.subclone_model.is_some(),
                 );
 
-                let num_frags = scale_coverage(ctx.config.coverage, mult);
+                let num_frags =
+                    scale_junction_coverage(ctx.config.coverage, mult, ctx.budget_scale);
                 if num_frags == 0 {
                     continue;
                 }
@@ -2080,7 +2082,8 @@ fn process_chimeric_variants(
                     (cn - ploidy) as f64 / ploidy as f64
                 };
 
-                let num_frags = scale_coverage(ctx.config.coverage, mult);
+                let num_frags =
+                    scale_junction_coverage(ctx.config.coverage, mult, ctx.budget_scale);
                 if num_frags == 0 {
                     continue;
                 }
@@ -2315,7 +2318,8 @@ fn process_chimeric_variants(
                     Genotype::Heterozygous => 1.0 / (ctx.config.ploidy as f64),
                 };
 
-                let num_frags = scale_coverage(ctx.config.coverage, mult);
+                let num_frags =
+                    scale_junction_coverage(ctx.config.coverage, mult, ctx.budget_scale);
                 if num_frags == 0 {
                     continue;
                 }
@@ -4140,6 +4144,18 @@ fn scale_coverage(base: usize, multiplier: f64) -> usize {
     (base as f64 * multiplier).round() as usize
 }
 
+/// The junction-fragment count of an SV event: `base` coverage times the event's allele fraction
+/// `mult`, times the target-budget `budget_scale` (#889). The baseline passes scale their budget
+/// by `budget_scale` so `coverage` means on-target depth; a junction count that did not would
+/// leave the event's support at `1/budget_scale` of the local depth. Equals [`scale_coverage`]
+/// when `budget_scale` is 1.0.
+fn scale_junction_coverage(base: usize, mult: f64, budget_scale: f64) -> usize {
+    if !budget_scale.is_finite() || budget_scale <= 0.0 {
+        return 0;
+    }
+    scale_coverage(base, mult * budget_scale)
+}
+
 /// The fragment-budget multiplier that makes `coverage` mean on-target depth on a `target_bed`
 /// run (#578): 1 / (the fraction of read bases that land on target), estimated from the BED
 /// geometry and the fragment model by [`on_target_fraction`]. Exactly 1.0 without a BED.
@@ -5304,6 +5320,22 @@ mod tests {
         assert_eq!(scale_coverage(10, 0.49), 5);
         // 0.04 * 10 = 0.4 → rounds to 0.
         assert_eq!(scale_coverage(10, 0.04), 0);
+    }
+
+    #[test]
+    fn junction_coverage_follows_the_budget_scale() {
+        // Scale 1.0 is exactly the old count.
+        assert_eq!(
+            scale_junction_coverage(30, 0.5, 1.0),
+            scale_coverage(30, 0.5)
+        );
+        // Het (mult 0.5) at 30x with a 2x budget scale: 30 * 0.5 * 2 = 30.
+        assert_eq!(scale_junction_coverage(30, 0.5, 2.0), 30);
+        assert_eq!(scale_junction_coverage(30, 0.5, 1.5), 23); // 22.5 rounds up
+        // A bad scale draws nothing, as in fragment_budget.
+        assert_eq!(scale_junction_coverage(30, 0.5, 0.0), 0);
+        assert_eq!(scale_junction_coverage(30, 0.5, f64::NAN), 0);
+        assert_eq!(scale_junction_coverage(30, 0.5, f64::INFINITY), 0);
     }
 
     #[test]

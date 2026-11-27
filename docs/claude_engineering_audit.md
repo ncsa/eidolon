@@ -853,6 +853,15 @@ draws (`FragmentLengthModel::max_length`), pinned by a known-answer count on 5 k
 a no-variant control, at the smallest size it claims to support. "Vanishes at realistic scale"
 is a claim about size and has to be measured at that size.
 
+**A second budget, found by crossing two features (#889).** #882 made `coverage` mean on-target
+depth by multiplying each baseline fragment budget by a budget scale, and its tests passed. The
+chimeric pass counts an SV event's junction fragments by a different expression, which that
+change did not touch, and no test combined `target_bed` with an SV. Counting the 40-mer that spans
+each junction in the FASTQ gave 80 reads at scale 1.000 and 80 at 1.509 for eight het deletions;
+INV gave 152 and 152. The same shape had already been fixed once for a duplication's extra copy.
+The check that found it is cheap and general: when a feature rescales one quantity, list every
+other place that sets the same quantity and measure each one against a same-seed control.
+
 ---
 
 ## 6. Case study: BND
