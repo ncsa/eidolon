@@ -282,3 +282,88 @@ fn a_duplication_inside_a_target_keeps_its_ratio_when_the_budget_is_scaled() {
         "ratio {ratio_scaled:.3} with a scaled budget against {ratio_one:.3} without"
     );
 }
+
+/// Runs the isolated-target fixture and returns its log (stdout and stderr), with an optional GC
+/// bias model file.
+fn stderr_with_gc_model(dir: &Path, name: &str, model: Option<&Path>) -> String {
+    let out = dir.join(name);
+    std::fs::create_dir_all(&out).unwrap();
+    let reference = write_reference(&out);
+    let targets: Vec<(usize, usize)> = (0..20)
+        .map(|i| (50_000 + i * 4_000, 50_000 + i * 4_000 + 180))
+        .collect();
+    let bed = write_bed(&out, &targets);
+    let gc = model
+        .map(|m| format!("gc_bias_model: {}\n", m.display()))
+        .unwrap_or_default();
+    let cfg = out.join("c.yml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "reference: {ref}\ntarget_bed: {bed}\nread_len: 100\ncoverage: 10\nploidy: 2\n\
+             paired_ended: true\nfragment_mean: 250\nfragment_st_dev: 25\n{gc}\
+             produce_vcf: false\nproduce_fastq: false\nproduce_bam: true\n\
+             sv_rate_scale: 0.0\noverwrite_output: true\n\
+             output_dir: {out}\noutput_basename: o\nrng_seed: gc warning {name}\nnum_threads: 2\n",
+            ref = reference.display(),
+            bed = bed.display(),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    let output = eidolon()
+        .args(["gen-reads", "-c"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The estimate behind `coverage` is geometry only. With a non-uniform GC model the placement
+/// weights starts by GC, so `coverage` is not the mean on-target depth (47x for a requested 30x on
+/// the chr22 IDT exome with a moderate model), and the run says so. It must not say so without a
+/// model.
+#[test]
+fn a_gc_model_with_a_target_bed_warns_that_coverage_is_not_corrected_for_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 101 weights, one per percent GC: depleted at the AT end, 1.0 from 50% up.
+    let weights: Vec<String> = (0..=100)
+        .map(|p| format!("{:.3}", (0.2 + 0.8 * (p as f64 / 50.0)).min(1.0)))
+        .collect();
+    let model = tmp.path().join("gc.json.gz");
+    let mut enc = flate2::write::GzEncoder::new(
+        std::fs::File::create(&model).unwrap(),
+        flate2::Compression::default(),
+    );
+    std::io::Write::write_all(
+        &mut enc,
+        format!(
+            "{{\"is_uniform\": false, \"weights_by_percent_gc\": [{}]}}",
+            weights.join(", ")
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    enc.finish().unwrap();
+
+    let with = stderr_with_gc_model(tmp.path(), "with_model", Some(&model));
+    assert!(
+        with.contains("not corrected for GC bias"),
+        "no warning with a non-uniform GC model:\n{with}"
+    );
+    let without = stderr_with_gc_model(tmp.path(), "no_model", None);
+    assert!(
+        without.contains("fragment budget is scaled"),
+        "the estimate did not run, so this does not test the warning:\n{without}"
+    );
+    assert!(
+        !without.contains("GC bias"),
+        "warned about GC bias with no model:\n{without}"
+    );
+}
